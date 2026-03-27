@@ -1,0 +1,71 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary: endara-relay
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary: endara-relay
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            binary: endara-relay
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            binary: endara-relay
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            binary: endara-relay.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cross-compilation tools
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+      - name: Build release
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Rename binary
+        shell: bash
+        run: |
+          src="target/${{ matrix.target }}/release/${{ matrix.binary }}"
+          dst="endara-relay-${{ matrix.target }}"
+          if [[ "${{ matrix.target }}" == *"windows"* ]]; then
+            dst="${dst}.exe"
+          fi
+          cp "$src" "$dst"
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: endara-relay-${{ matrix.target }}
+          path: endara-relay-${{ matrix.target }}*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: artifacts/*
+
