@@ -1,10 +1,10 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// Top-level configuration structure.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub relay: RelayConfig,
     #[serde(default)]
@@ -12,7 +12,7 @@ pub struct Config {
 }
 
 /// Relay-specific configuration.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RelayConfig {
     pub machine_name: String,
     #[serde(default)]
@@ -20,7 +20,7 @@ pub struct RelayConfig {
 }
 
 /// Transport type for an endpoint.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
     Stdio,
@@ -39,7 +39,7 @@ impl fmt::Display for Transport {
 }
 
 /// Configuration for a single MCP endpoint.
-#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct EndpointConfig {
     pub name: String,
     pub transport: Transport,
@@ -95,6 +95,36 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+/// Create a default configuration with the system hostname and no endpoints.
+pub fn default_config() -> Config {
+    let machine_name = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    Config {
+        relay: RelayConfig {
+            machine_name,
+            local_js_execution: None,
+        },
+        endpoints: Vec::new(),
+    }
+}
+
+/// Write a default config file to the given path, creating parent directories as needed.
+pub fn create_default_config_file(path: &Path) -> Result<Config, ConfigError> {
+    let resolved = expand_tilde(path);
+    if let Some(parent) = resolved.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let config = default_config();
+    let toml_str = toml::to_string_pretty(&config).map_err(|e| {
+        ConfigError::ValidationError(format!("Failed to serialize default config: {}", e))
+    })?;
+    std::fs::write(&resolved, &toml_str)?;
+    Ok(config)
 }
 
 /// Load, parse, resolve env vars, and validate a config file.
@@ -155,12 +185,6 @@ fn resolve_env_value(value: &str, endpoint_name: &str) -> Result<String, ConfigE
 
 /// Validate the parsed config.
 fn validate(config: &Config) -> Result<(), ConfigError> {
-    if config.endpoints.is_empty() {
-        return Err(ConfigError::ValidationError(
-            "At least one endpoint must be configured".to_string(),
-        ));
-    }
-
     let mut seen_names = std::collections::HashSet::new();
     for ep in &config.endpoints {
         if ep.name.is_empty() {
@@ -423,18 +447,14 @@ command = "cat"
     }
 
     #[test]
-    fn empty_config() {
+    fn empty_config_is_valid() {
         let toml_str = r#"
 [relay]
 machine_name = "test"
 "#;
-        let err = parse_and_validate(toml_str).unwrap_err();
-        match err {
-            ConfigError::ValidationError(msg) => {
-                assert!(msg.contains("At least one endpoint"), "Error: {}", msg);
-            }
-            other => panic!("Expected ValidationError, got: {:?}", other),
-        }
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(config.relay.machine_name, "test");
+        assert!(config.endpoints.is_empty());
     }
 
     // --- Config diff tests ---

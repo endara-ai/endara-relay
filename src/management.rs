@@ -6,13 +6,15 @@ use axum::{
     Json, Router,
 };
 use serde::Serialize;
+use tower_http::cors::CorsLayer;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
 
-use crate::adapter::{HealthStatus, McpAdapter};
+use crate::adapter::HealthStatus;
 use crate::config::Config;
+use crate::registry::AdapterRegistry;
 
 // ---------------------------------------------------------------------------
 // App state
@@ -24,27 +26,6 @@ pub struct ManagementState {
     pub registry: Arc<AdapterRegistry>,
     pub config: Arc<RwLock<Config>>,
     pub start_time: Instant,
-}
-
-/// Registry holding named adapters and their metadata.
-pub struct AdapterRegistry {
-    pub entries: RwLock<HashMap<String, AdapterEntry>>,
-}
-
-/// One entry in the registry.
-pub struct AdapterEntry {
-    pub adapter: Box<dyn McpAdapter>,
-    pub transport: String,
-    pub last_activity: Option<Instant>,
-    pub stderr_lines: Arc<RwLock<Vec<String>>>,
-}
-
-impl AdapterRegistry {
-    pub fn new() -> Self {
-        Self {
-            entries: RwLock::new(HashMap::new()),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -114,7 +95,7 @@ fn endpoint_not_found(name: &str) -> impl IntoResponse {
 
 /// GET /api/status
 async fn get_status(State(state): State<ManagementState>) -> Json<StatusResponse> {
-    let entries = state.registry.entries.read().await;
+    let entries = state.registry.entries().read().await;
     let healthy_count = entries
         .values()
         .filter(|e| matches!(e.adapter.health(), HealthStatus::Healthy))
@@ -130,18 +111,23 @@ async fn get_status(State(state): State<ManagementState>) -> Json<StatusResponse
 
 /// GET /api/endpoints
 async fn get_endpoints(State(state): State<ManagementState>) -> Json<Vec<EndpointInfo>> {
-    let entries = state.registry.entries.read().await;
+    let entries = state.registry.entries().read().await;
     let now = Instant::now();
-    let mut endpoints: Vec<EndpointInfo> = entries
-        .iter()
-        .map(|(name, entry)| EndpointInfo {
+    let mut endpoints: Vec<EndpointInfo> = Vec::new();
+    for (name, entry) in entries.iter() {
+        let tool_count = if matches!(entry.adapter.health(), HealthStatus::Healthy) {
+            entry.adapter.list_tools().await.map(|t| t.len()).unwrap_or(0)
+        } else {
+            0
+        };
+        endpoints.push(EndpointInfo {
             name: name.clone(),
             transport: entry.transport.clone(),
             health: entry.adapter.health().to_string(),
-            tool_count: 0, // filled lazily or cached; 0 is safe default
+            tool_count,
             last_activity: entry.last_activity.map(|t| now.duration_since(t).as_secs()),
-        })
-        .collect();
+        });
+    }
     endpoints.sort_by(|a, b| a.name.cmp(&b.name));
     Json(endpoints)
 }
@@ -151,7 +137,7 @@ async fn restart_endpoint(
     State(state): State<ManagementState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let mut entries = state.registry.entries.write().await;
+    let mut entries = state.registry.entries().write().await;
     let Some(entry) = entries.get_mut(&name) else {
         return endpoint_not_found(&name).into_response();
     };
@@ -183,7 +169,7 @@ async fn refresh_endpoint(
     State(state): State<ManagementState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let entries = state.registry.entries.read().await;
+    let entries = state.registry.entries().read().await;
     let Some(entry) = entries.get(&name) else {
         return endpoint_not_found(&name).into_response();
     };
@@ -207,7 +193,7 @@ async fn get_endpoint_logs(
     State(state): State<ManagementState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let entries = state.registry.entries.read().await;
+    let entries = state.registry.entries().read().await;
     let Some(entry) = entries.get(&name) else {
         return endpoint_not_found(&name).into_response();
     };
@@ -232,6 +218,8 @@ struct SanitizedConfig {
 #[derive(Serialize)]
 struct SanitizedRelay {
     machine_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_js_execution: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -252,6 +240,7 @@ fn sanitize_config(config: &Config) -> SanitizedConfig {
     SanitizedConfig {
         relay: SanitizedRelay {
             machine_name: config.relay.machine_name.clone(),
+            local_js_execution: config.relay.local_js_execution,
         },
         endpoints: config
             .endpoints
@@ -296,6 +285,7 @@ pub fn management_routes(state: ManagementState) -> Router {
         .route("/api/endpoints/{name}/logs", get(get_endpoint_logs))
         .route("/api/config", get(get_config))
         .route("/api/config/reload", post(reload_config))
+        .layer(CorsLayer::permissive())
         .with_state(state)
 }
 
@@ -304,7 +294,7 @@ async fn get_endpoint_tools(
     State(state): State<ManagementState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let entries = state.registry.entries.read().await;
+    let entries = state.registry.entries().read().await;
     let Some(entry) = entries.get(&name) else {
         return endpoint_not_found(&name).into_response();
     };
@@ -391,22 +381,17 @@ mod tests {
     }
 
     async fn test_state(adapters: Vec<(&str, MockAdapter)>) -> ManagementState {
-        let registry = AdapterRegistry::new();
-        {
-            let mut entries = registry.entries.write().await;
-            for (name, adapter) in adapters {
-                entries.insert(
-                    name.to_string(),
-                    AdapterEntry {
-                        adapter: Box::new(adapter),
-                        transport: "stdio".to_string(),
-                        last_activity: None,
-                        stderr_lines: Arc::new(RwLock::new(vec![
-                            "line1".to_string(),
-                            "line2".to_string(),
-                        ])),
-                    },
-                );
+        let registry = AdapterRegistry::new("test-machine".into());
+        for (name, adapter) in adapters {
+            registry
+                .register(name.to_string(), Box::new(adapter), "stdio".to_string())
+                .await;
+            // Add test stderr lines
+            let entries = registry.entries().read().await;
+            if let Some(entry) = entries.get(name) {
+                let mut lines = entry.stderr_lines.write().await;
+                lines.push("line1".to_string());
+                lines.push("line2".to_string());
             }
         }
         ManagementState {
@@ -445,8 +430,20 @@ mod tests {
 
     #[tokio::test]
     async fn management_endpoints_list() {
+        let tools = vec![
+            ToolInfo {
+                name: "t1".into(),
+                description: None,
+                input_schema: serde_json::json!({}),
+            },
+            ToolInfo {
+                name: "t2".into(),
+                description: None,
+                input_schema: serde_json::json!({}),
+            },
+        ];
         let state = test_state(vec![
-            ("a", MockAdapter::healthy_with_tools(vec![])),
+            ("a", MockAdapter::healthy_with_tools(tools)),
             ("b", MockAdapter::unhealthy("down")),
         ])
         .await;
@@ -466,8 +463,10 @@ mod tests {
         // sorted by name
         assert_eq!(arr[0]["name"], "a");
         assert_eq!(arr[0]["health"], "healthy");
+        assert_eq!(arr[0]["tool_count"], 2);
         assert_eq!(arr[1]["name"], "b");
         assert!(arr[1]["health"].as_str().unwrap().contains("unhealthy"));
+        assert_eq!(arr[1]["tool_count"], 0);
     }
 
     #[tokio::test]

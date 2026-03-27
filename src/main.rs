@@ -51,12 +51,34 @@ enum Commands {
 }
 
 fn init_tracing(log_format: &str) {
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::fmt;
+
+    // File logging to ~/.endara/logs/ with daily rotation
+    let log_dir = dirs::home_dir()
+        .map(|h| h.join(".endara").join("logs"))
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/endara-logs"));
+
+    let file_appender = tracing_appender::rolling::daily(&log_dir, "relay.log");
+    let file_layer = fmt::layer()
+        .with_writer(file_appender)
+        .with_ansi(false)
+        .boxed();
+
     match log_format {
         "json" => {
-            tracing_subscriber::fmt().json().init();
+            let stdout_layer = fmt::layer().json().with_ansi(false).boxed();
+            tracing_subscriber::registry()
+                .with(stdout_layer)
+                .with(file_layer)
+                .init();
         }
         _ => {
-            tracing_subscriber::fmt().init();
+            let stdout_layer = fmt::layer().with_ansi(false).boxed();
+            tracing_subscriber::registry()
+                .with(stdout_layer)
+                .with(file_layer)
+                .init();
         }
     }
 }
@@ -83,6 +105,28 @@ async fn main() {
                     );
                     cfg
                 }
+                Err(config::ConfigError::IoError(ref io_err))
+                    if io_err.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    info!(
+                        path = %config_path.display(),
+                        "Config file not found, creating default configuration"
+                    );
+                    match config::create_default_config_file(&config_path) {
+                        Ok(cfg) => {
+                            info!(
+                                machine_name = %cfg.relay.machine_name,
+                                path = %config_path.display(),
+                                "Created default configuration"
+                            );
+                            cfg
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Failed to create default configuration");
+                            std::process::exit(1);
+                        }
+                    }
+                }
                 Err(e) => {
                     error!(error = %e, "Failed to load configuration");
                     std::process::exit(1);
@@ -106,7 +150,7 @@ async fn main() {
                         match adapter.initialize().await {
                             Ok(()) => {
                                 info!(endpoint = %ep.name, "Adapter initialized");
-                                registry.register(ep.name.clone(), Box::new(adapter)).await;
+                                registry.register(ep.name.clone(), Box::new(adapter), ep.transport.to_string()).await;
                             }
                             Err(e) => {
                                 warn!(endpoint = %ep.name, error = %e, "Failed to initialize adapter, skipping");
@@ -120,7 +164,7 @@ async fn main() {
                         match adapter.initialize().await {
                             Ok(()) => {
                                 info!(endpoint = %ep.name, "SSE adapter initialized");
-                                registry.register(ep.name.clone(), Box::new(adapter)).await;
+                                registry.register(ep.name.clone(), Box::new(adapter), ep.transport.to_string()).await;
                             }
                             Err(e) => {
                                 warn!(endpoint = %ep.name, error = %e, "Failed to initialize SSE adapter, skipping");
@@ -134,7 +178,7 @@ async fn main() {
                         match adapter.initialize().await {
                             Ok(()) => {
                                 info!(endpoint = %ep.name, "HTTP adapter initialized");
-                                registry.register(ep.name.clone(), Box::new(adapter)).await;
+                                registry.register(ep.name.clone(), Box::new(adapter), ep.transport.to_string()).await;
                             }
                             Err(e) => {
                                 warn!(endpoint = %ep.name, error = %e, "Failed to initialize HTTP adapter, skipping");
@@ -159,7 +203,7 @@ async fn main() {
                 meta_tool_handler,
             };
             let mgmt_state = management::ManagementState {
-                registry: Arc::new(management::AdapterRegistry::new()),
+                registry: registry.clone(),
                 config: Arc::new(tokio::sync::RwLock::new(cfg.clone())),
                 start_time: std::time::Instant::now(),
             };
