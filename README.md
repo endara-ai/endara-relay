@@ -268,6 +268,31 @@ cargo test --all-targets
 
 ---
 
+## Releasing
+
+Releases are automated via GitHub Actions. To create a new release:
+
+1. Tag the commit: `git tag v0.1.0 && git push origin v0.1.0`
+2. The [release workflow](.github/workflows/release.yml) automatically:
+   - Builds release binaries for all platforms (Linux x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64)
+   - Creates a GitHub Release with the tag
+   - Uploads platform binaries as release assets
+
+Binary naming convention: `endara-relay-{target_triple}` (e.g. `endara-relay-aarch64-apple-darwin`, `endara-relay-x86_64-pc-windows-msvc.exe`)
+
+The [Endara Desktop](https://github.com/endara-ai/endara-desktop) release workflow downloads these binaries to bundle as a Tauri sidecar.
+
+### CI
+
+On every push and PR, the CI workflow runs:
+- `cargo fmt --check` — formatting
+- `cargo clippy -- -D warnings` — linting
+- `cargo test` — unit tests
+- `cargo test --test '*'` — integration tests
+- Cross-platform build matrix (Linux, macOS, Windows)
+
+---
+
 ## Contributing
 
 Contributions are welcome! Here's how to get started:
