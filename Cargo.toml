@@ -2,6 +2,11 @@
 name = "endara-relay"
 version = "0.1.0"
 edition = "2021"
+description = "Local MCP tool aggregator — aggregate multiple MCP servers behind a single endpoint"
+license = "Apache-2.0"
+repository = "https://github.com/endara-ai/endara-relay"
+keywords = ["mcp", "ai", "tools", "aggregator", "model-context-protocol"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 async-trait = "0.1"
