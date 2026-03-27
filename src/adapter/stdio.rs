@@ -47,6 +47,7 @@ impl RingBuffer {
         }
     }
 
+    #[allow(dead_code)] // Used in tests
     pub fn lines(&self) -> Vec<&str> {
         if self.count < self.capacity {
             self.lines[..self.count].iter().map(|s| s.as_str()).collect()
@@ -60,6 +61,7 @@ impl RingBuffer {
         }
     }
 
+    #[allow(dead_code)] // Used in tests
     pub fn len(&self) -> usize {
         self.count
     }
@@ -67,6 +69,7 @@ impl RingBuffer {
 
 /// Crash tracking for exponential backoff.
 #[derive(Debug)]
+#[allow(dead_code)] // Used by try_respawn, kept for respawn support
 struct CrashTracker {
     timestamps: Vec<Instant>,
     consecutive_crashes: u32,
@@ -81,6 +84,7 @@ impl CrashTracker {
     }
 
     /// Record a crash and return whether the adapter should be marked unhealthy.
+    #[allow(dead_code)] // Used by try_respawn
     fn record_crash(&mut self) -> bool {
         let now = Instant::now();
         self.consecutive_crashes += 1;
@@ -95,6 +99,7 @@ impl CrashTracker {
     }
 
     /// Calculate backoff duration based on consecutive crashes.
+    #[allow(dead_code)] // Used by try_respawn
     fn backoff_duration(&self) -> Duration {
         let secs = match self.consecutive_crashes {
             0 => 1,
@@ -113,6 +118,7 @@ impl CrashTracker {
 }
 
 /// Calculate backoff duration from crash count (exposed for testing).
+#[allow(dead_code)] // Used in tests
 pub fn calculate_backoff(consecutive_crashes: u32) -> Duration {
     let secs = match consecutive_crashes {
         0 | 1 => 1,
@@ -370,6 +376,7 @@ impl McpAdapter for StdioAdapter {
 
 /// Attempt to respawn after a crash with exponential backoff.
 /// Returns Err if the adapter should be marked permanently unhealthy.
+#[allow(dead_code)] // Kept for future respawn support
 pub async fn try_respawn(adapter: &mut StdioAdapter) -> Result<(), AdapterError> {
     let should_stop = {
         let mut tracker = adapter.crash_tracker.lock().await;

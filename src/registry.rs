@@ -2,14 +2,23 @@ use crate::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::prefix;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
+
+/// A registered adapter with its metadata.
+pub struct RegisteredAdapter {
+    pub adapter: Box<dyn McpAdapter>,
+    pub transport: String,
+    pub last_activity: Option<Instant>,
+    pub stderr_lines: Arc<RwLock<Vec<String>>>,
+}
 
 /// Thread-safe registry of MCP adapters keyed by endpoint name.
 #[derive(Clone)]
 pub struct AdapterRegistry {
     machine_name: String,
-    adapters: Arc<RwLock<HashMap<String, Box<dyn McpAdapter>>>>,
+    adapters: Arc<RwLock<HashMap<String, RegisteredAdapter>>>,
 }
 
 impl AdapterRegistry {
@@ -22,24 +31,38 @@ impl AdapterRegistry {
     }
 
     /// Register an adapter under the given endpoint name.
-    pub async fn register(&self, name: String, adapter: Box<dyn McpAdapter>) {
+    pub async fn register(&self, name: String, adapter: Box<dyn McpAdapter>, transport: String) {
         debug!(endpoint = %name, "Registering adapter");
-        self.adapters.write().await.insert(name, adapter);
+        self.adapters.write().await.insert(
+            name,
+            RegisteredAdapter {
+                adapter,
+                transport,
+                last_activity: None,
+                stderr_lines: Arc::new(RwLock::new(Vec::new())),
+            },
+        );
     }
 
     /// Remove an adapter by endpoint name.
-    pub async fn remove(&self, name: &str) -> Option<Box<dyn McpAdapter>> {
+    pub async fn remove(&self, name: &str) -> Option<RegisteredAdapter> {
         self.adapters.write().await.remove(name)
     }
 
     /// List endpoint names of healthy adapters.
+    #[allow(dead_code)] // Kept for future management API use
     pub async fn list_healthy(&self) -> Vec<String> {
         let adapters = self.adapters.read().await;
         adapters
             .iter()
-            .filter(|(_, adapter)| matches!(adapter.health(), HealthStatus::Healthy))
+            .filter(|(_, entry)| matches!(entry.adapter.health(), HealthStatus::Healthy))
             .map(|(name, _)| name.clone())
             .collect()
+    }
+
+    /// Access the underlying adapters map (for management API use).
+    pub fn entries(&self) -> &Arc<RwLock<HashMap<String, RegisteredAdapter>>> {
+        &self.adapters
     }
 
     /// Build merged tool catalog from all healthy adapters, with prefixed names.
@@ -47,13 +70,13 @@ impl AdapterRegistry {
         let adapters = self.adapters.read().await;
         let mut catalog = Vec::new();
 
-        for (endpoint_name, adapter) in adapters.iter() {
-            if !matches!(adapter.health(), HealthStatus::Healthy) {
+        for (endpoint_name, entry) in adapters.iter() {
+            if !matches!(entry.adapter.health(), HealthStatus::Healthy) {
                 debug!(endpoint = %endpoint_name, "Skipping unhealthy adapter");
                 continue;
             }
 
-            match adapter.list_tools().await {
+            match entry.adapter.list_tools().await {
                 Ok(tools) => {
                     for tool in tools {
                         let prefixed_name = prefix::encode_tool_name(
@@ -88,21 +111,22 @@ impl AdapterRegistry {
         })?;
 
         let adapters = self.adapters.read().await;
-        let adapter = adapters.get(&endpoint).ok_or_else(|| {
+        let entry = adapters.get(&endpoint).ok_or_else(|| {
             AdapterError::ProtocolError(format!("no adapter found for endpoint '{}'", endpoint))
         })?;
 
-        if !matches!(adapter.health(), HealthStatus::Healthy) {
+        if !matches!(entry.adapter.health(), HealthStatus::Healthy) {
             return Err(AdapterError::ProtocolError(format!(
                 "endpoint '{}' is not healthy",
                 endpoint
             )));
         }
 
-        adapter.call_tool(&tool, arguments).await
+        entry.adapter.call_tool(&tool, arguments).await
     }
 
     /// Get the machine name.
+    #[allow(dead_code)] // Accessor kept for future use
     pub fn machine_name(&self) -> &str {
         &self.machine_name
     }
@@ -167,10 +191,10 @@ mod tests {
     async fn test_merged_catalog_with_multiple_adapters() {
         let registry = AdapterRegistry::new("laptop".into());
         registry
-            .register("ep1".into(), Box::new(MockAdapter::healthy(vec![make_tool("read")])))
+            .register("ep1".into(), Box::new(MockAdapter::healthy(vec![make_tool("read")])), "stdio".into())
             .await;
         registry
-            .register("ep2".into(), Box::new(MockAdapter::healthy(vec![make_tool("write")])))
+            .register("ep2".into(), Box::new(MockAdapter::healthy(vec![make_tool("write")])), "stdio".into())
             .await;
 
         let catalog = registry.merged_catalog().await;
@@ -185,10 +209,10 @@ mod tests {
     async fn test_unhealthy_excluded_from_catalog() {
         let registry = AdapterRegistry::new("m".into());
         registry
-            .register("good".into(), Box::new(MockAdapter::healthy(vec![make_tool("tool")])))
+            .register("good".into(), Box::new(MockAdapter::healthy(vec![make_tool("tool")])), "stdio".into())
             .await;
         registry
-            .register("bad".into(), Box::new(MockAdapter::unhealthy()))
+            .register("bad".into(), Box::new(MockAdapter::unhealthy()), "stdio".into())
             .await;
 
         let catalog = registry.merged_catalog().await;
@@ -200,7 +224,7 @@ mod tests {
     async fn test_route_tool_call() {
         let registry = AdapterRegistry::new("m".into());
         registry
-            .register("ep".into(), Box::new(MockAdapter::healthy(vec![make_tool("echo")])))
+            .register("ep".into(), Box::new(MockAdapter::healthy(vec![make_tool("echo")])), "stdio".into())
             .await;
 
         let result = registry

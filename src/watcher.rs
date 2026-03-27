@@ -128,8 +128,8 @@ pub async fn apply_diff(diff: &ConfigDiff, registry: &AdapterRegistry) {
     // Remove endpoints
     for name in &diff.removed {
         info!(endpoint = %name, "Removing endpoint");
-        if let Some(mut adapter) = registry.remove(name).await {
-            if let Err(e) = adapter.shutdown().await {
+        if let Some(mut entry) = registry.remove(name).await {
+            if let Err(e) = entry.adapter.shutdown().await {
                 warn!(endpoint = %name, error = %e, "Error shutting down removed adapter");
             }
         }
@@ -138,13 +138,13 @@ pub async fn apply_diff(diff: &ConfigDiff, registry: &AdapterRegistry) {
     // Changed endpoints: shutdown old, create new
     for (name, new_ep) in &diff.changed {
         info!(endpoint = %name, "Restarting changed endpoint");
-        if let Some(mut adapter) = registry.remove(name).await {
-            if let Err(e) = adapter.shutdown().await {
+        if let Some(mut entry) = registry.remove(name).await {
+            if let Err(e) = entry.adapter.shutdown().await {
                 warn!(endpoint = %name, error = %e, "Error shutting down old adapter");
             }
         }
         if let Some(adapter) = create_adapter(new_ep).await {
-            registry.register(name.clone(), adapter).await;
+            registry.register(name.clone(), adapter, new_ep.transport.to_string()).await;
             info!(endpoint = %name, "Changed endpoint re-registered");
         }
     }
@@ -153,7 +153,7 @@ pub async fn apply_diff(diff: &ConfigDiff, registry: &AdapterRegistry) {
     for ep in &diff.added {
         info!(endpoint = %ep.name, transport = %ep.transport, "Adding new endpoint");
         if let Some(adapter) = create_adapter(ep).await {
-            registry.register(ep.name.clone(), adapter).await;
+            registry.register(ep.name.clone(), adapter, ep.transport.to_string()).await;
             info!(endpoint = %ep.name, "New endpoint registered");
         }
     }

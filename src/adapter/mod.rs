@@ -61,8 +61,6 @@ pub enum AdapterError {
     #[error("adapter not initialized")]
     NotInitialized,
 
-    #[error("adapter is shutting down")]
-    ShuttingDown,
 
     #[error("connection failed: {0}")]
     ConnectionFailed(String),

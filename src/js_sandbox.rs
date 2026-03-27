@@ -26,8 +26,6 @@ pub enum JsSandboxError {
     Timeout(u64),
     #[error("JavaScript error: {0}")]
     JsError(String),
-    #[error("tool call error: {0}")]
-    ToolCallError(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -439,6 +437,7 @@ mod tests {
                 make_tool("add", "Add numbers"),
                 make_tool("greet", "Greeting tool"),
             ])),
+            "stdio".into(),
         ).await;
         Arc::new(registry)
     }

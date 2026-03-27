@@ -27,6 +27,7 @@ impl SseConfig {
         }
     }
 
+    #[allow(dead_code)] // Builder method kept for API completeness
     pub fn with_timeout(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
         self
@@ -35,6 +36,7 @@ impl SseConfig {
 
 /// Crash tracking for exponential backoff.
 #[derive(Debug)]
+#[allow(dead_code)] // Used by try_reconnect, kept for reconnection support
 struct CrashTracker {
     timestamps: Vec<Instant>,
     consecutive_failures: u32,
@@ -48,6 +50,7 @@ impl CrashTracker {
         }
     }
 
+    #[allow(dead_code)] // Used by try_reconnect
     fn record_failure(&mut self) -> bool {
         let now = Instant::now();
         self.consecutive_failures += 1;
@@ -57,6 +60,7 @@ impl CrashTracker {
         self.timestamps.len() >= 3
     }
 
+    #[allow(dead_code)] // Used by try_reconnect
     fn backoff_duration(&self) -> Duration {
         let secs = match self.consecutive_failures {
             0 | 1 => 1,
@@ -425,6 +429,7 @@ impl McpAdapter for SseAdapter {
 }
 
 /// Attempt to reconnect after a failure with exponential backoff.
+#[allow(dead_code)] // Kept for future reconnection support
 pub async fn try_reconnect(adapter: &mut SseAdapter) -> Result<(), AdapterError> {
     let should_stop = {
         let mut tracker = adapter.crash_tracker.lock().await;

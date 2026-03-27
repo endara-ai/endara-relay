@@ -26,6 +26,7 @@ impl HttpConfig {
         }
     }
 
+    #[allow(dead_code)] // Builder method kept for API completeness
     pub fn with_timeout(mut self, secs: u64) -> Self {
         self.timeout_secs = secs;
         self
