@@ -1,0 +1,52 @@
+[package]
+name = "endara-relay"
+version = "0.1.0"
+edition = "2021"
+description = "Local MCP tool aggregator — aggregate multiple MCP servers behind a single endpoint"
+license = "Apache-2.0"
+repository = "https://github.com/endara-ai/endara-relay"
+keywords = ["mcp", "ai", "tools", "aggregator", "model-context-protocol"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+async-trait = "0.1"
+axum = { version = "0.8", features = ["json"] }
+boa_engine = "0.20"
+clap = { version = "4", features = ["derive"] }
+dirs = "6.0.0"
+futures-util = "0.3.32"
+hostname = "0.4.2"
+notify = "7"
+reqwest = { version = "0.13.2", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+toml = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors"] }
+tracing = "0.1"
+tracing-appender = "0.2.4"
+tracing-subscriber = { version = "0.3", features = ["json"] }
+url = "2.5.8"
+
+[[bin]]
+name = "fixture-slow-server"
+path = "tests/fixtures/slow_server.rs"
+
+[[bin]]
+name = "fixture-crash-server"
+path = "tests/fixtures/crash_server.rs"
+
+[[bin]]
+name = "fixture-multi-tool-server"
+path = "tests/fixtures/multi_tool_server.rs"
+
+[[bin]]
+name = "fixture-sse-server"
+path = "tests/fixtures/sse_server.rs"
+
+[[bin]]
+name = "fixture-http-server"
+path = "tests/fixtures/http_server.rs"
