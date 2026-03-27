@@ -40,7 +40,7 @@ struct SandboxState {
 }
 
 thread_local! {
-    static SANDBOX_STATE: RefCell<Option<SandboxState>> = RefCell::new(None);
+    static SANDBOX_STATE: RefCell<Option<SandboxState>> = const { RefCell::new(None) };
 }
 
 // ---------------------------------------------------------------------------
@@ -173,7 +173,7 @@ fn register_call_tool(context: &mut Context) -> Result<(), JsSandboxError> {
 
 fn call_tool_native(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let tool_name = args
-        .get(0)
+        .first()
         .ok_or_else(|| JsNativeError::typ().with_message("__call_tool: missing tool name"))?
         .to_string(context)?
         .to_std_string_escaped();
@@ -271,7 +271,7 @@ fn js_value_to_json(val: &JsValue, context: &mut Context) -> Result<Value, JsSan
         .as_object()
         .ok_or_else(|| JsSandboxError::Internal("JSON.stringify not a function".into()))?;
     let result = stringify_fn
-        .call(&json_global, &[val.clone()], context)
+        .call(&json_global, std::slice::from_ref(val), context)
         .map_err(|e| JsSandboxError::JsError(format!("JSON.stringify failed: {}", e)))?;
     let json_str = result
         .to_string(context)
@@ -366,7 +366,7 @@ impl MetaToolHandler {
                 t.name.to_lowercase().contains(&query_lower)
                     || t.description
                         .as_ref()
-                        .map_or(false, |d| d.to_lowercase().contains(&query_lower))
+                        .is_some_and(|d| d.to_lowercase().contains(&query_lower))
             })
             .take(limit)
             .map(Into::into)

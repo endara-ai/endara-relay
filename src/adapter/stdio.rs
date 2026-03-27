@@ -68,6 +68,11 @@ impl RingBuffer {
     pub fn len(&self) -> usize {
         self.count
     }
+
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
 }
 
 /// Crash tracking for exponential backoff.
