@@ -34,7 +34,7 @@ async fn test_config_diff_add_endpoint() {
     };
     let mut echo_adapter = StdioAdapter::new(echo_config);
     echo_adapter.initialize().await.expect("echo init failed");
-    registry.register("echo-ep".into(), Box::new(echo_adapter)).await;
+    registry.register("echo-ep".into(), Box::new(echo_adapter), "stdio".into()).await;
 
     // Verify initial state: 1 endpoint
     let catalog = registry.merged_catalog().await;
@@ -106,7 +106,7 @@ async fn test_config_diff_remove_endpoint() {
     };
     let mut echo_adapter = StdioAdapter::new(echo_config);
     echo_adapter.initialize().await.expect("echo init failed");
-    registry.register("echo-ep".into(), Box::new(echo_adapter)).await;
+    registry.register("echo-ep".into(), Box::new(echo_adapter), "stdio".into()).await;
 
     let multi_config = StdioConfig {
         command: multi_tool_bin(),
@@ -115,7 +115,7 @@ async fn test_config_diff_remove_endpoint() {
     };
     let mut multi_adapter = StdioAdapter::new(multi_config);
     multi_adapter.initialize().await.expect("multi init failed");
-    registry.register("multi-ep".into(), Box::new(multi_adapter)).await;
+    registry.register("multi-ep".into(), Box::new(multi_adapter), "stdio".into()).await;
 
     let catalog = registry.merged_catalog().await;
     assert!(catalog.len() > 1, "should start with more than 1 tool");

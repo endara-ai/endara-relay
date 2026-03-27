@@ -6,9 +6,8 @@
 
 use endara_relay::adapter::{HealthStatus, McpAdapter, ToolInfo, AdapterError};
 use endara_relay::config::{Config, EndpointConfig, RelayConfig, Transport};
-use endara_relay::management::{
-    AdapterEntry, AdapterRegistry, ManagementState, management_routes,
-};
+use endara_relay::management::{ManagementState, management_routes};
+use endara_relay::registry::AdapterRegistry;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -16,7 +15,6 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
 
 /// Mock adapter for management API tests.
 struct MockAdapter {
@@ -74,27 +72,23 @@ fn test_config() -> Config {
 async fn start_management_server(
     adapters: Vec<(&str, MockAdapter)>,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let registry = AdapterRegistry::new();
-    {
-        let mut entries = registry.entries.write().await;
-        for (name, adapter) in adapters {
-            entries.insert(
-                name.to_string(),
-                AdapterEntry {
-                    adapter: Box::new(adapter),
-                    transport: "stdio".to_string(),
-                    last_activity: None,
-                    stderr_lines: Arc::new(RwLock::new(vec![
-                        "log line 1".to_string(),
-                        "log line 2".to_string(),
-                    ])),
-                },
-            );
+    let registry = AdapterRegistry::new("test-machine".into());
+    for (name, adapter) in adapters {
+        registry
+            .register(name.to_string(), Box::new(adapter), "stdio".to_string())
+            .await;
+        // Add test stderr lines
+        let entries = registry.entries().read().await;
+        if let Some(entry) = entries.get(name) {
+            let mut lines = entry.stderr_lines.write().await;
+            lines.push("log line 1".to_string());
+            lines.push("log line 2".to_string());
         }
     }
+    let registry = Arc::new(registry);
     let state = ManagementState {
-        registry: Arc::new(registry),
-        config: Arc::new(RwLock::new(test_config())),
+        registry,
+        config: Arc::new(tokio::sync::RwLock::new(test_config())),
         start_time: Instant::now(),
     };
 

@@ -29,7 +29,7 @@ async fn setup_server() -> (SocketAddr, AdapterRegistry, tokio::task::JoinHandle
     let mut adapter = StdioAdapter::new(config);
     adapter.initialize().await.expect("adapter init failed");
     registry
-        .register("echo-ep".into(), Box::new(adapter))
+        .register("echo-ep".into(), Box::new(adapter), "stdio".into())
         .await;
 
     let registry_arc = Arc::new(registry.clone());

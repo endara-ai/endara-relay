@@ -40,7 +40,7 @@ async fn setup_multi_endpoint_server() -> (SocketAddr, AdapterRegistry, tokio::t
     };
     let mut echo_adapter = StdioAdapter::new(echo_config);
     echo_adapter.initialize().await.expect("echo adapter init failed");
-    registry.register("echo-ep".into(), Box::new(echo_adapter)).await;
+    registry.register("echo-ep".into(), Box::new(echo_adapter), "stdio".into()).await;
 
     // Endpoint 2: multi-tool server
     let multi_config = StdioConfig {
@@ -50,7 +50,7 @@ async fn setup_multi_endpoint_server() -> (SocketAddr, AdapterRegistry, tokio::t
     };
     let mut multi_adapter = StdioAdapter::new(multi_config);
     multi_adapter.initialize().await.expect("multi-tool adapter init failed");
-    registry.register("multi-ep".into(), Box::new(multi_adapter)).await;
+    registry.register("multi-ep".into(), Box::new(multi_adapter), "stdio".into()).await;
 
     let registry_arc = Arc::new(registry.clone());
     let state = AppState {
