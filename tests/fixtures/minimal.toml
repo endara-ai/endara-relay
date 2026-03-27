@@ -1,0 +1,9 @@
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "echo"
+transport = "stdio"
+command = "echo"
+args = ["hello"]
+
