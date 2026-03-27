@@ -9,10 +9,10 @@ mod prefix;
 mod registry;
 mod server;
 
-use adapter::McpAdapter;
 use adapter::http::{HttpAdapter, HttpConfig};
 use adapter::sse::{SseAdapter, SseConfig};
 use adapter::stdio::{StdioAdapter, StdioConfig};
+use adapter::McpAdapter;
 use clap::{Parser, Subcommand};
 use js_sandbox::MetaToolHandler;
 use registry::AdapterRegistry;
@@ -51,8 +51,8 @@ enum Commands {
 }
 
 fn init_tracing(log_format: &str) {
-    use tracing_subscriber::prelude::*;
     use tracing_subscriber::fmt;
+    use tracing_subscriber::prelude::*;
 
     // File logging to ~/.endara/logs/ with daily rotation
     let log_dir = dirs::home_dir()
@@ -150,7 +150,13 @@ async fn main() {
                         match adapter.initialize().await {
                             Ok(()) => {
                                 info!(endpoint = %ep.name, "Adapter initialized");
-                                registry.register(ep.name.clone(), Box::new(adapter), ep.transport.to_string()).await;
+                                registry
+                                    .register(
+                                        ep.name.clone(),
+                                        Box::new(adapter),
+                                        ep.transport.to_string(),
+                                    )
+                                    .await;
                             }
                             Err(e) => {
                                 warn!(endpoint = %ep.name, error = %e, "Failed to initialize adapter, skipping");
@@ -164,7 +170,13 @@ async fn main() {
                         match adapter.initialize().await {
                             Ok(()) => {
                                 info!(endpoint = %ep.name, "SSE adapter initialized");
-                                registry.register(ep.name.clone(), Box::new(adapter), ep.transport.to_string()).await;
+                                registry
+                                    .register(
+                                        ep.name.clone(),
+                                        Box::new(adapter),
+                                        ep.transport.to_string(),
+                                    )
+                                    .await;
                             }
                             Err(e) => {
                                 warn!(endpoint = %ep.name, error = %e, "Failed to initialize SSE adapter, skipping");
@@ -178,7 +190,13 @@ async fn main() {
                         match adapter.initialize().await {
                             Ok(()) => {
                                 info!(endpoint = %ep.name, "HTTP adapter initialized");
-                                registry.register(ep.name.clone(), Box::new(adapter), ep.transport.to_string()).await;
+                                registry
+                                    .register(
+                                        ep.name.clone(),
+                                        Box::new(adapter),
+                                        ep.transport.to_string(),
+                                    )
+                                    .await;
                             }
                             Err(e) => {
                                 warn!(endpoint = %ep.name, error = %e, "Failed to initialize HTTP adapter, skipping");
@@ -232,4 +250,3 @@ async fn main() {
         }
     }
 }
-

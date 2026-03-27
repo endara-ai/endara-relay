@@ -92,10 +92,11 @@ async fn main() {
 
     let app = Router::new().route("/mcp", post(handle_mcp));
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await.unwrap();
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     eprintln!("http-server: listening on {}", addr);
 
     axum::serve(listener, app).await.unwrap();
 }
-

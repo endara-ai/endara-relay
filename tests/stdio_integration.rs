@@ -40,7 +40,11 @@ async fn test_stdio_full_lifecycle() {
         .await
         .expect("call_tool failed");
     let content = result.get("content").expect("missing content");
-    let text = content[0].get("text").expect("missing text").as_str().unwrap();
+    let text = content[0]
+        .get("text")
+        .expect("missing text")
+        .as_str()
+        .unwrap();
     assert!(text.contains("hello world"));
 
     // Shutdown
@@ -60,4 +64,3 @@ async fn test_stdio_spawn_nonexistent_command() {
     let result = adapter.initialize().await;
     assert!(result.is_err());
 }
-

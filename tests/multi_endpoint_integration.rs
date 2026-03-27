@@ -29,7 +29,8 @@ fn multi_tool_bin() -> String {
     env!("CARGO_BIN_EXE_fixture-multi-tool-server").to_string()
 }
 
-async fn setup_multi_endpoint_server() -> (SocketAddr, AdapterRegistry, tokio::task::JoinHandle<()>) {
+async fn setup_multi_endpoint_server() -> (SocketAddr, AdapterRegistry, tokio::task::JoinHandle<()>)
+{
     let registry = AdapterRegistry::new("testmachine".into());
 
     // Endpoint 1: echo (bash script)
@@ -39,8 +40,13 @@ async fn setup_multi_endpoint_server() -> (SocketAddr, AdapterRegistry, tokio::t
         env: HashMap::new(),
     };
     let mut echo_adapter = StdioAdapter::new(echo_config);
-    echo_adapter.initialize().await.expect("echo adapter init failed");
-    registry.register("echo-ep".into(), Box::new(echo_adapter), "stdio".into()).await;
+    echo_adapter
+        .initialize()
+        .await
+        .expect("echo adapter init failed");
+    registry
+        .register("echo-ep".into(), Box::new(echo_adapter), "stdio".into())
+        .await;
 
     // Endpoint 2: multi-tool server
     let multi_config = StdioConfig {
@@ -49,8 +55,13 @@ async fn setup_multi_endpoint_server() -> (SocketAddr, AdapterRegistry, tokio::t
         env: HashMap::new(),
     };
     let mut multi_adapter = StdioAdapter::new(multi_config);
-    multi_adapter.initialize().await.expect("multi-tool adapter init failed");
-    registry.register("multi-ep".into(), Box::new(multi_adapter), "stdio".into()).await;
+    multi_adapter
+        .initialize()
+        .await
+        .expect("multi-tool adapter init failed");
+    registry
+        .register("multi-ep".into(), Box::new(multi_adapter), "stdio".into())
+        .await;
 
     let registry_arc = Arc::new(registry.clone());
     let state = AppState {
@@ -60,7 +71,9 @@ async fn setup_multi_endpoint_server() -> (SocketAddr, AdapterRegistry, tokio::t
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-    let (bound_addr, handle) = start_server(router, addr).await.expect("server start failed");
+    let (bound_addr, handle) = start_server(router, addr)
+        .await
+        .expect("server start failed");
 
     (bound_addr, registry, handle)
 }
@@ -82,14 +95,28 @@ async fn test_multi_endpoint_merged_catalog() {
     let tools = body["result"]["tools"].as_array().expect("tools array");
 
     // echo-ep has 1 tool, multi-ep has 12 tools, + 3 meta-tools = 16 total
-    assert_eq!(tools.len(), 16, "expected 16 tools (1+12+3), got {}", tools.len());
+    assert_eq!(
+        tools.len(),
+        16,
+        "expected 16 tools (1+12+3), got {}",
+        tools.len()
+    );
 
     let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
     // Verify prefixed names from echo endpoint
-    assert!(tool_names.contains(&"testmachine__echo-ep__echo"), "missing echo-ep echo tool");
+    assert!(
+        tool_names.contains(&"testmachine__echo-ep__echo"),
+        "missing echo-ep echo tool"
+    );
     // Verify prefixed names from multi-tool endpoint
-    assert!(tool_names.contains(&"testmachine__multi-ep__add"), "missing multi-ep add tool");
-    assert!(tool_names.contains(&"testmachine__multi-ep__uppercase"), "missing multi-ep uppercase");
+    assert!(
+        tool_names.contains(&"testmachine__multi-ep__add"),
+        "missing multi-ep add tool"
+    );
+    assert!(
+        tool_names.contains(&"testmachine__multi-ep__uppercase"),
+        "missing multi-ep uppercase"
+    );
     // Verify meta-tools
     assert!(tool_names.contains(&"list_tools"));
     assert!(tool_names.contains(&"search_tools"));
@@ -122,7 +149,9 @@ async fn test_multi_endpoint_cross_routing() {
             "params": {"name": "testmachine__multi-ep__add", "arguments": {"a": 3, "b": 7}},
             "id": 3
         }))
-        .send().await.expect("request failed");
+        .send()
+        .await
+        .expect("request failed");
     let body: serde_json::Value = resp.json().await.unwrap();
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("10"), "expected 10, got: {}", text);
@@ -135,9 +164,10 @@ async fn test_multi_endpoint_cross_routing() {
             "params": {"name": "testmachine__multi-ep__uppercase", "arguments": {"text": "hello"}},
             "id": 4
         }))
-        .send().await.expect("request failed");
+        .send()
+        .await
+        .expect("request failed");
     let body: serde_json::Value = resp.json().await.unwrap();
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     assert_eq!(text, "HELLO");
 }
-

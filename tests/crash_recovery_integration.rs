@@ -99,7 +99,9 @@ async fn test_crash_server_immediate_crash() {
     let result = timeout(Duration::from_secs(5), async {
         let mut error_seen = false;
         for _ in 0..5 {
-            let r = adapter.call_tool("echo", json!({"message": "trigger"})).await;
+            let r = adapter
+                .call_tool("echo", json!({"message": "trigger"}))
+                .await;
             if r.is_err() {
                 error_seen = true;
                 break;
@@ -114,4 +116,3 @@ async fn test_crash_server_immediate_crash() {
 
     let _ = adapter.shutdown().await;
 }
-

@@ -90,7 +90,8 @@ pub struct SseAdapter {
     /// The POST endpoint URL received from the SSE stream.
     post_endpoint: Arc<RwLock<Option<String>>>,
     /// Pending responses indexed by request ID.
-    pending: Arc<Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<JsonRpcResponse>>>>,
+    pending:
+        Arc<Mutex<std::collections::HashMap<u64, tokio::sync::oneshot::Sender<JsonRpcResponse>>>>,
     /// Handle for the background SSE listener task.
     sse_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     crash_tracker: Arc<Mutex<CrashTracker>>,
@@ -135,7 +136,12 @@ impl SseAdapter {
         let base = &self.config.url;
         if let Some(idx) = base.rfind('/') {
             let origin = &base[..idx];
-            format!("{}{}", origin, if endpoint.starts_with('/') { "" } else { "/" }).to_string()
+            format!(
+                "{}{}",
+                origin,
+                if endpoint.starts_with('/') { "" } else { "/" }
+            )
+            .to_string()
                 + endpoint
         } else {
             endpoint.to_string()
@@ -236,21 +242,19 @@ impl SseAdapter {
                                         let _ = tx.send(endpoint_url);
                                     }
                                 }
-                                "message" => {
-                                    match serde_json::from_str::<JsonRpcResponse>(&data) {
-                                        Ok(response) => {
-                                            if let Some(id) = response.id {
-                                                let mut map = pending.lock().await;
-                                                if let Some(tx) = map.remove(&id) {
-                                                    let _ = tx.send(response);
-                                                }
+                                "message" => match serde_json::from_str::<JsonRpcResponse>(&data) {
+                                    Ok(response) => {
+                                        if let Some(id) = response.id {
+                                            let mut map = pending.lock().await;
+                                            if let Some(tx) = map.remove(&id) {
+                                                let _ = tx.send(response);
                                             }
                                         }
-                                        Err(e) => {
-                                            warn!(error = %e, data = %data, "failed to parse SSE message");
-                                        }
                                     }
-                                }
+                                    Err(e) => {
+                                        warn!(error = %e, data = %data, "failed to parse SSE message");
+                                    }
+                                },
                                 _ => {
                                     debug!(event_type = %etype, "ignoring SSE event");
                                 }
@@ -293,9 +297,7 @@ impl SseAdapter {
     ) -> Result<Value, AdapterError> {
         let endpoint = {
             let guard = self.post_endpoint.read().await;
-            guard
-                .clone()
-                .ok_or(AdapterError::NotInitialized)?
+            guard.clone().ok_or(AdapterError::NotInitialized)?
         };
 
         let id = self.next_id();
@@ -438,7 +440,10 @@ pub async fn try_reconnect(adapter: &mut SseAdapter) -> Result<(), AdapterError>
             true
         } else {
             let backoff = tracker.backoff_duration();
-            info!(backoff_secs = backoff.as_secs(), "backing off before SSE reconnect");
+            info!(
+                backoff_secs = backoff.as_secs(),
+                "backing off before SSE reconnect"
+            );
             drop(tracker);
             tokio::time::sleep(backoff).await;
             false

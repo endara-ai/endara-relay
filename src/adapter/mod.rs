@@ -61,7 +61,6 @@ pub enum AdapterError {
     #[error("adapter not initialized")]
     NotInitialized,
 
-
     #[error("connection failed: {0}")]
     ConnectionFailed(String),
 
@@ -96,4 +95,3 @@ pub trait McpAdapter: Send + Sync {
     /// Shut down the adapter gracefully.
     async fn shutdown(&mut self) -> Result<(), AdapterError>;
 }
-

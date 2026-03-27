@@ -6,11 +6,11 @@ use axum::{
     Json, Router,
 };
 use serde::Serialize;
-use tower_http::cors::CorsLayer;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
+use tower_http::cors::CorsLayer;
 
 use crate::adapter::HealthStatus;
 use crate::config::Config;
@@ -85,7 +85,10 @@ fn endpoint_not_found(name: &str) -> impl IntoResponse {
     error_response(
         StatusCode::NOT_FOUND,
         "endpoint not found",
-        Some(&format!("No endpoint named '{}'. Use GET /api/endpoints to list available endpoints.", name)),
+        Some(&format!(
+            "No endpoint named '{}'. Use GET /api/endpoints to list available endpoints.",
+            name
+        )),
     )
 }
 
@@ -116,7 +119,12 @@ async fn get_endpoints(State(state): State<ManagementState>) -> Json<Vec<Endpoin
     let mut endpoints: Vec<EndpointInfo> = Vec::new();
     for (name, entry) in entries.iter() {
         let tool_count = if matches!(entry.adapter.health(), HealthStatus::Healthy) {
-            entry.adapter.list_tools().await.map(|t| t.len()).unwrap_or(0)
+            entry
+                .adapter
+                .list_tools()
+                .await
+                .map(|t| t.len())
+                .unwrap_or(0)
         } else {
             0
         };
@@ -312,11 +320,11 @@ async fn get_endpoint_tools(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
+    use crate::config::{Config, EndpointConfig, RelayConfig, Transport};
     use async_trait::async_trait;
     use axum::body::Body;
     use axum::http::Request;
-    use crate::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
-    use crate::config::{Config, EndpointConfig, RelayConfig, Transport};
     use serde_json::Value;
     use tower::ServiceExt; // for oneshot
 
@@ -375,7 +383,10 @@ mod tests {
                 command: Some("echo".to_string()),
                 args: Some(vec!["hello".to_string()]),
                 url: None,
-                env: Some(HashMap::from([("SECRET".to_string(), "s3cret".to_string())])),
+                env: Some(HashMap::from([(
+                    "SECRET".to_string(),
+                    "s3cret".to_string(),
+                )])),
             }],
         }
     }
@@ -449,11 +460,7 @@ mod tests {
         .await;
         let app = management_routes(state);
         let resp = app
-            .oneshot(
-                Request::get("/api/endpoints")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::get("/api/endpoints").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -508,10 +515,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         let body = body_json(resp).await;
         assert_eq!(body["error"], "endpoint not found");
-        assert!(body["detail"]
-            .as_str()
-            .unwrap()
-            .contains("nonexistent"));
+        assert!(body["detail"].as_str().unwrap().contains("nonexistent"));
     }
 
     #[tokio::test]

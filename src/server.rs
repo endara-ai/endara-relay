@@ -155,18 +155,21 @@ async fn mcp_tools_call(
         .get("name")
         .and_then(|v| v.as_str())
         .ok_or_else(|| jsonrpc_error(body.id.clone(), -32602, "missing 'name' in params"))?;
-    let arguments = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or(json!({}));
+    let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
     let js_mode = state.js_execution_mode.load(Ordering::Relaxed);
 
     // Check if this is a meta-tool call
     match tool_name {
         "list_tools" => {
-            let limit = arguments.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
-            let offset = arguments.get("offset").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let limit = arguments
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let offset = arguments
+                .get("offset")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
             match state.meta_tool_handler.list_tools(limit, offset).await {
                 Ok(result) => return Ok(jsonrpc_response(body.id, result)),
                 Err(e) => return Err(jsonrpc_error(body.id, -32603, &e.to_string())),
@@ -177,7 +180,10 @@ async fn mcp_tools_call(
                 .get("query")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let limit = arguments.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+            let limit = arguments
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
             match state.meta_tool_handler.search_tools(query, limit).await {
                 Ok(result) => return Ok(jsonrpc_response(body.id, result)),
                 Err(e) => return Err(jsonrpc_error(body.id, -32603, &e.to_string())),
@@ -205,11 +211,7 @@ async fn mcp_tools_call(
         ));
     }
 
-    match state
-        .registry
-        .route_tool_call(tool_name, arguments)
-        .await
-    {
+    match state.registry.route_tool_call(tool_name, arguments).await {
         Ok(result) => Ok(jsonrpc_response(body.id, result)),
         Err(e) => Err(jsonrpc_error(body.id, -32603, &e.to_string())),
     }
@@ -221,9 +223,7 @@ async fn mcp_sse() -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infalli
 
     tokio::spawn(async move {
         let _ = tx
-            .send(Ok(Event::default()
-                .event("endpoint")
-                .data("/mcp")))
+            .send(Ok(Event::default().event("endpoint").data("/mcp")))
             .await;
     });
 
@@ -263,4 +263,3 @@ pub async fn start_server(
 
     Ok((local_addr, handle))
 }
-

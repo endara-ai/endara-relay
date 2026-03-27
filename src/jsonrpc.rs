@@ -48,7 +48,11 @@ mod tests {
 
     #[test]
     fn test_request_serialization_roundtrip() {
-        let req = new_request("initialize", Some(json!({"protocolVersion": "2024-11-05"})), 1);
+        let req = new_request(
+            "initialize",
+            Some(json!({"protocolVersion": "2024-11-05"})),
+            1,
+        );
         let serialized = serde_json::to_string(&req).unwrap();
         let deserialized: JsonRpcRequest = serde_json::from_str(&serialized).unwrap();
         assert_eq!(deserialized.jsonrpc, "2.0");
@@ -114,4 +118,3 @@ mod tests {
         assert_eq!(parsed.id, 42);
     }
 }
-

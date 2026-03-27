@@ -24,7 +24,10 @@ fn main() {
         }
     }
 
-    eprintln!("crash-server: starting, will crash after {} calls", crash_after);
+    eprintln!(
+        "crash-server: starting, will crash after {} calls",
+        crash_after
+    );
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -109,4 +112,3 @@ fn main() {
         out.flush().unwrap();
     }
 }
-

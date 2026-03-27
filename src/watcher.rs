@@ -1,7 +1,7 @@
-use crate::adapter::McpAdapter;
 use crate::adapter::http::{HttpAdapter, HttpConfig};
 use crate::adapter::sse::{SseAdapter, SseConfig};
 use crate::adapter::stdio::{StdioAdapter, StdioConfig};
+use crate::adapter::McpAdapter;
 use crate::config::{self, ConfigDiff, EndpointConfig, Transport};
 use crate::registry::AdapterRegistry;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -31,7 +31,8 @@ impl ConfigWatcher {
         js_execution_mode: Arc<AtomicBool>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
-            if let Err(e) = watch_loop(config_path, registry, machine_name, js_execution_mode).await {
+            if let Err(e) = watch_loop(config_path, registry, machine_name, js_execution_mode).await
+            {
                 error!(error = %e, "Config watcher terminated with error");
             }
         })
@@ -61,10 +62,7 @@ async fn watch_loop(
     )?;
 
     // Watch the parent directory so renames/atomic writes are caught
-    let watch_path = config_path
-        .parent()
-        .unwrap_or(&config_path)
-        .to_path_buf();
+    let watch_path = config_path.parent().unwrap_or(&config_path).to_path_buf();
     watcher.watch(&watch_path, RecursiveMode::NonRecursive)?;
 
     info!(path = %config_path.display(), "Config watcher started");
@@ -82,7 +80,7 @@ async fn watch_loop(
         let deadline = Instant::now() + Duration::from_millis(500);
         loop {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
-                Ok(Some(())) => continue, // more events, keep draining
+                Ok(Some(())) => continue,  // more events, keep draining
                 Ok(None) => return Ok(()), // channel closed
                 Err(_) => break,           // timeout expired, proceed
             }
@@ -144,7 +142,9 @@ pub async fn apply_diff(diff: &ConfigDiff, registry: &AdapterRegistry) {
             }
         }
         if let Some(adapter) = create_adapter(new_ep).await {
-            registry.register(name.clone(), adapter, new_ep.transport.to_string()).await;
+            registry
+                .register(name.clone(), adapter, new_ep.transport.to_string())
+                .await;
             info!(endpoint = %name, "Changed endpoint re-registered");
         }
     }
@@ -153,7 +153,9 @@ pub async fn apply_diff(diff: &ConfigDiff, registry: &AdapterRegistry) {
     for ep in &diff.added {
         info!(endpoint = %ep.name, transport = %ep.transport, "Adding new endpoint");
         if let Some(adapter) = create_adapter(ep).await {
-            registry.register(ep.name.clone(), adapter, ep.transport.to_string()).await;
+            registry
+                .register(ep.name.clone(), adapter, ep.transport.to_string())
+                .await;
             info!(endpoint = %ep.name, "New endpoint registered");
         }
     }
@@ -206,4 +208,3 @@ async fn create_adapter(ep: &EndpointConfig) -> Option<Box<dyn McpAdapter>> {
         }
     }
 }
-

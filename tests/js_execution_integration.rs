@@ -33,7 +33,9 @@ async fn setup_js_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     };
     let mut adapter = StdioAdapter::new(config);
     adapter.initialize().await.expect("adapter init failed");
-    registry.register("echo-ep".into(), Box::new(adapter), "stdio".into()).await;
+    registry
+        .register("echo-ep".into(), Box::new(adapter), "stdio".into())
+        .await;
 
     let registry_arc = Arc::new(registry.clone());
     let state = AppState {
@@ -43,7 +45,9 @@ async fn setup_js_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-    let (bound_addr, handle) = start_server(router, addr).await.expect("server start failed");
+    let (bound_addr, handle) = start_server(router, addr)
+        .await
+        .expect("server start failed");
     (bound_addr, handle)
 }
 
@@ -107,7 +111,10 @@ async fn test_list_tools_meta_tool() {
     assert!(resp.status().is_success());
     let body: serde_json::Value = resp.json().await.unwrap();
     let result = &body["result"];
-    assert!(result["total"].as_u64().unwrap() >= 1, "expected at least 1 tool");
+    assert!(
+        result["total"].as_u64().unwrap() >= 1,
+        "expected at least 1 tool"
+    );
     let tools = result["tools"].as_array().unwrap();
     assert!(!tools.is_empty());
 }
@@ -139,4 +146,3 @@ async fn test_search_tools_meta_tool() {
         "first result should contain 'echo'"
     );
 }
-

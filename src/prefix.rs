@@ -35,13 +35,13 @@ pub fn decode_tool_name(prefixed: &str) -> Result<(String, String, String), Pref
         .next()
         .ok_or_else(|| PrefixError::InvalidFormat("empty string".to_string()))?;
 
-    let endpoint = parts
-        .next()
-        .ok_or_else(|| PrefixError::InvalidFormat(format!("missing endpoint segment in '{}'", prefixed)))?;
+    let endpoint = parts.next().ok_or_else(|| {
+        PrefixError::InvalidFormat(format!("missing endpoint segment in '{}'", prefixed))
+    })?;
 
-    let tool = parts
-        .next()
-        .ok_or_else(|| PrefixError::InvalidFormat(format!("missing tool segment in '{}'", prefixed)))?;
+    let tool = parts.next().ok_or_else(|| {
+        PrefixError::InvalidFormat(format!("missing tool segment in '{}'", prefixed))
+    })?;
 
     if machine.is_empty() || endpoint.is_empty() || tool.is_empty() {
         return Err(PrefixError::InvalidFormat(format!(
@@ -115,4 +115,3 @@ mod tests {
         assert_eq!(t, "file.read");
     }
 }
-

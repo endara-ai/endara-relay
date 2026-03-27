@@ -119,7 +119,9 @@ fn main() {
         serde_json::to_writer(&mut out, &response).unwrap();
         out.write_all(b"\n").unwrap();
         out.flush().unwrap();
-        eprintln!("slow-server: responded to {} (delayed {}ms)", method, delay_ms);
+        eprintln!(
+            "slow-server: responded to {} (delayed {}ms)",
+            method, delay_ms
+        );
     }
 }
-

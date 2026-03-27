@@ -154,7 +154,6 @@ fn run_js(script: &str, catalog: &[ToolInfo]) -> Result<Value, JsSandboxError> {
     js_value_to_json(&result_val, &mut context)
 }
 
-
 // ---------------------------------------------------------------------------
 // Native function: __call_tool(name, args_json) -> result_json_string
 // ---------------------------------------------------------------------------
@@ -172,11 +171,7 @@ fn register_call_tool(context: &mut Context) -> Result<(), JsSandboxError> {
     Ok(())
 }
 
-fn call_tool_native(
-    _this: &JsValue,
-    args: &[JsValue],
-    context: &mut Context,
-) -> JsResult<JsValue> {
+fn call_tool_native(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let tool_name = args
         .get(0)
         .ok_or_else(|| JsNativeError::typ().with_message("__call_tool: missing tool name"))?
@@ -286,8 +281,6 @@ fn js_value_to_json(val: &JsValue, context: &mut Context) -> Result<Value, JsSan
         .map_err(|e| JsSandboxError::Internal(format!("failed to parse JSON output: {}", e)))
 }
 
-
-
 // ---------------------------------------------------------------------------
 // MetaToolHandler — list_tools, search_tools, execute_tools
 // ---------------------------------------------------------------------------
@@ -343,7 +336,12 @@ impl MetaToolHandler {
         let total = catalog.len();
         let limit = limit.unwrap_or(50).min(200);
         let offset = offset.unwrap_or(0).min(total);
-        let page: Vec<ToolInfoSlim> = catalog.iter().skip(offset).take(limit).map(Into::into).collect();
+        let page: Vec<ToolInfoSlim> = catalog
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(Into::into)
+            .collect();
         let resp = ListToolsResponse {
             tools: page,
             total,
@@ -383,7 +381,6 @@ impl MetaToolHandler {
     }
 }
 
-
 // ===========================================================================
 // Tests
 // ===========================================================================
@@ -391,8 +388,8 @@ impl MetaToolHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_trait::async_trait;
     use crate::adapter::{AdapterError, HealthStatus, McpAdapter};
+    use async_trait::async_trait;
     use serde_json::json;
 
     // --- Mock adapter ---
@@ -409,15 +406,21 @@ mod tests {
 
     #[async_trait]
     impl McpAdapter for MockAdapter {
-        async fn initialize(&mut self) -> Result<(), AdapterError> { Ok(()) }
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
         async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
             Ok(self.tools.clone())
         }
         async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
             Ok(json!({ "called": name, "args": arguments }))
         }
-        fn health(&self) -> HealthStatus { HealthStatus::Healthy }
-        async fn shutdown(&mut self) -> Result<(), AdapterError> { Ok(()) }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
     }
 
     fn make_tool(name: &str, desc: &str) -> ToolInfo {
@@ -430,15 +433,17 @@ mod tests {
 
     async fn make_registry() -> Arc<AdapterRegistry> {
         let registry = AdapterRegistry::new("m".into());
-        registry.register(
-            "ep".into(),
-            Box::new(MockAdapter::new(vec![
-                make_tool("echo", "Echo tool"),
-                make_tool("add", "Add numbers"),
-                make_tool("greet", "Greeting tool"),
-            ])),
-            "stdio".into(),
-        ).await;
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::new(vec![
+                    make_tool("echo", "Echo tool"),
+                    make_tool("add", "Add numbers"),
+                    make_tool("greet", "Greeting tool"),
+                ])),
+                "stdio".into(),
+            )
+            .await;
         Arc::new(registry)
     }
 
@@ -507,7 +512,6 @@ mod tests {
         assert_eq!(tools.len(), 1);
     }
 
-
     // --- JS execution tests ---
 
     #[tokio::test]
@@ -522,7 +526,10 @@ mod tests {
     async fn test_js_sandbox_return_object() {
         let reg = make_registry().await;
         let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
-        let result = sandbox.execute(r#"return {a: 1, b: "hello"};"#).await.unwrap();
+        let result = sandbox
+            .execute(r#"return {a: 1, b: "hello"};"#)
+            .await
+            .unwrap();
         assert_eq!(result["a"], 1);
         assert_eq!(result["b"], "hello");
     }
@@ -565,7 +572,10 @@ mod tests {
         let reg = make_registry().await;
         let sandbox = JsSandbox::new(reg, Duration::from_secs(10));
         let result = sandbox.execute("while(true) {}").await;
-        assert!(result.is_err(), "infinite loop should be stopped by loop iteration limit");
+        assert!(
+            result.is_err(),
+            "infinite loop should be stopped by loop iteration limit"
+        );
         // boa's RuntimeLimits throws a JsError when the loop iteration limit is exceeded
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
@@ -580,10 +590,7 @@ mod tests {
         let reg = make_registry().await;
         let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
         // require / import / Deno / process should not exist
-        let result = sandbox
-            .execute(r#"return typeof require;"#)
-            .await
-            .unwrap();
+        let result = sandbox.execute(r#"return typeof require;"#).await.unwrap();
         assert_eq!(result, json!("undefined"));
     }
 
@@ -591,10 +598,7 @@ mod tests {
     async fn test_js_sandbox_no_network_access() {
         let reg = make_registry().await;
         let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
-        let result = sandbox
-            .execute(r#"return typeof fetch;"#)
-            .await
-            .unwrap();
+        let result = sandbox.execute(r#"return typeof fetch;"#).await.unwrap();
         assert_eq!(result, json!("undefined"));
     }
 
@@ -605,7 +609,11 @@ mod tests {
         let result = sandbox.execute("throw new Error('boom');").await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("boom"), "error should contain 'boom': {}", err_msg);
+        assert!(
+            err_msg.contains("boom"),
+            "error should contain 'boom': {}",
+            err_msg
+        );
     }
 
     // --- Integration test: execute script that calls tools ---

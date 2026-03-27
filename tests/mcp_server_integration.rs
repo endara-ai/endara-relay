@@ -41,7 +41,9 @@ async fn setup_server() -> (SocketAddr, AdapterRegistry, tokio::task::JoinHandle
     let router = build_router(state);
     // Bind to port 0 to get a random available port
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-    let (bound_addr, handle) = start_server(router, addr).await.expect("server start failed");
+    let (bound_addr, handle) = start_server(router, addr)
+        .await
+        .expect("server start failed");
 
     (bound_addr, registry, handle)
 }
@@ -161,4 +163,3 @@ async fn test_mcp_tools_call_invalid_prefix() {
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body["error"].is_object(), "expected error response");
 }
-

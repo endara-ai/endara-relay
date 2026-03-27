@@ -79,11 +79,8 @@ impl AdapterRegistry {
             match entry.adapter.list_tools().await {
                 Ok(tools) => {
                     for tool in tools {
-                        let prefixed_name = prefix::encode_tool_name(
-                            &self.machine_name,
-                            endpoint_name,
-                            &tool.name,
-                        );
+                        let prefixed_name =
+                            prefix::encode_tool_name(&self.machine_name, endpoint_name, &tool.name);
                         catalog.push(ToolInfo {
                             name: prefixed_name,
                             description: tool.description,
@@ -106,9 +103,8 @@ impl AdapterRegistry {
         prefixed_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value, AdapterError> {
-        let (_machine, endpoint, tool) = prefix::decode_tool_name(prefixed_name).map_err(|e| {
-            AdapterError::ProtocolError(format!("invalid tool name prefix: {}", e))
-        })?;
+        let (_machine, endpoint, tool) = prefix::decode_tool_name(prefixed_name)
+            .map_err(|e| AdapterError::ProtocolError(format!("invalid tool name prefix: {}", e)))?;
 
         let adapters = self.adapters.read().await;
         let entry = adapters.get(&endpoint).ok_or_else(|| {
@@ -168,7 +164,11 @@ mod tests {
         async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
             Ok(self.tools.clone())
         }
-        async fn call_tool(&self, name: &str, arguments: serde_json::Value) -> Result<serde_json::Value, AdapterError> {
+        async fn call_tool(
+            &self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, AdapterError> {
             Ok(json!({ "called": name, "args": arguments }))
         }
         fn health(&self) -> HealthStatus {
@@ -191,10 +191,18 @@ mod tests {
     async fn test_merged_catalog_with_multiple_adapters() {
         let registry = AdapterRegistry::new("laptop".into());
         registry
-            .register("ep1".into(), Box::new(MockAdapter::healthy(vec![make_tool("read")])), "stdio".into())
+            .register(
+                "ep1".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("read")])),
+                "stdio".into(),
+            )
             .await;
         registry
-            .register("ep2".into(), Box::new(MockAdapter::healthy(vec![make_tool("write")])), "stdio".into())
+            .register(
+                "ep2".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("write")])),
+                "stdio".into(),
+            )
             .await;
 
         let catalog = registry.merged_catalog().await;
@@ -209,10 +217,18 @@ mod tests {
     async fn test_unhealthy_excluded_from_catalog() {
         let registry = AdapterRegistry::new("m".into());
         registry
-            .register("good".into(), Box::new(MockAdapter::healthy(vec![make_tool("tool")])), "stdio".into())
+            .register(
+                "good".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("tool")])),
+                "stdio".into(),
+            )
             .await;
         registry
-            .register("bad".into(), Box::new(MockAdapter::unhealthy()), "stdio".into())
+            .register(
+                "bad".into(),
+                Box::new(MockAdapter::unhealthy()),
+                "stdio".into(),
+            )
             .await;
 
         let catalog = registry.merged_catalog().await;
@@ -224,7 +240,11 @@ mod tests {
     async fn test_route_tool_call() {
         let registry = AdapterRegistry::new("m".into());
         registry
-            .register("ep".into(), Box::new(MockAdapter::healthy(vec![make_tool("echo")])), "stdio".into())
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("echo")])),
+                "stdio".into(),
+            )
             .await;
 
         let result = registry
@@ -251,4 +271,3 @@ mod tests {
         assert!(result.is_err());
     }
 }
-

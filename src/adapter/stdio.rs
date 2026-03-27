@@ -50,7 +50,10 @@ impl RingBuffer {
     #[allow(dead_code)] // Used in tests
     pub fn lines(&self) -> Vec<&str> {
         if self.count < self.capacity {
-            self.lines[..self.count].iter().map(|s| s.as_str()).collect()
+            self.lines[..self.count]
+                .iter()
+                .map(|s| s.as_str())
+                .collect()
         } else {
             let mut result = Vec::with_capacity(self.capacity);
             for i in 0..self.capacity {
@@ -181,15 +184,18 @@ impl StdioAdapter {
             AdapterError::ProcessSpawnFailed(format!("{}: {}", self.config.command, e))
         })?;
 
-        let stdin = child.stdin.take().ok_or_else(|| {
-            AdapterError::ProcessSpawnFailed("failed to capture stdin".into())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            AdapterError::ProcessSpawnFailed("failed to capture stdout".into())
-        })?;
-        let stderr = child.stderr.take().ok_or_else(|| {
-            AdapterError::ProcessSpawnFailed("failed to capture stderr".into())
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| AdapterError::ProcessSpawnFailed("failed to capture stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AdapterError::ProcessSpawnFailed("failed to capture stdout".into()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| AdapterError::ProcessSpawnFailed("failed to capture stderr".into()))?;
 
         // Set up stdout line reader via channel
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
@@ -238,15 +244,15 @@ impl StdioAdapter {
         // Write to stdin
         {
             let mut writer_guard = self.stdin_writer.lock().await;
-            let writer = writer_guard
-                .as_mut()
-                .ok_or(AdapterError::NotInitialized)?;
-            writer.write_all(line.as_bytes()).await.map_err(|e| {
-                AdapterError::ProcessCrashed(format!("stdin write failed: {}", e))
-            })?;
-            writer.flush().await.map_err(|e| {
-                AdapterError::ProcessCrashed(format!("stdin flush failed: {}", e))
-            })?;
+            let writer = writer_guard.as_mut().ok_or(AdapterError::NotInitialized)?;
+            writer
+                .write_all(line.as_bytes())
+                .await
+                .map_err(|e| AdapterError::ProcessCrashed(format!("stdin write failed: {}", e)))?;
+            writer
+                .flush()
+                .await
+                .map_err(|e| AdapterError::ProcessCrashed(format!("stdin flush failed: {}", e)))?;
         }
 
         // Read response from stdout with timeout
@@ -256,9 +262,7 @@ impl StdioAdapter {
             tokio::time::timeout(Duration::from_secs(30), rx.recv())
                 .await
                 .map_err(|_| AdapterError::Timeout(30))?
-                .ok_or_else(|| {
-                    AdapterError::ProcessCrashed("stdout channel closed".into())
-                })?
+                .ok_or_else(|| AdapterError::ProcessCrashed("stdout channel closed".into()))?
         };
 
         let response: JsonRpcResponse = serde_json::from_str(&response_line).map_err(|e| {
@@ -385,7 +389,10 @@ pub async fn try_respawn(adapter: &mut StdioAdapter) -> Result<(), AdapterError>
             true
         } else {
             let backoff = tracker.backoff_duration();
-            info!(backoff_secs = backoff.as_secs(), "backing off before respawn");
+            info!(
+                backoff_secs = backoff.as_secs(),
+                "backing off before respawn"
+            );
             drop(tracker);
             tokio::time::sleep(backoff).await;
             false
@@ -467,7 +474,7 @@ mod tests {
         let mut tracker = CrashTracker::new();
         assert!(!tracker.record_crash()); // 1st crash
         assert!(!tracker.record_crash()); // 2nd crash
-        assert!(tracker.record_crash());  // 3rd crash → unhealthy
+        assert!(tracker.record_crash()); // 3rd crash → unhealthy
     }
 
     #[test]
@@ -489,4 +496,3 @@ mod tests {
         assert_eq!(tracker.backoff_duration(), Duration::from_secs(1));
     }
 }
-

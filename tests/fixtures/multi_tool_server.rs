@@ -42,13 +42,18 @@ fn handle_tool_call(name: &str, args: &Value) -> String {
             format!("{}", a + b)
         }
         "concat" => {
-            let items: Vec<&str> = args["items"].as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str()).collect()).unwrap_or_default();
+            let items: Vec<&str> = args["items"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
             items.join(args["separator"].as_str().unwrap_or(","))
         }
         "lookup" => {
             let key = args["key"].as_str().unwrap_or("");
-            args["data"].get(key).map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())
+            args["data"]
+                .get(key)
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "null".to_string())
         }
         "toggle" => format!("{}", !args["value"].as_bool().unwrap_or(false)),
         "uppercase" => args["text"].as_str().unwrap_or("").to_uppercase(),
@@ -57,7 +62,11 @@ fn handle_tool_call(name: &str, args: &Value) -> String {
             let name = args["name"].as_str().unwrap_or("World");
             let title = args["title"].as_str();
             if args["formal"].as_bool().unwrap_or(false) {
-                format!("Dear {}{}", title.map(|t| format!("{} ", t)).unwrap_or_default(), name)
+                format!(
+                    "Dear {}{}",
+                    title.map(|t| format!("{} ", t)).unwrap_or_default(),
+                    name
+                )
             } else {
                 format!("Hello, {}!", name)
             }
@@ -65,15 +74,26 @@ fn handle_tool_call(name: &str, args: &Value) -> String {
         "multiply_matrix" => {
             let s = args["scalar"].as_f64().unwrap_or(1.0);
             if let Some(matrix) = args["matrix"].as_array() {
-                let rows: Vec<String> = matrix.iter().map(|row| {
-                    let vals: Vec<String> = row.as_array().unwrap_or(&vec![]).iter()
-                        .map(|v| format!("{}", v.as_f64().unwrap_or(0.0) * s)).collect();
-                    format!("[{}]", vals.join(","))
-                }).collect();
+                let rows: Vec<String> = matrix
+                    .iter()
+                    .map(|row| {
+                        let vals: Vec<String> = row
+                            .as_array()
+                            .unwrap_or(&vec![])
+                            .iter()
+                            .map(|v| format!("{}", v.as_f64().unwrap_or(0.0) * s))
+                            .collect();
+                        format!("[{}]", vals.join(","))
+                    })
+                    .collect();
                 format!("[{}]", rows.join(","))
-            } else { "[]".to_string() }
+            } else {
+                "[]".to_string()
+            }
         }
-        "get_metadata" => json!({"server": "multi-tool-mcp", "version": "0.1.0", "tool_count": 12}).to_string(),
+        "get_metadata" => {
+            json!({"server": "multi-tool-mcp", "version": "0.1.0", "tool_count": 12}).to_string()
+        }
         "validate_email" => {
             let e = args["email"].as_str().unwrap_or("");
             format!("{}", e.contains('@') && e.contains('.'))
@@ -81,7 +101,9 @@ fn handle_tool_call(name: &str, args: &Value) -> String {
         "merge_objects" => {
             let mut base = args["base"].clone();
             if let (Some(b), Some(o)) = (base.as_object_mut(), args["overlay"].as_object()) {
-                for (k, v) in o { b.insert(k.clone(), v.clone()); }
+                for (k, v) in o {
+                    b.insert(k.clone(), v.clone());
+                }
             }
             base.to_string()
         }
@@ -95,11 +117,20 @@ fn main() {
     let stdout = io::stdout();
 
     for line in stdin.lock().lines() {
-        let line = match line { Ok(l) => l, Err(_) => break };
-        if line.trim().is_empty() { continue; }
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
 
         let request: Value = match serde_json::from_str(&line) {
-            Ok(v) => v, Err(e) => { eprintln!("parse error: {}", e); continue; }
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("parse error: {}", e);
+                continue;
+            }
         };
         let method = request["method"].as_str().unwrap_or("");
         let id = &request["id"];
@@ -108,13 +139,17 @@ fn main() {
             "initialize" => json!({"jsonrpc": "2.0", "result": {
                 "protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
                 "serverInfo": {"name": "multi-tool-mcp", "version": "0.1.0"}}, "id": id}),
-            "tools/list" => json!({"jsonrpc": "2.0", "result": {"tools": tool_definitions()}, "id": id}),
+            "tools/list" => {
+                json!({"jsonrpc": "2.0", "result": {"tools": tool_definitions()}, "id": id})
+            }
             "tools/call" => {
                 let p = &request["params"];
                 let text = handle_tool_call(p["name"].as_str().unwrap_or(""), &p["arguments"]);
                 json!({"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": text}]}, "id": id})
             }
-            _ => json!({"jsonrpc": "2.0", "error": {"code": -32601, "message": "Method not found"}, "id": id}),
+            _ => {
+                json!({"jsonrpc": "2.0", "error": {"code": -32601, "message": "Method not found"}, "id": id})
+            }
         };
 
         let mut out = stdout.lock();
@@ -123,4 +158,3 @@ fn main() {
         out.flush().unwrap();
     }
 }
-

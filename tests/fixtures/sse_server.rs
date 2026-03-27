@@ -51,14 +51,19 @@ async fn handle_sse(
         while let Some(Ok((id, response))) = stream.next().await {
             let _ = id; // All sessions get all messages; real impl would filter
             let data = serde_json::to_string(&response).unwrap_or_default();
-            if tx.send(Ok(Event::default().event("message").data(data))).await.is_err() {
+            if tx
+                .send(Ok(Event::default().event("message").data(data)))
+                .await
+                .is_err()
+            {
                 break;
             }
         }
     });
 
     eprintln!("sse-server: new SSE connection (session {})", session_id);
-    Sse::new(tokio_stream::wrappers::ReceiverStream::new(client_rx)).keep_alive(KeepAlive::default())
+    Sse::new(tokio_stream::wrappers::ReceiverStream::new(client_rx))
+        .keep_alive(KeepAlive::default())
 }
 
 fn handle_method(method: &str, params: &Value, id: u64) -> Value {
@@ -74,7 +79,11 @@ fn handle_method(method: &str, params: &Value, id: u64) -> Value {
         ]}, "id": id}),
         "tools/call" => {
             let tool = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let msg = params.get("arguments").and_then(|a| a.get("message")).and_then(|v| v.as_str()).unwrap_or("");
+            let msg = params
+                .get("arguments")
+                .and_then(|a| a.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             let text = match tool {
                 "echo" => format!("echo: {}", msg),
                 "reverse" => format!("reverse: {}", msg.chars().rev().collect::<String>()),
@@ -82,7 +91,9 @@ fn handle_method(method: &str, params: &Value, id: u64) -> Value {
             };
             json!({"jsonrpc": "2.0", "result": {"content": [{"type": "text", "text": text}]}, "id": id})
         }
-        _ => json!({"jsonrpc": "2.0", "error": {"code": -32601, "message": "Method not found"}, "id": id}),
+        _ => {
+            json!({"jsonrpc": "2.0", "error": {"code": -32601, "message": "Method not found"}, "id": id})
+        }
     }
 }
 
@@ -107,21 +118,27 @@ async fn main() {
         if args[i] == "--port" && i + 1 < args.len() {
             port = args[i + 1].parse().unwrap_or(9100);
             i += 2;
-        } else { i += 1; }
+        } else {
+            i += 1;
+        }
     }
 
     let (tx, _) = broadcast::channel::<(u64, Value)>(256);
-    let state = AppState { tx: Arc::new(tx), next_session: Arc::new(Mutex::new(0)) };
+    let state = AppState {
+        tx: Arc::new(tx),
+        next_session: Arc::new(Mutex::new(0)),
+    };
 
     let app = Router::new()
         .route("/sse", get(handle_sse))
         .route("/message", post(handle_message))
         .with_state(state);
 
-    let listener = TcpListener::bind(format!("127.0.0.1:{}", port)).await.unwrap();
+    let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
+        .await
+        .unwrap();
     let addr = listener.local_addr().unwrap();
     eprintln!("sse-server: listening on {}", addr);
 
     axum::serve(listener, app).await.unwrap();
 }
-

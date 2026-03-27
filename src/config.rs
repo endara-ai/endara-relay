@@ -65,7 +65,11 @@ impl fmt::Display for ConfigError {
             ConfigError::IoError(e) => write!(f, "IO error: {}", e),
             ConfigError::ParseError(e) => write!(f, "TOML parse error: {}", e),
             ConfigError::EnvVarMissing { var_name, endpoint } => {
-                write!(f, "Environment variable '{}' not found for endpoint '{}'", var_name, endpoint)
+                write!(
+                    f,
+                    "Environment variable '{}' not found for endpoint '{}'",
+                    var_name, endpoint
+                )
             }
             ConfigError::ValidationError(msg) => write!(f, "Validation error: {}", msg),
         }
@@ -171,7 +175,11 @@ fn resolve_env_value(value: &str, endpoint_name: &str) -> Result<String, ConfigE
         match std::env::var(var_name) {
             Ok(val) => Ok(val),
             Err(_) => {
-                tracing::warn!(var = var_name, endpoint = endpoint_name, "Environment variable not found");
+                tracing::warn!(
+                    var = var_name,
+                    endpoint = endpoint_name,
+                    "Environment variable not found"
+                );
                 Err(ConfigError::EnvVarMissing {
                     var_name: var_name.to_string(),
                     endpoint: endpoint_name.to_string(),
@@ -394,7 +402,11 @@ transport = "stdio"
         match err {
             ConfigError::ValidationError(msg) => {
                 assert!(msg.contains("stdio"), "Error should mention stdio: {}", msg);
-                assert!(msg.contains("command"), "Error should mention command: {}", msg);
+                assert!(
+                    msg.contains("command"),
+                    "Error should mention command: {}",
+                    msg
+                );
             }
             other => panic!("Expected ValidationError, got: {:?}", other),
         }
@@ -439,8 +451,16 @@ command = "cat"
         let err = parse_and_validate(toml_str).unwrap_err();
         match err {
             ConfigError::ValidationError(msg) => {
-                assert!(msg.contains("Duplicate"), "Error should mention duplicate: {}", msg);
-                assert!(msg.contains("dup"), "Error should mention the name: {}", msg);
+                assert!(
+                    msg.contains("Duplicate"),
+                    "Error should mention duplicate: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("dup"),
+                    "Error should mention the name: {}",
+                    msg
+                );
             }
             other => panic!("Expected ValidationError, got: {:?}", other),
         }
@@ -499,9 +519,9 @@ machine_name = "test"
             stdio_ep("change_me", "old_cmd"),
         ]);
         let new = make_config(vec![
-            stdio_ep("keep", "echo"),          // unchanged
-            stdio_ep("change_me", "new_cmd"),  // changed
-            sse_ep("new_ep", "http://x"),       // added
+            stdio_ep("keep", "echo"),         // unchanged
+            stdio_ep("change_me", "new_cmd"), // changed
+            sse_ep("new_ep", "http://x"),     // added
         ]);
 
         let diff = diff_configs(&old, &new);
@@ -516,10 +536,7 @@ machine_name = "test"
 
     #[test]
     fn config_diff_no_changes() {
-        let cfg = make_config(vec![
-            stdio_ep("a", "echo"),
-            stdio_ep("b", "cat"),
-        ]);
+        let cfg = make_config(vec![stdio_ep("a", "echo"), stdio_ep("b", "cat")]);
         let diff = diff_configs(&cfg, &cfg);
         assert!(diff.added.is_empty());
         assert!(diff.removed.is_empty());
@@ -529,14 +546,8 @@ machine_name = "test"
 
     #[test]
     fn config_diff_all_different() {
-        let old = make_config(vec![
-            stdio_ep("a", "echo"),
-            stdio_ep("b", "cat"),
-        ]);
-        let new = make_config(vec![
-            stdio_ep("c", "ls"),
-            sse_ep("d", "http://y"),
-        ]);
+        let old = make_config(vec![stdio_ep("a", "echo"), stdio_ep("b", "cat")]);
+        let new = make_config(vec![stdio_ep("c", "ls"), sse_ep("d", "http://y")]);
         let diff = diff_configs(&old, &new);
         assert_eq!(diff.added.len(), 2);
         assert_eq!(diff.removed.len(), 2);

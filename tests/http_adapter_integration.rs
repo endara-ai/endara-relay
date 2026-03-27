@@ -60,7 +60,11 @@ async fn test_http_adapter_full_lifecycle() {
         .await
         .expect("call_tool echo failed");
     let text = result["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("http test"), "unexpected echo response: {}", text);
+    assert!(
+        text.contains("http test"),
+        "unexpected echo response: {}",
+        text
+    );
 
     // Call reverse tool
     let result = adapter
@@ -68,7 +72,11 @@ async fn test_http_adapter_full_lifecycle() {
         .await
         .expect("call_tool reverse failed");
     let text = result["content"][0]["text"].as_str().unwrap();
-    assert!(text.contains("olleh"), "unexpected reverse response: {}", text);
+    assert!(
+        text.contains("olleh"),
+        "unexpected reverse response: {}",
+        text
+    );
 
     // Shutdown adapter
     adapter.shutdown().await.expect("shutdown failed");
@@ -95,9 +103,10 @@ async fn test_http_adapter_server_death_detection() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // After server is killed, a tool call should fail
-    let result = adapter.call_tool("echo", json!({"message": "after death"})).await;
+    let result = adapter
+        .call_tool("echo", json!({"message": "after death"}))
+        .await;
     assert!(result.is_err(), "expected error after server death");
 
     let _ = adapter.shutdown().await;
 }
-

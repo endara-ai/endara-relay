@@ -4,11 +4,11 @@
 //! /api/endpoints/:name/tools, /api/endpoints/:name/refresh,
 //! /api/endpoints/:name/logs, /api/config.
 
-use endara_relay::adapter::{HealthStatus, McpAdapter, ToolInfo, AdapterError};
-use endara_relay::config::{Config, EndpointConfig, RelayConfig, Transport};
-use endara_relay::management::{ManagementState, management_routes};
-use endara_relay::registry::AdapterRegistry;
 use async_trait::async_trait;
+use endara_relay::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
+use endara_relay::config::{Config, EndpointConfig, RelayConfig, Transport};
+use endara_relay::management::{management_routes, ManagementState};
+use endara_relay::registry::AdapterRegistry;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -208,11 +208,8 @@ async fn test_management_api_refresh_endpoint() {
 
 #[tokio::test]
 async fn test_management_api_endpoint_logs() {
-    let (addr, _handle) = start_management_server(vec![(
-        "echo-ep",
-        MockAdapter::healthy_with_tools(vec![]),
-    )])
-    .await;
+    let (addr, _handle) =
+        start_management_server(vec![("echo-ep", MockAdapter::healthy_with_tools(vec![]))]).await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -230,11 +227,8 @@ async fn test_management_api_endpoint_logs() {
 
 #[tokio::test]
 async fn test_management_api_config() {
-    let (addr, _handle) = start_management_server(vec![(
-        "echo-ep",
-        MockAdapter::healthy_with_tools(vec![]),
-    )])
-    .await;
+    let (addr, _handle) =
+        start_management_server(vec![("echo-ep", MockAdapter::healthy_with_tools(vec![]))]).await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -250,4 +244,3 @@ async fn test_management_api_config() {
     assert_eq!(endpoints[0]["name"], "echo");
     assert_eq!(endpoints[0]["transport"], "stdio");
 }
-
