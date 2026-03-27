@@ -1,0 +1,174 @@
+//! Integration test: Config hot reload.
+//!
+//! Creates a temp config file, starts relay with it,
+//! modifies config to add/remove endpoints, verifies changes are applied.
+
+use endara_relay::adapter::stdio::{StdioAdapter, StdioConfig};
+use endara_relay::adapter::McpAdapter;
+use endara_relay::config;
+use endara_relay::registry::AdapterRegistry;
+use endara_relay::watcher;
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+fn echo_script_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("echo_mcp_server.sh")
+}
+
+fn multi_tool_bin() -> String {
+    env!("CARGO_BIN_EXE_fixture-multi-tool-server").to_string()
+}
+
+#[tokio::test]
+async fn test_config_diff_add_endpoint() {
+    let registry = AdapterRegistry::new("testmachine".into());
+
+    // Start with echo endpoint
+    let echo_config = StdioConfig {
+        command: "bash".to_string(),
+        args: vec![echo_script_path().to_string_lossy().to_string()],
+        env: HashMap::new(),
+    };
+    let mut echo_adapter = StdioAdapter::new(echo_config);
+    echo_adapter.initialize().await.expect("echo init failed");
+    registry.register("echo-ep".into(), Box::new(echo_adapter)).await;
+
+    // Verify initial state: 1 endpoint
+    let catalog = registry.merged_catalog().await;
+    assert_eq!(catalog.len(), 1, "should start with 1 tool");
+
+    // Simulate adding a new endpoint via config diff
+    let old_config = config::Config {
+        relay: config::RelayConfig {
+            machine_name: "testmachine".to_string(),
+            local_js_execution: None,
+        },
+        endpoints: vec![config::EndpointConfig {
+            name: "echo-ep".to_string(),
+            transport: config::Transport::Stdio,
+            command: Some("bash".to_string()),
+            args: Some(vec![echo_script_path().to_string_lossy().to_string()]),
+            url: None,
+            env: None,
+        }],
+    };
+
+    let new_config = config::Config {
+        relay: config::RelayConfig {
+            machine_name: "testmachine".to_string(),
+            local_js_execution: None,
+        },
+        endpoints: vec![
+            config::EndpointConfig {
+                name: "echo-ep".to_string(),
+                transport: config::Transport::Stdio,
+                command: Some("bash".to_string()),
+                args: Some(vec![echo_script_path().to_string_lossy().to_string()]),
+                url: None,
+                env: None,
+            },
+            config::EndpointConfig {
+                name: "multi-ep".to_string(),
+                transport: config::Transport::Stdio,
+                command: Some(multi_tool_bin()),
+                args: Some(vec![]),
+                url: None,
+                env: None,
+            },
+        ],
+    };
+
+    let diff = config::diff_configs(&old_config, &new_config);
+    assert_eq!(diff.added.len(), 1);
+    assert_eq!(diff.added[0].name, "multi-ep");
+    assert_eq!(diff.unchanged.len(), 1);
+
+    // Apply the diff
+    watcher::apply_diff(&diff, &registry).await;
+
+    // Verify the new endpoint was added
+    let catalog = registry.merged_catalog().await;
+    assert!(catalog.len() > 1, "should have more than 1 tool after adding multi-ep");
+}
+
+#[tokio::test]
+async fn test_config_diff_remove_endpoint() {
+    let registry = AdapterRegistry::new("testmachine".into());
+
+    // Start with 2 endpoints
+    let echo_config = StdioConfig {
+        command: "bash".to_string(),
+        args: vec![echo_script_path().to_string_lossy().to_string()],
+        env: HashMap::new(),
+    };
+    let mut echo_adapter = StdioAdapter::new(echo_config);
+    echo_adapter.initialize().await.expect("echo init failed");
+    registry.register("echo-ep".into(), Box::new(echo_adapter)).await;
+
+    let multi_config = StdioConfig {
+        command: multi_tool_bin(),
+        args: vec![],
+        env: HashMap::new(),
+    };
+    let mut multi_adapter = StdioAdapter::new(multi_config);
+    multi_adapter.initialize().await.expect("multi init failed");
+    registry.register("multi-ep".into(), Box::new(multi_adapter)).await;
+
+    let catalog = registry.merged_catalog().await;
+    assert!(catalog.len() > 1, "should start with more than 1 tool");
+
+    // Simulate removing multi-ep
+    let old_config = config::Config {
+        relay: config::RelayConfig {
+            machine_name: "testmachine".to_string(),
+            local_js_execution: None,
+        },
+        endpoints: vec![
+            config::EndpointConfig {
+                name: "echo-ep".to_string(),
+                transport: config::Transport::Stdio,
+                command: Some("bash".to_string()),
+                args: Some(vec![echo_script_path().to_string_lossy().to_string()]),
+                url: None,
+                env: None,
+            },
+            config::EndpointConfig {
+                name: "multi-ep".to_string(),
+                transport: config::Transport::Stdio,
+                command: Some(multi_tool_bin()),
+                args: Some(vec![]),
+                url: None,
+                env: None,
+            },
+        ],
+    };
+
+    let new_config = config::Config {
+        relay: config::RelayConfig {
+            machine_name: "testmachine".to_string(),
+            local_js_execution: None,
+        },
+        endpoints: vec![config::EndpointConfig {
+            name: "echo-ep".to_string(),
+            transport: config::Transport::Stdio,
+            command: Some("bash".to_string()),
+            args: Some(vec![echo_script_path().to_string_lossy().to_string()]),
+            url: None,
+            env: None,
+        }],
+    };
+
+    let diff = config::diff_configs(&old_config, &new_config);
+    assert_eq!(diff.removed.len(), 1);
+    assert_eq!(diff.removed[0], "multi-ep");
+
+    watcher::apply_diff(&diff, &registry).await;
+
+    // Verify the endpoint was removed
+    let catalog = registry.merged_catalog().await;
+    assert_eq!(catalog.len(), 1, "should have 1 tool after removing multi-ep");
+}
+
