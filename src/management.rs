@@ -2,11 +2,12 @@ use axum::{
     extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::Serialize;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -26,6 +27,8 @@ pub struct ManagementState {
     pub registry: Arc<AdapterRegistry>,
     pub config: Arc<RwLock<Config>>,
     pub start_time: Instant,
+    /// Path to the TOML config file on disk (used by DELETE endpoint).
+    pub config_path: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -278,6 +281,107 @@ async fn reload_config() -> Json<ActionResponse> {
     })
 }
 
+/// DELETE /api/endpoints/:name
+///
+/// Removes the named endpoint from the config file on disk. The config file
+/// watcher (hot-reload) will automatically pick up the change and unload the
+/// endpoint from the running registry.
+async fn delete_endpoint(
+    State(state): State<ManagementState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let Some(config_path) = &state.config_path else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_path not configured",
+            Some("The management API was not initialised with a config file path."),
+        )
+        .into_response();
+    };
+
+    let resolved = crate::config::expand_tilde(config_path);
+
+    // Read the raw TOML from disk so we can do a targeted edit.
+    let contents = match std::fs::read_to_string(&resolved) {
+        Ok(c) => c,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read config file",
+                Some(&e.to_string()),
+            )
+            .into_response();
+        }
+    };
+
+    let mut parsed: toml::Table = match contents.parse() {
+        Ok(t) => t,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to parse config file",
+                Some(&e.to_string()),
+            )
+            .into_response();
+        }
+    };
+
+    // Remove the matching endpoint from the [[endpoints]] array.
+    let found = if let Some(toml::Value::Array(endpoints)) = parsed.get_mut("endpoints") {
+        let original_len = endpoints.len();
+        endpoints.retain(|ep| {
+            ep.get("name")
+                .and_then(|v| v.as_str())
+                .map(|n| n != name)
+                .unwrap_or(true)
+        });
+        endpoints.len() < original_len
+    } else {
+        false
+    };
+
+    if !found {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Endpoint not found: {}", name),
+                detail: None,
+            }),
+        )
+            .into_response();
+    }
+
+    // Serialize and write back.
+    let new_contents = match toml::to_string_pretty(&parsed) {
+        Ok(s) => s,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to serialize config",
+                Some(&e.to_string()),
+            )
+            .into_response();
+        }
+    };
+
+    if let Err(e) = std::fs::write(&resolved, &new_contents) {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to write config file",
+            Some(&e.to_string()),
+        )
+        .into_response();
+    }
+
+    // Return success — the config watcher will pick up the file change and
+    // unload the endpoint from the registry automatically.
+    Json(serde_json::json!({
+        "status": "removed",
+        "name": name,
+    }))
+    .into_response()
+}
+
 // ---------------------------------------------------------------------------
 // Router builder
 // ---------------------------------------------------------------------------
@@ -287,6 +391,7 @@ pub fn management_routes(state: ManagementState) -> Router {
     Router::new()
         .route("/api/status", get(get_status))
         .route("/api/endpoints", get(get_endpoints))
+        .route("/api/endpoints/{name}", delete(delete_endpoint))
         .route("/api/endpoints/{name}/tools", get(get_endpoint_tools))
         .route("/api/endpoints/{name}/restart", post(restart_endpoint))
         .route("/api/endpoints/{name}/refresh", post(refresh_endpoint))
@@ -409,6 +514,7 @@ mod tests {
             registry: Arc::new(registry),
             config: Arc::new(RwLock::new(test_config())),
             start_time: Instant::now(),
+            config_path: None,
         }
     }
 
@@ -626,5 +732,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn management_delete_endpoint_success() {
+        // Write a temp config file with two endpoints
+        let dir = std::env::temp_dir().join(format!("relay-test-delete-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_file = dir.join("config.toml");
+        let toml_content = r#"[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "echo"
+transport = "stdio"
+command = "echo"
+
+[[endpoints]]
+name = "keep-me"
+transport = "stdio"
+command = "cat"
+"#;
+        std::fs::write(&config_file, toml_content).unwrap();
+
+        let mut state = test_state(vec![("echo", MockAdapter::healthy_with_tools(vec![]))]).await;
+        state.config_path = Some(config_file.clone());
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::delete("/api/endpoints/echo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["status"], "removed");
+        assert_eq!(body["name"], "echo");
+
+        // Verify the config file was updated
+        let updated = std::fs::read_to_string(&config_file).unwrap();
+        assert!(!updated.contains("\"echo\""));
+        assert!(updated.contains("keep-me"));
+
+        // Clean up
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn management_delete_endpoint_not_found() {
+        let dir = std::env::temp_dir().join(format!("relay-test-delete-nf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_file = dir.join("config.toml");
+        let toml_content = r#"[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "echo"
+transport = "stdio"
+command = "echo"
+"#;
+        std::fs::write(&config_file, toml_content).unwrap();
+
+        let mut state = test_state(vec![]).await;
+        state.config_path = Some(config_file.clone());
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::delete("/api/endpoints/nonexistent")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = body_json(resp).await;
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("Endpoint not found"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn management_delete_endpoint_no_config_path() {
+        let state = test_state(vec![]).await;
+        // config_path is None
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::delete("/api/endpoints/echo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(resp).await;
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("config_path not configured"));
     }
 }

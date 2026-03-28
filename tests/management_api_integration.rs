@@ -10,7 +10,6 @@ use endara_relay::config::{Config, EndpointConfig, RelayConfig, Transport};
 use endara_relay::management::{management_routes, ManagementState};
 use endara_relay::registry::AdapterRegistry;
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -90,6 +89,7 @@ async fn start_management_server(
         registry,
         config: Arc::new(tokio::sync::RwLock::new(test_config())),
         start_time: Instant::now(),
+        config_path: None,
     };
 
     let app = management_routes(state);
@@ -243,4 +243,100 @@ async fn test_management_api_config() {
     assert_eq!(endpoints.len(), 1);
     assert_eq!(endpoints[0]["name"], "echo");
     assert_eq!(endpoints[0]["transport"], "stdio");
+}
+
+async fn start_management_server_with_config(
+    adapters: Vec<(&str, MockAdapter)>,
+    config_path: std::path::PathBuf,
+) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let registry = AdapterRegistry::new("test-machine".into());
+    for (name, adapter) in adapters {
+        registry
+            .register(name.to_string(), Box::new(adapter), "stdio".to_string())
+            .await;
+    }
+    let registry = Arc::new(registry);
+    let state = ManagementState {
+        registry,
+        config: Arc::new(tokio::sync::RwLock::new(test_config())),
+        start_time: Instant::now(),
+        config_path: Some(config_path),
+    };
+
+    let app = management_routes(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr, handle)
+}
+
+#[tokio::test]
+async fn test_management_api_delete_endpoint() {
+    // Write a temp config file
+    let dir = std::env::temp_dir().join(format!("relay-integ-delete-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config_file = dir.join("config.toml");
+    let toml_content = r#"[relay]
+machine_name = "test-machine"
+
+[[endpoints]]
+name = "echo-ep"
+transport = "stdio"
+command = "echo"
+args = ["hello"]
+
+[[endpoints]]
+name = "other-ep"
+transport = "stdio"
+command = "cat"
+"#;
+    std::fs::write(&config_file, toml_content).unwrap();
+
+    let tools = vec![ToolInfo {
+        name: "echo".into(),
+        description: Some("Echoes input".into()),
+        input_schema: json!({"type": "object"}),
+    }];
+    let (addr, _handle) = start_management_server_with_config(
+        vec![("echo-ep", MockAdapter::healthy_with_tools(tools))],
+        config_file.clone(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // Delete the endpoint
+    let resp = client
+        .delete(format!("http://{}/api/endpoints/echo-ep", addr))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "removed");
+    assert_eq!(body["name"], "echo-ep");
+
+    // Verify config file no longer contains echo-ep
+    let updated = std::fs::read_to_string(&config_file).unwrap();
+    assert!(!updated.contains("echo-ep"));
+    assert!(updated.contains("other-ep"));
+
+    // Try deleting a non-existent endpoint
+    let resp = client
+        .delete(format!("http://{}/api/endpoints/nonexistent", addr))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), 404);
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("Endpoint not found"));
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

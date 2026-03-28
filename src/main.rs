@@ -224,6 +224,7 @@ async fn main() {
                 registry: registry.clone(),
                 config: Arc::new(tokio::sync::RwLock::new(cfg.clone())),
                 start_time: std::time::Instant::now(),
+                config_path: Some(config_path.clone()),
             };
             let router = build_router(state).merge(management::management_routes(mgmt_state));
             let addr: SocketAddr = ([0, 0, 0, 0], port).into();
