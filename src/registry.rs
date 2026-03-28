@@ -270,4 +270,150 @@ mod tests {
             .await;
         assert!(result.is_err());
     }
+
+    #[tokio::test]
+    async fn test_register_and_remove() {
+        let registry = AdapterRegistry::new("m".into());
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("t")])),
+                "stdio".into(),
+            )
+            .await;
+
+        // Verify it exists via catalog
+        assert_eq!(registry.merged_catalog().await.len(), 1);
+
+        // Remove and verify it's gone
+        let removed = registry.remove("ep").await;
+        assert!(removed.is_some());
+        assert_eq!(removed.unwrap().transport, "stdio");
+        assert!(registry.merged_catalog().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_remove_nonexistent() {
+        let registry = AdapterRegistry::new("m".into());
+        assert!(registry.remove("ghost").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_list_healthy() {
+        let registry = AdapterRegistry::new("m".into());
+        registry
+            .register(
+                "good".into(),
+                Box::new(MockAdapter::healthy(vec![])),
+                "stdio".into(),
+            )
+            .await;
+        registry
+            .register(
+                "bad".into(),
+                Box::new(MockAdapter::unhealthy()),
+                "stdio".into(),
+            )
+            .await;
+
+        let healthy = registry.list_healthy().await;
+        assert_eq!(healthy, vec!["good"]);
+    }
+
+    #[tokio::test]
+    async fn test_empty_registry_catalog() {
+        let registry = AdapterRegistry::new("m".into());
+        assert!(registry.merged_catalog().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_empty_registry_list_healthy() {
+        let registry = AdapterRegistry::new("m".into());
+        assert!(registry.list_healthy().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_name_overwrites() {
+        let registry = AdapterRegistry::new("m".into());
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("old_tool")])),
+                "stdio".into(),
+            )
+            .await;
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("new_tool")])),
+                "sse".into(),
+            )
+            .await;
+
+        let catalog = registry.merged_catalog().await;
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].name, "m__ep__new_tool");
+    }
+
+    #[tokio::test]
+    async fn test_route_to_unhealthy_endpoint() {
+        let registry = AdapterRegistry::new("m".into());
+        registry
+            .register(
+                "sick".into(),
+                Box::new(MockAdapter::unhealthy()),
+                "stdio".into(),
+            )
+            .await;
+
+        let result = registry.route_tool_call("m__sick__tool", json!({})).await;
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("not healthy"));
+    }
+
+    #[tokio::test]
+    async fn test_machine_name_accessor() {
+        let registry = AdapterRegistry::new("my-laptop".into());
+        assert_eq!(registry.machine_name(), "my-laptop");
+    }
+
+    #[tokio::test]
+    async fn test_entries_accessor() {
+        let registry = AdapterRegistry::new("m".into());
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![])),
+                "stdio".into(),
+            )
+            .await;
+
+        let entries = registry.entries().read().await;
+        assert_eq!(entries.len(), 1);
+        assert!(entries.contains_key("ep"));
+    }
+
+    #[tokio::test]
+    async fn test_merged_catalog_multiple_tools_per_endpoint() {
+        let registry = AdapterRegistry::new("m".into());
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![
+                    make_tool("read"),
+                    make_tool("write"),
+                    make_tool("delete"),
+                ])),
+                "stdio".into(),
+            )
+            .await;
+
+        let catalog = registry.merged_catalog().await;
+        assert_eq!(catalog.len(), 3);
+        let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"m__ep__read"));
+        assert!(names.contains(&"m__ep__write"));
+        assert!(names.contains(&"m__ep__delete"));
+    }
 }

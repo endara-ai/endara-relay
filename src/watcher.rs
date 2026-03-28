@@ -208,3 +208,227 @@ async fn create_adapter(ep: &EndpointConfig) -> Option<Box<dyn McpAdapter>> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
+    use async_trait::async_trait;
+    use serde_json::json;
+
+    /// A mock adapter that tracks whether shutdown was called.
+    struct MockAdapter {
+        health: HealthStatus,
+        tools: Vec<ToolInfo>,
+        shutdown_called: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl MockAdapter {
+        fn healthy(
+            tools: Vec<ToolInfo>,
+            shutdown_called: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        ) -> Self {
+            Self {
+                health: HealthStatus::Healthy,
+                tools,
+                shutdown_called,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl McpAdapter for MockAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(self.tools.clone())
+        }
+        async fn call_tool(
+            &self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, AdapterError> {
+            Ok(json!({ "called": name, "args": arguments }))
+        }
+        fn health(&self) -> HealthStatus {
+            self.health.clone()
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            self.shutdown_called
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn make_tool(name: &str) -> ToolInfo {
+        ToolInfo {
+            name: name.to_string(),
+            description: Some(format!("{} tool", name)),
+            input_schema: json!({"type": "object"}),
+        }
+    }
+
+    fn empty_diff() -> ConfigDiff {
+        ConfigDiff {
+            added: vec![],
+            removed: vec![],
+            changed: vec![],
+            unchanged: vec![],
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_diff_empty_is_noop() {
+        let registry = Arc::new(AdapterRegistry::new("m".into()));
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        registry
+            .register(
+                "existing".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("t")], shutdown.clone())),
+                "stdio".into(),
+            )
+            .await;
+
+        apply_diff(&empty_diff(), &registry).await;
+
+        // Existing adapter should still be there, not shut down
+        assert!(!shutdown.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(registry.merged_catalog().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn apply_diff_removes_endpoint() {
+        let registry = Arc::new(AdapterRegistry::new("m".into()));
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        registry
+            .register(
+                "to_remove".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("t")], shutdown.clone())),
+                "stdio".into(),
+            )
+            .await;
+
+        let diff = ConfigDiff {
+            removed: vec!["to_remove".to_string()],
+            ..empty_diff()
+        };
+
+        apply_diff(&diff, &registry).await;
+
+        assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(registry.merged_catalog().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_diff_remove_nonexistent_is_ok() {
+        let registry = Arc::new(AdapterRegistry::new("m".into()));
+        let diff = ConfigDiff {
+            removed: vec!["ghost".to_string()],
+            ..empty_diff()
+        };
+
+        // Should not panic
+        apply_diff(&diff, &registry).await;
+    }
+
+    #[tokio::test]
+    async fn apply_diff_changed_shuts_down_old() {
+        let registry = Arc::new(AdapterRegistry::new("m".into()));
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("t")], shutdown.clone())),
+                "stdio".into(),
+            )
+            .await;
+
+        // Change the endpoint config — create_adapter will fail to spawn a real process,
+        // but the old adapter should be shut down and removed
+        let changed_ep = EndpointConfig {
+            name: "ep".to_string(),
+            transport: Transport::Stdio,
+            command: Some("/nonexistent/binary/that/wont/start".to_string()),
+            args: None,
+            url: None,
+            env: None,
+        };
+        let diff = ConfigDiff {
+            changed: vec![("ep".to_string(), changed_ep)],
+            ..empty_diff()
+        };
+
+        apply_diff(&diff, &registry).await;
+
+        // Old adapter should have been shut down
+        assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn apply_diff_added_with_invalid_command_does_not_register() {
+        let registry = Arc::new(AdapterRegistry::new("m".into()));
+
+        let new_ep = EndpointConfig {
+            name: "bad_ep".to_string(),
+            transport: Transport::Stdio,
+            command: Some("/nonexistent/binary/that/wont/start".to_string()),
+            args: None,
+            url: None,
+            env: None,
+        };
+        let diff = ConfigDiff {
+            added: vec![new_ep],
+            ..empty_diff()
+        };
+
+        apply_diff(&diff, &registry).await;
+
+        // The failed adapter should not appear in the registry
+        assert!(registry.merged_catalog().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_diff_preserves_unchanged_endpoints() {
+        let registry = Arc::new(AdapterRegistry::new("m".into()));
+        let shutdown_keep = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_remove = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        registry
+            .register(
+                "keep".into(),
+                Box::new(MockAdapter::healthy(
+                    vec![make_tool("t1")],
+                    shutdown_keep.clone(),
+                )),
+                "stdio".into(),
+            )
+            .await;
+        registry
+            .register(
+                "remove".into(),
+                Box::new(MockAdapter::healthy(
+                    vec![make_tool("t2")],
+                    shutdown_remove.clone(),
+                )),
+                "stdio".into(),
+            )
+            .await;
+
+        let diff = ConfigDiff {
+            removed: vec!["remove".to_string()],
+            unchanged: vec!["keep".to_string()],
+            ..empty_diff()
+        };
+
+        apply_diff(&diff, &registry).await;
+
+        // "keep" should still be alive
+        assert!(!shutdown_keep.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(registry.merged_catalog().await.len(), 1);
+        assert_eq!(registry.merged_catalog().await[0].name, "m__keep__t1");
+
+        // "remove" should be shut down
+        assert!(shutdown_remove.load(std::sync::atomic::Ordering::SeqCst));
+    }
+}
