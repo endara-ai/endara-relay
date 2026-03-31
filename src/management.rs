@@ -5,7 +5,8 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -13,6 +14,11 @@ use std::time::Instant;
 use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 
+use tracing::warn;
+
+use crate::adapter::http::{HttpAdapter, HttpConfig};
+use crate::adapter::sse::{SseAdapter, SseConfig};
+use crate::adapter::stdio::{StdioAdapter, StdioConfig};
 use crate::adapter::HealthStatus;
 use crate::config::Config;
 use crate::registry::AdapterRegistry;
@@ -50,6 +56,9 @@ pub struct EndpointInfo {
     pub health: String,
     pub tool_count: usize,
     pub last_activity: Option<u64>,
+    pub disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -68,6 +77,46 @@ pub struct ErrorResponse {
 pub struct ActionResponse {
     pub ok: bool,
     pub message: String,
+}
+
+/// Request body for POST /api/test-connection.
+#[derive(Deserialize)]
+pub struct TestConnectionRequest {
+    pub transport: String,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub headers: Option<HashMap<String, String>>,
+}
+
+/// Response body for POST /api/test-connection.
+#[derive(Serialize)]
+pub struct TestConnectionResponse {
+    pub success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tools: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogEntry {
+    pub name: String,
+    pub description: Option<String>,
+    pub input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+    pub endpoint: String,
+    pub available: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,22 +170,29 @@ async fn get_endpoints(State(state): State<ManagementState>) -> Json<Vec<Endpoin
     let now = Instant::now();
     let mut endpoints: Vec<EndpointInfo> = Vec::new();
     for (name, entry) in entries.iter() {
-        let tool_count = if matches!(entry.adapter.health(), HealthStatus::Healthy) {
-            entry
+        let (health, tool_count, error) = if entry.disabled {
+            ("stopped".to_string(), 0, None)
+        } else if matches!(entry.adapter.health(), HealthStatus::Healthy) {
+            let count = entry
                 .adapter
                 .list_tools()
                 .await
                 .map(|t| t.len())
-                .unwrap_or(0)
+                .unwrap_or(0);
+            (entry.adapter.health().to_string(), count, None)
+        } else if let HealthStatus::Unhealthy(reason) = entry.adapter.health() {
+            ("offline".to_string(), 0, Some(reason))
         } else {
-            0
+            (entry.adapter.health().to_string(), 0, None)
         };
         endpoints.push(EndpointInfo {
             name: name.clone(),
             transport: entry.transport.clone(),
-            health: entry.adapter.health().to_string(),
+            health,
             tool_count,
             last_activity: entry.last_activity.map(|t| now.duration_since(t).as_secs()),
+            disabled: entry.disabled,
+            error,
         });
     }
     endpoints.sort_by(|a, b| a.name.cmp(&b.name));
@@ -208,7 +264,9 @@ async fn get_endpoint_logs(
     let Some(entry) = entries.get(&name) else {
         return endpoint_not_found(&name).into_response();
     };
-    let lines = entry.stderr_lines.read().await.clone();
+    let mut lines = entry.adapter.stderr_lines().await;
+    let activity = entry.adapter.activity_log().await;
+    lines.extend(activity);
     Json(LogsResponse { lines }).into_response()
 }
 
@@ -383,6 +441,141 @@ async fn delete_endpoint(
 }
 
 // ---------------------------------------------------------------------------
+// Persist disabled state
+// ---------------------------------------------------------------------------
+
+/// Read disabled/disabled_tools from the registry and write them back to config.toml.
+async fn persist_disabled_state(state: &ManagementState) {
+    let Some(ref config_path) = state.config_path else {
+        return;
+    };
+    let mut config = state.config.write().await;
+
+    // Read current disabled state from registry
+    let entries = state.registry.entries().read().await;
+    for ep_config in &mut config.endpoints {
+        if let Some(entry) = entries.get(&ep_config.name) {
+            ep_config.disabled = entry.disabled;
+            ep_config.disabled_tools = entry.disabled_tools.iter().cloned().collect();
+        }
+    }
+    drop(entries);
+
+    // Write back to file
+    let resolved = crate::config::expand_tilde(config_path);
+    if let Ok(toml_str) = toml::to_string_pretty(&*config) {
+        if let Err(e) = std::fs::write(&resolved, &toml_str) {
+            warn!(error = %e, "Failed to persist disabled state");
+        }
+    }
+}
+
+/// POST /api/test-connection
+///
+/// Creates a temporary adapter from the provided config, initializes it,
+/// lists tools, then shuts it down. Returns success with tool info or an error.
+async fn test_connection(
+    Json(req): Json<TestConnectionRequest>,
+) -> impl IntoResponse {
+    let transport = req.transport.to_lowercase();
+
+    // Create a temporary adapter based on transport type
+    let mut adapter: Box<dyn crate::adapter::McpAdapter> = match transport.as_str() {
+        "stdio" => {
+            let config = StdioConfig {
+                command: req.command.unwrap_or_default(),
+                args: req.args.unwrap_or_default(),
+                env: req.env.unwrap_or_default(),
+            };
+            Box::new(StdioAdapter::new(config))
+        }
+        "sse" => {
+            let url = req.url.unwrap_or_default();
+            let mut config = SseConfig::new(url);
+            config.headers = req.headers.unwrap_or_default();
+            Box::new(SseAdapter::new(config))
+        }
+        "http" => {
+            let url = req.url.unwrap_or_default();
+            let mut config = HttpConfig::new(url);
+            config.headers = req.headers.unwrap_or_default();
+            Box::new(HttpAdapter::new(config))
+        }
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(TestConnectionResponse {
+                    success: false,
+                    tool_count: None,
+                    tools: None,
+                    error: Some(format!("Unknown transport: {}", req.transport)),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // Initialize (handshake) with a timeout
+    let init_result =
+        tokio::time::timeout(std::time::Duration::from_secs(30), adapter.initialize()).await;
+
+    match init_result {
+        Ok(Ok(())) => {
+            // List tools
+            let tools_result = adapter.list_tools().await;
+            // Always shut down regardless of list_tools result
+            let _ = adapter.shutdown().await;
+
+            match tools_result {
+                Ok(tools) => Json(TestConnectionResponse {
+                    success: true,
+                    tool_count: Some(tools.len()),
+                    tools: Some(tools.into_iter().map(|t| t.name).collect()),
+                    error: None,
+                })
+                .into_response(),
+                Err(e) => (
+                    StatusCode::OK,
+                    Json(TestConnectionResponse {
+                        success: false,
+                        tool_count: None,
+                        tools: None,
+                        error: Some(format!("Connected but failed to list tools: {}", e)),
+                    }),
+                )
+                    .into_response(),
+            }
+        }
+        Ok(Err(e)) => {
+            let _ = adapter.shutdown().await;
+            (
+                StatusCode::OK,
+                Json(TestConnectionResponse {
+                    success: false,
+                    tool_count: None,
+                    tools: None,
+                    error: Some(format!("Connection failed: {}", e)),
+                }),
+            )
+                .into_response()
+        }
+        Err(_) => {
+            let _ = adapter.shutdown().await;
+            (
+                StatusCode::OK,
+                Json(TestConnectionResponse {
+                    success: false,
+                    tool_count: None,
+                    tools: None,
+                    error: Some("Connection timed out after 30 seconds".to_string()),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Router builder
 // ---------------------------------------------------------------------------
 
@@ -395,9 +588,21 @@ pub fn management_routes(state: ManagementState) -> Router {
         .route("/api/endpoints/{name}/tools", get(get_endpoint_tools))
         .route("/api/endpoints/{name}/restart", post(restart_endpoint))
         .route("/api/endpoints/{name}/refresh", post(refresh_endpoint))
+        .route("/api/endpoints/{name}/disable", post(disable_endpoint))
+        .route("/api/endpoints/{name}/enable", post(enable_endpoint))
         .route("/api/endpoints/{name}/logs", get(get_endpoint_logs))
+        .route(
+            "/api/endpoints/{name}/tools/{tool_name}/disable",
+            post(disable_tool),
+        )
+        .route(
+            "/api/endpoints/{name}/tools/{tool_name}/enable",
+            post(enable_tool),
+        )
+        .route("/api/catalog", get(get_catalog))
         .route("/api/config", get(get_config))
         .route("/api/config/reload", post(reload_config))
+        .route("/api/test-connection", post(test_connection))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
@@ -412,7 +617,22 @@ async fn get_endpoint_tools(
         return endpoint_not_found(&name).into_response();
     };
     match entry.adapter.list_tools().await {
-        Ok(tools) => Json(tools).into_response(),
+        Ok(tools) => {
+            let tools_with_status: Vec<ToolInfoWithStatus> = tools
+                .into_iter()
+                .map(|t| {
+                    let disabled = entry.disabled_tools.contains(&t.name);
+                    ToolInfoWithStatus {
+                        name: t.name,
+                        description: t.description,
+                        input_schema: t.input_schema,
+                        disabled,
+                        annotations: t.annotations,
+                    }
+                })
+                .collect();
+            Json(tools_with_status).into_response()
+        }
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "failed to list tools",
@@ -420,6 +640,150 @@ async fn get_endpoint_tools(
         )
         .into_response(),
     }
+}
+
+#[derive(Serialize)]
+struct ToolInfoWithStatus {
+    name: String,
+    description: Option<String>,
+    input_schema: Value,
+    disabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    annotations: Option<Value>,
+}
+
+/// GET /api/catalog
+///
+/// Returns the full merged/prefixed tool catalog across all endpoints,
+/// including source endpoint name and availability status.
+async fn get_catalog(State(state): State<ManagementState>) -> Json<Vec<CatalogEntry>> {
+    let (tools, lookup) = state.registry.merged_catalog_with_lookup().await;
+    let entries = state.registry.entries().read().await;
+    let mut catalog = Vec::new();
+
+    for tool in tools {
+        let (endpoint_name, available) = match lookup.get(&tool.name) {
+            Some((ep, _raw)) => {
+                let avail = entries
+                    .get(ep.as_str())
+                    .map(|e| {
+                        !e.disabled
+                            && matches!(e.adapter.health(), crate::adapter::HealthStatus::Healthy)
+                    })
+                    .unwrap_or(false);
+                (ep.clone(), avail)
+            }
+            None => ("unknown".to_string(), false),
+        };
+
+        catalog.push(CatalogEntry {
+            name: tool.name,
+            description: tool.description,
+            input_schema: tool.input_schema,
+            annotations: tool.annotations,
+            endpoint: endpoint_name,
+            available,
+        });
+    }
+
+    Json(catalog)
+}
+
+/// POST /api/endpoints/:name/disable
+async fn disable_endpoint(
+    State(state): State<ManagementState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    {
+        let mut entries = state.registry.entries().write().await;
+        let Some(entry) = entries.get_mut(&name) else {
+            return endpoint_not_found(&name).into_response();
+        };
+        if let Err(e) = entry.adapter.shutdown().await {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to shutdown adapter",
+                Some(&e.to_string()),
+            )
+            .into_response();
+        }
+        entry.disabled = true;
+    }
+    persist_disabled_state(&state).await;
+    Json(ActionResponse {
+        ok: true,
+        message: format!("Endpoint '{}' disabled", name),
+    })
+    .into_response()
+}
+
+/// POST /api/endpoints/:name/enable
+async fn enable_endpoint(
+    State(state): State<ManagementState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let result = {
+        let mut entries = state.registry.entries().write().await;
+        let Some(entry) = entries.get_mut(&name) else {
+            return endpoint_not_found(&name).into_response();
+        };
+        entry.disabled = false;
+        entry.adapter.initialize().await
+    };
+    persist_disabled_state(&state).await;
+    match result {
+        Ok(()) => Json(ActionResponse {
+            ok: true,
+            message: format!("Endpoint '{}' enabled", name),
+        })
+        .into_response(),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to initialize adapter",
+            Some(&e.to_string()),
+        )
+        .into_response(),
+    }
+}
+
+/// POST /api/endpoints/:name/tools/:tool_name/disable
+async fn disable_tool(
+    State(state): State<ManagementState>,
+    Path((name, tool_name)): Path<(String, String)>,
+) -> impl IntoResponse {
+    {
+        let mut entries = state.registry.entries().write().await;
+        let Some(entry) = entries.get_mut(&name) else {
+            return endpoint_not_found(&name).into_response();
+        };
+        entry.disabled_tools.insert(tool_name.clone());
+    }
+    persist_disabled_state(&state).await;
+    Json(ActionResponse {
+        ok: true,
+        message: format!("Tool '{}' disabled on '{}'", tool_name, name),
+    })
+    .into_response()
+}
+
+/// POST /api/endpoints/:name/tools/:tool_name/enable
+async fn enable_tool(
+    State(state): State<ManagementState>,
+    Path((name, tool_name)): Path<(String, String)>,
+) -> impl IntoResponse {
+    {
+        let mut entries = state.registry.entries().write().await;
+        let Some(entry) = entries.get_mut(&name) else {
+            return endpoint_not_found(&name).into_response();
+        };
+        entry.disabled_tools.remove(&tool_name);
+    }
+    persist_disabled_state(&state).await;
+    Json(ActionResponse {
+        ok: true,
+        message: format!("Tool '{}' enabled on '{}'", tool_name, name),
+    })
+    .into_response()
 }
 
 #[cfg(test)]
@@ -437,6 +801,7 @@ mod tests {
     struct MockAdapter {
         health: HealthStatus,
         tools: Vec<ToolInfo>,
+        stderr: Vec<String>,
     }
 
     impl MockAdapter {
@@ -444,6 +809,7 @@ mod tests {
             Self {
                 health: HealthStatus::Healthy,
                 tools,
+                stderr: vec![],
             }
         }
 
@@ -451,7 +817,13 @@ mod tests {
             Self {
                 health: HealthStatus::Unhealthy(reason.to_string()),
                 tools: vec![],
+                stderr: vec![],
             }
+        }
+
+        fn with_stderr(mut self, lines: Vec<String>) -> Self {
+            self.stderr = lines;
+            self
         }
     }
 
@@ -474,6 +846,9 @@ mod tests {
             self.health = HealthStatus::Stopped;
             Ok(())
         }
+        async fn stderr_lines(&self) -> Vec<String> {
+            self.stderr.clone()
+        }
     }
 
     fn test_config() -> Config {
@@ -484,6 +859,7 @@ mod tests {
             },
             endpoints: vec![EndpointConfig {
                 name: "echo".to_string(),
+                description: None,
                 transport: Transport::Stdio,
                 command: Some("echo".to_string()),
                 args: Some(vec!["hello".to_string()]),
@@ -492,23 +868,19 @@ mod tests {
                     "SECRET".to_string(),
                     "s3cret".to_string(),
                 )])),
+                headers: None,
+                disabled: false,
+                disabled_tools: Vec::new(),
             }],
         }
     }
 
     async fn test_state(adapters: Vec<(&str, MockAdapter)>) -> ManagementState {
-        let registry = AdapterRegistry::new("test-machine".into());
+        let registry = AdapterRegistry::new();
         for (name, adapter) in adapters {
             registry
-                .register(name.to_string(), Box::new(adapter), "stdio".to_string())
+                .register(name.to_string(), Box::new(adapter), "stdio".to_string(), None)
                 .await;
-            // Add test stderr lines
-            let entries = registry.entries().read().await;
-            if let Some(entry) = entries.get(name) {
-                let mut lines = entry.stderr_lines.write().await;
-                lines.push("line1".to_string());
-                lines.push("line2".to_string());
-            }
         }
         ManagementState {
             registry: Arc::new(registry),
@@ -531,6 +903,7 @@ mod tests {
             name: "t1".into(),
             description: None,
             input_schema: serde_json::json!({}),
+            annotations: None,
         }];
         let state = test_state(vec![("echo", MockAdapter::healthy_with_tools(tools))]).await;
         let app = management_routes(state);
@@ -552,11 +925,13 @@ mod tests {
                 name: "t1".into(),
                 description: None,
                 input_schema: serde_json::json!({}),
+                annotations: None,
             },
             ToolInfo {
                 name: "t2".into(),
                 description: None,
                 input_schema: serde_json::json!({}),
+                annotations: None,
             },
         ];
         let state = test_state(vec![
@@ -578,7 +953,8 @@ mod tests {
         assert_eq!(arr[0]["health"], "healthy");
         assert_eq!(arr[0]["tool_count"], 2);
         assert_eq!(arr[1]["name"], "b");
-        assert!(arr[1]["health"].as_str().unwrap().contains("unhealthy"));
+        assert_eq!(arr[1]["health"], "offline");
+        assert_eq!(arr[1]["error"], "down");
         assert_eq!(arr[1]["tool_count"], 0);
     }
 
@@ -588,6 +964,7 @@ mod tests {
             name: "read_file".into(),
             description: Some("Read a file".into()),
             input_schema: serde_json::json!({"type": "object"}),
+            annotations: None,
         }];
         let state = test_state(vec![("fs", MockAdapter::healthy_with_tools(tools))]).await;
         let app = management_routes(state);
@@ -626,7 +1003,9 @@ mod tests {
 
     #[tokio::test]
     async fn management_endpoint_logs() {
-        let state = test_state(vec![("echo", MockAdapter::healthy_with_tools(vec![]))]).await;
+        let mock = MockAdapter::healthy_with_tools(vec![])
+            .with_stderr(vec!["line1".into(), "line2".into()]);
+        let state = test_state(vec![("echo", mock)]).await;
         let app = management_routes(state);
         let resp = app
             .oneshot(
@@ -702,6 +1081,7 @@ mod tests {
             name: "t1".into(),
             description: None,
             input_schema: serde_json::json!({}),
+            annotations: None,
         }];
         let state = test_state(vec![("echo", MockAdapter::healthy_with_tools(tools))]).await;
         let app = management_routes(state);
@@ -838,5 +1218,254 @@ command = "echo"
             .as_str()
             .unwrap()
             .contains("config_path not configured"));
+    }
+
+    #[tokio::test]
+    async fn management_disable_endpoint() {
+        let tools = vec![ToolInfo {
+            name: "t1".into(),
+            description: None,
+            input_schema: serde_json::json!({}),
+            annotations: None,
+        }];
+        let state = test_state(vec![("echo", MockAdapter::healthy_with_tools(tools))]).await;
+        let app = management_routes(state);
+
+        // Disable the endpoint
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/endpoints/echo/disable")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["ok"], true);
+        assert!(body["message"].as_str().unwrap().contains("disabled"));
+
+        // Verify GET /api/endpoints shows disabled=true and health=stopped
+        let resp = app
+            .oneshot(Request::get("/api/endpoints").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let arr = body.as_array().unwrap();
+        assert_eq!(arr[0]["disabled"], true);
+        assert_eq!(arr[0]["health"], "stopped");
+        assert_eq!(arr[0]["tool_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn management_enable_endpoint() {
+        let tools = vec![ToolInfo {
+            name: "t1".into(),
+            description: None,
+            input_schema: serde_json::json!({}),
+            annotations: None,
+        }];
+        let state = test_state(vec![("echo", MockAdapter::healthy_with_tools(tools))]).await;
+        let app = management_routes(state);
+
+        // Disable first
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/endpoints/echo/disable")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Enable the endpoint
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/endpoints/echo/enable")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["ok"], true);
+        assert!(body["message"].as_str().unwrap().contains("enabled"));
+
+        // Verify GET /api/endpoints shows disabled=false and health=healthy
+        let resp = app
+            .oneshot(Request::get("/api/endpoints").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let arr = body.as_array().unwrap();
+        assert_eq!(arr[0]["disabled"], false);
+        assert_eq!(arr[0]["health"], "healthy");
+    }
+
+    #[tokio::test]
+    async fn management_disable_not_found() {
+        let state = test_state(vec![]).await;
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/missing/disable")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn management_disable_tool() {
+        let tools = vec![
+            ToolInfo {
+                name: "read".into(),
+                description: Some("Read".into()),
+                input_schema: serde_json::json!({"type": "object"}),
+                annotations: None,
+            },
+            ToolInfo {
+                name: "write".into(),
+                description: Some("Write".into()),
+                input_schema: serde_json::json!({"type": "object"}),
+                annotations: None,
+            },
+        ];
+        let state = test_state(vec![("fs", MockAdapter::healthy_with_tools(tools))]).await;
+        let app = management_routes(state);
+
+        // Disable the "read" tool
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/endpoints/fs/tools/read/disable")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["ok"], true);
+
+        // Verify GET /api/endpoints/fs/tools shows disabled=true for "read"
+        let resp = app
+            .oneshot(
+                Request::get("/api/endpoints/fs/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let arr = body.as_array().unwrap();
+        let read_tool = arr.iter().find(|t| t["name"] == "read").unwrap();
+        assert_eq!(read_tool["disabled"], true);
+        let write_tool = arr.iter().find(|t| t["name"] == "write").unwrap();
+        assert_eq!(write_tool["disabled"], false);
+    }
+
+    #[tokio::test]
+    async fn management_enable_tool() {
+        let tools = vec![ToolInfo {
+            name: "read".into(),
+            description: Some("Read".into()),
+            input_schema: serde_json::json!({"type": "object"}),
+            annotations: None,
+        }];
+        let state = test_state(vec![("fs", MockAdapter::healthy_with_tools(tools))]).await;
+        let app = management_routes(state);
+
+        // Disable then enable
+        let _resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/endpoints/fs/tools/read/disable")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/endpoints/fs/tools/read/enable")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["ok"], true);
+
+        // Verify tool is no longer disabled
+        let resp = app
+            .oneshot(
+                Request::get("/api/endpoints/fs/tools")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        let arr = body.as_array().unwrap();
+        let read_tool = arr.iter().find(|t| t["name"] == "read").unwrap();
+        assert_eq!(read_tool["disabled"], false);
+    }
+
+    #[tokio::test]
+    async fn management_test_connection_unknown_transport() {
+        let state = test_state(vec![]).await;
+        let app = management_routes(state);
+        let body = serde_json::json!({
+            "transport": "grpc"
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/test-connection")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["success"], false);
+        assert!(body["error"].as_str().unwrap().contains("Unknown transport"));
+    }
+
+    #[tokio::test]
+    async fn management_test_connection_stdio_bad_command() {
+        let state = test_state(vec![]).await;
+        let app = management_routes(state);
+        let body = serde_json::json!({
+            "transport": "stdio",
+            "command": "/nonexistent/binary/that/does/not/exist"
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/test-connection")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["success"], false);
+        assert!(body["error"].is_string());
     }
 }

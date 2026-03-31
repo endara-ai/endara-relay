@@ -300,6 +300,8 @@ pub struct ToolInfoSlim {
     pub name: String,
     pub description: Option<String>,
     pub input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
 }
 
 impl From<&ToolInfo> for ToolInfoSlim {
@@ -308,6 +310,7 @@ impl From<&ToolInfo> for ToolInfoSlim {
             name: t.name.clone(),
             description: t.description.clone(),
             input_schema: t.input_schema.clone(),
+            annotations: t.annotations.clone(),
         }
     }
 }
@@ -428,11 +431,12 @@ mod tests {
             name: name.to_string(),
             description: Some(desc.to_string()),
             input_schema: json!({"type": "object"}),
+            annotations: None,
         }
     }
 
     async fn make_registry() -> Arc<AdapterRegistry> {
-        let registry = AdapterRegistry::new("m".into());
+        let registry = AdapterRegistry::new();
         registry
             .register(
                 "ep".into(),
@@ -442,6 +446,7 @@ mod tests {
                     make_tool("greet", "Greeting tool"),
                 ])),
                 "stdio".into(),
+                None,
             )
             .await;
         Arc::new(registry)
@@ -547,7 +552,7 @@ mod tests {
         let reg = make_registry().await;
         let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
         let result = sandbox
-            .execute(r#"const r = await tools.m__ep__echo({text: "hi"}); return r;"#)
+            .execute(r#"const r = await tools.ep__echo({text: "hi"}); return r;"#)
             .await
             .unwrap();
         assert_eq!(result["called"], "echo");
@@ -560,7 +565,7 @@ mod tests {
         let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
         // Without await — should also work since tool calls are synchronous
         let result = sandbox
-            .execute(r#"const r = tools.m__ep__echo({msg: "sync"}); return r;"#)
+            .execute(r#"const r = tools.ep__echo({msg: "sync"}); return r;"#)
             .await
             .unwrap();
         assert_eq!(result["called"], "echo");
@@ -623,8 +628,8 @@ mod tests {
         let reg = make_registry().await;
         let sandbox = JsSandbox::new(reg, Duration::from_secs(10));
         let script = r#"
-            const r1 = await tools.m__ep__echo({text: "first"});
-            const r2 = await tools.m__ep__add({a: 1, b: 2});
+            const r1 = await tools.ep__echo({text: "first"});
+            const r2 = await tools.ep__add({a: 1, b: 2});
             return { echo_result: r1, add_result: r2 };
         "#;
         let result = sandbox.execute(script).await.unwrap();
