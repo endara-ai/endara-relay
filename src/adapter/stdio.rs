@@ -1,5 +1,6 @@
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::jsonrpc::{self, JsonRpcResponse};
+use crate::prefix;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -47,7 +48,6 @@ impl RingBuffer {
         }
     }
 
-    #[allow(dead_code)] // Used in tests
     pub fn lines(&self) -> Vec<&str> {
         if self.count < self.capacity {
             self.lines[..self.count]
@@ -148,6 +148,8 @@ pub struct StdioAdapter {
     health: Arc<RwLock<HealthStatus>>,
     request_id: AtomicU64,
     crash_tracker: Arc<Mutex<CrashTracker>>,
+    /// Sanitized server name from the MCP initialize response.
+    server_type: Arc<RwLock<Option<String>>>,
     // Background task handles
     _stderr_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     _stdout_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -165,6 +167,7 @@ impl StdioAdapter {
             health: Arc::new(RwLock::new(HealthStatus::Stopped)),
             request_id: AtomicU64::new(1),
             crash_tracker: Arc::new(Mutex::new(CrashTracker::new())),
+            server_type: Arc::new(RwLock::new(None)),
             _stderr_handle: Arc::new(Mutex::new(None)),
             _stdout_handle: Arc::new(Mutex::new(None)),
         }
@@ -298,7 +301,19 @@ impl StdioAdapter {
             }
         });
 
-        let _result = self.send_request("initialize", Some(params)).await?;
+        let result = self.send_request("initialize", Some(params)).await?;
+
+        // Capture serverInfo.name from the initialize response
+        if let Some(name) = result
+            .get("serverInfo")
+            .and_then(|si| si.get("name"))
+            .and_then(|n| n.as_str())
+        {
+            let sanitized = prefix::sanitize_name(name);
+            info!(raw_name = %name, sanitized = ?sanitized, "MCP server reported serverInfo.name");
+            *self.server_type.write().await = sanitized;
+        }
+
         info!("MCP initialize handshake complete");
         Ok(())
     }
@@ -337,6 +352,20 @@ impl McpAdapter for StdioAdapter {
             Ok(h) => h.clone(),
             Err(_) => HealthStatus::Starting,
         }
+    }
+
+    fn server_type(&self) -> Option<String> {
+        self.server_type.try_read().ok().and_then(|g| g.clone())
+    }
+
+    async fn stderr_lines(&self) -> Vec<String> {
+        self.stderr_buffer
+            .read()
+            .await
+            .lines()
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     async fn shutdown(&mut self) -> Result<(), AdapterError> {

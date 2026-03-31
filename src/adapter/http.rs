@@ -1,13 +1,17 @@
+use super::stdio::RingBuffer;
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::jsonrpc::{self, JsonRpcResponse};
+use crate::prefix;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tokio::time::Instant;
+use tracing::{debug, error, info, warn};
 
 /// Configuration for the HTTP MCP adapter.
 #[derive(Debug, Clone)]
@@ -16,6 +20,8 @@ pub struct HttpConfig {
     pub url: String,
     /// Request timeout in seconds (default: 30).
     pub timeout_secs: u64,
+    /// Custom HTTP headers to include in every request.
+    pub headers: HashMap<String, String>,
 }
 
 impl HttpConfig {
@@ -23,6 +29,7 @@ impl HttpConfig {
         Self {
             url: url.into(),
             timeout_secs: 30,
+            headers: HashMap::new(),
         }
     }
 
@@ -39,13 +46,34 @@ pub struct HttpAdapter {
     client: Client,
     health: Arc<RwLock<HealthStatus>>,
     request_id: AtomicU64,
+    /// Sanitized server name from the MCP initialize response.
+    server_type: Arc<RwLock<Option<String>>>,
+    /// Ring buffer recording tool call activity.
+    activity_log: Arc<RwLock<RingBuffer>>,
 }
 
 impl HttpAdapter {
     /// Create a new HttpAdapter with the given configuration.
     pub fn new(config: HttpConfig) -> Self {
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        for (key, value) in &config.headers {
+            if key.eq_ignore_ascii_case("content-type") {
+                warn!(header = %key, "Ignoring custom Content-Type header; JSON-RPC requires application/json");
+                continue;
+            }
+            if let (Ok(name), Ok(val)) = (
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
+            ) {
+                default_headers.insert(name, val);
+            } else {
+                warn!(header = %key, "Invalid header name or value, skipping");
+            }
+        }
+
         let client = Client::builder()
             .timeout(Duration::from_secs(config.timeout_secs))
+            .default_headers(default_headers)
             .build()
             .expect("failed to build HTTP client");
 
@@ -54,6 +82,8 @@ impl HttpAdapter {
             client,
             health: Arc::new(RwLock::new(HealthStatus::Stopped)),
             request_id: AtomicU64::new(1),
+            server_type: Arc::new(RwLock::new(None)),
+            activity_log: Arc::new(RwLock::new(RingBuffer::new(1000))),
         }
     }
 
@@ -130,7 +160,18 @@ impl McpAdapter for HttpAdapter {
         });
 
         match self.send_request("initialize", Some(params)).await {
-            Ok(_result) => {
+            Ok(result) => {
+                // Capture serverInfo.name from the initialize response
+                if let Some(name) = result
+                    .get("serverInfo")
+                    .and_then(|si| si.get("name"))
+                    .and_then(|n| n.as_str())
+                {
+                    let sanitized = prefix::sanitize_name(name);
+                    info!(raw_name = %name, sanitized = ?sanitized, "MCP server reported serverInfo.name");
+                    *self.server_type.write().await = sanitized;
+                }
+
                 *self.health.write().await = HealthStatus::Healthy;
                 info!(url = %self.config.url, "HTTP MCP adapter initialized");
                 Ok(())
@@ -158,7 +199,29 @@ impl McpAdapter for HttpAdapter {
             "name": name,
             "arguments": arguments,
         });
-        self.send_request("tools/call", Some(params)).await
+        let start = Instant::now();
+        let result = self.send_request("tools/call", Some(params)).await;
+        let duration_ms = start.elapsed().as_millis();
+        let now = {
+            let d = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
+            let secs = d.as_secs();
+            let millis = d.subsec_millis();
+            format!("{}.{:03}", secs, millis)
+        };
+        let log_line = match &result {
+            Ok(_) => format!(
+                "{}  INFO call_tool tool={} status=ok duration={}ms",
+                now, name, duration_ms
+            ),
+            Err(e) => format!(
+                "{}  WARN call_tool tool={} status=error duration={}ms error={}",
+                now, name, duration_ms, e
+            ),
+        };
+        self.activity_log.write().await.push(log_line);
+        result
     }
 
     fn health(&self) -> HealthStatus {
@@ -168,10 +231,24 @@ impl McpAdapter for HttpAdapter {
         }
     }
 
+    fn server_type(&self) -> Option<String> {
+        self.server_type.try_read().ok().and_then(|g| g.clone())
+    }
+
     async fn shutdown(&mut self) -> Result<(), AdapterError> {
         *self.health.write().await = HealthStatus::Stopped;
         info!(url = %self.config.url, "HTTP MCP adapter shut down");
         Ok(())
+    }
+
+    async fn activity_log(&self) -> Vec<String> {
+        self.activity_log
+            .read()
+            .await
+            .lines()
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 }
 
