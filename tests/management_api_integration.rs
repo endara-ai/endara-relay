@@ -19,6 +19,7 @@ use tokio::net::TcpListener;
 struct MockAdapter {
     health: HealthStatus,
     tools: Vec<ToolInfo>,
+    stderr: Vec<String>,
 }
 
 impl MockAdapter {
@@ -26,7 +27,29 @@ impl MockAdapter {
         Self {
             health: HealthStatus::Healthy,
             tools,
+            stderr: vec![],
         }
+    }
+
+    fn unhealthy() -> Self {
+        Self {
+            health: HealthStatus::Unhealthy("test error".into()),
+            tools: vec![],
+            stderr: vec![],
+        }
+    }
+
+    fn unhealthy_with_tools(tools: Vec<ToolInfo>) -> Self {
+        Self {
+            health: HealthStatus::Unhealthy("test error".into()),
+            tools,
+            stderr: vec![],
+        }
+    }
+
+    fn with_stderr(mut self, lines: Vec<String>) -> Self {
+        self.stderr = lines;
+        self
     }
 }
 
@@ -49,6 +72,9 @@ impl McpAdapter for MockAdapter {
         self.health = HealthStatus::Stopped;
         Ok(())
     }
+    async fn stderr_lines(&self) -> Vec<String> {
+        self.stderr.clone()
+    }
 }
 
 fn test_config() -> Config {
@@ -59,11 +85,15 @@ fn test_config() -> Config {
         },
         endpoints: vec![EndpointConfig {
             name: "echo".to_string(),
+            description: None,
             transport: Transport::Stdio,
             command: Some("echo".to_string()),
             args: Some(vec!["hello".to_string()]),
             url: None,
             env: None,
+            headers: None,
+            disabled: false,
+            disabled_tools: Vec::new(),
         }],
     }
 }
@@ -71,18 +101,11 @@ fn test_config() -> Config {
 async fn start_management_server(
     adapters: Vec<(&str, MockAdapter)>,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let registry = AdapterRegistry::new("test-machine".into());
+    let registry = AdapterRegistry::new();
     for (name, adapter) in adapters {
         registry
-            .register(name.to_string(), Box::new(adapter), "stdio".to_string())
+            .register(name.to_string(), Box::new(adapter), "stdio".to_string(), None)
             .await;
-        // Add test stderr lines
-        let entries = registry.entries().read().await;
-        if let Some(entry) = entries.get(name) {
-            let mut lines = entry.stderr_lines.write().await;
-            lines.push("log line 1".to_string());
-            lines.push("log line 2".to_string());
-        }
     }
     let registry = Arc::new(registry);
     let state = ManagementState {
@@ -112,6 +135,7 @@ async fn test_management_api_status() {
         name: "echo".into(),
         description: Some("Echoes input".into()),
         input_schema: json!({"type": "object"}),
+        annotations: None,
     }];
     let (addr, _handle) =
         start_management_server(vec![("echo-ep", MockAdapter::healthy_with_tools(tools))]).await;
@@ -135,6 +159,7 @@ async fn test_management_api_endpoints() {
         name: "t1".into(),
         description: None,
         input_schema: json!({}),
+        annotations: None,
     }];
     let (addr, _handle) =
         start_management_server(vec![("echo-ep", MockAdapter::healthy_with_tools(tools))]).await;
@@ -160,11 +185,13 @@ async fn test_management_api_endpoint_tools() {
             name: "read_file".into(),
             description: Some("Read a file".into()),
             input_schema: json!({"type": "object"}),
+            annotations: None,
         },
         ToolInfo {
             name: "write_file".into(),
             description: Some("Write a file".into()),
             input_schema: json!({"type": "object"}),
+            annotations: None,
         },
     ];
     let (addr, _handle) =
@@ -190,6 +217,7 @@ async fn test_management_api_refresh_endpoint() {
         name: "t1".into(),
         description: None,
         input_schema: json!({}),
+        annotations: None,
     }];
     let (addr, _handle) =
         start_management_server(vec![("echo-ep", MockAdapter::healthy_with_tools(tools))]).await;
@@ -208,8 +236,9 @@ async fn test_management_api_refresh_endpoint() {
 
 #[tokio::test]
 async fn test_management_api_endpoint_logs() {
-    let (addr, _handle) =
-        start_management_server(vec![("echo-ep", MockAdapter::healthy_with_tools(vec![]))]).await;
+    let mock = MockAdapter::healthy_with_tools(vec![])
+        .with_stderr(vec!["log line 1".into(), "log line 2".into()]);
+    let (addr, _handle) = start_management_server(vec![("echo-ep", mock)]).await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -249,10 +278,10 @@ async fn start_management_server_with_config(
     adapters: Vec<(&str, MockAdapter)>,
     config_path: std::path::PathBuf,
 ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-    let registry = AdapterRegistry::new("test-machine".into());
+    let registry = AdapterRegistry::new();
     for (name, adapter) in adapters {
         registry
-            .register(name.to_string(), Box::new(adapter), "stdio".to_string())
+            .register(name.to_string(), Box::new(adapter), "stdio".to_string(), None)
             .await;
     }
     let registry = Arc::new(registry);
@@ -301,6 +330,7 @@ command = "cat"
         name: "echo".into(),
         description: Some("Echoes input".into()),
         input_schema: json!({"type": "object"}),
+        annotations: None,
     }];
     let (addr, _handle) = start_management_server_with_config(
         vec![("echo-ep", MockAdapter::healthy_with_tools(tools))],
@@ -339,4 +369,256 @@ command = "cat"
         .contains("Endpoint not found"));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_management_api_catalog() {
+    let tools = vec![
+        ToolInfo {
+            name: "read_file".into(),
+            description: Some("Read a file".into()),
+            input_schema: json!({"type": "object"}),
+            annotations: None,
+        },
+        ToolInfo {
+            name: "write_file".into(),
+            description: Some("Write a file".into()),
+            input_schema: json!({"type": "object"}),
+            annotations: Some(json!({"readOnly": true})),
+        },
+    ];
+    let (addr, _handle) = start_management_server(vec![
+        ("fs-ep", MockAdapter::healthy_with_tools(tools)),
+        ("bad-ep", MockAdapter::unhealthy()),
+    ])
+    .await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("http://{}/api/catalog", addr))
+        .send()
+        .await
+        .expect("request failed");
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    let arr = body.as_array().unwrap();
+
+    // Only healthy endpoint tools appear (unhealthy has empty tools list)
+    assert_eq!(arr.len(), 2);
+
+    // Find the entries by name (order may vary due to HashMap)
+    let read_entry = arr
+        .iter()
+        .find(|e| e["name"].as_str().unwrap().contains("read_file"))
+        .expect("read_file entry not found");
+    let write_entry = arr
+        .iter()
+        .find(|e| e["name"].as_str().unwrap().contains("write_file"))
+        .expect("write_file entry not found");
+
+    // Check prefixed names: no collision, so format is {endpoint}__{tool}
+    assert!(
+        read_entry["name"]
+            .as_str()
+            .unwrap()
+            .contains("fs-ep__read_file")
+    );
+    assert!(
+        write_entry["name"]
+            .as_str()
+            .unwrap()
+            .contains("fs-ep__write_file")
+    );
+
+    // Check source endpoint
+    assert_eq!(read_entry["endpoint"], "fs-ep");
+    assert_eq!(write_entry["endpoint"], "fs-ep");
+
+    // Check availability
+    assert_eq!(read_entry["available"], true);
+    assert_eq!(write_entry["available"], true);
+
+    // Check descriptions (enriched with endpoint label by merged_catalog)
+    assert_eq!(read_entry["description"], "[fs-ep] Read a file");
+    assert_eq!(write_entry["description"], "[fs-ep] Write a file");
+
+    // Check annotations (only present on write_file)
+    assert!(read_entry.get("annotations").is_none() || read_entry["annotations"].is_null());
+    assert_eq!(write_entry["annotations"]["readOnly"], true);
+
+    // Check inputSchema is present
+    assert_eq!(read_entry["inputSchema"]["type"], "object");
+}
+
+#[tokio::test]
+async fn test_management_api_test_connection_unknown_transport() {
+    let (addr, _handle) =
+        start_management_server(vec![("echo-ep", MockAdapter::healthy_with_tools(vec![]))]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("http://{}/api/test-connection", addr))
+        .json(&json!({ "transport": "grpc" }))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status().as_u16(), 400);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], false);
+    assert!(body["error"].as_str().unwrap().contains("Unknown transport"));
+}
+
+#[tokio::test]
+async fn test_management_api_test_connection_bad_command() {
+    let (addr, _handle) =
+        start_management_server(vec![("echo-ep", MockAdapter::healthy_with_tools(vec![]))]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("http://{}/api/test-connection", addr))
+        .json(&json!({
+            "transport": "stdio",
+            "command": "/nonexistent/binary/that/does/not/exist"
+        }))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], false);
+    assert!(body["error"].is_string());
+}
+
+
+#[tokio::test]
+async fn test_management_api_catalog_with_unhealthy_endpoints() {
+    let healthy_tools = vec![ToolInfo {
+        name: "read_file".into(),
+        description: Some("Read a file".into()),
+        input_schema: json!({"type": "object"}),
+        annotations: None,
+    }];
+    let unhealthy_tools = vec![
+        ToolInfo {
+            name: "ping".into(),
+            description: Some("Ping server".into()),
+            input_schema: json!({"type": "object"}),
+            annotations: None,
+        },
+        ToolInfo {
+            name: "status".into(),
+            description: Some("Server status".into()),
+            input_schema: json!({"type": "object"}),
+            annotations: None,
+        },
+    ];
+    let (addr, _handle) = start_management_server(vec![
+        ("healthy-ep", MockAdapter::healthy_with_tools(healthy_tools)),
+        (
+            "sick-ep",
+            MockAdapter::unhealthy_with_tools(unhealthy_tools),
+        ),
+    ])
+    .await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("http://{}/api/catalog", addr))
+        .send()
+        .await
+        .expect("request failed");
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    let arr = body.as_array().unwrap();
+
+    // All tools should be present: 1 healthy + 2 unhealthy = 3
+    assert_eq!(arr.len(), 3, "expected 3 catalog entries, got {}", arr.len());
+
+    // Find the healthy tool
+    let read_entry = arr
+        .iter()
+        .find(|e| e["name"].as_str().unwrap().contains("read_file"))
+        .expect("read_file entry not found");
+    assert_eq!(read_entry["available"], true);
+    assert_eq!(read_entry["endpoint"], "healthy-ep");
+
+    // Find the unhealthy tools
+    let ping_entry = arr
+        .iter()
+        .find(|e| e["name"].as_str().unwrap().contains("ping"))
+        .expect("ping entry not found");
+    assert_eq!(ping_entry["available"], false);
+    assert_eq!(ping_entry["endpoint"], "sick-ep");
+    assert_eq!(ping_entry["description"], "[⚠️ UNAVAILABLE] [sick-ep] Ping server");
+
+    let status_entry = arr
+        .iter()
+        .find(|e| e["name"].as_str().unwrap().contains("status"))
+        .expect("status entry not found");
+    assert_eq!(status_entry["available"], false);
+    assert_eq!(status_entry["endpoint"], "sick-ep");
+}
+
+#[tokio::test]
+async fn test_management_api_catalog_description_enriched() {
+    // The catalog API uses merged_catalog which enriches descriptions with [endpoint] prefix
+    let tools = vec![ToolInfo {
+        name: "read".into(),
+        description: Some("Read a file".into()),
+        input_schema: json!({"type": "object"}),
+        annotations: None,
+    }];
+    let (addr, _handle) = start_management_server(vec![(
+        "fs-ep",
+        MockAdapter::healthy_with_tools(tools),
+    )])
+    .await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("http://{}/api/catalog", addr))
+        .send()
+        .await
+        .expect("request failed");
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    let arr = body.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+
+    // The catalog API enriches descriptions with [endpoint] prefix
+    assert_eq!(arr[0]["description"], "[fs-ep] Read a file");
+}
+
+#[tokio::test]
+async fn test_management_api_test_connection_happy_path() {
+    let (addr, _handle) =
+        start_management_server(vec![("echo-ep", MockAdapter::healthy_with_tools(vec![]))]).await;
+    let client = reqwest::Client::new();
+
+    let echo_script = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("echo_mcp_server.sh");
+
+    let resp = client
+        .post(format!("http://{}/api/test-connection", addr))
+        .json(&json!({
+            "transport": "stdio",
+            "command": "bash",
+            "args": [echo_script.to_string_lossy()]
+        }))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], true);
+    assert!(
+        body["tool_count"].as_u64().unwrap() > 0,
+        "expected at least 1 tool, got {:?}",
+        body["tool_count"]
+    );
+    // The echo server exposes one tool called "echo"
+    let tools = body["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|t| t.as_str() == Some("echo")));
 }

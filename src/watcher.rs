@@ -1,7 +1,7 @@
 use crate::adapter::http::{HttpAdapter, HttpConfig};
 use crate::adapter::sse::{SseAdapter, SseConfig};
 use crate::adapter::stdio::{StdioAdapter, StdioConfig};
-use crate::adapter::McpAdapter;
+use crate::adapter::{FailedAdapter, McpAdapter};
 use crate::config::{self, ConfigDiff, EndpointConfig, Transport};
 use crate::registry::AdapterRegistry;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
@@ -133,31 +133,61 @@ pub async fn apply_diff(diff: &ConfigDiff, registry: &AdapterRegistry) {
         }
     }
 
-    // Changed endpoints: shutdown old, create new
+    // Changed endpoints: shutdown old, create new, preserve disabled state
     for (name, new_ep) in &diff.changed {
         info!(endpoint = %name, "Restarting changed endpoint");
+        // Capture disabled state from old entry before removing
+        let (was_disabled, old_disabled_tools) = {
+            let entries = registry.entries().read().await;
+            if let Some(entry) = entries.get(name.as_str()) {
+                (entry.disabled, entry.disabled_tools.clone())
+            } else {
+                (
+                    new_ep.disabled,
+                    new_ep.disabled_tools.iter().cloned().collect(),
+                )
+            }
+        };
         if let Some(mut entry) = registry.remove(name).await {
             if let Err(e) = entry.adapter.shutdown().await {
                 warn!(endpoint = %name, error = %e, "Error shutting down old adapter");
             }
         }
-        if let Some(adapter) = create_adapter(new_ep).await {
-            registry
-                .register(name.clone(), adapter, new_ep.transport.to_string())
-                .await;
-            info!(endpoint = %name, "Changed endpoint re-registered");
+        let adapter = create_adapter(new_ep).await;
+        registry
+            .register(name.clone(), adapter, new_ep.transport.to_string(), new_ep.description.clone())
+            .await;
+        // Re-apply disabled state
+        let mut entries = registry.entries().write().await;
+        if let Some(entry) = entries.get_mut(name.as_str()) {
+            entry.disabled = was_disabled;
+            entry.disabled_tools = old_disabled_tools;
+            if was_disabled {
+                let _ = entry.adapter.shutdown().await;
+            }
         }
+        info!(endpoint = %name, "Changed endpoint re-registered");
     }
 
     // Added endpoints
     for ep in &diff.added {
         info!(endpoint = %ep.name, transport = %ep.transport, "Adding new endpoint");
-        if let Some(adapter) = create_adapter(ep).await {
-            registry
-                .register(ep.name.clone(), adapter, ep.transport.to_string())
-                .await;
-            info!(endpoint = %ep.name, "New endpoint registered");
+        let adapter = create_adapter(ep).await;
+        registry
+            .register(ep.name.clone(), adapter, ep.transport.to_string(), ep.description.clone())
+            .await;
+        // Apply disabled state from config
+        if ep.disabled || !ep.disabled_tools.is_empty() {
+            let mut entries = registry.entries().write().await;
+            if let Some(entry) = entries.get_mut(ep.name.as_str()) {
+                entry.disabled = ep.disabled;
+                entry.disabled_tools = ep.disabled_tools.iter().cloned().collect();
+                if ep.disabled {
+                    let _ = entry.adapter.shutdown().await;
+                }
+            }
         }
+        info!(endpoint = %ep.name, "New endpoint registered");
     }
 
     // Log unchanged
@@ -167,7 +197,10 @@ pub async fn apply_diff(diff: &ConfigDiff, registry: &AdapterRegistry) {
 }
 
 /// Create an adapter from an endpoint configuration.
-async fn create_adapter(ep: &EndpointConfig) -> Option<Box<dyn McpAdapter>> {
+///
+/// Always returns an adapter. If initialization fails, returns a [`FailedAdapter`]
+/// so the endpoint still appears in the registry with an unhealthy status.
+async fn create_adapter(ep: &EndpointConfig) -> Box<dyn McpAdapter> {
     match ep.transport {
         Transport::Stdio => {
             let stdio_config = StdioConfig {
@@ -177,32 +210,36 @@ async fn create_adapter(ep: &EndpointConfig) -> Option<Box<dyn McpAdapter>> {
             };
             let mut adapter = StdioAdapter::new(stdio_config);
             match adapter.initialize().await {
-                Ok(()) => Some(Box::new(adapter)),
+                Ok(()) => Box::new(adapter),
                 Err(e) => {
-                    warn!(endpoint = %ep.name, error = %e, "Failed to initialize stdio adapter");
-                    None
+                    warn!(endpoint = %ep.name, error = %e, "Failed to initialize stdio adapter, registering as failed");
+                    Box::new(FailedAdapter::new(e.to_string()))
                 }
             }
         }
         Transport::Sse => {
             let url = ep.url.clone().unwrap_or_default();
-            let mut adapter = SseAdapter::new(SseConfig::new(url));
+            let mut sse_config = SseConfig::new(url);
+            sse_config.headers = ep.headers.clone().unwrap_or_default();
+            let mut adapter = SseAdapter::new(sse_config);
             match adapter.initialize().await {
-                Ok(()) => Some(Box::new(adapter)),
+                Ok(()) => Box::new(adapter),
                 Err(e) => {
-                    warn!(endpoint = %ep.name, error = %e, "Failed to initialize SSE adapter");
-                    None
+                    warn!(endpoint = %ep.name, error = %e, "Failed to initialize SSE adapter, registering as failed");
+                    Box::new(FailedAdapter::new(e.to_string()))
                 }
             }
         }
         Transport::Http => {
             let url = ep.url.clone().unwrap_or_default();
-            let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+            let mut http_config = HttpConfig::new(url);
+            http_config.headers = ep.headers.clone().unwrap_or_default();
+            let mut adapter = HttpAdapter::new(http_config);
             match adapter.initialize().await {
-                Ok(()) => Some(Box::new(adapter)),
+                Ok(()) => Box::new(adapter),
                 Err(e) => {
-                    warn!(endpoint = %ep.name, error = %e, "Failed to initialize HTTP adapter");
-                    None
+                    warn!(endpoint = %ep.name, error = %e, "Failed to initialize HTTP adapter, registering as failed");
+                    Box::new(FailedAdapter::new(e.to_string()))
                 }
             }
         }
@@ -266,6 +303,7 @@ mod tests {
             name: name.to_string(),
             description: Some(format!("{} tool", name)),
             input_schema: json!({"type": "object"}),
+            annotations: None,
         }
     }
 
@@ -280,13 +318,14 @@ mod tests {
 
     #[tokio::test]
     async fn apply_diff_empty_is_noop() {
-        let registry = Arc::new(AdapterRegistry::new("m".into()));
+        let registry = Arc::new(AdapterRegistry::new());
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         registry
             .register(
                 "existing".into(),
                 Box::new(MockAdapter::healthy(vec![make_tool("t")], shutdown.clone())),
                 "stdio".into(),
+                None,
             )
             .await;
 
@@ -299,13 +338,14 @@ mod tests {
 
     #[tokio::test]
     async fn apply_diff_removes_endpoint() {
-        let registry = Arc::new(AdapterRegistry::new("m".into()));
+        let registry = Arc::new(AdapterRegistry::new());
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         registry
             .register(
                 "to_remove".into(),
                 Box::new(MockAdapter::healthy(vec![make_tool("t")], shutdown.clone())),
                 "stdio".into(),
+                None,
             )
             .await;
 
@@ -322,7 +362,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_diff_remove_nonexistent_is_ok() {
-        let registry = Arc::new(AdapterRegistry::new("m".into()));
+        let registry = Arc::new(AdapterRegistry::new());
         let diff = ConfigDiff {
             removed: vec!["ghost".to_string()],
             ..empty_diff()
@@ -334,13 +374,14 @@ mod tests {
 
     #[tokio::test]
     async fn apply_diff_changed_shuts_down_old() {
-        let registry = Arc::new(AdapterRegistry::new("m".into()));
+        let registry = Arc::new(AdapterRegistry::new());
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         registry
             .register(
                 "ep".into(),
                 Box::new(MockAdapter::healthy(vec![make_tool("t")], shutdown.clone())),
                 "stdio".into(),
+                None,
             )
             .await;
 
@@ -348,11 +389,15 @@ mod tests {
         // but the old adapter should be shut down and removed
         let changed_ep = EndpointConfig {
             name: "ep".to_string(),
+            description: None,
             transport: Transport::Stdio,
             command: Some("/nonexistent/binary/that/wont/start".to_string()),
             args: None,
             url: None,
             env: None,
+            headers: None,
+            disabled: false,
+            disabled_tools: Vec::new(),
         };
         let diff = ConfigDiff {
             changed: vec![("ep".to_string(), changed_ep)],
@@ -366,16 +411,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_diff_added_with_invalid_command_does_not_register() {
-        let registry = Arc::new(AdapterRegistry::new("m".into()));
+    async fn apply_diff_added_with_invalid_command_registers_as_failed() {
+        let registry = Arc::new(AdapterRegistry::new());
 
         let new_ep = EndpointConfig {
             name: "bad_ep".to_string(),
+            description: None,
             transport: Transport::Stdio,
             command: Some("/nonexistent/binary/that/wont/start".to_string()),
             args: None,
             url: None,
             env: None,
+            headers: None,
+            disabled: false,
+            disabled_tools: Vec::new(),
         };
         let diff = ConfigDiff {
             added: vec![new_ep],
@@ -384,13 +433,18 @@ mod tests {
 
         apply_diff(&diff, &registry).await;
 
-        // The failed adapter should not appear in the registry
-        assert!(registry.merged_catalog().await.is_empty());
+        // The failed adapter should appear in the registry but with unhealthy status
+        // and empty tool catalog
+        assert!(registry.merged_catalog().await.is_empty()); // no tools exposed
+        let entries = registry.entries().read().await;
+        assert_eq!(entries.len(), 1); // but endpoint IS registered
+        let entry = entries.get("bad_ep").expect("bad_ep should be registered");
+        assert!(matches!(entry.adapter.health(), HealthStatus::Unhealthy(_)));
     }
 
     #[tokio::test]
     async fn apply_diff_preserves_unchanged_endpoints() {
-        let registry = Arc::new(AdapterRegistry::new("m".into()));
+        let registry = Arc::new(AdapterRegistry::new());
         let shutdown_keep = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown_remove = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -402,6 +456,7 @@ mod tests {
                     shutdown_keep.clone(),
                 )),
                 "stdio".into(),
+                None,
             )
             .await;
         registry
@@ -412,6 +467,7 @@ mod tests {
                     shutdown_remove.clone(),
                 )),
                 "stdio".into(),
+                None,
             )
             .await;
 
@@ -426,7 +482,7 @@ mod tests {
         // "keep" should still be alive
         assert!(!shutdown_keep.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(registry.merged_catalog().await.len(), 1);
-        assert_eq!(registry.merged_catalog().await[0].name, "m__keep__t1");
+        assert_eq!(registry.merged_catalog().await[0].name, "keep__t1");
 
         // "remove" should be shut down
         assert!(shutdown_remove.load(std::sync::atomic::Ordering::SeqCst));

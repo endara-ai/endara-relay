@@ -12,7 +12,7 @@ mod server;
 use adapter::http::{HttpAdapter, HttpConfig};
 use adapter::sse::{SseAdapter, SseConfig};
 use adapter::stdio::{StdioAdapter, StdioConfig};
-use adapter::McpAdapter;
+use adapter::{FailedAdapter, McpAdapter};
 use clap::{Parser, Subcommand};
 use js_sandbox::MetaToolHandler;
 use registry::AdapterRegistry;
@@ -134,12 +134,12 @@ async fn main() {
             };
 
             // Create adapter registry
-            let registry = AdapterRegistry::new(cfg.relay.machine_name.clone());
+            let registry = AdapterRegistry::new();
 
             // Register and initialize adapters for each endpoint
             for ep in &cfg.endpoints {
                 info!(name = %ep.name, transport = %ep.transport, "Configuring endpoint");
-                match ep.transport {
+                let adapter: Box<dyn McpAdapter> = match ep.transport {
                     config::Transport::Stdio => {
                         let stdio_config = StdioConfig {
                             command: ep.command.clone().unwrap_or_default(),
@@ -150,58 +150,66 @@ async fn main() {
                         match adapter.initialize().await {
                             Ok(()) => {
                                 info!(endpoint = %ep.name, "Adapter initialized");
-                                registry
-                                    .register(
-                                        ep.name.clone(),
-                                        Box::new(adapter),
-                                        ep.transport.to_string(),
-                                    )
-                                    .await;
+                                Box::new(adapter)
                             }
                             Err(e) => {
-                                warn!(endpoint = %ep.name, error = %e, "Failed to initialize adapter, skipping");
+                                warn!(endpoint = %ep.name, error = %e, "Failed to initialize adapter, registering as failed");
+                                Box::new(FailedAdapter::new(e.to_string()))
                             }
                         }
                     }
                     config::Transport::Sse => {
                         let url = ep.url.clone().unwrap_or_default();
-                        let sse_config = SseConfig::new(url);
+                        let mut sse_config = SseConfig::new(url);
+                        sse_config.headers = ep.headers.clone().unwrap_or_default();
                         let mut adapter = SseAdapter::new(sse_config);
                         match adapter.initialize().await {
                             Ok(()) => {
                                 info!(endpoint = %ep.name, "SSE adapter initialized");
-                                registry
-                                    .register(
-                                        ep.name.clone(),
-                                        Box::new(adapter),
-                                        ep.transport.to_string(),
-                                    )
-                                    .await;
+                                Box::new(adapter)
                             }
                             Err(e) => {
-                                warn!(endpoint = %ep.name, error = %e, "Failed to initialize SSE adapter, skipping");
+                                warn!(endpoint = %ep.name, error = %e, "Failed to initialize SSE adapter, registering as failed");
+                                Box::new(FailedAdapter::new(e.to_string()))
                             }
                         }
                     }
                     config::Transport::Http => {
                         let url = ep.url.clone().unwrap_or_default();
-                        let http_config = HttpConfig::new(url);
+                        let mut http_config = HttpConfig::new(url);
+                        http_config.headers = ep.headers.clone().unwrap_or_default();
                         let mut adapter = HttpAdapter::new(http_config);
                         match adapter.initialize().await {
                             Ok(()) => {
                                 info!(endpoint = %ep.name, "HTTP adapter initialized");
-                                registry
-                                    .register(
-                                        ep.name.clone(),
-                                        Box::new(adapter),
-                                        ep.transport.to_string(),
-                                    )
-                                    .await;
+                                Box::new(adapter)
                             }
                             Err(e) => {
-                                warn!(endpoint = %ep.name, error = %e, "Failed to initialize HTTP adapter, skipping");
+                                warn!(endpoint = %ep.name, error = %e, "Failed to initialize HTTP adapter, registering as failed");
+                                Box::new(FailedAdapter::new(e.to_string()))
                             }
                         }
+                    }
+                };
+                registry
+                    .register(ep.name.clone(), adapter, ep.transport.to_string(), ep.description.clone())
+                    .await;
+            }
+
+            // Apply disabled state from config
+            for ep in &cfg.endpoints {
+                if ep.disabled {
+                    let mut entries = registry.entries().write().await;
+                    if let Some(entry) = entries.get_mut(&ep.name) {
+                        entry.disabled = true;
+                        // Shut down the adapter process since endpoint is disabled
+                        let _ = entry.adapter.shutdown().await;
+                    }
+                }
+                if !ep.disabled_tools.is_empty() {
+                    let mut entries = registry.entries().write().await;
+                    if let Some(entry) = entries.get_mut(&ep.name) {
+                        entry.disabled_tools = ep.disabled_tools.iter().cloned().collect();
                     }
                 }
             }
@@ -242,6 +250,17 @@ async fn main() {
                     );
 
                     handle.await.ok();
+
+                    // Shut down all adapters gracefully (kills STDIO child processes, etc.)
+                    info!("Shutting down all adapters");
+                    let mut entries = registry.entries().write().await;
+                    for (name, entry) in entries.iter_mut() {
+                        info!(endpoint = %name, "Shutting down adapter");
+                        if let Err(e) = entry.adapter.shutdown().await {
+                            warn!(endpoint = %name, error = %e, "Error shutting down adapter");
+                        }
+                    }
+                    info!("All adapters shut down, exiting");
                 }
                 Err(e) => {
                     error!(error = %e, "Failed to start HTTP server");

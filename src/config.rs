@@ -39,15 +39,38 @@ impl fmt::Display for Transport {
 }
 
 /// Configuration for a single MCP endpoint.
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EndpointConfig {
     pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
     pub transport: Transport,
     pub command: Option<String>,
     pub args: Option<Vec<String>>,
     pub url: Option<String>,
     #[serde(default)]
     pub env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub disabled_tools: Vec<String>,
+}
+
+/// Custom PartialEq that ignores `disabled` and `disabled_tools` so that
+/// `diff_configs` treats an endpoint as "unchanged" when only these fields differ.
+/// Note: `headers` IS included — changing headers should trigger adapter restart.
+impl PartialEq for EndpointConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.transport == other.transport
+            && self.command == other.command
+            && self.args == other.args
+            && self.url == other.url
+            && self.env == other.env
+            && self.headers == other.headers
+    }
 }
 
 /// Errors that can occur during config loading.
@@ -146,7 +169,7 @@ pub fn parse_and_validate(contents: &str) -> Result<Config, ConfigError> {
     Ok(config)
 }
 
-/// Resolve environment variables in endpoint env maps.
+/// Resolve environment variables in endpoint env maps and header values.
 fn resolve_env_vars(config: &mut Config) -> Result<(), ConfigError> {
     for endpoint in &mut config.endpoints {
         if let Some(ref mut env_map) = endpoint.env {
@@ -156,6 +179,14 @@ fn resolve_env_vars(config: &mut Config) -> Result<(), ConfigError> {
                 resolved.insert(key.clone(), resolved_value);
             }
             *env_map = resolved;
+        }
+        if let Some(ref mut headers_map) = endpoint.headers {
+            let mut resolved = HashMap::new();
+            for (key, value) in headers_map.iter() {
+                let resolved_value = resolve_header_value(value, &endpoint.name)?;
+                resolved.insert(key.clone(), resolved_value);
+            }
+            *headers_map = resolved;
         }
     }
     Ok(())
@@ -191,41 +222,135 @@ fn resolve_env_value(value: &str, endpoint_name: &str) -> Result<String, ConfigE
     }
 }
 
-/// Validate the parsed config.
-fn validate(config: &Config) -> Result<(), ConfigError> {
-    let mut seen_names = std::collections::HashSet::new();
-    for ep in &config.endpoints {
-        if ep.name.is_empty() {
-            return Err(ConfigError::ValidationError(
-                "Endpoint name must not be empty".to_string(),
-            ));
-        }
-        if !seen_names.insert(&ep.name) {
-            return Err(ConfigError::ValidationError(format!(
-                "Duplicate endpoint name: '{}'",
-                ep.name
-            )));
-        }
-        match ep.transport {
-            Transport::Stdio => {
-                if ep.command.is_none() || ep.command.as_deref() == Some("") {
-                    return Err(ConfigError::ValidationError(format!(
-                        "Endpoint '{}': stdio transport requires a 'command' field",
-                        ep.name
-                    )));
+/// Resolve a header value string, supporting embedded `$VAR` references.
+/// - `$$` → literal `$`
+/// - `$VAR` within any position → replaced with the env var value
+/// - Supports mixed text like `Bearer $TOKEN`
+fn resolve_header_value(value: &str, endpoint_name: &str) -> Result<String, ConfigError> {
+    let mut result = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '$' {
+            if chars.peek() == Some(&'$') {
+                chars.next(); // consume second $
+                result.push('$');
+            } else {
+                // Collect the variable name (alphanumeric + underscore)
+                let mut var_name = String::new();
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_alphanumeric() || c == '_' {
+                        var_name.push(c);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if var_name.is_empty() {
+                    result.push('$');
+                } else {
+                    match std::env::var(&var_name) {
+                        Ok(val) => result.push_str(&val),
+                        Err(_) => {
+                            tracing::warn!(
+                                var = %var_name,
+                                endpoint = %endpoint_name,
+                                "Environment variable not found in header value"
+                            );
+                            return Err(ConfigError::EnvVarMissing {
+                                var_name,
+                                endpoint: endpoint_name.to_string(),
+                            });
+                        }
+                    }
                 }
             }
-            Transport::Sse | Transport::Http => {
-                if ep.url.is_none() || ep.url.as_deref() == Some("") {
-                    return Err(ConfigError::ValidationError(format!(
-                        "Endpoint '{}': {} transport requires a 'url' field",
-                        ep.name, ep.transport
-                    )));
-                }
-            }
+        } else {
+            result.push(ch);
         }
     }
-    Ok(())
+    Ok(result)
+}
+
+/// Returns `true` if `name` matches the allowed endpoint name pattern:
+/// starts with `[a-z0-9]`, followed by zero or more `[a-z0-9_-]`.
+fn is_valid_endpoint_name(name: &str) -> bool {
+    if name.is_empty() {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_lowercase() && !first.is_ascii_digit() {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+impl Config {
+    /// Validate the config, collecting **all** errors instead of stopping at the first.
+    ///
+    /// Each endpoint `name` must:
+    /// - match `^[a-z0-9][a-z0-9_-]*$`
+    /// - be unique across all endpoints
+    ///
+    /// Returns `Ok(())` when valid, or `Err(Vec<String>)` with every validation
+    /// error found.
+    pub fn validate(&self) -> Result<(), Vec<String>> {
+        let mut errors: Vec<String> = Vec::new();
+        let mut seen_names = std::collections::HashSet::new();
+
+        for ep in &self.endpoints {
+            if ep.name.is_empty() {
+                errors.push("Endpoint name must not be empty".to_string());
+            } else if !is_valid_endpoint_name(&ep.name) {
+                errors.push(format!(
+                    "Invalid endpoint name '{}': must match ^[a-z0-9][a-z0-9_-]*$ (lowercase alphanumeric, hyphens, underscores; must start with letter or digit)",
+                    ep.name
+                ));
+            }
+
+            if !ep.name.is_empty() && !seen_names.insert(&ep.name) {
+                errors.push(format!("Duplicate endpoint name: '{}'", ep.name));
+            }
+
+            match ep.transport {
+                Transport::Stdio => {
+                    if ep.command.is_none() || ep.command.as_deref() == Some("") {
+                        errors.push(format!(
+                            "Endpoint '{}': stdio transport requires a 'command' field",
+                            ep.name
+                        ));
+                    }
+                    if ep.headers.as_ref().is_some_and(|h| !h.is_empty()) {
+                        tracing::warn!(
+                            endpoint = %ep.name,
+                            "Headers are set on a stdio transport endpoint and will be ignored"
+                        );
+                    }
+                }
+                Transport::Sse | Transport::Http => {
+                    if ep.url.is_none() || ep.url.as_deref() == Some("") {
+                        errors.push(format!(
+                            "Endpoint '{}': {} transport requires a 'url' field",
+                            ep.name, ep.transport
+                        ));
+                    }
+                }
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+/// Validate the parsed config (internal wrapper for backward compatibility).
+fn validate(config: &Config) -> Result<(), ConfigError> {
+    config.validate().map_err(|errors| {
+        ConfigError::ValidationError(errors.join("; "))
+    })
 }
 
 /// Result of comparing two configs to determine what changed.
@@ -477,6 +602,119 @@ machine_name = "test"
         assert!(config.endpoints.is_empty());
     }
 
+    // --- Endpoint name format validation tests ---
+
+    #[test]
+    fn valid_endpoint_names() {
+        for name in &["echo", "my-server", "test_ep", "a", "0day", "abc-123", "a-b_c"] {
+            let toml_str = format!(
+                r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "{}"
+transport = "stdio"
+command = "echo"
+"#,
+                name
+            );
+            assert!(
+                parse_and_validate(&toml_str).is_ok(),
+                "Expected '{}' to be a valid endpoint name",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_endpoint_name_uppercase() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "MyServer"
+transport = "stdio"
+command = "echo"
+"#;
+        let err = parse_and_validate(toml_str).unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                assert!(msg.contains("MyServer"), "Error should mention the name: {}", msg);
+            }
+            other => panic!("Expected ValidationError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn invalid_endpoint_name_starts_with_hyphen() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "-bad"
+transport = "stdio"
+command = "echo"
+"#;
+        let err = parse_and_validate(toml_str).unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                assert!(msg.contains("-bad"), "Error should mention the name: {}", msg);
+            }
+            other => panic!("Expected ValidationError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn invalid_endpoint_name_special_chars() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "my server"
+transport = "stdio"
+command = "echo"
+"#;
+        let err = parse_and_validate(toml_str).unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                assert!(msg.contains("my server"), "Error should mention the name: {}", msg);
+            }
+            other => panic!("Expected ValidationError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn validate_collects_multiple_errors() {
+        let config = make_config(vec![
+            stdio_ep("Bad-Name", "echo"),
+            stdio_ep("_also_bad", "cat"),
+        ]);
+        let errors = config.validate().unwrap_err();
+        assert_eq!(errors.len(), 2, "Should have 2 errors: {:?}", errors);
+        assert!(errors[0].contains("Bad-Name"));
+        assert!(errors[1].contains("_also_bad"));
+    }
+
+    #[test]
+    fn validate_empty_config_is_ok() {
+        let config = make_config(vec![]);
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_reports_duplicates_and_invalid_names() {
+        let config = make_config(vec![
+            stdio_ep("good", "echo"),
+            stdio_ep("good", "cat"),
+        ]);
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("Duplicate")));
+    }
+
     // --- Config diff tests ---
 
     fn make_config(endpoints: Vec<EndpointConfig>) -> Config {
@@ -492,22 +730,30 @@ machine_name = "test"
     fn stdio_ep(name: &str, cmd: &str) -> EndpointConfig {
         EndpointConfig {
             name: name.to_string(),
+            description: None,
             transport: Transport::Stdio,
             command: Some(cmd.to_string()),
             args: None,
             url: None,
             env: None,
+            headers: None,
+            disabled: false,
+            disabled_tools: Vec::new(),
         }
     }
 
     fn sse_ep(name: &str, url: &str) -> EndpointConfig {
         EndpointConfig {
             name: name.to_string(),
+            description: None,
             transport: Transport::Sse,
             command: None,
             args: None,
             url: Some(url.to_string()),
             env: None,
+            headers: None,
+            disabled: false,
+            disabled_tools: Vec::new(),
         }
     }
 
@@ -552,6 +798,61 @@ machine_name = "test"
         assert_eq!(diff.added.len(), 2);
         assert_eq!(diff.removed.len(), 2);
         assert!(diff.changed.is_empty());
+        assert!(diff.unchanged.is_empty());
+    }
+
+    #[test]
+    fn parse_headers_on_http_endpoint() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "remote"
+transport = "http"
+url = "http://localhost:4000/mcp"
+headers = { Authorization = "Bearer my-token", X-Custom = "value" }
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        let headers = config.endpoints[0].headers.as_ref().unwrap();
+        assert_eq!(headers.get("Authorization").unwrap(), "Bearer my-token");
+        assert_eq!(headers.get("X-Custom").unwrap(), "value");
+    }
+
+    #[test]
+    fn headers_env_var_resolution() {
+        std::env::set_var("TEST_HEADER_TOKEN_12345", "secret-value");
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "remote"
+transport = "sse"
+url = "http://localhost:3000/sse"
+headers = { Authorization = "Bearer $TEST_HEADER_TOKEN_12345" }
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        let headers = config.endpoints[0].headers.as_ref().unwrap();
+        assert_eq!(
+            headers.get("Authorization").unwrap(),
+            "Bearer secret-value"
+        );
+        std::env::remove_var("TEST_HEADER_TOKEN_12345");
+    }
+
+    #[test]
+    fn headers_change_triggers_config_diff() {
+        let mut ep1 = sse_ep("remote", "http://localhost:3000/sse");
+        ep1.headers = Some(HashMap::from([("Auth".to_string(), "old".to_string())]));
+
+        let mut ep2 = sse_ep("remote", "http://localhost:3000/sse");
+        ep2.headers = Some(HashMap::from([("Auth".to_string(), "new".to_string())]));
+
+        let old = make_config(vec![ep1]);
+        let new = make_config(vec![ep2]);
+        let diff = diff_configs(&old, &new);
+        assert_eq!(diff.changed.len(), 1);
         assert!(diff.unchanged.is_empty());
     }
 }

@@ -34,6 +34,8 @@ pub struct ToolInfo {
     pub name: String,
     pub description: Option<String>,
     pub input_schema: Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
 }
 
 /// Errors that can occur in adapter operations.
@@ -94,4 +96,80 @@ pub trait McpAdapter: Send + Sync {
 
     /// Shut down the adapter gracefully.
     async fn shutdown(&mut self) -> Result<(), AdapterError>;
+
+    /// Return recent stderr lines from the adapter (if any).
+    ///
+    /// The default implementation returns an empty list. Adapters that capture
+    /// stderr (e.g. STDIO) override this to return buffered output.
+    async fn stderr_lines(&self) -> Vec<String> {
+        vec![]
+    }
+
+    /// Return recent activity log lines (e.g. tool call records).
+    ///
+    /// The default implementation returns an empty list. Adapters that record
+    /// tool call activity (e.g. SSE, HTTP) override this.
+    async fn activity_log(&self) -> Vec<String> {
+        vec![]
+    }
+
+    /// Return the sanitized server name reported by the MCP server during initialize.
+    ///
+    /// The default implementation returns `None`. Adapters that capture
+    /// `serverInfo.name` from the initialize response override this.
+    #[allow(dead_code)] // Will be used by upstream callers once prefix routing is wired
+    fn server_type(&self) -> Option<String> {
+        None
+    }
+}
+
+/// A placeholder adapter registered when the real adapter fails to initialize.
+///
+/// Reports [`HealthStatus::Unhealthy`] so the endpoint appears in the management
+/// UI as offline. Restarting the endpoint via the management API will call
+/// `initialize()` on the real adapter again (handled by the restart endpoint).
+pub struct FailedAdapter {
+    error_message: String,
+}
+
+impl FailedAdapter {
+    /// Create a new failed adapter with the error message from initialization.
+    pub fn new(error_message: String) -> Self {
+        Self { error_message }
+    }
+}
+
+#[async_trait]
+impl McpAdapter for FailedAdapter {
+    async fn initialize(&mut self) -> Result<(), AdapterError> {
+        // A failed adapter cannot be re-initialized in place.
+        // The restart endpoint should replace this with a real adapter.
+        Err(AdapterError::ConnectionFailed(format!(
+            "server failed to initialize: {}",
+            self.error_message
+        )))
+    }
+
+    async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+        Ok(vec![])
+    }
+
+    async fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, AdapterError> {
+        Err(AdapterError::ConnectionFailed(format!(
+            "server failed to initialize: {}",
+            self.error_message
+        )))
+    }
+
+    fn health(&self) -> HealthStatus {
+        HealthStatus::Unhealthy(self.error_message.clone())
+    }
+
+    async fn stderr_lines(&self) -> Vec<String> {
+        vec![format!("[ERROR] {}", self.error_message)]
+    }
+
+    async fn shutdown(&mut self) -> Result<(), AdapterError> {
+        Ok(())
+    }
 }

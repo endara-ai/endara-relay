@@ -131,11 +131,15 @@ async fn mcp_tools_list(
         let mut tools: Vec<Value> = catalog
             .into_iter()
             .map(|t| {
-                json!({
+                let mut tool = json!({
                     "name": t.name,
                     "description": t.description,
                     "inputSchema": t.input_schema,
-                })
+                });
+                if let Some(annotations) = t.annotations {
+                    tool["annotations"] = annotations;
+                }
+                tool
             })
             .collect();
         tools.extend(meta_tools);
@@ -241,6 +245,35 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Create a future that resolves when a shutdown signal (SIGINT or SIGTERM) is received.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install SIGINT handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("SIGINT received, shutting down");
+        }
+        _ = terminate => {
+            info!("SIGTERM received, shutting down");
+        }
+    }
+}
+
 /// Start the HTTP server and return the bound address.
 /// The server runs until the provided shutdown signal completes.
 pub async fn start_server(
@@ -253,10 +286,7 @@ pub async fn start_server(
 
     let handle = tokio::spawn(async move {
         axum::serve(listener, router)
-            .with_graceful_shutdown(async {
-                tokio::signal::ctrl_c().await.ok();
-                info!("Shutdown signal received");
-            })
+            .with_graceful_shutdown(shutdown_signal())
             .await
             .ok();
     });
