@@ -19,7 +19,7 @@ fn fixture_path() -> PathBuf {
 }
 
 async fn setup_server() -> (SocketAddr, AdapterRegistry, tokio::task::JoinHandle<()>) {
-    let registry = AdapterRegistry::new("testmachine".into());
+    let registry = AdapterRegistry::new();
 
     let config = StdioConfig {
         command: "bash".to_string(),
@@ -29,7 +29,7 @@ async fn setup_server() -> (SocketAddr, AdapterRegistry, tokio::task::JoinHandle
     let mut adapter = StdioAdapter::new(config);
     adapter.initialize().await.expect("adapter init failed");
     registry
-        .register("echo-ep".into(), Box::new(adapter), "stdio".into())
+        .register("echo-ep".into(), Box::new(adapter), "stdio".into(), None)
         .await;
 
     let registry_arc = Arc::new(registry.clone());
@@ -97,8 +97,8 @@ async fn test_mcp_tools_list_prefixed() {
     let tools = body["result"]["tools"].as_array().expect("tools array");
     // 1 prefixed catalog tool + 3 meta-tools = 4 total
     assert_eq!(tools.len(), 4);
-    // First tool should be prefixed: testmachine__echo-ep__echo
-    assert_eq!(tools[0]["name"], "testmachine__echo-ep__echo");
+    // First tool should be prefixed: echo-mcp__echo (server_type from serverInfo.name)
+    assert_eq!(tools[0]["name"], "echo-mcp__echo");
     assert!(tools[0]["description"].as_str().is_some());
     assert!(tools[0]["inputSchema"].is_object());
     // Meta-tools should be present
@@ -119,7 +119,7 @@ async fn test_mcp_tools_call_routing() {
             "jsonrpc": "2.0",
             "method": "tools/call",
             "params": {
-                "name": "testmachine__echo-ep__echo",
+                "name": "echo-mcp__echo",
                 "arguments": { "message": "hello from test" }
             },
             "id": 3
