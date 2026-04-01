@@ -67,8 +67,14 @@ async fn watch_loop(
 
     info!(path = %config_path.display(), "Config watcher started");
 
-    // Load initial config as baseline
-    let current_config = Arc::new(Mutex::new(config::load_config(&config_path)?));
+    // Load initial config as baseline (use graceful — fatal errors still propagate)
+    let (initial_config, initial_warnings) = config::load_config_graceful(&config_path)?;
+    if !initial_warnings.is_empty() {
+        for w in &initial_warnings {
+            warn!("{}", w);
+        }
+    }
+    let current_config = Arc::new(Mutex::new(initial_config));
 
     loop {
         // Wait for a filesystem event
@@ -88,21 +94,27 @@ async fn watch_loop(
 
         info!(path = %config_path.display(), "Config file change detected, reloading");
 
-        // Parse new config
-        let new_config = match config::load_config(&config_path) {
-            Ok(cfg) => cfg,
+        // Parse new config gracefully
+        let (new_config, warnings) = match config::load_config_graceful(&config_path) {
+            Ok(result) => result,
             Err(e) => {
                 warn!(error = %e, "Failed to parse updated config, keeping current config");
                 continue;
             }
         };
 
+        for w in &warnings {
+            warn!("{}", w);
+        }
+
+        let warned_names = config::warned_endpoint_names(&warnings);
+
         // Diff and apply
         let old_config = current_config.lock().await;
         let diff = config::diff_configs(&old_config, &new_config);
         drop(old_config);
 
-        apply_diff(&diff, &registry).await;
+        apply_diff_graceful(&diff, &registry, &warnings, &warned_names).await;
 
         // Update JS execution mode flag if it changed
         let new_js_mode = new_config.relay.local_js_execution.unwrap_or(false);
@@ -122,6 +134,7 @@ async fn watch_loop(
 /// Apply a config diff to the adapter registry.
 ///
 /// This is public so it can also be called from a manual reload endpoint.
+#[allow(dead_code)]
 pub async fn apply_diff(diff: &ConfigDiff, registry: &AdapterRegistry) {
     // Remove endpoints
     for name in &diff.removed {
@@ -155,7 +168,7 @@ pub async fn apply_diff(diff: &ConfigDiff, registry: &AdapterRegistry) {
         }
         let adapter = create_adapter(new_ep).await;
         registry
-            .register(name.clone(), adapter, new_ep.transport.to_string(), new_ep.description.clone())
+            .register(name.clone(), adapter, new_ep.transport.to_string(), new_ep.description.clone(), new_ep.resolved_tool_prefix())
             .await;
         // Re-apply disabled state
         let mut entries = registry.entries().write().await;
@@ -174,9 +187,116 @@ pub async fn apply_diff(diff: &ConfigDiff, registry: &AdapterRegistry) {
         info!(endpoint = %ep.name, transport = %ep.transport, "Adding new endpoint");
         let adapter = create_adapter(ep).await;
         registry
-            .register(ep.name.clone(), adapter, ep.transport.to_string(), ep.description.clone())
+            .register(ep.name.clone(), adapter, ep.transport.to_string(), ep.description.clone(), ep.resolved_tool_prefix())
             .await;
         // Apply disabled state from config
+        if ep.disabled || !ep.disabled_tools.is_empty() {
+            let mut entries = registry.entries().write().await;
+            if let Some(entry) = entries.get_mut(ep.name.as_str()) {
+                entry.disabled = ep.disabled;
+                entry.disabled_tools = ep.disabled_tools.iter().cloned().collect();
+                if ep.disabled {
+                    let _ = entry.adapter.shutdown().await;
+                }
+            }
+        }
+        info!(endpoint = %ep.name, "New endpoint registered");
+    }
+
+    // Log unchanged
+    for name in &diff.unchanged {
+        info!(endpoint = %name, "Endpoint unchanged, keeping running");
+    }
+}
+
+/// Like [`apply_diff`] but also handles per-endpoint validation warnings.
+///
+/// Endpoints whose names appear in `warned_names` are registered as `FailedAdapter`
+/// with the warning message instead of attempting initialization.
+pub async fn apply_diff_graceful(
+    diff: &ConfigDiff,
+    registry: &AdapterRegistry,
+    warnings: &[config::EndpointValidationWarning],
+    warned_names: &std::collections::HashSet<String>,
+) {
+    // Build warning message map
+    let warning_messages: std::collections::HashMap<String, String> = {
+        let mut map = std::collections::HashMap::new();
+        for w in warnings {
+            map.entry(w.endpoint_name.clone())
+                .and_modify(|msg: &mut String| {
+                    msg.push_str("; ");
+                    msg.push_str(&w.message);
+                })
+                .or_insert_with(|| w.message.clone());
+        }
+        map
+    };
+
+    // Remove endpoints
+    for name in &diff.removed {
+        info!(endpoint = %name, "Removing endpoint");
+        if let Some(mut entry) = registry.remove(name).await {
+            if let Err(e) = entry.adapter.shutdown().await {
+                warn!(endpoint = %name, error = %e, "Error shutting down removed adapter");
+            }
+        }
+    }
+
+    // Changed endpoints: shutdown old, create new, preserve disabled state
+    for (name, new_ep) in &diff.changed {
+        info!(endpoint = %name, "Restarting changed endpoint");
+        let (was_disabled, old_disabled_tools) = {
+            let entries = registry.entries().read().await;
+            if let Some(entry) = entries.get(name.as_str()) {
+                (entry.disabled, entry.disabled_tools.clone())
+            } else {
+                (
+                    new_ep.disabled,
+                    new_ep.disabled_tools.iter().cloned().collect(),
+                )
+            }
+        };
+        if let Some(mut entry) = registry.remove(name).await {
+            if let Err(e) = entry.adapter.shutdown().await {
+                warn!(endpoint = %name, error = %e, "Error shutting down old adapter");
+            }
+        }
+
+        let adapter: Box<dyn McpAdapter> = if warned_names.contains(name) {
+            let msg = warning_messages.get(name).cloned().unwrap_or_default();
+            warn!(endpoint = %name, "Registering as failed due to validation error: {}", msg);
+            Box::new(FailedAdapter::new(msg))
+        } else {
+            create_adapter(new_ep).await
+        };
+        registry
+            .register(name.clone(), adapter, new_ep.transport.to_string(), new_ep.description.clone(), new_ep.resolved_tool_prefix())
+            .await;
+        let mut entries = registry.entries().write().await;
+        if let Some(entry) = entries.get_mut(name.as_str()) {
+            entry.disabled = was_disabled;
+            entry.disabled_tools = old_disabled_tools;
+            if was_disabled {
+                let _ = entry.adapter.shutdown().await;
+            }
+        }
+        info!(endpoint = %name, "Changed endpoint re-registered");
+    }
+
+    // Added endpoints
+    for ep in &diff.added {
+        info!(endpoint = %ep.name, transport = %ep.transport, "Adding new endpoint");
+        let adapter: Box<dyn McpAdapter> = if warned_names.contains(&ep.name) {
+            let msg = warning_messages.get(&ep.name).cloned().unwrap_or_default();
+            warn!(endpoint = %ep.name, "Registering as failed due to validation error: {}", msg);
+            Box::new(FailedAdapter::new(msg))
+        } else {
+            create_adapter(ep).await
+        };
+        registry
+            .register(ep.name.clone(), adapter, ep.transport.to_string(), ep.description.clone(), ep.resolved_tool_prefix())
+            .await;
         if ep.disabled || !ep.disabled_tools.is_empty() {
             let mut entries = registry.entries().write().await;
             if let Some(entry) = entries.get_mut(ep.name.as_str()) {
@@ -326,6 +446,7 @@ mod tests {
                 Box::new(MockAdapter::healthy(vec![make_tool("t")], shutdown.clone())),
                 "stdio".into(),
                 None,
+                Some("existing".into()),
             )
             .await;
 
@@ -346,6 +467,7 @@ mod tests {
                 Box::new(MockAdapter::healthy(vec![make_tool("t")], shutdown.clone())),
                 "stdio".into(),
                 None,
+                Some("to_remove".into()),
             )
             .await;
 
@@ -382,6 +504,7 @@ mod tests {
                 Box::new(MockAdapter::healthy(vec![make_tool("t")], shutdown.clone())),
                 "stdio".into(),
                 None,
+                Some("ep".into()),
             )
             .await;
 
@@ -390,6 +513,7 @@ mod tests {
         let changed_ep = EndpointConfig {
             name: "ep".to_string(),
             description: None,
+            tool_prefix: None,
             transport: Transport::Stdio,
             command: Some("/nonexistent/binary/that/wont/start".to_string()),
             args: None,
@@ -417,6 +541,7 @@ mod tests {
         let new_ep = EndpointConfig {
             name: "bad_ep".to_string(),
             description: None,
+            tool_prefix: None,
             transport: Transport::Stdio,
             command: Some("/nonexistent/binary/that/wont/start".to_string()),
             args: None,
@@ -457,6 +582,7 @@ mod tests {
                 )),
                 "stdio".into(),
                 None,
+                Some("keep".into()),
             )
             .await;
         registry
@@ -468,6 +594,7 @@ mod tests {
                 )),
                 "stdio".into(),
                 None,
+                Some("remove".into()),
             )
             .await;
 
@@ -482,7 +609,8 @@ mod tests {
         // "keep" should still be alive
         assert!(!shutdown_keep.load(std::sync::atomic::Ordering::SeqCst));
         assert_eq!(registry.merged_catalog().await.len(), 1);
-        assert_eq!(registry.merged_catalog().await[0].name, "keep__t1");
+        // Single-server no-prefix mode: only one adapter remains, so no prefix
+        assert_eq!(registry.merged_catalog().await[0].name, "t1");
 
         // "remove" should be shut down
         assert!(shutdown_remove.load(std::sync::atomic::Ordering::SeqCst));

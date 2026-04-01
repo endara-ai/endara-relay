@@ -45,7 +45,7 @@ async fn setup_multi_endpoint_server() -> (SocketAddr, AdapterRegistry, tokio::t
         .await
         .expect("echo adapter init failed");
     registry
-        .register("echo-ep".into(), Box::new(echo_adapter), "stdio".into(), None)
+        .register("echo-ep".into(), Box::new(echo_adapter), "stdio".into(), None, Some("echo_ep".into()))
         .await;
 
     // Endpoint 2: multi-tool server
@@ -60,7 +60,7 @@ async fn setup_multi_endpoint_server() -> (SocketAddr, AdapterRegistry, tokio::t
         .await
         .expect("multi-tool adapter init failed");
     registry
-        .register("multi-ep".into(), Box::new(multi_adapter), "stdio".into(), None)
+        .register("multi-ep".into(), Box::new(multi_adapter), "stdio".into(), None, Some("multi_ep".into()))
         .await;
 
     let registry_arc = Arc::new(registry.clone());
@@ -103,19 +103,19 @@ async fn test_multi_endpoint_merged_catalog() {
     );
 
     let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    // Verify prefixed names from echo endpoint
+    // Verify prefixed names from echo endpoint (tool_prefix = "echo_ep")
     assert!(
-        tool_names.contains(&"echo-mcp__echo"),
-        "missing echo-mcp echo tool"
+        tool_names.contains(&"echo_ep__echo"),
+        "missing echo_ep echo tool"
     );
-    // Verify prefixed names from multi-tool endpoint
+    // Verify prefixed names from multi-tool endpoint (tool_prefix = "multi_ep")
     assert!(
-        tool_names.contains(&"multi-tool-mcp__add"),
-        "missing multi-tool-mcp add tool"
+        tool_names.contains(&"multi_ep__add"),
+        "missing multi_ep add tool"
     );
     assert!(
-        tool_names.contains(&"multi-tool-mcp__uppercase"),
-        "missing multi-tool-mcp uppercase"
+        tool_names.contains(&"multi_ep__uppercase"),
+        "missing multi_ep uppercase"
     );
     // Verify meta-tools
     assert!(tool_names.contains(&"list_tools"));
@@ -133,7 +133,7 @@ async fn test_multi_endpoint_cross_routing() {
         .post(format!("http://{}/mcp/tools/call", addr))
         .json(&json!({
             "jsonrpc": "2.0", "method": "tools/call",
-            "params": {"name": "echo-mcp__echo", "arguments": {"message": "cross-route"}},
+            "params": {"name": "echo_ep__echo", "arguments": {"message": "cross-route"}},
             "id": 2
         }))
         .send().await.expect("request failed");
@@ -146,7 +146,7 @@ async fn test_multi_endpoint_cross_routing() {
         .post(format!("http://{}/mcp/tools/call", addr))
         .json(&json!({
             "jsonrpc": "2.0", "method": "tools/call",
-            "params": {"name": "multi-tool-mcp__add", "arguments": {"a": 3, "b": 7}},
+            "params": {"name": "multi_ep__add", "arguments": {"a": 3, "b": 7}},
             "id": 3
         }))
         .send()
@@ -161,7 +161,7 @@ async fn test_multi_endpoint_cross_routing() {
         .post(format!("http://{}/mcp/tools/call", addr))
         .json(&json!({
             "jsonrpc": "2.0", "method": "tools/call",
-            "params": {"name": "multi-tool-mcp__uppercase", "arguments": {"text": "hello"}},
+            "params": {"name": "multi_ep__uppercase", "arguments": {"text": "hello"}},
             "id": 4
         }))
         .send()
@@ -190,7 +190,7 @@ async fn test_multi_endpoint_overlapping_tool_names() {
             .await
             .expect(&format!("{} adapter init failed", ep_name));
         registry
-            .register(ep_name.to_string(), Box::new(adapter), "stdio".into(), None)
+            .register(ep_name.to_string(), Box::new(adapter), "stdio".into(), None, Some(ep_name.to_string()))
             .await;
     }
 
@@ -230,10 +230,10 @@ async fn test_multi_endpoint_overlapping_tool_names() {
     let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
     // Verify each endpoint has its own prefixed "add" tool
-    // All three share server_type "multi-tool-mcp" → collision → instance prefix
-    assert!(tool_names.contains(&"multi-tool-mcp__multi-a__add"));
-    assert!(tool_names.contains(&"multi-tool-mcp__multi-b__add"));
-    assert!(tool_names.contains(&"multi-tool-mcp__multi-c__add"));
+    // Each endpoint uses its own name as tool_prefix: "multi-a", "multi-b", "multi-c"
+    assert!(tool_names.contains(&"multi-a__add"));
+    assert!(tool_names.contains(&"multi-b__add"));
+    assert!(tool_names.contains(&"multi-c__add"));
 
     // All three should be distinct entries
     let add_count = tool_names
@@ -262,7 +262,7 @@ async fn test_calling_unavailable_tool_returns_mcp_error() {
         .post(format!("http://{}/mcp/tools/call", addr))
         .json(&json!({
             "jsonrpc": "2.0", "method": "tools/call",
-            "params": {"name": "multi-tool-mcp__add", "arguments": {"a": 1, "b": 2}},
+            "params": {"name": "multi_ep__add", "arguments": {"a": 1, "b": 2}},
             "id": 10
         }))
         .send()

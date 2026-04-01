@@ -245,7 +245,7 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Create a future that resolves when a shutdown signal (SIGINT or SIGTERM) is received.
+/// Create a future that resolves when a shutdown signal (SIGINT, SIGTERM, or SIGHUP) is received.
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
@@ -261,8 +261,19 @@ async fn shutdown_signal() {
             .await;
     };
 
+    #[cfg(unix)]
+    let hangup = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .expect("failed to install SIGHUP handler")
+            .recv()
+            .await;
+    };
+
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
+
+    #[cfg(not(unix))]
+    let hangup = std::future::pending::<()>();
 
     tokio::select! {
         _ = ctrl_c => {
@@ -270,6 +281,9 @@ async fn shutdown_signal() {
         }
         _ = terminate => {
             info!("SIGTERM received, shutting down");
+        }
+        _ = hangup => {
+            info!("SIGHUP received, shutting down");
         }
     }
 }

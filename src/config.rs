@@ -1,3 +1,4 @@
+use crate::prefix;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
@@ -44,6 +45,8 @@ pub struct EndpointConfig {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_prefix: Option<String>,
     pub transport: Transport,
     pub command: Option<String>,
     pub args: Option<Vec<String>>,
@@ -58,18 +61,49 @@ pub struct EndpointConfig {
     pub disabled_tools: Vec<String>,
 }
 
+impl EndpointConfig {
+    /// Returns the tool prefix to use for this endpoint.
+    ///
+    /// Priority: explicit `tool_prefix` field → `sanitize_name(name)`.
+    /// Returns `None` if both fail (e.g. unicode-only name with no tool_prefix).
+    pub fn resolved_tool_prefix(&self) -> Option<String> {
+        if let Some(ref tp) = self.tool_prefix {
+            Some(tp.clone())
+        } else {
+            prefix::sanitize_name(&self.name)
+        }
+    }
+}
+
 /// Custom PartialEq that ignores `disabled` and `disabled_tools` so that
 /// `diff_configs` treats an endpoint as "unchanged" when only these fields differ.
 /// Note: `headers` IS included — changing headers should trigger adapter restart.
 impl PartialEq for EndpointConfig {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
+            && self.tool_prefix == other.tool_prefix
             && self.transport == other.transport
             && self.command == other.command
             && self.args == other.args
             && self.url == other.url
             && self.env == other.env
             && self.headers == other.headers
+    }
+}
+
+/// A per-endpoint validation warning. These do NOT prevent the relay from starting;
+/// instead the endpoint is registered as a `FailedAdapter`.
+#[derive(Debug, Clone)]
+pub struct EndpointValidationWarning {
+    /// The endpoint name (as written in the config).
+    pub endpoint_name: String,
+    /// Human-readable description of the problem.
+    pub message: String,
+}
+
+impl fmt::Display for EndpointValidationWarning {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Endpoint '{}': {}", self.endpoint_name, self.message)
     }
 }
 
@@ -155,6 +189,7 @@ pub fn create_default_config_file(path: &Path) -> Result<Config, ConfigError> {
 }
 
 /// Load, parse, resolve env vars, and validate a config file.
+#[allow(dead_code)]
 pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
     let resolved = expand_tilde(path);
     let contents = std::fs::read_to_string(&resolved)?;
@@ -162,6 +197,7 @@ pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
 }
 
 /// Parse TOML string, resolve env vars, and validate.
+#[allow(dead_code)]
 pub fn parse_and_validate(contents: &str) -> Result<Config, ConfigError> {
     let mut config: Config = toml::from_str(contents)?;
     resolve_env_vars(&mut config)?;
@@ -169,7 +205,41 @@ pub fn parse_and_validate(contents: &str) -> Result<Config, ConfigError> {
     Ok(config)
 }
 
+/// Parse TOML string, resolve env vars, and validate **gracefully**.
+///
+/// Fatal errors (TOML syntax, missing `[relay]`) still return `Err`.
+/// Per-endpoint issues (invalid name, missing command/url, duplicate names,
+/// env var resolution failures) are collected as warnings. The returned
+/// `Config` contains **all** endpoints (valid and invalid). The caller is
+/// expected to register invalid endpoints as `FailedAdapter`.
+pub fn parse_and_validate_graceful(
+    contents: &str,
+) -> Result<(Config, Vec<EndpointValidationWarning>), ConfigError> {
+    let mut config: Config = toml::from_str(contents)?;
+    let mut warnings = Vec::new();
+
+    // Resolve env vars per-endpoint, collecting failures as warnings
+    resolve_env_vars_graceful(&mut config, &mut warnings);
+
+    // Validate per-endpoint, collecting failures as warnings
+    validate_graceful(&config, &mut warnings);
+
+    Ok((config, warnings))
+}
+
+/// Load, parse, resolve env vars, and validate a config file **gracefully**.
+///
+/// Same semantics as [`parse_and_validate_graceful`] but reads from a file path.
+pub fn load_config_graceful(
+    path: &Path,
+) -> Result<(Config, Vec<EndpointValidationWarning>), ConfigError> {
+    let resolved = expand_tilde(path);
+    let contents = std::fs::read_to_string(&resolved)?;
+    parse_and_validate_graceful(&contents)
+}
+
 /// Resolve environment variables in endpoint env maps and header values.
+#[allow(dead_code)]
 fn resolve_env_vars(config: &mut Config) -> Result<(), ConfigError> {
     for endpoint in &mut config.endpoints {
         if let Some(ref mut env_map) = endpoint.env {
@@ -190,6 +260,62 @@ fn resolve_env_vars(config: &mut Config) -> Result<(), ConfigError> {
         }
     }
     Ok(())
+}
+
+/// Like [`resolve_env_vars`] but collects failures as warnings instead of
+/// returning an error. Endpoints with env resolution failures are left with
+/// their original (unresolved) values.
+fn resolve_env_vars_graceful(
+    config: &mut Config,
+    warnings: &mut Vec<EndpointValidationWarning>,
+) {
+    for endpoint in &mut config.endpoints {
+        let mut env_failed = false;
+        if let Some(ref mut env_map) = endpoint.env {
+            let mut resolved = HashMap::new();
+            for (key, value) in env_map.iter() {
+                match resolve_env_value(value, &endpoint.name) {
+                    Ok(v) => {
+                        resolved.insert(key.clone(), v);
+                    }
+                    Err(e) => {
+                        env_failed = true;
+                        warnings.push(EndpointValidationWarning {
+                            endpoint_name: endpoint.name.clone(),
+                            message: e.to_string(),
+                        });
+                        break;
+                    }
+                }
+            }
+            if !env_failed {
+                *env_map = resolved;
+            }
+        }
+
+        if !env_failed {
+            if let Some(ref mut headers_map) = endpoint.headers {
+                let mut resolved = HashMap::new();
+                for (key, value) in headers_map.iter() {
+                    match resolve_header_value(value, &endpoint.name) {
+                        Ok(v) => {
+                            resolved.insert(key.clone(), v);
+                        }
+                        Err(e) => {
+                            warnings.push(EndpointValidationWarning {
+                                endpoint_name: endpoint.name.clone(),
+                                message: e.to_string(),
+                            });
+                            break;
+                        }
+                    }
+                }
+                if warnings.iter().all(|w| w.endpoint_name != endpoint.name) {
+                    *headers_map = resolved;
+                }
+            }
+        }
+    }
 }
 
 /// Resolve a single env value string.
@@ -288,28 +414,44 @@ fn is_valid_endpoint_name(name: &str) -> bool {
 impl Config {
     /// Validate the config, collecting **all** errors instead of stopping at the first.
     ///
-    /// Each endpoint `name` must:
-    /// - match `^[a-z0-9][a-z0-9_-]*$`
-    /// - be unique across all endpoints
+    /// Each endpoint must have a resolvable tool_prefix (either explicitly set or
+    /// auto-sanitized from the name) that matches `^[a-z0-9][a-z0-9_-]*$` and is
+    /// unique across all endpoints.
     ///
     /// Returns `Ok(())` when valid, or `Err(Vec<String>)` with every validation
     /// error found.
+    #[allow(dead_code)]
     pub fn validate(&self) -> Result<(), Vec<String>> {
         let mut errors: Vec<String> = Vec::new();
-        let mut seen_names = std::collections::HashSet::new();
+        let mut seen_prefixes = std::collections::HashSet::new();
 
         for ep in &self.endpoints {
             if ep.name.is_empty() {
                 errors.push("Endpoint name must not be empty".to_string());
-            } else if !is_valid_endpoint_name(&ep.name) {
-                errors.push(format!(
-                    "Invalid endpoint name '{}': must match ^[a-z0-9][a-z0-9_-]*$ (lowercase alphanumeric, hyphens, underscores; must start with letter or digit)",
-                    ep.name
-                ));
             }
 
-            if !ep.name.is_empty() && !seen_names.insert(&ep.name) {
-                errors.push(format!("Duplicate endpoint name: '{}'", ep.name));
+            // Validate resolved tool_prefix
+            match ep.resolved_tool_prefix() {
+                None => {
+                    errors.push(format!(
+                        "Endpoint '{}': name cannot be sanitized into a valid tool prefix. Set 'tool_prefix' explicitly.",
+                        ep.name
+                    ));
+                }
+                Some(ref tp) if !is_valid_endpoint_name(tp) => {
+                    errors.push(format!(
+                        "Endpoint '{}': tool_prefix '{}' must match ^[a-z0-9][a-z0-9_-]*$ (lowercase alphanumeric, hyphens, underscores; must start with letter or digit)",
+                        ep.name, tp
+                    ));
+                }
+                Some(ref tp) => {
+                    if !seen_prefixes.insert(tp.clone()) {
+                        errors.push(format!(
+                            "Duplicate tool_prefix '{}' (from endpoint '{}')",
+                            tp, ep.name
+                        ));
+                    }
+                }
             }
 
             match ep.transport {
@@ -347,10 +489,99 @@ impl Config {
 }
 
 /// Validate the parsed config (internal wrapper for backward compatibility).
+#[allow(dead_code)]
 fn validate(config: &Config) -> Result<(), ConfigError> {
     config.validate().map_err(|errors| {
         ConfigError::ValidationError(errors.join("; "))
     })
+}
+
+/// Per-endpoint validation that collects warnings instead of erroring.
+///
+/// Checks: resolved tool_prefix validity, missing command/url, duplicate prefixes.
+/// First occurrence of a duplicate wins; subsequent duplicates are warned.
+fn validate_graceful(
+    config: &Config,
+    warnings: &mut Vec<EndpointValidationWarning>,
+) {
+    let mut seen_prefixes = std::collections::HashSet::new();
+
+    for ep in &config.endpoints {
+        // Check if this endpoint already has an env-var warning (skip further checks)
+        let already_warned = warnings.iter().any(|w| w.endpoint_name == ep.name);
+
+        if ep.name.is_empty() {
+            warnings.push(EndpointValidationWarning {
+                endpoint_name: ep.name.clone(),
+                message: "Endpoint name must not be empty".to_string(),
+            });
+        }
+
+        // Validate resolved tool_prefix
+        match ep.resolved_tool_prefix() {
+            None => {
+                warnings.push(EndpointValidationWarning {
+                    endpoint_name: ep.name.clone(),
+                    message: format!(
+                        "Endpoint '{}': name cannot be sanitized into a valid tool prefix. Set 'tool_prefix' explicitly.",
+                        ep.name
+                    ),
+                });
+            }
+            Some(ref tp) if !is_valid_endpoint_name(tp) => {
+                warnings.push(EndpointValidationWarning {
+                    endpoint_name: ep.name.clone(),
+                    message: format!(
+                        "Endpoint '{}': tool_prefix '{}' is invalid: must match ^[a-z0-9][a-z0-9_-]*$",
+                        ep.name, tp
+                    ),
+                });
+            }
+            Some(ref tp) => {
+                if !seen_prefixes.insert(tp.clone()) {
+                    warnings.push(EndpointValidationWarning {
+                        endpoint_name: ep.name.clone(),
+                        message: format!(
+                            "Duplicate tool_prefix '{}' (from endpoint '{}')",
+                            tp, ep.name
+                        ),
+                    });
+                }
+            }
+        }
+
+        // Only check transport requirements if not already warned (env var issue)
+        if !already_warned {
+            match ep.transport {
+                Transport::Stdio => {
+                    if ep.command.is_none() || ep.command.as_deref() == Some("") {
+                        warnings.push(EndpointValidationWarning {
+                            endpoint_name: ep.name.clone(),
+                            message: "stdio transport requires a 'command' field".to_string(),
+                        });
+                    }
+                }
+                Transport::Sse | Transport::Http => {
+                    if ep.url.is_none() || ep.url.as_deref() == Some("") {
+                        warnings.push(EndpointValidationWarning {
+                            endpoint_name: ep.name.clone(),
+                            message: format!(
+                                "{} transport requires a 'url' field",
+                                ep.transport
+                            ),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Helper: get the set of endpoint names that have validation warnings.
+pub fn warned_endpoint_names(
+    warnings: &[EndpointValidationWarning],
+) -> std::collections::HashSet<String> {
+    warnings.iter().map(|w| w.endpoint_name.clone()).collect()
 }
 
 /// Result of comparing two configs to determine what changed.
@@ -606,6 +837,7 @@ machine_name = "test"
 
     #[test]
     fn valid_endpoint_names() {
+        // These names are all directly valid tool_prefix values
         for name in &["echo", "my-server", "test_ep", "a", "0day", "abc-123", "a-b_c"] {
             let toml_str = format!(
                 r#"
@@ -628,7 +860,8 @@ command = "echo"
     }
 
     #[test]
-    fn invalid_endpoint_name_uppercase() {
+    fn freeform_name_uppercase_is_valid() {
+        // Freeform names: "MyServer" sanitizes to "myserver" which is valid
         let toml_str = r#"
 [relay]
 machine_name = "test"
@@ -638,17 +871,27 @@ name = "MyServer"
 transport = "stdio"
 command = "echo"
 "#;
-        let err = parse_and_validate(toml_str).unwrap_err();
-        match err {
-            ConfigError::ValidationError(msg) => {
-                assert!(msg.contains("MyServer"), "Error should mention the name: {}", msg);
-            }
-            other => panic!("Expected ValidationError, got: {:?}", other),
-        }
+        assert!(parse_and_validate(toml_str).is_ok());
+    }
+
+    #[test]
+    fn freeform_name_with_spaces_is_valid() {
+        // "my server" sanitizes to "my_server" which is valid
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "my server"
+transport = "stdio"
+command = "echo"
+"#;
+        assert!(parse_and_validate(toml_str).is_ok());
     }
 
     #[test]
     fn invalid_endpoint_name_starts_with_hyphen() {
+        // "-bad" sanitizes to "-bad" which starts with hyphen → invalid
         let toml_str = r#"
 [relay]
 machine_name = "test"
@@ -661,42 +904,59 @@ command = "echo"
         let err = parse_and_validate(toml_str).unwrap_err();
         match err {
             ConfigError::ValidationError(msg) => {
-                assert!(msg.contains("-bad"), "Error should mention the name: {}", msg);
+                assert!(msg.contains("-bad"), "Error should mention the prefix: {}", msg);
             }
             other => panic!("Expected ValidationError, got: {:?}", other),
         }
     }
 
     #[test]
-    fn invalid_endpoint_name_special_chars() {
+    fn unicode_only_name_fails() {
+        // Unicode-only name with no sanitizable ASCII chars → tool_prefix is None
         let toml_str = r#"
 [relay]
 machine_name = "test"
 
 [[endpoints]]
-name = "my server"
+name = "日本語"
 transport = "stdio"
 command = "echo"
 "#;
         let err = parse_and_validate(toml_str).unwrap_err();
         match err {
             ConfigError::ValidationError(msg) => {
-                assert!(msg.contains("my server"), "Error should mention the name: {}", msg);
+                assert!(msg.contains("cannot be sanitized"), "Error should mention sanitization: {}", msg);
             }
             other => panic!("Expected ValidationError, got: {:?}", other),
         }
     }
 
     #[test]
+    fn explicit_tool_prefix_overrides_name() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "日本語サーバー"
+tool_prefix = "japanese_server"
+transport = "stdio"
+command = "echo"
+"#;
+        assert!(parse_and_validate(toml_str).is_ok());
+    }
+
+    #[test]
     fn validate_collects_multiple_errors() {
+        // "_also_bad" sanitizes to "_also_bad" which starts with underscore → invalid
         let config = make_config(vec![
-            stdio_ep("Bad-Name", "echo"),
-            stdio_ep("_also_bad", "cat"),
+            stdio_ep("_also_bad", "echo"),
+            stdio_ep("-starts-with-hyphen", "cat"),
         ]);
         let errors = config.validate().unwrap_err();
         assert_eq!(errors.len(), 2, "Should have 2 errors: {:?}", errors);
-        assert!(errors[0].contains("Bad-Name"));
-        assert!(errors[1].contains("_also_bad"));
+        assert!(errors[0].contains("_also_bad"));
+        assert!(errors[1].contains("-starts-with-hyphen"));
     }
 
     #[test]
@@ -706,13 +966,24 @@ command = "echo"
     }
 
     #[test]
-    fn validate_reports_duplicates_and_invalid_names() {
+    fn validate_reports_duplicates() {
         let config = make_config(vec![
             stdio_ep("good", "echo"),
             stdio_ep("good", "cat"),
         ]);
         let errors = config.validate().unwrap_err();
         assert!(errors.iter().any(|e| e.contains("Duplicate")));
+    }
+
+    #[test]
+    fn validate_duplicate_resolved_prefix() {
+        // "My Server" and "my_server" both resolve to "my_server"
+        let config = make_config(vec![
+            stdio_ep("My Server", "echo"),
+            stdio_ep("my_server", "cat"),
+        ]);
+        let errors = config.validate().unwrap_err();
+        assert!(errors.iter().any(|e| e.contains("Duplicate tool_prefix")));
     }
 
     // --- Config diff tests ---
@@ -731,6 +1002,7 @@ command = "echo"
         EndpointConfig {
             name: name.to_string(),
             description: None,
+            tool_prefix: None,
             transport: Transport::Stdio,
             command: Some(cmd.to_string()),
             args: None,
@@ -746,6 +1018,7 @@ command = "echo"
         EndpointConfig {
             name: name.to_string(),
             description: None,
+            tool_prefix: None,
             transport: Transport::Sse,
             command: None,
             args: None,
@@ -854,5 +1127,156 @@ headers = { Authorization = "Bearer $TEST_HEADER_TOKEN_12345" }
         let diff = diff_configs(&old, &new);
         assert_eq!(diff.changed.len(), 1);
         assert!(diff.unchanged.is_empty());
+    }
+
+    // --- Graceful validation tests ---
+
+    #[test]
+    fn graceful_freeform_name_is_valid() {
+        // "Sequential Thinking" sanitizes to "sequential_thinking" — now valid
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "Sequential Thinking"
+transport = "stdio"
+command = "echo"
+"#;
+        let (config, warnings) = parse_and_validate_graceful(toml_str).unwrap();
+        assert_eq!(config.endpoints.len(), 1);
+        assert!(warnings.is_empty(), "Expected no warnings, got: {:?}", warnings);
+    }
+
+    #[test]
+    fn graceful_unicode_only_name_returns_warning() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "日本語"
+transport = "stdio"
+command = "echo"
+"#;
+        let (config, warnings) = parse_and_validate_graceful(toml_str).unwrap();
+        assert_eq!(config.endpoints.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("cannot be sanitized"));
+    }
+
+    #[test]
+    fn graceful_mixed_valid_and_invalid_endpoints() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "good-endpoint"
+transport = "stdio"
+command = "echo"
+
+[[endpoints]]
+name = "日本語"
+transport = "stdio"
+command = "cat"
+
+[[endpoints]]
+name = "another-good"
+transport = "stdio"
+command = "ls"
+"#;
+        let (config, warnings) = parse_and_validate_graceful(toml_str).unwrap();
+        assert_eq!(config.endpoints.len(), 3);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].endpoint_name, "日本語");
+        let warned = warned_endpoint_names(&warnings);
+        assert!(warned.contains("日本語"));
+        assert!(!warned.contains("good-endpoint"));
+        assert!(!warned.contains("another-good"));
+    }
+
+    #[test]
+    fn graceful_missing_command_returns_warning() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "no-cmd"
+transport = "stdio"
+"#;
+        let (_, warnings) = parse_and_validate_graceful(toml_str).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("command"));
+    }
+
+    #[test]
+    fn graceful_missing_url_returns_warning() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "no-url"
+transport = "sse"
+"#;
+        let (_, warnings) = parse_and_validate_graceful(toml_str).unwrap();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("url"));
+    }
+
+    #[test]
+    fn graceful_duplicate_names_warned() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "dup"
+transport = "stdio"
+command = "echo"
+
+[[endpoints]]
+name = "dup"
+transport = "stdio"
+command = "cat"
+"#;
+        let (config, warnings) = parse_and_validate_graceful(toml_str).unwrap();
+        assert_eq!(config.endpoints.len(), 2);
+        assert!(warnings.iter().any(|w| w.message.contains("Duplicate")));
+    }
+
+    #[test]
+    fn graceful_toml_syntax_error_still_fatal() {
+        let toml_str = "this is not valid toml [[[";
+        assert!(parse_and_validate_graceful(toml_str).is_err());
+    }
+
+    #[test]
+    fn graceful_missing_relay_section_still_fatal() {
+        let toml_str = r#"
+[[endpoints]]
+name = "test"
+transport = "stdio"
+command = "echo"
+"#;
+        assert!(parse_and_validate_graceful(toml_str).is_err());
+    }
+
+    #[test]
+    fn graceful_no_warnings_for_valid_config() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "echo"
+transport = "stdio"
+command = "echo"
+"#;
+        let (config, warnings) = parse_and_validate_graceful(toml_str).unwrap();
+        assert_eq!(config.endpoints.len(), 1);
+        assert!(warnings.is_empty());
     }
 }

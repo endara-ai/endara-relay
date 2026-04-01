@@ -11,6 +11,7 @@ pub struct RegisteredAdapter {
     pub adapter: Box<dyn McpAdapter>,
     pub transport: String,
     pub description: Option<String>,
+    pub tool_prefix: Option<String>,
     pub last_activity: Option<Instant>,
     pub disabled: bool,
     pub disabled_tools: HashSet<String>,
@@ -44,14 +45,16 @@ impl AdapterRegistry {
         adapter: Box<dyn McpAdapter>,
         transport: String,
         description: Option<String>,
+        tool_prefix: Option<String>,
     ) {
-        debug!(endpoint = %name, "Registering adapter");
+        debug!(endpoint = %name, ?tool_prefix, "Registering adapter");
         self.adapters.write().await.insert(
             name,
             RegisteredAdapter {
                 adapter,
                 transport,
                 description,
+                tool_prefix,
                 last_activity: None,
                 disabled: false,
                 disabled_tools: HashSet::new(),
@@ -80,15 +83,13 @@ impl AdapterRegistry {
         &self.adapters
     }
 
-    /// Build merged tool catalog from all adapters, with collision-aware prefixed names.
+    /// Build merged tool catalog from all adapters, with prefix-aware names.
     ///
     /// Naming strategy:
-    /// 1. Each adapter reports a `server_type()` (sanitized `serverInfo.name`).
-    ///    If unavailable, the endpoint name is used as fallback.
-    /// 2. If only one endpoint has a given server_type, tools are named
-    ///    `{server_type}__{tool}`.
-    /// 3. If multiple endpoints share a server_type (collision), tools are named
-    ///    `{server_type}__{endpoint_name}__{tool}`.
+    /// 1. Each adapter has a `tool_prefix` (from config's `resolved_tool_prefix`).
+    /// 2. **Single-server no-prefix mode**: if only one non-disabled adapter is
+    ///    registered, tool names are passed through without any prefix.
+    /// 3. Otherwise, tools are named `{tool_prefix}__{tool}`.
     ///
     /// Also builds and returns a reverse lookup map for use by `route_tool_call`.
     ///
@@ -112,23 +113,10 @@ impl AdapterRegistry {
     ) -> (Vec<ToolInfo>, HashMap<String, (String, String)>) {
         let adapters = self.adapters.read().await;
 
-        // First pass: determine server_type for each endpoint and detect collisions
-        let mut server_type_map: HashMap<String, String> = HashMap::new(); // endpoint -> server_type
-        let mut type_counts: HashMap<String, usize> = HashMap::new();
+        // Count non-disabled adapters for single-server no-prefix mode
+        let active_count = adapters.values().filter(|e| !e.disabled).count();
+        let skip_prefix = active_count <= 1;
 
-        for (endpoint_name, entry) in adapters.iter() {
-            if entry.disabled {
-                continue;
-            }
-            let st = entry
-                .adapter
-                .server_type()
-                .unwrap_or_else(|| endpoint_name.clone());
-            *type_counts.entry(st.clone()).or_insert(0) += 1;
-            server_type_map.insert(endpoint_name.clone(), st);
-        }
-
-        // Second pass: build catalog with collision-aware names
         let mut catalog = Vec::new();
         let mut lookup: HashMap<String, (String, String)> = HashMap::new();
 
@@ -144,11 +132,12 @@ impl AdapterRegistry {
                 .as_deref()
                 .unwrap_or(endpoint_name.as_str());
 
-            let server_type = server_type_map
-                .get(endpoint_name)
-                .cloned()
-                .unwrap_or_else(|| endpoint_name.clone());
-            let has_collision = type_counts.get(&server_type).copied().unwrap_or(0) > 1;
+            // Determine the prefix to use (if any)
+            let effective_prefix = if skip_prefix {
+                None
+            } else {
+                entry.tool_prefix.clone()
+            };
 
             match entry.adapter.list_tools().await {
                 Ok(tools) => {
@@ -156,13 +145,10 @@ impl AdapterRegistry {
                         if entry.disabled_tools.contains(&tool.name) {
                             continue;
                         }
-                        let instance = if has_collision {
-                            Some(endpoint_name.as_str())
-                        } else {
-                            None
+                        let final_name = match &effective_prefix {
+                            Some(pfx) => prefix::encode_tool_name(pfx, None, &tool.name),
+                            None => tool.name.clone(),
                         };
-                        let prefixed_name =
-                            prefix::encode_tool_name(&server_type, instance, &tool.name);
                         let enriched_description = if is_healthy {
                             match tool.description {
                                 Some(desc) => Some(format!("[{}] {}", label, desc)),
@@ -177,11 +163,11 @@ impl AdapterRegistry {
                             }
                         };
                         lookup.insert(
-                            prefixed_name.clone(),
+                            final_name.clone(),
                             (endpoint_name.clone(), tool.name.clone()),
                         );
                         catalog.push(ToolInfo {
-                            name: prefixed_name,
+                            name: final_name,
                             description: enriched_description,
                             input_schema: tool.input_schema,
                             annotations: tool.annotations,
@@ -327,10 +313,10 @@ mod tests {
         }
     }
 
-    // --- No collision: each endpoint has unique server_type (falls back to endpoint name) ---
+    // --- Single-server no-prefix mode ---
 
     #[tokio::test]
-    async fn test_merged_catalog_no_collision() {
+    async fn test_single_server_no_prefix() {
         let registry = AdapterRegistry::new();
         registry
             .register(
@@ -338,6 +324,28 @@ mod tests {
                 Box::new(MockAdapter::healthy(vec![make_tool("read")])),
                 "stdio".into(),
                 None,
+                Some("ep1".into()),
+            )
+            .await;
+
+        let catalog = registry.merged_catalog().await;
+        assert_eq!(catalog.len(), 1);
+        // Single adapter → no prefix
+        assert_eq!(catalog[0].name, "read");
+    }
+
+    // --- Multi-server with tool_prefix ---
+
+    #[tokio::test]
+    async fn test_multi_server_uses_tool_prefix() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "ep1".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("read")])),
+                "stdio".into(),
+                None,
+                Some("ep1".into()),
             )
             .await;
         registry
@@ -346,6 +354,7 @@ mod tests {
                 Box::new(MockAdapter::healthy(vec![make_tool("write")])),
                 "stdio".into(),
                 None,
+                Some("ep2".into()),
             )
             .await;
 
@@ -353,59 +362,8 @@ mod tests {
         assert_eq!(catalog.len(), 2);
 
         let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
-        // No collision: server_type == endpoint_name, so format is {ep}__{tool}
         assert!(names.contains(&"ep1__read"));
         assert!(names.contains(&"ep2__write"));
-    }
-
-    // --- With server_type: no collision ---
-
-    #[tokio::test]
-    async fn test_merged_catalog_with_server_type_no_collision() {
-        let registry = AdapterRegistry::new();
-        registry
-            .register(
-                "echo-ep".into(),
-                Box::new(MockAdapter::healthy_with_type(vec![make_tool("echo")], "echo_mcp")),
-                "stdio".into(),
-                None,
-            )
-            .await;
-
-        let catalog = registry.merged_catalog().await;
-        assert_eq!(catalog.len(), 1);
-        assert_eq!(catalog[0].name, "echo_mcp__echo");
-    }
-
-    // --- With server_type: collision (same type, different endpoints) ---
-
-    #[tokio::test]
-    async fn test_merged_catalog_collision_adds_instance() {
-        let registry = AdapterRegistry::new();
-        registry
-            .register(
-                "fs-local".into(),
-                Box::new(MockAdapter::healthy_with_type(vec![make_tool("read")], "filesystem")),
-                "stdio".into(),
-                None,
-            )
-            .await;
-        registry
-            .register(
-                "fs-remote".into(),
-                Box::new(MockAdapter::healthy_with_type(vec![make_tool("read")], "filesystem")),
-                "stdio".into(),
-                None,
-            )
-            .await;
-
-        let catalog = registry.merged_catalog().await;
-        assert_eq!(catalog.len(), 2);
-
-        let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
-        // Collision: both have server_type "filesystem", so instance prefix added
-        assert!(names.contains(&"filesystem__fs-local__read"));
-        assert!(names.contains(&"filesystem__fs-remote__read"));
     }
 
     // --- Unhealthy endpoints still show in catalog ---
@@ -419,6 +377,7 @@ mod tests {
                 Box::new(MockAdapter::healthy(vec![make_tool("tool")])),
                 "stdio".into(),
                 None,
+                Some("good".into()),
             )
             .await;
         registry
@@ -427,6 +386,7 @@ mod tests {
                 Box::new(MockAdapter::unhealthy()),
                 "stdio".into(),
                 None,
+                Some("bad".into()),
             )
             .await;
 
@@ -439,7 +399,7 @@ mod tests {
     // --- Route tool call ---
 
     #[tokio::test]
-    async fn test_route_tool_call() {
+    async fn test_route_tool_call_single_server() {
         let registry = AdapterRegistry::new();
         registry
             .register(
@@ -447,11 +407,13 @@ mod tests {
                 Box::new(MockAdapter::healthy(vec![make_tool("echo")])),
                 "stdio".into(),
                 None,
+                Some("ep".into()),
             )
             .await;
 
+        // Single server → no prefix
         let result = registry
-            .route_tool_call("ep__echo", json!({"msg": "hi"}))
+            .route_tool_call("echo", json!({"msg": "hi"}))
             .await
             .unwrap();
         assert_eq!(result["called"], "echo");
@@ -459,52 +421,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_route_tool_call_with_server_type() {
-        let registry = AdapterRegistry::new();
-        registry
-            .register(
-                "echo-ep".into(),
-                Box::new(MockAdapter::healthy_with_type(vec![make_tool("echo")], "echo_mcp")),
-                "stdio".into(),
-                None,
-            )
-            .await;
-
-        let result = registry
-            .route_tool_call("echo_mcp__echo", json!({"msg": "hi"}))
-            .await
-            .unwrap();
-        assert_eq!(result["called"], "echo");
-    }
-
-    #[tokio::test]
-    async fn test_route_tool_call_with_collision() {
+    async fn test_route_tool_call_multi_server() {
         let registry = AdapterRegistry::new();
         registry
             .register(
                 "fs-local".into(),
-                Box::new(MockAdapter::healthy_with_type(vec![make_tool("read")], "fs")),
+                Box::new(MockAdapter::healthy(vec![make_tool("read")])),
                 "stdio".into(),
                 None,
+                Some("fs-local".into()),
             )
             .await;
         registry
             .register(
                 "fs-remote".into(),
-                Box::new(MockAdapter::healthy_with_type(vec![make_tool("read")], "fs")),
+                Box::new(MockAdapter::healthy(vec![make_tool("read")])),
                 "stdio".into(),
                 None,
+                Some("fs-remote".into()),
             )
             .await;
 
         let result = registry
-            .route_tool_call("fs__fs-local__read", json!({}))
+            .route_tool_call("fs-local__read", json!({}))
             .await
             .unwrap();
         assert_eq!(result["called"], "read");
 
         let result = registry
-            .route_tool_call("fs__fs-remote__read", json!({}))
+            .route_tool_call("fs-remote__read", json!({}))
             .await
             .unwrap();
         assert_eq!(result["called"], "read");
@@ -537,6 +482,7 @@ mod tests {
                 Box::new(MockAdapter::healthy(vec![make_tool("t")])),
                 "stdio".into(),
                 None,
+                Some("ep".into()),
             )
             .await;
 
@@ -563,6 +509,7 @@ mod tests {
                 Box::new(MockAdapter::healthy(vec![])),
                 "stdio".into(),
                 None,
+                Some("good".into()),
             )
             .await;
         registry
@@ -571,6 +518,7 @@ mod tests {
                 Box::new(MockAdapter::unhealthy()),
                 "stdio".into(),
                 None,
+                Some("bad".into()),
             )
             .await;
 
@@ -599,6 +547,7 @@ mod tests {
                 Box::new(MockAdapter::healthy(vec![make_tool("old_tool")])),
                 "stdio".into(),
                 None,
+                Some("ep".into()),
             )
             .await;
         registry
@@ -607,12 +556,14 @@ mod tests {
                 Box::new(MockAdapter::healthy(vec![make_tool("new_tool")])),
                 "sse".into(),
                 None,
+                Some("ep".into()),
             )
             .await;
 
+        // After overwrite, single adapter → no prefix
         let catalog = registry.merged_catalog().await;
         assert_eq!(catalog.len(), 1);
-        assert_eq!(catalog[0].name, "ep__new_tool");
+        assert_eq!(catalog[0].name, "new_tool");
     }
 
     #[tokio::test]
@@ -624,10 +575,12 @@ mod tests {
                 Box::new(MockAdapter::unhealthy_with_tools(vec![make_tool("tool")])),
                 "stdio".into(),
                 None,
+                Some("sick".into()),
             )
             .await;
 
-        let result = registry.route_tool_call("sick__tool", json!({})).await;
+        // Single server → no prefix
+        let result = registry.route_tool_call("tool", json!({})).await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("not healthy"));
@@ -642,6 +595,7 @@ mod tests {
                 Box::new(MockAdapter::healthy(vec![])),
                 "stdio".into(),
                 None,
+                Some("ep".into()),
             )
             .await;
 
@@ -663,15 +617,17 @@ mod tests {
                 ])),
                 "stdio".into(),
                 None,
+                Some("ep".into()),
             )
             .await;
 
+        // Single adapter → no prefix
         let catalog = registry.merged_catalog().await;
         assert_eq!(catalog.len(), 3);
         let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
-        assert!(names.contains(&"ep__read"));
-        assert!(names.contains(&"ep__write"));
-        assert!(names.contains(&"ep__delete"));
+        assert!(names.contains(&"read"));
+        assert!(names.contains(&"write"));
+        assert!(names.contains(&"delete"));
     }
 
     #[tokio::test]
@@ -683,6 +639,7 @@ mod tests {
                 Box::new(MockAdapter::healthy(vec![make_tool("t")])),
                 "stdio".into(),
                 None,
+                Some("ep".into()),
             )
             .await;
 
@@ -707,6 +664,7 @@ mod tests {
                 ])),
                 "stdio".into(),
                 None,
+                Some("ep".into()),
             )
             .await;
 
@@ -719,9 +677,10 @@ mod tests {
                 .insert("read".into());
         }
 
+        // Single adapter → no prefix
         let catalog = registry.merged_catalog().await;
         assert_eq!(catalog.len(), 1);
-        assert_eq!(catalog[0].name, "ep__write");
+        assert_eq!(catalog[0].name, "write");
     }
 
     #[tokio::test]
@@ -733,6 +692,7 @@ mod tests {
                 Box::new(MockAdapter::healthy(vec![make_tool("t")])),
                 "stdio".into(),
                 None,
+                Some("ep".into()),
             )
             .await;
 
@@ -746,7 +706,7 @@ mod tests {
         }
 
         // The tool is disabled so it won't appear in lookup → route fails
-        let result = registry.route_tool_call("ep__t", json!({})).await;
+        let result = registry.route_tool_call("t", json!({})).await;
         assert!(result.is_err());
     }
 
@@ -759,6 +719,7 @@ mod tests {
                 Box::new(MockAdapter::healthy(vec![make_tool("read")])),
                 "stdio".into(),
                 None,
+                Some("filesystem".into()),
             )
             .await;
 
@@ -779,6 +740,7 @@ mod tests {
                 Box::new(MockAdapter::healthy(vec![make_tool("read")])),
                 "stdio".into(),
                 Some("File System".into()),
+                Some("fs-server".into()),
             )
             .await;
 
@@ -805,6 +767,7 @@ mod tests {
                 Box::new(MockAdapter::healthy(vec![tool_no_desc])),
                 "stdio".into(),
                 None,
+                Some("ep".into()),
             )
             .await;
 
@@ -825,19 +788,21 @@ mod tests {
                 ])),
                 "stdio".into(),
                 None,
+                Some("broken".into()),
             )
             .await;
 
+        // Single adapter → no prefix
         let catalog = registry.merged_catalog().await;
         assert_eq!(catalog.len(), 2);
 
-        let read_tool = catalog.iter().find(|t| t.name == "broken__read").unwrap();
+        let read_tool = catalog.iter().find(|t| t.name == "read").unwrap();
         assert_eq!(
             read_tool.description.as_deref(),
             Some("[⚠️ UNAVAILABLE] [broken] read tool")
         );
 
-        let write_tool = catalog.iter().find(|t| t.name == "broken__write").unwrap();
+        let write_tool = catalog.iter().find(|t| t.name == "write").unwrap();
         assert_eq!(
             write_tool.description.as_deref(),
             Some("[⚠️ UNAVAILABLE] [broken] write tool")
@@ -853,6 +818,7 @@ mod tests {
                 Box::new(MockAdapter::unhealthy_with_tools(vec![make_tool("read")])),
                 "stdio".into(),
                 Some("My Server".into()),
+                Some("broken".into()),
             )
             .await;
 
@@ -873,11 +839,13 @@ mod tests {
                 Box::new(MockAdapter::unhealthy_with_tools(vec![make_tool("read")])),
                 "stdio".into(),
                 None,
+                Some("broken".into()),
             )
             .await;
 
+        // Single server → no prefix
         let result = registry
-            .route_tool_call("broken__read", json!({}))
+            .route_tool_call("read", json!({}))
             .await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
@@ -885,11 +853,10 @@ mod tests {
         assert!(err_msg.contains("broken"));
     }
 
-    // --- Collision: multiple endpoints, no server_type override → endpoint name used ---
-    // Different endpoint names = no collision = no instance prefix
+    // --- Multiple endpoints with tool_prefix ---
 
     #[tokio::test]
-    async fn test_multiple_endpoints_different_names_no_collision() {
+    async fn test_multiple_endpoints_with_tool_prefix() {
         let registry = AdapterRegistry::new();
         registry
             .register(
@@ -900,6 +867,7 @@ mod tests {
                 ])),
                 "stdio".into(),
                 Some("Local FS".into()),
+                Some("fs-local".into()),
             )
             .await;
         registry
@@ -911,6 +879,7 @@ mod tests {
                 ])),
                 "stdio".into(),
                 Some("Remote FS".into()),
+                Some("fs-remote".into()),
             )
             .await;
 
@@ -918,7 +887,6 @@ mod tests {
         assert_eq!(catalog.len(), 4);
 
         let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
-        // Different endpoint names → no collision → {endpoint}__{tool}
         assert!(names.contains(&"fs-local__read"));
         assert!(names.contains(&"fs-local__write"));
         assert!(names.contains(&"fs-remote__read"));
@@ -952,6 +920,7 @@ mod tests {
                 Box::new(MockAdapter::healthy(vec![make_tool("read")])),
                 "stdio".into(),
                 None,
+                Some("fs-ok".into()),
             )
             .await;
         registry
@@ -960,6 +929,7 @@ mod tests {
                 Box::new(MockAdapter::unhealthy_with_tools(vec![make_tool("read")])),
                 "stdio".into(),
                 None,
+                Some("fs-down".into()),
             )
             .await;
 

@@ -86,6 +86,7 @@ fn test_config() -> Config {
         endpoints: vec![EndpointConfig {
             name: "echo".to_string(),
             description: None,
+            tool_prefix: None,
             transport: Transport::Stdio,
             command: Some("echo".to_string()),
             args: Some(vec!["hello".to_string()]),
@@ -104,7 +105,7 @@ async fn start_management_server(
     let registry = AdapterRegistry::new();
     for (name, adapter) in adapters {
         registry
-            .register(name.to_string(), Box::new(adapter), "stdio".to_string(), None)
+            .register(name.to_string(), Box::new(adapter), "stdio".to_string(), None, Some(name.to_string()))
             .await;
     }
     let registry = Arc::new(registry);
@@ -281,7 +282,7 @@ async fn start_management_server_with_config(
     let registry = AdapterRegistry::new();
     for (name, adapter) in adapters {
         registry
-            .register(name.to_string(), Box::new(adapter), "stdio".to_string(), None)
+            .register(name.to_string(), Box::new(adapter), "stdio".to_string(), None, Some(name.to_string()))
             .await;
     }
     let registry = Arc::new(registry);

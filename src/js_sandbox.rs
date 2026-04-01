@@ -447,6 +447,7 @@ mod tests {
                 ])),
                 "stdio".into(),
                 None,
+                Some("ep".into()),
             )
             .await;
         Arc::new(registry)
@@ -552,7 +553,7 @@ mod tests {
         let reg = make_registry().await;
         let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
         let result = sandbox
-            .execute(r#"const r = await tools.ep__echo({text: "hi"}); return r;"#)
+            .execute(r#"const r = await tools.echo({text: "hi"}); return r;"#)
             .await
             .unwrap();
         assert_eq!(result["called"], "echo");
@@ -565,7 +566,7 @@ mod tests {
         let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
         // Without await — should also work since tool calls are synchronous
         let result = sandbox
-            .execute(r#"const r = tools.ep__echo({msg: "sync"}); return r;"#)
+            .execute(r#"const r = tools.echo({msg: "sync"}); return r;"#)
             .await
             .unwrap();
         assert_eq!(result["called"], "echo");
@@ -628,8 +629,8 @@ mod tests {
         let reg = make_registry().await;
         let sandbox = JsSandbox::new(reg, Duration::from_secs(10));
         let script = r#"
-            const r1 = await tools.ep__echo({text: "first"});
-            const r2 = await tools.ep__add({a: 1, b: 2});
+            const r1 = await tools.echo({text: "first"});
+            const r2 = await tools.add({a: 1, b: 2});
             return { echo_result: r1, add_result: r2 };
         "#;
         let result = sandbox.execute(script).await.unwrap();
