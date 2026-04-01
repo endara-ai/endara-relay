@@ -59,6 +59,8 @@ pub struct EndpointInfo {
     pub disabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_prefix: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -193,6 +195,7 @@ async fn get_endpoints(State(state): State<ManagementState>) -> Json<Vec<Endpoin
             last_activity: entry.last_activity.map(|t| now.duration_since(t).as_secs()),
             disabled: entry.disabled,
             error,
+            tool_prefix: entry.tool_prefix.clone(),
         });
     }
     endpoints.sort_by(|a, b| a.name.cmp(&b.name));
@@ -860,6 +863,7 @@ mod tests {
             endpoints: vec![EndpointConfig {
                 name: "echo".to_string(),
                 description: None,
+                tool_prefix: None,
                 transport: Transport::Stdio,
                 command: Some("echo".to_string()),
                 args: Some(vec!["hello".to_string()]),
@@ -879,7 +883,7 @@ mod tests {
         let registry = AdapterRegistry::new();
         for (name, adapter) in adapters {
             registry
-                .register(name.to_string(), Box::new(adapter), "stdio".to_string(), None)
+                .register(name.to_string(), Box::new(adapter), "stdio".to_string(), None, Some(name.to_string()))
                 .await;
         }
         ManagementState {

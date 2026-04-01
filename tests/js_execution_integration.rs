@@ -34,7 +34,7 @@ async fn setup_js_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let mut adapter = StdioAdapter::new(config);
     adapter.initialize().await.expect("adapter init failed");
     registry
-        .register("echo-ep".into(), Box::new(adapter), "stdio".into(), None)
+        .register("echo-ep".into(), Box::new(adapter), "stdio".into(), None, Some("echo_ep".into()))
         .await;
 
     let registry_arc = Arc::new(registry.clone());
@@ -60,7 +60,7 @@ async fn test_execute_tools_with_echo() {
     // The sandbox exposes tools as `tools["prefixed_name"](args)` which
     // returns the parsed JSON result directly (synchronous, no await needed).
     let script = r#"
-        var result = tools["echo-mcp__echo"]({ message: "from js" });
+        var result = tools["echo"]({ message: "from js" });
         return result;
     "#;
 

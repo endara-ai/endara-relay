@@ -96,14 +96,18 @@ async fn main() {
             init_tracing(&log_format);
             info!(config = %config_path.display(), "Starting endara-relay");
 
-            let cfg = match config::load_config(&config_path) {
-                Ok(cfg) => {
+            let (cfg, validation_warnings) = match config::load_config_graceful(&config_path) {
+                Ok((cfg, warnings)) => {
                     info!(
                         machine_name = %cfg.relay.machine_name,
                         endpoints = cfg.endpoints.len(),
+                        warnings = warnings.len(),
                         "Configuration loaded successfully"
                     );
-                    cfg
+                    for w in &warnings {
+                        warn!("{}", w);
+                    }
+                    (cfg, warnings)
                 }
                 Err(config::ConfigError::IoError(ref io_err))
                     if io_err.kind() == std::io::ErrorKind::NotFound =>
@@ -119,7 +123,7 @@ async fn main() {
                                 path = %config_path.display(),
                                 "Created default configuration"
                             );
-                            cfg
+                            (cfg, Vec::new())
                         }
                         Err(e) => {
                             error!(error = %e, "Failed to create default configuration");
@@ -133,11 +137,49 @@ async fn main() {
                 }
             };
 
+            // Collect endpoint names that have validation warnings
+            let warned_names = config::warned_endpoint_names(&validation_warnings);
+            // Build a map from endpoint name to its warning message(s)
+            let warning_messages: std::collections::HashMap<String, String> = {
+                let mut map = std::collections::HashMap::new();
+                for w in &validation_warnings {
+                    map.entry(w.endpoint_name.clone())
+                        .and_modify(|msg: &mut String| {
+                            msg.push_str("; ");
+                            msg.push_str(&w.message);
+                        })
+                        .or_insert_with(|| w.message.clone());
+                }
+                map
+            };
+
             // Create adapter registry
             let registry = AdapterRegistry::new();
 
+            // Track duplicate endpoint names: first occurrence wins
+            let mut registered_names = std::collections::HashSet::new();
+
             // Register and initialize adapters for each endpoint
             for ep in &cfg.endpoints {
+                // Handle duplicate endpoint names: first wins, rest become FailedAdapter
+                if !ep.name.is_empty() && !registered_names.insert(ep.name.clone()) {
+                    let msg = format!("Duplicate endpoint name: '{}'", ep.name);
+                    warn!(endpoint = %ep.name, "{}", msg);
+                    // Skip duplicate — already registered above
+                    continue;
+                }
+
+                // If this endpoint has validation warnings, register as FailedAdapter
+                if warned_names.contains(&ep.name) {
+                    let msg = warning_messages.get(&ep.name).cloned().unwrap_or_default();
+                    warn!(endpoint = %ep.name, "Registering as failed due to validation error: {}", msg);
+                    let adapter: Box<dyn McpAdapter> = Box::new(FailedAdapter::new(msg));
+                    registry
+                        .register(ep.name.clone(), adapter, ep.transport.to_string(), ep.description.clone(), ep.resolved_tool_prefix())
+                        .await;
+                    continue;
+                }
+
                 info!(name = %ep.name, transport = %ep.transport, "Configuring endpoint");
                 let adapter: Box<dyn McpAdapter> = match ep.transport {
                     config::Transport::Stdio => {
@@ -192,7 +234,7 @@ async fn main() {
                     }
                 };
                 registry
-                    .register(ep.name.clone(), adapter, ep.transport.to_string(), ep.description.clone())
+                    .register(ep.name.clone(), adapter, ep.transport.to_string(), ep.description.clone(), ep.resolved_tool_prefix())
                     .await;
             }
 
