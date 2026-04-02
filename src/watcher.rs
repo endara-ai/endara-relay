@@ -1,10 +1,15 @@
 use crate::adapter::http::{HttpAdapter, HttpConfig};
+use crate::adapter::oauth::OAuthAdapter;
 use crate::adapter::sse::{SseAdapter, SseConfig};
 use crate::adapter::stdio::{StdioAdapter, StdioConfig};
-use crate::adapter::{FailedAdapter, McpAdapter};
+use crate::adapter::{FailedAdapter, McpAdapter, StartingAdapter};
 use crate::config::{self, ConfigDiff, EndpointConfig, Transport};
+use crate::oauth::OAuthFlowManager;
 use crate::registry::AdapterRegistry;
+use crate::token_manager::TokenManager;
+use crate::OAuthTokenNotifiers;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -29,9 +34,20 @@ impl ConfigWatcher {
         registry: Arc<AdapterRegistry>,
         machine_name: String,
         js_execution_mode: Arc<AtomicBool>,
+        token_manager: Arc<TokenManager>,
+        _oauth_flow_manager: Arc<OAuthFlowManager>,
+        oauth_token_notifiers: OAuthTokenNotifiers,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
-            if let Err(e) = watch_loop(config_path, registry, machine_name, js_execution_mode).await
+            if let Err(e) = watch_loop(
+                config_path,
+                registry,
+                machine_name,
+                js_execution_mode,
+                token_manager,
+                oauth_token_notifiers,
+            )
+            .await
             {
                 error!(error = %e, "Config watcher terminated with error");
             }
@@ -44,6 +60,8 @@ async fn watch_loop(
     registry: Arc<AdapterRegistry>,
     _machine_name: String,
     js_execution_mode: Arc<AtomicBool>,
+    token_manager: Arc<TokenManager>,
+    oauth_token_notifiers: OAuthTokenNotifiers,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
@@ -114,7 +132,15 @@ async fn watch_loop(
         let diff = config::diff_configs(&old_config, &new_config);
         drop(old_config);
 
-        apply_diff_graceful(&diff, &registry, &warnings, &warned_names).await;
+        apply_diff_graceful(
+            &diff,
+            &registry,
+            &warnings,
+            &warned_names,
+            &token_manager,
+            &oauth_token_notifiers,
+        )
+        .await;
 
         // Update JS execution mode flag if it changed
         let new_js_mode = new_config.relay.local_js_execution.unwrap_or(false);
@@ -135,7 +161,12 @@ async fn watch_loop(
 ///
 /// This is public so it can also be called from a manual reload endpoint.
 #[allow(dead_code)]
-pub async fn apply_diff(diff: &ConfigDiff, registry: &AdapterRegistry) {
+pub async fn apply_diff(
+    diff: &ConfigDiff,
+    registry: &AdapterRegistry,
+    token_manager: &Arc<TokenManager>,
+    oauth_token_notifiers: &OAuthTokenNotifiers,
+) {
     // Remove endpoints
     for name in &diff.removed {
         info!(endpoint = %name, "Removing endpoint");
@@ -146,10 +177,9 @@ pub async fn apply_diff(diff: &ConfigDiff, registry: &AdapterRegistry) {
         }
     }
 
-    // Changed endpoints: shutdown old, create new, preserve disabled state
+    // Changed endpoints: shutdown old, register as Starting, init in background
     for (name, new_ep) in &diff.changed {
         info!(endpoint = %name, "Restarting changed endpoint");
-        // Capture disabled state from old entry before removing
         let (was_disabled, old_disabled_tools) = {
             let entries = registry.entries().read().await;
             if let Some(entry) = entries.get(name.as_str()) {
@@ -166,41 +196,82 @@ pub async fn apply_diff(diff: &ConfigDiff, registry: &AdapterRegistry) {
                 warn!(endpoint = %name, error = %e, "Error shutting down old adapter");
             }
         }
-        let adapter = create_adapter(new_ep).await;
+
+        // Register immediately with Starting status
         registry
-            .register(name.clone(), adapter, new_ep.transport.to_string(), new_ep.description.clone(), new_ep.resolved_tool_prefix())
+            .register(
+                name.clone(),
+                Box::new(StartingAdapter),
+                new_ep.transport.to_string(),
+                new_ep.description.clone(),
+                new_ep.resolved_tool_prefix(),
+            )
             .await;
-        // Re-apply disabled state
-        let mut entries = registry.entries().write().await;
-        if let Some(entry) = entries.get_mut(name.as_str()) {
-            entry.disabled = was_disabled;
-            entry.disabled_tools = old_disabled_tools;
-            if was_disabled {
-                let _ = entry.adapter.shutdown().await;
+        {
+            let mut entries = registry.entries().write().await;
+            if let Some(entry) = entries.get_mut(name.as_str()) {
+                entry.disabled = was_disabled;
+                entry.disabled_tools = old_disabled_tools.clone();
             }
         }
-        info!(endpoint = %name, "Changed endpoint re-registered");
+
+        // Spawn background initialization
+        let reg = registry.clone();
+        let ep_clone = new_ep.clone();
+        let name_clone = name.clone();
+        let tm = token_manager.clone();
+        let otn = oauth_token_notifiers.clone();
+        tokio::spawn(async move {
+            let adapter = create_adapter(&ep_clone, &tm, &otn).await;
+            let mut entries = reg.entries().write().await;
+            if let Some(entry) = entries.get_mut(name_clone.as_str()) {
+                entry.adapter = adapter;
+                if was_disabled {
+                    let _ = entry.adapter.shutdown().await;
+                }
+            }
+            info!(endpoint = %name_clone, "Changed endpoint initialized");
+        });
     }
 
     // Added endpoints
     for ep in &diff.added {
         info!(endpoint = %ep.name, transport = %ep.transport, "Adding new endpoint");
-        let adapter = create_adapter(ep).await;
+
+        // Register immediately with Starting status
         registry
-            .register(ep.name.clone(), adapter, ep.transport.to_string(), ep.description.clone(), ep.resolved_tool_prefix())
+            .register(
+                ep.name.clone(),
+                Box::new(StartingAdapter),
+                ep.transport.to_string(),
+                ep.description.clone(),
+                ep.resolved_tool_prefix(),
+            )
             .await;
-        // Apply disabled state from config
         if ep.disabled || !ep.disabled_tools.is_empty() {
             let mut entries = registry.entries().write().await;
             if let Some(entry) = entries.get_mut(ep.name.as_str()) {
                 entry.disabled = ep.disabled;
                 entry.disabled_tools = ep.disabled_tools.iter().cloned().collect();
-                if ep.disabled {
+            }
+        }
+
+        // Spawn background initialization
+        let reg = registry.clone();
+        let ep_clone = ep.clone();
+        let tm = token_manager.clone();
+        let otn = oauth_token_notifiers.clone();
+        tokio::spawn(async move {
+            let adapter = create_adapter(&ep_clone, &tm, &otn).await;
+            let mut entries = reg.entries().write().await;
+            if let Some(entry) = entries.get_mut(ep_clone.name.as_str()) {
+                entry.adapter = adapter;
+                if ep_clone.disabled {
                     let _ = entry.adapter.shutdown().await;
                 }
             }
-        }
-        info!(endpoint = %ep.name, "New endpoint registered");
+            info!(endpoint = %ep_clone.name, "New endpoint initialized");
+        });
     }
 
     // Log unchanged
@@ -218,6 +289,8 @@ pub async fn apply_diff_graceful(
     registry: &AdapterRegistry,
     warnings: &[config::EndpointValidationWarning],
     warned_names: &std::collections::HashSet<String>,
+    token_manager: &Arc<TokenManager>,
+    oauth_token_notifiers: &OAuthTokenNotifiers,
 ) {
     // Build warning message map
     let warning_messages: std::collections::HashMap<String, String> = {
@@ -243,7 +316,7 @@ pub async fn apply_diff_graceful(
         }
     }
 
-    // Changed endpoints: shutdown old, create new, preserve disabled state
+    // Changed endpoints: shutdown old, register as Starting, init in background
     for (name, new_ep) in &diff.changed {
         info!(endpoint = %name, "Restarting changed endpoint");
         let (was_disabled, old_disabled_tools) = {
@@ -263,51 +336,127 @@ pub async fn apply_diff_graceful(
             }
         }
 
-        let adapter: Box<dyn McpAdapter> = if warned_names.contains(name) {
+        // Warned endpoints get FailedAdapter immediately (no background init)
+        if warned_names.contains(name) {
             let msg = warning_messages.get(name).cloned().unwrap_or_default();
             warn!(endpoint = %name, "Registering as failed due to validation error: {}", msg);
-            Box::new(FailedAdapter::new(msg))
-        } else {
-            create_adapter(new_ep).await
-        };
+            registry
+                .register(
+                    name.clone(),
+                    Box::new(FailedAdapter::new(msg)),
+                    new_ep.transport.to_string(),
+                    new_ep.description.clone(),
+                    new_ep.resolved_tool_prefix(),
+                )
+                .await;
+            let mut entries = registry.entries().write().await;
+            if let Some(entry) = entries.get_mut(name.as_str()) {
+                entry.disabled = was_disabled;
+                entry.disabled_tools = old_disabled_tools;
+            }
+            info!(endpoint = %name, "Changed endpoint re-registered (failed)");
+            continue;
+        }
+
+        // Register immediately with Starting status
         registry
-            .register(name.clone(), adapter, new_ep.transport.to_string(), new_ep.description.clone(), new_ep.resolved_tool_prefix())
+            .register(
+                name.clone(),
+                Box::new(StartingAdapter),
+                new_ep.transport.to_string(),
+                new_ep.description.clone(),
+                new_ep.resolved_tool_prefix(),
+            )
             .await;
-        let mut entries = registry.entries().write().await;
-        if let Some(entry) = entries.get_mut(name.as_str()) {
-            entry.disabled = was_disabled;
-            entry.disabled_tools = old_disabled_tools;
-            if was_disabled {
-                let _ = entry.adapter.shutdown().await;
+        {
+            let mut entries = registry.entries().write().await;
+            if let Some(entry) = entries.get_mut(name.as_str()) {
+                entry.disabled = was_disabled;
+                entry.disabled_tools = old_disabled_tools.clone();
             }
         }
-        info!(endpoint = %name, "Changed endpoint re-registered");
+
+        // Spawn background initialization
+        let reg = registry.clone();
+        let ep_clone = new_ep.clone();
+        let name_clone = name.clone();
+        let tm = token_manager.clone();
+        let otn = oauth_token_notifiers.clone();
+        tokio::spawn(async move {
+            let adapter = create_adapter(&ep_clone, &tm, &otn).await;
+            let mut entries = reg.entries().write().await;
+            if let Some(entry) = entries.get_mut(name_clone.as_str()) {
+                entry.adapter = adapter;
+                if was_disabled {
+                    let _ = entry.adapter.shutdown().await;
+                }
+            }
+            info!(endpoint = %name_clone, "Changed endpoint initialized");
+        });
     }
 
     // Added endpoints
     for ep in &diff.added {
         info!(endpoint = %ep.name, transport = %ep.transport, "Adding new endpoint");
-        let adapter: Box<dyn McpAdapter> = if warned_names.contains(&ep.name) {
+
+        // Warned endpoints get FailedAdapter immediately
+        if warned_names.contains(&ep.name) {
             let msg = warning_messages.get(&ep.name).cloned().unwrap_or_default();
             warn!(endpoint = %ep.name, "Registering as failed due to validation error: {}", msg);
-            Box::new(FailedAdapter::new(msg))
-        } else {
-            create_adapter(ep).await
-        };
+            registry
+                .register(
+                    ep.name.clone(),
+                    Box::new(FailedAdapter::new(msg)),
+                    ep.transport.to_string(),
+                    ep.description.clone(),
+                    ep.resolved_tool_prefix(),
+                )
+                .await;
+            if ep.disabled || !ep.disabled_tools.is_empty() {
+                let mut entries = registry.entries().write().await;
+                if let Some(entry) = entries.get_mut(ep.name.as_str()) {
+                    entry.disabled = ep.disabled;
+                    entry.disabled_tools = ep.disabled_tools.iter().cloned().collect();
+                }
+            }
+            info!(endpoint = %ep.name, "New endpoint registered (failed)");
+            continue;
+        }
+
+        // Register immediately with Starting status
         registry
-            .register(ep.name.clone(), adapter, ep.transport.to_string(), ep.description.clone(), ep.resolved_tool_prefix())
+            .register(
+                ep.name.clone(),
+                Box::new(StartingAdapter),
+                ep.transport.to_string(),
+                ep.description.clone(),
+                ep.resolved_tool_prefix(),
+            )
             .await;
         if ep.disabled || !ep.disabled_tools.is_empty() {
             let mut entries = registry.entries().write().await;
             if let Some(entry) = entries.get_mut(ep.name.as_str()) {
                 entry.disabled = ep.disabled;
                 entry.disabled_tools = ep.disabled_tools.iter().cloned().collect();
-                if ep.disabled {
+            }
+        }
+
+        // Spawn background initialization
+        let reg = registry.clone();
+        let ep_clone = ep.clone();
+        let tm = token_manager.clone();
+        let otn = oauth_token_notifiers.clone();
+        tokio::spawn(async move {
+            let adapter = create_adapter(&ep_clone, &tm, &otn).await;
+            let mut entries = reg.entries().write().await;
+            if let Some(entry) = entries.get_mut(ep_clone.name.as_str()) {
+                entry.adapter = adapter;
+                if ep_clone.disabled {
                     let _ = entry.adapter.shutdown().await;
                 }
             }
-        }
-        info!(endpoint = %ep.name, "New endpoint registered");
+            info!(endpoint = %ep_clone.name, "New endpoint initialized");
+        });
     }
 
     // Log unchanged
@@ -320,7 +469,11 @@ pub async fn apply_diff_graceful(
 ///
 /// Always returns an adapter. If initialization fails, returns a [`FailedAdapter`]
 /// so the endpoint still appears in the registry with an unhealthy status.
-async fn create_adapter(ep: &EndpointConfig) -> Box<dyn McpAdapter> {
+pub(crate) async fn create_adapter(
+    ep: &EndpointConfig,
+    token_manager: &Arc<TokenManager>,
+    oauth_token_notifiers: &OAuthTokenNotifiers,
+) -> Box<dyn McpAdapter> {
     match ep.transport {
         Transport::Stdio => {
             let stdio_config = StdioConfig {
@@ -363,6 +516,29 @@ async fn create_adapter(ep: &EndpointConfig) -> Box<dyn McpAdapter> {
                 }
             }
         }
+        Transport::Oauth => {
+            let url = ep.url.clone().unwrap_or_default();
+            // Create a watch channel for this endpoint's tokens
+            let (tx, rx) = tokio::sync::watch::channel(None);
+            oauth_token_notifiers
+                .write()
+                .await
+                .insert(ep.name.clone(), tx);
+
+            // Try to load existing tokens from disk
+            if let Ok(Some(token_set)) = token_manager.load(&ep.name).await {
+                info!(endpoint = %ep.name, "Loaded existing OAuth tokens from disk");
+                let notifiers = oauth_token_notifiers.read().await;
+                if let Some(tx) = notifiers.get(&ep.name) {
+                    let _ = tx.send(Some(token_set.access_token));
+                }
+            }
+
+            let mut adapter = OAuthAdapter::new(ep.name.clone(), url, rx);
+            adapter.initialize().await.ok();
+            info!(endpoint = %ep.name, "OAuth adapter initialized");
+            Box::new(adapter)
+        }
     }
 }
 
@@ -372,6 +548,8 @@ mod tests {
     use crate::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
     use async_trait::async_trait;
     use serde_json::json;
+    use std::collections::HashMap;
+    use tokio::sync::RwLock;
 
     /// A mock adapter that tracks whether shutdown was called.
     struct MockAdapter {
@@ -436,9 +614,19 @@ mod tests {
         }
     }
 
+    fn test_oauth_infra() -> (Arc<TokenManager>, OAuthTokenNotifiers) {
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let notifiers = Arc::new(RwLock::new(HashMap::new()));
+        // Leak the tempdir so it lives for the duration of the test
+        std::mem::forget(tmp);
+        (token_manager, notifiers)
+    }
+
     #[tokio::test]
     async fn apply_diff_empty_is_noop() {
         let registry = Arc::new(AdapterRegistry::new());
+        let (tm, notifiers) = test_oauth_infra();
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         registry
             .register(
@@ -450,7 +638,7 @@ mod tests {
             )
             .await;
 
-        apply_diff(&empty_diff(), &registry).await;
+        apply_diff(&empty_diff(), &registry, &tm, &notifiers).await;
 
         // Existing adapter should still be there, not shut down
         assert!(!shutdown.load(std::sync::atomic::Ordering::SeqCst));
@@ -460,6 +648,7 @@ mod tests {
     #[tokio::test]
     async fn apply_diff_removes_endpoint() {
         let registry = Arc::new(AdapterRegistry::new());
+        let (tm, notifiers) = test_oauth_infra();
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         registry
             .register(
@@ -476,7 +665,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry).await;
+        apply_diff(&diff, &registry, &tm, &notifiers).await;
 
         assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
         assert!(registry.merged_catalog().await.is_empty());
@@ -485,18 +674,20 @@ mod tests {
     #[tokio::test]
     async fn apply_diff_remove_nonexistent_is_ok() {
         let registry = Arc::new(AdapterRegistry::new());
+        let (tm, notifiers) = test_oauth_infra();
         let diff = ConfigDiff {
             removed: vec!["ghost".to_string()],
             ..empty_diff()
         };
 
         // Should not panic
-        apply_diff(&diff, &registry).await;
+        apply_diff(&diff, &registry, &tm, &notifiers).await;
     }
 
     #[tokio::test]
     async fn apply_diff_changed_shuts_down_old() {
         let registry = Arc::new(AdapterRegistry::new());
+        let (tm, notifiers) = test_oauth_infra();
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         registry
             .register(
@@ -522,13 +713,17 @@ mod tests {
             headers: None,
             disabled: false,
             disabled_tools: Vec::new(),
+            oauth_server_url: None,
+            client_id: None,
+            client_secret: None,
+            scopes: None,
         };
         let diff = ConfigDiff {
             changed: vec![("ep".to_string(), changed_ep)],
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry).await;
+        apply_diff(&diff, &registry, &tm, &notifiers).await;
 
         // Old adapter should have been shut down
         assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
@@ -537,6 +732,7 @@ mod tests {
     #[tokio::test]
     async fn apply_diff_added_with_invalid_command_registers_as_failed() {
         let registry = Arc::new(AdapterRegistry::new());
+        let (tm, notifiers) = test_oauth_infra();
 
         let new_ep = EndpointConfig {
             name: "bad_ep".to_string(),
@@ -550,13 +746,20 @@ mod tests {
             headers: None,
             disabled: false,
             disabled_tools: Vec::new(),
+            oauth_server_url: None,
+            client_id: None,
+            client_secret: None,
+            scopes: None,
         };
         let diff = ConfigDiff {
             added: vec![new_ep],
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry).await;
+        apply_diff(&diff, &registry, &tm, &notifiers).await;
+
+        // Wait for background initialization to complete
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         // The failed adapter should appear in the registry but with unhealthy status
         // and empty tool catalog
@@ -570,6 +773,7 @@ mod tests {
     #[tokio::test]
     async fn apply_diff_preserves_unchanged_endpoints() {
         let registry = Arc::new(AdapterRegistry::new());
+        let (tm, notifiers) = test_oauth_infra();
         let shutdown_keep = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown_remove = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -604,7 +808,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry).await;
+        apply_diff(&diff, &registry, &tm, &notifiers).await;
 
         // "keep" should still be alive
         assert!(!shutdown_keep.load(std::sync::atomic::Ordering::SeqCst));
@@ -614,5 +818,72 @@ mod tests {
 
         // "remove" should be shut down
         assert!(shutdown_remove.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn apply_diff_added_oauth_creates_oauth_adapter() {
+        let registry = Arc::new(AdapterRegistry::new());
+        let (tm, notifiers) = test_oauth_infra();
+
+        let new_ep = EndpointConfig {
+            name: "oauth_ep".to_string(),
+            description: None,
+            tool_prefix: None,
+            transport: Transport::Oauth,
+            command: None,
+            args: None,
+            url: Some("http://localhost:5000/mcp".to_string()),
+            env: None,
+            headers: None,
+            disabled: false,
+            disabled_tools: Vec::new(),
+            oauth_server_url: Some("https://auth.example.com".to_string()),
+            client_id: Some("client123".to_string()),
+            client_secret: None,
+            scopes: None,
+        };
+        let diff = ConfigDiff {
+            added: vec![new_ep],
+            ..empty_diff()
+        };
+
+        apply_diff(&diff, &registry, &tm, &notifiers).await;
+
+        // Wait for background initialization to complete
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // The OAuth adapter should be registered (not a FailedAdapter with restart message)
+        let entries = registry.entries().read().await;
+        assert_eq!(entries.len(), 1);
+        let entry = entries
+            .get("oauth_ep")
+            .expect("oauth_ep should be registered");
+        // OAuthAdapter reports Unhealthy("needs login") when no tokens are available,
+        // NOT the FailedAdapter message about restart
+        match &entry.adapter.health() {
+            HealthStatus::Unhealthy(msg) => {
+                assert!(
+                    !msg.contains("restart"),
+                    "Should be a real OAuthAdapter, not a FailedAdapter with restart message. Got: {}",
+                    msg
+                );
+            }
+            other => {
+                // Stopped is also acceptable — OAuthAdapter initializes to Stopped then
+                // transitions to Unhealthy("needs login") after initialize()
+                assert!(
+                    matches!(other, HealthStatus::Stopped),
+                    "Expected Unhealthy or Stopped, got: {:?}",
+                    other
+                );
+            }
+        }
+
+        // Verify the notifier was inserted
+        let notifier_map = notifiers.read().await;
+        assert!(
+            notifier_map.contains_key("oauth_ep"),
+            "Notifier should be registered for oauth_ep"
+        );
     }
 }

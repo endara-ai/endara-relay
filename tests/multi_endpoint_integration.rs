@@ -45,7 +45,13 @@ async fn setup_multi_endpoint_server() -> (SocketAddr, AdapterRegistry, tokio::t
         .await
         .expect("echo adapter init failed");
     registry
-        .register("echo-ep".into(), Box::new(echo_adapter), "stdio".into(), None, Some("echo_ep".into()))
+        .register(
+            "echo-ep".into(),
+            Box::new(echo_adapter),
+            "stdio".into(),
+            None,
+            Some("echo_ep".into()),
+        )
         .await;
 
     // Endpoint 2: multi-tool server
@@ -60,7 +66,13 @@ async fn setup_multi_endpoint_server() -> (SocketAddr, AdapterRegistry, tokio::t
         .await
         .expect("multi-tool adapter init failed");
     registry
-        .register("multi-ep".into(), Box::new(multi_adapter), "stdio".into(), None, Some("multi_ep".into()))
+        .register(
+            "multi-ep".into(),
+            Box::new(multi_adapter),
+            "stdio".into(),
+            None,
+            Some("multi_ep".into()),
+        )
         .await;
 
     let registry_arc = Arc::new(registry.clone());
@@ -68,6 +80,9 @@ async fn setup_multi_endpoint_server() -> (SocketAddr, AdapterRegistry, tokio::t
         registry: registry.clone(),
         js_execution_mode: Arc::new(AtomicBool::new(false)),
         meta_tool_handler: Arc::new(MetaToolHandler::new(registry_arc, Duration::from_secs(30))),
+        oauth_flow_manager: None,
+        token_manager: None,
+        oauth_token_notifiers: None,
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
@@ -136,7 +151,9 @@ async fn test_multi_endpoint_cross_routing() {
             "params": {"name": "echo_ep__echo", "arguments": {"message": "cross-route"}},
             "id": 2
         }))
-        .send().await.expect("request failed");
+        .send()
+        .await
+        .expect("request failed");
     let body: serde_json::Value = resp.json().await.unwrap();
     let text = body["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("cross-route"));
@@ -172,7 +189,6 @@ async fn test_multi_endpoint_cross_routing() {
     assert_eq!(text, "HELLO");
 }
 
-
 #[tokio::test]
 async fn test_multi_endpoint_overlapping_tool_names() {
     let registry = AdapterRegistry::new();
@@ -190,7 +206,13 @@ async fn test_multi_endpoint_overlapping_tool_names() {
             .await
             .expect(&format!("{} adapter init failed", ep_name));
         registry
-            .register(ep_name.to_string(), Box::new(adapter), "stdio".into(), None, Some(ep_name.to_string()))
+            .register(
+                ep_name.to_string(),
+                Box::new(adapter),
+                "stdio".into(),
+                None,
+                Some(ep_name.to_string()),
+            )
             .await;
     }
 
@@ -199,6 +221,9 @@ async fn test_multi_endpoint_overlapping_tool_names() {
         registry: registry.clone(),
         js_execution_mode: Arc::new(AtomicBool::new(false)),
         meta_tool_handler: Arc::new(MetaToolHandler::new(registry_arc, Duration::from_secs(30))),
+        oauth_flow_manager: None,
+        token_manager: None,
+        oauth_token_notifiers: None,
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
@@ -236,10 +261,7 @@ async fn test_multi_endpoint_overlapping_tool_names() {
     assert!(tool_names.contains(&"multi-c__add"));
 
     // All three should be distinct entries
-    let add_count = tool_names
-        .iter()
-        .filter(|n| n.ends_with("__add"))
-        .count();
+    let add_count = tool_names.iter().filter(|n| n.ends_with("__add")).count();
     assert_eq!(add_count, 3, "expected 3 'add' tools, got {}", add_count);
 }
 

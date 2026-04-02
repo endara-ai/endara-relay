@@ -87,6 +87,20 @@ impl HttpAdapter {
         }
     }
 
+    /// Create a new HttpAdapter with a pre-built reqwest::Client.
+    ///
+    /// Used by OAuthAdapter to inject a client with Bearer token headers.
+    pub fn new_with_client(config: HttpConfig, client: Client) -> Self {
+        Self {
+            config,
+            client,
+            health: Arc::new(RwLock::new(HealthStatus::Stopped)),
+            request_id: AtomicU64::new(1),
+            server_type: Arc::new(RwLock::new(None)),
+            activity_log: Arc::new(RwLock::new(RingBuffer::new(1000))),
+        }
+    }
+
     fn next_id(&self) -> u64 {
         self.request_id.fetch_add(1, Ordering::SeqCst)
     }

@@ -18,6 +18,8 @@ pub struct RelayConfig {
     pub machine_name: String,
     #[serde(default)]
     pub local_js_execution: Option<bool>,
+    #[serde(default)]
+    pub token_dir: Option<String>,
 }
 
 /// Transport type for an endpoint.
@@ -27,6 +29,7 @@ pub enum Transport {
     Stdio,
     Sse,
     Http,
+    Oauth,
 }
 
 impl fmt::Display for Transport {
@@ -35,6 +38,7 @@ impl fmt::Display for Transport {
             Transport::Stdio => write!(f, "stdio"),
             Transport::Sse => write!(f, "sse"),
             Transport::Http => write!(f, "http"),
+            Transport::Oauth => write!(f, "oauth"),
         }
     }
 }
@@ -59,6 +63,14 @@ pub struct EndpointConfig {
     pub disabled: bool,
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+    #[serde(default)]
+    pub oauth_server_url: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    #[serde(default)]
+    pub client_secret: Option<String>,
+    #[serde(default)]
+    pub scopes: Option<Vec<String>>,
 }
 
 impl EndpointConfig {
@@ -78,6 +90,7 @@ impl EndpointConfig {
 /// Custom PartialEq that ignores `disabled` and `disabled_tools` so that
 /// `diff_configs` treats an endpoint as "unchanged" when only these fields differ.
 /// Note: `headers` IS included — changing headers should trigger adapter restart.
+/// OAuth fields are included — changing OAuth config should trigger adapter restart.
 impl PartialEq for EndpointConfig {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
@@ -88,6 +101,10 @@ impl PartialEq for EndpointConfig {
             && self.url == other.url
             && self.env == other.env
             && self.headers == other.headers
+            && self.oauth_server_url == other.oauth_server_url
+            && self.client_id == other.client_id
+            && self.client_secret == other.client_secret
+            && self.scopes == other.scopes
     }
 }
 
@@ -169,6 +186,7 @@ pub fn default_config() -> Config {
         relay: RelayConfig {
             machine_name,
             local_js_execution: None,
+            token_dir: None,
         },
         endpoints: Vec::new(),
     }
@@ -265,10 +283,7 @@ fn resolve_env_vars(config: &mut Config) -> Result<(), ConfigError> {
 /// Like [`resolve_env_vars`] but collects failures as warnings instead of
 /// returning an error. Endpoints with env resolution failures are left with
 /// their original (unresolved) values.
-fn resolve_env_vars_graceful(
-    config: &mut Config,
-    warnings: &mut Vec<EndpointValidationWarning>,
-) {
+fn resolve_env_vars_graceful(config: &mut Config, warnings: &mut Vec<EndpointValidationWarning>) {
     for endpoint in &mut config.endpoints {
         let mut env_failed = false;
         if let Some(ref mut env_map) = endpoint.env {
@@ -477,6 +492,26 @@ impl Config {
                         ));
                     }
                 }
+                Transport::Oauth => {
+                    if ep.url.is_none() || ep.url.as_deref() == Some("") {
+                        errors.push(format!(
+                            "Endpoint '{}': oauth transport requires a 'url' field",
+                            ep.name
+                        ));
+                    }
+                    if ep.client_id.is_none() || ep.client_id.as_deref() == Some("") {
+                        errors.push(format!(
+                            "Endpoint '{}': oauth transport requires a 'client_id' field",
+                            ep.name
+                        ));
+                    }
+                    if ep.oauth_server_url.is_none() || ep.oauth_server_url.as_deref() == Some("") {
+                        errors.push(format!(
+                            "Endpoint '{}': oauth transport requires an 'oauth_server_url' field",
+                            ep.name
+                        ));
+                    }
+                }
             }
         }
 
@@ -491,19 +526,16 @@ impl Config {
 /// Validate the parsed config (internal wrapper for backward compatibility).
 #[allow(dead_code)]
 fn validate(config: &Config) -> Result<(), ConfigError> {
-    config.validate().map_err(|errors| {
-        ConfigError::ValidationError(errors.join("; "))
-    })
+    config
+        .validate()
+        .map_err(|errors| ConfigError::ValidationError(errors.join("; ")))
 }
 
 /// Per-endpoint validation that collects warnings instead of erroring.
 ///
 /// Checks: resolved tool_prefix validity, missing command/url, duplicate prefixes.
 /// First occurrence of a duplicate wins; subsequent duplicates are warned.
-fn validate_graceful(
-    config: &Config,
-    warnings: &mut Vec<EndpointValidationWarning>,
-) {
+fn validate_graceful(config: &Config, warnings: &mut Vec<EndpointValidationWarning>) {
     let mut seen_prefixes = std::collections::HashSet::new();
 
     for ep in &config.endpoints {
@@ -565,10 +597,28 @@ fn validate_graceful(
                     if ep.url.is_none() || ep.url.as_deref() == Some("") {
                         warnings.push(EndpointValidationWarning {
                             endpoint_name: ep.name.clone(),
-                            message: format!(
-                                "{} transport requires a 'url' field",
-                                ep.transport
-                            ),
+                            message: format!("{} transport requires a 'url' field", ep.transport),
+                        });
+                    }
+                }
+                Transport::Oauth => {
+                    if ep.url.is_none() || ep.url.as_deref() == Some("") {
+                        warnings.push(EndpointValidationWarning {
+                            endpoint_name: ep.name.clone(),
+                            message: "oauth transport requires a 'url' field".to_string(),
+                        });
+                    }
+                    if ep.client_id.is_none() || ep.client_id.as_deref() == Some("") {
+                        warnings.push(EndpointValidationWarning {
+                            endpoint_name: ep.name.clone(),
+                            message: "oauth transport requires a 'client_id' field".to_string(),
+                        });
+                    }
+                    if ep.oauth_server_url.is_none() || ep.oauth_server_url.as_deref() == Some("") {
+                        warnings.push(EndpointValidationWarning {
+                            endpoint_name: ep.name.clone(),
+                            message: "oauth transport requires an 'oauth_server_url' field"
+                                .to_string(),
                         });
                     }
                 }
@@ -838,7 +888,15 @@ machine_name = "test"
     #[test]
     fn valid_endpoint_names() {
         // These names are all directly valid tool_prefix values
-        for name in &["echo", "my-server", "test_ep", "a", "0day", "abc-123", "a-b_c"] {
+        for name in &[
+            "echo",
+            "my-server",
+            "test_ep",
+            "a",
+            "0day",
+            "abc-123",
+            "a-b_c",
+        ] {
             let toml_str = format!(
                 r#"
 [relay]
@@ -904,7 +962,11 @@ command = "echo"
         let err = parse_and_validate(toml_str).unwrap_err();
         match err {
             ConfigError::ValidationError(msg) => {
-                assert!(msg.contains("-bad"), "Error should mention the prefix: {}", msg);
+                assert!(
+                    msg.contains("-bad"),
+                    "Error should mention the prefix: {}",
+                    msg
+                );
             }
             other => panic!("Expected ValidationError, got: {:?}", other),
         }
@@ -925,7 +987,11 @@ command = "echo"
         let err = parse_and_validate(toml_str).unwrap_err();
         match err {
             ConfigError::ValidationError(msg) => {
-                assert!(msg.contains("cannot be sanitized"), "Error should mention sanitization: {}", msg);
+                assert!(
+                    msg.contains("cannot be sanitized"),
+                    "Error should mention sanitization: {}",
+                    msg
+                );
             }
             other => panic!("Expected ValidationError, got: {:?}", other),
         }
@@ -967,10 +1033,7 @@ command = "echo"
 
     #[test]
     fn validate_reports_duplicates() {
-        let config = make_config(vec![
-            stdio_ep("good", "echo"),
-            stdio_ep("good", "cat"),
-        ]);
+        let config = make_config(vec![stdio_ep("good", "echo"), stdio_ep("good", "cat")]);
         let errors = config.validate().unwrap_err();
         assert!(errors.iter().any(|e| e.contains("Duplicate")));
     }
@@ -993,6 +1056,7 @@ command = "echo"
             relay: RelayConfig {
                 machine_name: "test".to_string(),
                 local_js_execution: None,
+                token_dir: None,
             },
             endpoints,
         }
@@ -1011,6 +1075,10 @@ command = "echo"
             headers: None,
             disabled: false,
             disabled_tools: Vec::new(),
+            oauth_server_url: None,
+            client_id: None,
+            client_secret: None,
+            scopes: None,
         }
     }
 
@@ -1027,6 +1095,10 @@ command = "echo"
             headers: None,
             disabled: false,
             disabled_tools: Vec::new(),
+            oauth_server_url: None,
+            client_id: None,
+            client_secret: None,
+            scopes: None,
         }
     }
 
@@ -1107,10 +1179,7 @@ headers = { Authorization = "Bearer $TEST_HEADER_TOKEN_12345" }
 "#;
         let config = parse_and_validate(toml_str).unwrap();
         let headers = config.endpoints[0].headers.as_ref().unwrap();
-        assert_eq!(
-            headers.get("Authorization").unwrap(),
-            "Bearer secret-value"
-        );
+        assert_eq!(headers.get("Authorization").unwrap(), "Bearer secret-value");
         std::env::remove_var("TEST_HEADER_TOKEN_12345");
     }
 
@@ -1145,7 +1214,11 @@ command = "echo"
 "#;
         let (config, warnings) = parse_and_validate_graceful(toml_str).unwrap();
         assert_eq!(config.endpoints.len(), 1);
-        assert!(warnings.is_empty(), "Expected no warnings, got: {:?}", warnings);
+        assert!(
+            warnings.is_empty(),
+            "Expected no warnings, got: {:?}",
+            warnings
+        );
     }
 
     #[test]
@@ -1278,5 +1351,215 @@ command = "echo"
         let (config, warnings) = parse_and_validate_graceful(toml_str).unwrap();
         assert_eq!(config.endpoints.len(), 1);
         assert!(warnings.is_empty());
+    }
+
+    // --- OAuth transport tests ---
+
+    #[test]
+    fn parse_oauth_transport_with_all_fields() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "oauth-ep"
+transport = "oauth"
+url = "http://localhost:5000/mcp"
+client_id = "my-client-id"
+client_secret = "my-secret"
+oauth_server_url = "https://auth.example.com"
+scopes = ["read", "write"]
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(config.endpoints.len(), 1);
+        let ep = &config.endpoints[0];
+        assert_eq!(ep.transport, Transport::Oauth);
+        assert_eq!(ep.url.as_deref(), Some("http://localhost:5000/mcp"));
+        assert_eq!(ep.client_id.as_deref(), Some("my-client-id"));
+        assert_eq!(ep.client_secret.as_deref(), Some("my-secret"));
+        assert_eq!(
+            ep.oauth_server_url.as_deref(),
+            Some("https://auth.example.com")
+        );
+        assert_eq!(
+            ep.scopes.as_deref(),
+            Some(&["read".to_string(), "write".to_string()][..])
+        );
+    }
+
+    #[test]
+    fn oauth_missing_client_id_is_error() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "oauth-ep"
+transport = "oauth"
+url = "http://localhost:5000/mcp"
+oauth_server_url = "https://auth.example.com"
+"#;
+        let err = parse_and_validate(toml_str).unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                assert!(
+                    msg.contains("client_id"),
+                    "Error should mention client_id: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected ValidationError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn oauth_missing_server_url_is_error() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "oauth-ep"
+transport = "oauth"
+url = "http://localhost:5000/mcp"
+client_id = "my-client-id"
+"#;
+        let err = parse_and_validate(toml_str).unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                assert!(
+                    msg.contains("oauth_server_url"),
+                    "Error should mention oauth_server_url: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected ValidationError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn oauth_no_fields_reports_all_missing() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "oauth-ep"
+transport = "oauth"
+"#;
+        let err = parse_and_validate(toml_str).unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                assert!(msg.contains("url"), "Error should mention url: {}", msg);
+                assert!(
+                    msg.contains("client_id"),
+                    "Error should mention client_id: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("oauth_server_url"),
+                    "Error should mention oauth_server_url: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected ValidationError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn oauth_scopes_and_client_secret_are_optional() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "oauth-ep"
+transport = "oauth"
+url = "http://localhost:5000/mcp"
+client_id = "my-client-id"
+oauth_server_url = "https://auth.example.com"
+"#;
+        // Should succeed without scopes and client_secret
+        let config = parse_and_validate(toml_str).unwrap();
+        assert!(config.endpoints[0].scopes.is_none());
+        assert!(config.endpoints[0].client_secret.is_none());
+    }
+
+    #[test]
+    fn oauth_client_secret_optional_some() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "oauth-ep"
+transport = "oauth"
+url = "http://localhost:5000/mcp"
+client_id = "my-client-id"
+client_secret = "s3cret"
+oauth_server_url = "https://auth.example.com"
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(config.endpoints[0].client_secret.as_deref(), Some("s3cret"));
+    }
+
+    #[test]
+    fn oauth_scopes_parses_as_vec() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "oauth-ep"
+transport = "oauth"
+url = "http://localhost:5000/mcp"
+client_id = "my-client-id"
+oauth_server_url = "https://auth.example.com"
+scopes = ["openid", "profile", "email"]
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        let scopes = config.endpoints[0].scopes.as_ref().unwrap();
+        assert_eq!(
+            scopes,
+            &vec![
+                "openid".to_string(),
+                "profile".to_string(),
+                "email".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn oauth_field_change_triggers_config_diff() {
+        let ep1 = EndpointConfig {
+            name: "oauth-ep".to_string(),
+            description: None,
+            tool_prefix: None,
+            transport: Transport::Oauth,
+            command: None,
+            args: None,
+            url: Some("http://localhost:5000/mcp".to_string()),
+            env: None,
+            headers: None,
+            disabled: false,
+            disabled_tools: Vec::new(),
+            oauth_server_url: Some("https://auth.example.com".to_string()),
+            client_id: Some("old-client".to_string()),
+            client_secret: None,
+            scopes: None,
+        };
+
+        let mut ep2 = ep1.clone();
+        ep2.client_id = Some("new-client".to_string());
+
+        let old = make_config(vec![ep1]);
+        let new = make_config(vec![ep2]);
+        let diff = diff_configs(&old, &new);
+        assert_eq!(
+            diff.changed.len(),
+            1,
+            "OAuth field change should trigger diff"
+        );
+        assert!(diff.unchanged.is_empty());
     }
 }

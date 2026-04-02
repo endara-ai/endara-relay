@@ -1,4 +1,5 @@
 pub mod http;
+pub mod oauth;
 pub mod sse;
 pub mod stdio;
 
@@ -167,6 +168,36 @@ impl McpAdapter for FailedAdapter {
 
     async fn stderr_lines(&self) -> Vec<String> {
         vec![format!("[ERROR] {}", self.error_message)]
+    }
+
+    async fn shutdown(&mut self) -> Result<(), AdapterError> {
+        Ok(())
+    }
+}
+
+/// A placeholder adapter registered while the real adapter is initializing.
+///
+/// Reports [`HealthStatus::Starting`] so the endpoint appears in the management
+/// UI with a spinner. Once initialization completes, the caller replaces this
+/// adapter in the registry with the real (or failed) adapter.
+pub struct StartingAdapter;
+
+#[async_trait]
+impl McpAdapter for StartingAdapter {
+    async fn initialize(&mut self) -> Result<(), AdapterError> {
+        Err(AdapterError::NotInitialized)
+    }
+
+    async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+        Ok(vec![])
+    }
+
+    async fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, AdapterError> {
+        Err(AdapterError::NotInitialized)
+    }
+
+    fn health(&self) -> HealthStatus {
+        HealthStatus::Starting
     }
 
     async fn shutdown(&mut self) -> Result<(), AdapterError> {
