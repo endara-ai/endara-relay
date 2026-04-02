@@ -763,16 +763,14 @@ async fn oauth_status(
             // Compute next_refresh_at from token expiry using the 75% rule
             let next_refresh_at = tokens
                 .as_ref()
-                .and_then(|t| {
-                    match (t.issued_at, t.expires_at) {
-                        (Some(issued), Some(expires)) if expires > issued => {
-                            let lifetime = expires - issued;
-                            let seventy_five_pct = issued + (lifetime * 3 / 4);
-                            let five_min_before = expires.saturating_sub(300);
-                            Some(std::cmp::min(seventy_five_pct, five_min_before))
-                        }
-                        _ => None,
+                .and_then(|t| match (t.issued_at, t.expires_at) {
+                    (Some(issued), Some(expires)) if expires > issued => {
+                        let lifetime = expires - issued;
+                        let seventy_five_pct = issued + (lifetime * 3 / 4);
+                        let five_min_before = expires.saturating_sub(300);
+                        Some(std::cmp::min(seventy_five_pct, five_min_before))
                     }
+                    _ => None,
                 });
 
             let status = match oauth_state {
@@ -898,7 +896,10 @@ async fn oauth_refresh(
 
     // Check current state — refuse if NeedsLogin or Disconnected
     let current_state = inner.state.read().await.clone();
-    if matches!(current_state, OAuthState::NeedsLogin | OAuthState::Disconnected) {
+    if matches!(
+        current_state,
+        OAuthState::NeedsLogin | OAuthState::Disconnected
+    ) {
         let reason = match current_state {
             OAuthState::NeedsLogin => "endpoint has never been authenticated",
             OAuthState::Disconnected => "endpoint is disconnected",
@@ -2111,10 +2112,7 @@ command = "echo"
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp).await;
-        assert!(body["detail"]
-            .as_str()
-            .unwrap()
-            .contains("disconnected"));
+        assert!(body["detail"].as_str().unwrap().contains("disconnected"));
     }
 
     #[tokio::test]

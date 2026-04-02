@@ -339,10 +339,7 @@ pub struct OAuthAdapter {
 
 impl OAuthAdapter {
     /// Create a new OAuthAdapter.
-    pub fn new(
-        config: OAuthAdapterConfig,
-        token_manager: Arc<TokenManager>,
-    ) -> Self {
+    pub fn new(config: OAuthAdapterConfig, token_manager: Arc<TokenManager>) -> Self {
         Self {
             inner: Arc::new(OAuthAdapterInner {
                 state: RwLock::new(OAuthState::NeedsLogin),
@@ -367,8 +364,12 @@ impl OAuthAdapter {
             OAuthState::NeedsLogin => HealthStatus::Unhealthy("needs login".to_string()),
             OAuthState::Authenticated => HealthStatus::Healthy,
             OAuthState::Refreshing => HealthStatus::Healthy, // still serving with current token
-            OAuthState::AuthRequired => HealthStatus::Unhealthy("authentication required".to_string()),
-            OAuthState::ConnectionFailed => HealthStatus::Unhealthy("connection failed".to_string()),
+            OAuthState::AuthRequired => {
+                HealthStatus::Unhealthy("authentication required".to_string())
+            }
+            OAuthState::ConnectionFailed => {
+                HealthStatus::Unhealthy("connection failed".to_string())
+            }
             OAuthState::Disconnected => HealthStatus::Stopped,
         }
     }
@@ -763,7 +764,7 @@ mod tests {
         let expires = issued + Duration::from_secs(3600);
         let deadline = refresh_deadline(issued, expires);
         let expected = issued + Duration::from_secs(2700); // 45 min
-        // Allow 1ms tolerance for Instant arithmetic
+                                                           // Allow 1ms tolerance for Instant arithmetic
         assert!(deadline >= expected - Duration::from_millis(1));
         assert!(deadline <= expected + Duration::from_millis(1));
     }

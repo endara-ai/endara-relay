@@ -184,7 +184,10 @@ mod tests {
     fn is_valid_with_no_expiry() {
         let mut ts = make_token_set();
         ts.expires_at = None;
-        assert!(ts.is_valid(), "Tokens with no expiry should be considered valid");
+        assert!(
+            ts.is_valid(),
+            "Tokens with no expiry should be considered valid"
+        );
     }
 
     #[test]
@@ -196,7 +199,10 @@ mod tests {
         let mut ts = make_token_set();
         // Expires in 20 seconds — within the 30-second buffer, so should be invalid
         ts.expires_at = Some(now + 20);
-        assert!(!ts.is_valid(), "Token expiring within 30s buffer should be invalid");
+        assert!(
+            !ts.is_valid(),
+            "Token expiring within 30s buffer should be invalid"
+        );
     }
 
     #[test]
@@ -208,7 +214,10 @@ mod tests {
         let mut ts = make_token_set();
         // Expires in 31 seconds — just outside the 30-second buffer
         ts.expires_at = Some(now + 31);
-        assert!(ts.is_valid(), "Token expiring in 31s should be valid (outside 30s buffer)");
+        assert!(
+            ts.is_valid(),
+            "Token expiring in 31s should be valid (outside 30s buffer)"
+        );
     }
 
     #[test]
