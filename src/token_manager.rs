@@ -20,6 +20,26 @@ pub struct TokenSet {
     pub token_type: String,
     /// Space-delimited scopes as returned by the authorization server.
     pub scope: Option<String>,
+    /// Unix timestamp (seconds) when the token was issued.
+    #[serde(default)]
+    pub issued_at: Option<u64>,
+}
+
+impl TokenSet {
+    /// Returns `true` if the token has not expired, using a 30-second buffer
+    /// for clock skew. Tokens with no `expires_at` are assumed valid.
+    pub fn is_valid(&self) -> bool {
+        match self.expires_at {
+            Some(exp) => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                exp > now + 30 // 30-second buffer for clock skew
+            }
+            None => true, // No expiry = assume valid
+        }
+    }
 }
 
 /// Owns token persistence. One instance shared across all OAuth adapters via `Arc<TokenManager>`.
@@ -84,6 +104,7 @@ mod tests {
             expires_at: Some(1700000000),
             token_type: "Bearer".to_string(),
             scope: Some("read write".to_string()),
+            issued_at: Some(1699996400),
         }
     }
 
@@ -137,5 +158,82 @@ mod tests {
         let path = tmp.path().join("perm-test.json");
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "Expected 0600, got {:o}", mode & 0o777);
+    }
+
+    // --- TokenSet::is_valid() tests ---
+
+    #[test]
+    fn is_valid_with_future_expiry() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut ts = make_token_set();
+        ts.expires_at = Some(now + 3600); // expires in 1 hour
+        assert!(ts.is_valid());
+    }
+
+    #[test]
+    fn is_valid_with_past_expiry() {
+        let mut ts = make_token_set();
+        ts.expires_at = Some(1000); // long expired
+        assert!(!ts.is_valid());
+    }
+
+    #[test]
+    fn is_valid_with_no_expiry() {
+        let mut ts = make_token_set();
+        ts.expires_at = None;
+        assert!(ts.is_valid(), "Tokens with no expiry should be considered valid");
+    }
+
+    #[test]
+    fn is_valid_within_30s_buffer() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut ts = make_token_set();
+        // Expires in 20 seconds — within the 30-second buffer, so should be invalid
+        ts.expires_at = Some(now + 20);
+        assert!(!ts.is_valid(), "Token expiring within 30s buffer should be invalid");
+    }
+
+    #[test]
+    fn is_valid_just_outside_buffer() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let mut ts = make_token_set();
+        // Expires in 31 seconds — just outside the 30-second buffer
+        ts.expires_at = Some(now + 31);
+        assert!(ts.is_valid(), "Token expiring in 31s should be valid (outside 30s buffer)");
+    }
+
+    #[test]
+    fn is_valid_issued_at_field_present() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ts = TokenSet {
+            access_token: "tok".into(),
+            refresh_token: None,
+            expires_at: Some(now + 3600),
+            token_type: "Bearer".into(),
+            scope: None,
+            issued_at: Some(now),
+        };
+        assert!(ts.is_valid());
+        assert_eq!(ts.issued_at, Some(now));
+    }
+
+    #[test]
+    fn issued_at_defaults_to_none_on_deserialize() {
+        // Tokens saved by Slice 1 (without issued_at) should deserialize with issued_at = None
+        let json = r#"{"access_token":"tok","refresh_token":null,"expires_at":999999999999,"token_type":"Bearer","scope":null}"#;
+        let ts: TokenSet = serde_json::from_str(json).unwrap();
+        assert_eq!(ts.issued_at, None);
     }
 }

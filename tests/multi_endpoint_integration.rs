@@ -16,7 +16,6 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::timeout;
 
 fn echo_script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -82,7 +81,7 @@ async fn setup_multi_endpoint_server() -> (SocketAddr, AdapterRegistry, tokio::t
         meta_tool_handler: Arc::new(MetaToolHandler::new(registry_arc, Duration::from_secs(30))),
         oauth_flow_manager: None,
         token_manager: None,
-        oauth_token_notifiers: None,
+        oauth_adapter_inners: None,
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
@@ -223,7 +222,7 @@ async fn test_multi_endpoint_overlapping_tool_names() {
         meta_tool_handler: Arc::new(MetaToolHandler::new(registry_arc, Duration::from_secs(30))),
         oauth_flow_manager: None,
         token_manager: None,
-        oauth_token_notifiers: None,
+        oauth_adapter_inners: None,
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();

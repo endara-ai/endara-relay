@@ -128,17 +128,20 @@ impl HttpAdapter {
                 } else if e.is_connect() {
                     AdapterError::ConnectionFailed(format!("{}: {}", self.config.url, e))
                 } else {
-                    AdapterError::HttpError(e.to_string())
+                    AdapterError::HttpError {
+                        status: 0,
+                        body: e.to_string(),
+                    }
                 }
             })?;
 
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(AdapterError::HttpError(format!(
-                "HTTP {}: {}",
-                status, body
-            )));
+            return Err(AdapterError::HttpError {
+                status: status.as_u16(),
+                body,
+            });
         }
 
         let response: JsonRpcResponse = resp.json().await.map_err(|e| {

@@ -127,6 +127,7 @@ async fn start_management_server(
         config_path: None,
         oauth_flow_manager: None,
         relay_port: 9400,
+        oauth_adapter_inners: None,
     };
 
     let app = management_routes(state);
@@ -312,6 +313,7 @@ async fn start_management_server_with_config(
         config_path: Some(config_path),
         oauth_flow_manager: None,
         relay_port: 9400,
+        oauth_adapter_inners: None,
     };
 
     let app = management_routes(state);

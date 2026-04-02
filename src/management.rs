@@ -17,12 +17,14 @@ use tower_http::cors::CorsLayer;
 use tracing::warn;
 
 use crate::adapter::http::{HttpAdapter, HttpConfig};
+use crate::adapter::oauth::OAuthState;
 use crate::adapter::sse::{SseAdapter, SseConfig};
 use crate::adapter::stdio::{StdioAdapter, StdioConfig};
 use crate::adapter::HealthStatus;
 use crate::config::Config;
 use crate::oauth::{OAuthFlowManager, PkceChallenge};
 use crate::registry::AdapterRegistry;
+use crate::OAuthAdapterInners;
 
 // ---------------------------------------------------------------------------
 // App state
@@ -40,6 +42,8 @@ pub struct ManagementState {
     pub oauth_flow_manager: Option<Arc<OAuthFlowManager>>,
     /// Port the relay is listening on (used to construct redirect_uri).
     pub relay_port: u16,
+    /// Per-endpoint shared OAuth adapter inner states.
+    pub oauth_adapter_inners: Option<OAuthAdapterInners>,
 }
 
 // ---------------------------------------------------------------------------
@@ -591,10 +595,44 @@ struct OAuthStartResponse {
     authorize_url: String,
 }
 
-/// Response for GET /api/endpoints/:name/oauth/status
+/// Response for GET /api/endpoints/:name/oauth/status (simple)
 #[derive(Serialize)]
 struct OAuthStatusResponse {
     status: String,
+}
+
+/// Enhanced response for GET /api/endpoints/:name/oauth/status
+#[derive(Serialize)]
+struct OAuthStatusDetailedResponse {
+    status: String,
+    has_access_token: bool,
+    has_refresh_token: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_in_seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_refreshed_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_refresh_at: Option<u64>,
+    state: String,
+}
+
+/// Response for POST /api/endpoints/:name/oauth/revoke
+#[derive(Serialize)]
+struct OAuthRevokeResponse {
+    status: String,
+    endpoint: String,
+}
+
+/// Response for POST /api/endpoints/:name/oauth/refresh
+#[derive(Serialize)]
+struct OAuthRefreshResponse {
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refreshed_at: Option<u64>,
 }
 
 /// POST /api/endpoints/:name/oauth/start
@@ -688,16 +726,83 @@ fn urlencoding(s: &str) -> String {
 
 /// GET /api/endpoints/:name/oauth/status
 ///
-/// Returns whether the endpoint is authenticated or needs login.
+/// Returns detailed OAuth status for the endpoint including token info.
 async fn oauth_status(
     State(state): State<ManagementState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let entries = state.registry.entries().read().await;
-    let Some(entry) = entries.get(&name) else {
-        return endpoint_not_found(&name).into_response();
-    };
+    // Verify endpoint exists in registry
+    {
+        let entries = state.registry.entries().read().await;
+        if !entries.contains_key(&name) {
+            return endpoint_not_found(&name).into_response();
+        }
+    }
 
+    // Try to get detailed OAuth info from the adapter inners
+    if let Some(ref inners) = state.oauth_adapter_inners {
+        let inners_guard = inners.read().await;
+        if let Some(inner) = inners_guard.get(&name) {
+            let oauth_state = inner.state.read().await.clone();
+            let tokens = inner.tokens.read().await;
+
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let has_access_token = tokens.is_some();
+            let has_refresh_token = tokens
+                .as_ref()
+                .and_then(|t| t.refresh_token.as_ref())
+                .is_some();
+            let expires_at = tokens.as_ref().and_then(|t| t.expires_at);
+            let expires_in_seconds = expires_at.map(|exp| exp as i64 - now_secs as i64);
+            let last_refreshed_at = tokens.as_ref().and_then(|t| t.issued_at);
+
+            // Compute next_refresh_at from token expiry using the 75% rule
+            let next_refresh_at = tokens
+                .as_ref()
+                .and_then(|t| {
+                    match (t.issued_at, t.expires_at) {
+                        (Some(issued), Some(expires)) if expires > issued => {
+                            let lifetime = expires - issued;
+                            let seventy_five_pct = issued + (lifetime * 3 / 4);
+                            let five_min_before = expires.saturating_sub(300);
+                            Some(std::cmp::min(seventy_five_pct, five_min_before))
+                        }
+                        _ => None,
+                    }
+                });
+
+            let status = match oauth_state {
+                OAuthState::Authenticated => "authenticated",
+                OAuthState::NeedsLogin => "needs_login",
+                OAuthState::Refreshing => "refreshing",
+                OAuthState::AuthRequired => "auth_required",
+                OAuthState::Disconnected => "disconnected",
+                OAuthState::ConnectionFailed => "connection_failed",
+            };
+
+            let state_str = format!("{:?}", oauth_state);
+
+            return Json(OAuthStatusDetailedResponse {
+                status: status.to_string(),
+                has_access_token,
+                has_refresh_token,
+                expires_at,
+                expires_in_seconds,
+                last_refreshed_at,
+                next_refresh_at,
+                state: state_str,
+            })
+            .into_response();
+        }
+    }
+
+    // Fallback: endpoint exists but is not an OAuth endpoint
+    let entries = state.registry.entries().read().await;
+    let entry = entries.get(&name).unwrap();
     let status = match entry.adapter.health() {
         HealthStatus::Healthy => "authorized",
         HealthStatus::Unhealthy(ref msg) if msg == "needs login" => "needs_login",
@@ -708,6 +813,134 @@ async fn oauth_status(
         status: status.to_string(),
     })
     .into_response()
+}
+
+/// POST /api/endpoints/:name/oauth/revoke
+///
+/// Disconnects the OAuth adapter and deletes tokens.
+async fn oauth_revoke(
+    State(state): State<ManagementState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    // Verify endpoint exists in registry
+    {
+        let entries = state.registry.entries().read().await;
+        if !entries.contains_key(&name) {
+            return endpoint_not_found(&name).into_response();
+        }
+    }
+
+    let Some(ref inners) = state.oauth_adapter_inners else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "endpoint is not configured for OAuth",
+            Some("No OAuth adapter inners available"),
+        )
+        .into_response();
+    };
+
+    let inners_guard = inners.read().await;
+    let Some(inner) = inners_guard.get(&name) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "endpoint is not configured for OAuth",
+            Some(&format!("Endpoint '{}' is not an OAuth endpoint", name)),
+        )
+        .into_response();
+    };
+
+    let inner = inner.clone();
+    drop(inners_guard);
+
+    // Call disconnect (aborts refresh task, clears tokens, deletes from disk)
+    inner.disconnect().await;
+
+    Json(OAuthRevokeResponse {
+        status: "disconnected".to_string(),
+        endpoint: name,
+    })
+    .into_response()
+}
+
+/// POST /api/endpoints/:name/oauth/refresh
+///
+/// Triggers a manual token refresh.
+async fn oauth_refresh(
+    State(state): State<ManagementState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    // Verify endpoint exists in registry
+    {
+        let entries = state.registry.entries().read().await;
+        if !entries.contains_key(&name) {
+            return endpoint_not_found(&name).into_response();
+        }
+    }
+
+    let Some(ref inners) = state.oauth_adapter_inners else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "endpoint is not configured for OAuth",
+            Some("No OAuth adapter inners available"),
+        )
+        .into_response();
+    };
+
+    let inners_guard = inners.read().await;
+    let Some(inner) = inners_guard.get(&name) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "endpoint is not configured for OAuth",
+            Some(&format!("Endpoint '{}' is not an OAuth endpoint", name)),
+        )
+        .into_response();
+    };
+
+    // Check current state — refuse if NeedsLogin or Disconnected
+    let current_state = inner.state.read().await.clone();
+    if matches!(current_state, OAuthState::NeedsLogin | OAuthState::Disconnected) {
+        let reason = match current_state {
+            OAuthState::NeedsLogin => "endpoint has never been authenticated",
+            OAuthState::Disconnected => "endpoint is disconnected",
+            _ => unreachable!(),
+        };
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "cannot refresh tokens",
+            Some(reason),
+        )
+        .into_response();
+    }
+
+    let inner = inner.clone();
+    drop(inners_guard);
+
+    // Attempt refresh
+    match inner.do_token_refresh().await {
+        Ok(new_tokens) => {
+            let expires_at = new_tokens.expires_at;
+            let refreshed_at = new_tokens.issued_at;
+            inner.apply_tokens(new_tokens).await;
+
+            let status = {
+                let s = inner.state.read().await;
+                format!("{:?}", *s)
+            };
+
+            Json(OAuthRefreshResponse {
+                status,
+                expires_at,
+                refreshed_at,
+            })
+            .into_response()
+        }
+        Err(e) => error_response(
+            StatusCode::BAD_GATEWAY,
+            "token refresh failed",
+            Some(&e.to_string()),
+        )
+        .into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -736,6 +969,8 @@ pub fn management_routes(state: ManagementState) -> Router {
         )
         .route("/api/endpoints/{name}/oauth/start", post(oauth_start))
         .route("/api/endpoints/{name}/oauth/status", get(oauth_status))
+        .route("/api/endpoints/{name}/oauth/revoke", post(oauth_revoke))
+        .route("/api/endpoints/{name}/oauth/refresh", post(oauth_refresh))
         .route("/api/catalog", get(get_catalog))
         .route("/api/config", get(get_config))
         .route("/api/config/reload", post(reload_config))
@@ -1039,6 +1274,7 @@ mod tests {
             config_path: None,
             oauth_flow_manager: None,
             relay_port: 9400,
+            oauth_adapter_inners: None,
         }
     }
 
@@ -1638,5 +1874,292 @@ command = "echo"
         let body = body_json(resp).await;
         assert_eq!(body["success"], false);
         assert!(body["error"].is_string());
+    }
+
+    // --- OAuth management route tests ---
+
+    use crate::adapter::oauth::{OAuthAdapter, OAuthAdapterConfig, OAuthAdapterInner, OAuthState};
+    use crate::token_manager::TokenManager;
+
+    fn make_oauth_config(name: &str) -> OAuthAdapterConfig {
+        OAuthAdapterConfig {
+            endpoint_name: name.to_string(),
+            url: "http://127.0.0.1:19999/mcp".to_string(),
+            token_endpoint_url: "http://127.0.0.1:19999/token".to_string(),
+            client_id: "test-client".to_string(),
+            client_secret: None,
+        }
+    }
+
+    async fn test_state_with_oauth(
+        name: &str,
+        tmp_dir: &std::path::Path,
+    ) -> (ManagementState, Arc<OAuthAdapterInner>) {
+        let token_manager = Arc::new(TokenManager::new(tmp_dir.to_path_buf()));
+        let config = make_oauth_config(name);
+        let adapter = OAuthAdapter::new(config, token_manager.clone());
+        let shared_inner = adapter.shared_inner();
+
+        let oauth_inners: OAuthAdapterInners =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        oauth_inners
+            .write()
+            .await
+            .insert(name.to_string(), shared_inner.clone());
+
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                name.to_string(),
+                Box::new(adapter),
+                "oauth".to_string(),
+                None,
+                None,
+            )
+            .await;
+
+        let state = ManagementState {
+            registry: Arc::new(registry),
+            config: Arc::new(RwLock::new(test_config())),
+            start_time: Instant::now(),
+            config_path: None,
+            oauth_flow_manager: None,
+            relay_port: 9400,
+            oauth_adapter_inners: Some(oauth_inners),
+        };
+
+        (state, shared_inner)
+    }
+
+    #[tokio::test]
+    async fn oauth_status_detailed_needs_login() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _inner) = test_state_with_oauth("oauth-ep", tmp.path()).await;
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/endpoints/oauth-ep/oauth/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["status"], "needs_login");
+        assert_eq!(body["has_access_token"], false);
+        assert_eq!(body["has_refresh_token"], false);
+    }
+
+    #[tokio::test]
+    async fn oauth_status_detailed_with_tokens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, inner) = test_state_with_oauth("oauth-ep", tmp.path()).await;
+
+        // Set up tokens with expiry
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token_set = crate::token_manager::TokenSet {
+            access_token: "test-access".to_string(),
+            refresh_token: Some("test-refresh".to_string()),
+            expires_at: Some(now + 3600),
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: Some(now),
+        };
+        *inner.tokens.write().await = Some(token_set);
+        *inner.state.write().await = OAuthState::Authenticated;
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::get("/api/endpoints/oauth-ep/oauth/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["status"], "authenticated");
+        assert_eq!(body["has_access_token"], true);
+        assert_eq!(body["has_refresh_token"], true);
+        assert!(body["expires_at"].is_number());
+        assert!(body["expires_in_seconds"].is_number());
+        assert!(body["last_refreshed_at"].is_number());
+        assert!(body["next_refresh_at"].is_number());
+    }
+
+    #[tokio::test]
+    async fn oauth_status_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _inner) = test_state_with_oauth("oauth-ep", tmp.path()).await;
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/endpoints/nonexistent/oauth/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn oauth_revoke_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, inner) = test_state_with_oauth("oauth-ep", tmp.path()).await;
+
+        // Set authenticated state
+        *inner.state.write().await = OAuthState::Authenticated;
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/oauth-ep/oauth/revoke")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["status"], "disconnected");
+        assert_eq!(body["endpoint"], "oauth-ep");
+
+        // Verify state changed to Disconnected
+        let state = inner.state.read().await;
+        assert_eq!(*state, OAuthState::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn oauth_revoke_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _inner) = test_state_with_oauth("oauth-ep", tmp.path()).await;
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/nonexistent/oauth/revoke")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn oauth_revoke_not_oauth_endpoint() {
+        // Non-OAuth endpoint with no adapter inners
+        let state = test_state(vec![("echo", MockAdapter::healthy_with_tools(vec![]))]).await;
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/echo/oauth/revoke")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn oauth_refresh_needs_login_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _inner) = test_state_with_oauth("oauth-ep", tmp.path()).await;
+        // State is NeedsLogin by default
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/oauth-ep/oauth/refresh")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("never been authenticated"));
+    }
+
+    #[tokio::test]
+    async fn oauth_refresh_disconnected_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, inner) = test_state_with_oauth("oauth-ep", tmp.path()).await;
+        *inner.state.write().await = OAuthState::Disconnected;
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/oauth-ep/oauth/refresh")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("disconnected"));
+    }
+
+    #[tokio::test]
+    async fn oauth_refresh_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _inner) = test_state_with_oauth("oauth-ep", tmp.path()).await;
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/nonexistent/oauth/refresh")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn oauth_refresh_no_refresh_token_returns_502() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, inner) = test_state_with_oauth("oauth-ep", tmp.path()).await;
+
+        // Set Authenticated state but with no refresh token
+        *inner.state.write().await = OAuthState::Authenticated;
+        *inner.tokens.write().await = Some(crate::token_manager::TokenSet {
+            access_token: "test-access".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        });
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/oauth-ep/oauth/refresh")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Should return 502 because refresh fails (no refresh token)
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 }

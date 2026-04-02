@@ -67,8 +67,17 @@ pub enum AdapterError {
     #[error("connection failed: {0}")]
     ConnectionFailed(String),
 
-    #[error("HTTP error: {0}")]
-    HttpError(String),
+    #[error("HTTP error {status}: {body}")]
+    HttpError {
+        status: u16,
+        body: String,
+    },
+
+    #[error("Authentication required for endpoint '{endpoint}': {message}")]
+    AuthenticationRequired {
+        endpoint: String,
+        message: String,
+    },
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

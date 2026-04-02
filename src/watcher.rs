@@ -1,5 +1,5 @@
 use crate::adapter::http::{HttpAdapter, HttpConfig};
-use crate::adapter::oauth::OAuthAdapter;
+use crate::adapter::oauth::{OAuthAdapter, OAuthAdapterConfig};
 use crate::adapter::sse::{SseAdapter, SseConfig};
 use crate::adapter::stdio::{StdioAdapter, StdioConfig};
 use crate::adapter::{FailedAdapter, McpAdapter, StartingAdapter};
@@ -7,7 +7,7 @@ use crate::config::{self, ConfigDiff, EndpointConfig, Transport};
 use crate::oauth::OAuthFlowManager;
 use crate::registry::AdapterRegistry;
 use crate::token_manager::TokenManager;
-use crate::OAuthTokenNotifiers;
+use crate::OAuthAdapterInners;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use std::path::PathBuf;
@@ -36,7 +36,7 @@ impl ConfigWatcher {
         js_execution_mode: Arc<AtomicBool>,
         token_manager: Arc<TokenManager>,
         _oauth_flow_manager: Arc<OAuthFlowManager>,
-        oauth_token_notifiers: OAuthTokenNotifiers,
+        oauth_adapter_inners: OAuthAdapterInners,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             if let Err(e) = watch_loop(
@@ -45,7 +45,7 @@ impl ConfigWatcher {
                 machine_name,
                 js_execution_mode,
                 token_manager,
-                oauth_token_notifiers,
+                oauth_adapter_inners,
             )
             .await
             {
@@ -61,7 +61,7 @@ async fn watch_loop(
     _machine_name: String,
     js_execution_mode: Arc<AtomicBool>,
     token_manager: Arc<TokenManager>,
-    oauth_token_notifiers: OAuthTokenNotifiers,
+    oauth_adapter_inners: OAuthAdapterInners,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
@@ -138,7 +138,7 @@ async fn watch_loop(
             &warnings,
             &warned_names,
             &token_manager,
-            &oauth_token_notifiers,
+            &oauth_adapter_inners,
         )
         .await;
 
@@ -165,7 +165,7 @@ pub async fn apply_diff(
     diff: &ConfigDiff,
     registry: &AdapterRegistry,
     token_manager: &Arc<TokenManager>,
-    oauth_token_notifiers: &OAuthTokenNotifiers,
+    oauth_adapter_inners: &OAuthAdapterInners,
 ) {
     // Remove endpoints
     for name in &diff.removed {
@@ -220,9 +220,9 @@ pub async fn apply_diff(
         let ep_clone = new_ep.clone();
         let name_clone = name.clone();
         let tm = token_manager.clone();
-        let otn = oauth_token_notifiers.clone();
+        let oai = oauth_adapter_inners.clone();
         tokio::spawn(async move {
-            let adapter = create_adapter(&ep_clone, &tm, &otn).await;
+            let adapter = create_adapter(&ep_clone, &tm, &oai).await;
             let mut entries = reg.entries().write().await;
             if let Some(entry) = entries.get_mut(name_clone.as_str()) {
                 entry.adapter = adapter;
@@ -260,9 +260,9 @@ pub async fn apply_diff(
         let reg = registry.clone();
         let ep_clone = ep.clone();
         let tm = token_manager.clone();
-        let otn = oauth_token_notifiers.clone();
+        let oai = oauth_adapter_inners.clone();
         tokio::spawn(async move {
-            let adapter = create_adapter(&ep_clone, &tm, &otn).await;
+            let adapter = create_adapter(&ep_clone, &tm, &oai).await;
             let mut entries = reg.entries().write().await;
             if let Some(entry) = entries.get_mut(ep_clone.name.as_str()) {
                 entry.adapter = adapter;
@@ -290,7 +290,7 @@ pub async fn apply_diff_graceful(
     warnings: &[config::EndpointValidationWarning],
     warned_names: &std::collections::HashSet<String>,
     token_manager: &Arc<TokenManager>,
-    oauth_token_notifiers: &OAuthTokenNotifiers,
+    oauth_adapter_inners: &OAuthAdapterInners,
 ) {
     // Build warning message map
     let warning_messages: std::collections::HashMap<String, String> = {
@@ -381,9 +381,9 @@ pub async fn apply_diff_graceful(
         let ep_clone = new_ep.clone();
         let name_clone = name.clone();
         let tm = token_manager.clone();
-        let otn = oauth_token_notifiers.clone();
+        let oai = oauth_adapter_inners.clone();
         tokio::spawn(async move {
-            let adapter = create_adapter(&ep_clone, &tm, &otn).await;
+            let adapter = create_adapter(&ep_clone, &tm, &oai).await;
             let mut entries = reg.entries().write().await;
             if let Some(entry) = entries.get_mut(name_clone.as_str()) {
                 entry.adapter = adapter;
@@ -445,9 +445,9 @@ pub async fn apply_diff_graceful(
         let reg = registry.clone();
         let ep_clone = ep.clone();
         let tm = token_manager.clone();
-        let otn = oauth_token_notifiers.clone();
+        let oai = oauth_adapter_inners.clone();
         tokio::spawn(async move {
-            let adapter = create_adapter(&ep_clone, &tm, &otn).await;
+            let adapter = create_adapter(&ep_clone, &tm, &oai).await;
             let mut entries = reg.entries().write().await;
             if let Some(entry) = entries.get_mut(ep_clone.name.as_str()) {
                 entry.adapter = adapter;
@@ -472,7 +472,7 @@ pub async fn apply_diff_graceful(
 pub(crate) async fn create_adapter(
     ep: &EndpointConfig,
     token_manager: &Arc<TokenManager>,
-    oauth_token_notifiers: &OAuthTokenNotifiers,
+    oauth_adapter_inners: &OAuthAdapterInners,
 ) -> Box<dyn McpAdapter> {
     match ep.transport {
         Transport::Stdio => {
@@ -517,24 +517,24 @@ pub(crate) async fn create_adapter(
             }
         }
         Transport::Oauth => {
-            let url = ep.url.clone().unwrap_or_default();
-            // Create a watch channel for this endpoint's tokens
-            let (tx, rx) = tokio::sync::watch::channel(None);
-            oauth_token_notifiers
+            let oauth_config = OAuthAdapterConfig {
+                endpoint_name: ep.name.clone(),
+                url: ep.url.clone().unwrap_or_default(),
+                token_endpoint_url: format!(
+                    "{}/token",
+                    ep.oauth_server_url.as_deref().unwrap_or_default()
+                ),
+                client_id: ep.client_id.clone().unwrap_or_default(),
+                client_secret: ep.client_secret.clone(),
+            };
+
+            let mut adapter = OAuthAdapter::new(oauth_config, token_manager.clone());
+            let shared_inner = adapter.shared_inner();
+            oauth_adapter_inners
                 .write()
                 .await
-                .insert(ep.name.clone(), tx);
+                .insert(ep.name.clone(), shared_inner);
 
-            // Try to load existing tokens from disk
-            if let Ok(Some(token_set)) = token_manager.load(&ep.name).await {
-                info!(endpoint = %ep.name, "Loaded existing OAuth tokens from disk");
-                let notifiers = oauth_token_notifiers.read().await;
-                if let Some(tx) = notifiers.get(&ep.name) {
-                    let _ = tx.send(Some(token_set.access_token));
-                }
-            }
-
-            let mut adapter = OAuthAdapter::new(ep.name.clone(), url, rx);
             adapter.initialize().await.ok();
             info!(endpoint = %ep.name, "OAuth adapter initialized");
             Box::new(adapter)
@@ -614,19 +614,19 @@ mod tests {
         }
     }
 
-    fn test_oauth_infra() -> (Arc<TokenManager>, OAuthTokenNotifiers) {
+    fn test_oauth_infra() -> (Arc<TokenManager>, OAuthAdapterInners) {
         let tmp = tempfile::tempdir().unwrap();
         let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
-        let notifiers = Arc::new(RwLock::new(HashMap::new()));
+        let inners = Arc::new(RwLock::new(HashMap::new()));
         // Leak the tempdir so it lives for the duration of the test
         std::mem::forget(tmp);
-        (token_manager, notifiers)
+        (token_manager, inners)
     }
 
     #[tokio::test]
     async fn apply_diff_empty_is_noop() {
         let registry = Arc::new(AdapterRegistry::new());
-        let (tm, notifiers) = test_oauth_infra();
+        let (tm, inners) = test_oauth_infra();
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         registry
             .register(
@@ -638,7 +638,7 @@ mod tests {
             )
             .await;
 
-        apply_diff(&empty_diff(), &registry, &tm, &notifiers).await;
+        apply_diff(&empty_diff(), &registry, &tm, &inners).await;
 
         // Existing adapter should still be there, not shut down
         assert!(!shutdown.load(std::sync::atomic::Ordering::SeqCst));
@@ -648,7 +648,7 @@ mod tests {
     #[tokio::test]
     async fn apply_diff_removes_endpoint() {
         let registry = Arc::new(AdapterRegistry::new());
-        let (tm, notifiers) = test_oauth_infra();
+        let (tm, inners) = test_oauth_infra();
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         registry
             .register(
@@ -665,7 +665,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &notifiers).await;
+        apply_diff(&diff, &registry, &tm, &inners).await;
 
         assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
         assert!(registry.merged_catalog().await.is_empty());
@@ -674,20 +674,20 @@ mod tests {
     #[tokio::test]
     async fn apply_diff_remove_nonexistent_is_ok() {
         let registry = Arc::new(AdapterRegistry::new());
-        let (tm, notifiers) = test_oauth_infra();
+        let (tm, inners) = test_oauth_infra();
         let diff = ConfigDiff {
             removed: vec!["ghost".to_string()],
             ..empty_diff()
         };
 
         // Should not panic
-        apply_diff(&diff, &registry, &tm, &notifiers).await;
+        apply_diff(&diff, &registry, &tm, &inners).await;
     }
 
     #[tokio::test]
     async fn apply_diff_changed_shuts_down_old() {
         let registry = Arc::new(AdapterRegistry::new());
-        let (tm, notifiers) = test_oauth_infra();
+        let (tm, inners) = test_oauth_infra();
         let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         registry
             .register(
@@ -723,7 +723,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &notifiers).await;
+        apply_diff(&diff, &registry, &tm, &inners).await;
 
         // Old adapter should have been shut down
         assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
@@ -732,7 +732,7 @@ mod tests {
     #[tokio::test]
     async fn apply_diff_added_with_invalid_command_registers_as_failed() {
         let registry = Arc::new(AdapterRegistry::new());
-        let (tm, notifiers) = test_oauth_infra();
+        let (tm, inners) = test_oauth_infra();
 
         let new_ep = EndpointConfig {
             name: "bad_ep".to_string(),
@@ -756,7 +756,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &notifiers).await;
+        apply_diff(&diff, &registry, &tm, &inners).await;
 
         // Wait for background initialization to complete
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -773,7 +773,7 @@ mod tests {
     #[tokio::test]
     async fn apply_diff_preserves_unchanged_endpoints() {
         let registry = Arc::new(AdapterRegistry::new());
-        let (tm, notifiers) = test_oauth_infra();
+        let (tm, inners) = test_oauth_infra();
         let shutdown_keep = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown_remove = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -808,7 +808,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &notifiers).await;
+        apply_diff(&diff, &registry, &tm, &inners).await;
 
         // "keep" should still be alive
         assert!(!shutdown_keep.load(std::sync::atomic::Ordering::SeqCst));
@@ -823,7 +823,7 @@ mod tests {
     #[tokio::test]
     async fn apply_diff_added_oauth_creates_oauth_adapter() {
         let registry = Arc::new(AdapterRegistry::new());
-        let (tm, notifiers) = test_oauth_infra();
+        let (tm, inners) = test_oauth_infra();
 
         let new_ep = EndpointConfig {
             name: "oauth_ep".to_string(),
@@ -847,7 +847,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &notifiers).await;
+        apply_diff(&diff, &registry, &tm, &inners).await;
 
         // Wait for background initialization to complete
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -879,11 +879,11 @@ mod tests {
             }
         }
 
-        // Verify the notifier was inserted
-        let notifier_map = notifiers.read().await;
+        // Verify the inner was inserted
+        let inner_map = inners.read().await;
         assert!(
-            notifier_map.contains_key("oauth_ep"),
-            "Notifier should be registered for oauth_ep"
+            inner_map.contains_key("oauth_ep"),
+            "Inner should be registered for oauth_ep"
         );
     }
 }

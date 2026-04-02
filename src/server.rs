@@ -2,7 +2,7 @@ use crate::js_sandbox::MetaToolHandler;
 use crate::oauth::OAuthFlowManager;
 use crate::registry::AdapterRegistry;
 use crate::token_manager::TokenManager;
-use crate::OAuthTokenNotifiers;
+use crate::OAuthAdapterInners;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -35,8 +35,8 @@ pub struct AppState {
     pub oauth_flow_manager: Option<Arc<OAuthFlowManager>>,
     /// Token manager for persisting OAuth tokens.
     pub token_manager: Option<Arc<TokenManager>>,
-    /// Per-endpoint token notifiers: endpoint_name -> watch::Sender.
-    pub oauth_token_notifiers: Option<OAuthTokenNotifiers>,
+    /// Per-endpoint shared OAuth adapter inner states.
+    pub oauth_adapter_inners: Option<OAuthAdapterInners>,
 }
 
 /// JSON-RPC request body expected by MCP routes.
@@ -373,21 +373,22 @@ async fn oauth_callback(
         );
     }
 
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
     let token_set = crate::token_manager::TokenSet {
         access_token: access_token.clone(),
         refresh_token: token_json["refresh_token"].as_str().map(|s| s.to_string()),
-        expires_at: token_json["expires_in"].as_u64().map(|secs| {
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-                + secs
-        }),
+        expires_at: token_json["expires_in"]
+            .as_u64()
+            .map(|secs| now_secs + secs),
         token_type: token_json["token_type"]
             .as_str()
             .unwrap_or("Bearer")
             .to_string(),
         scope: token_json["scope"].as_str().map(|s| s.to_string()),
+        issued_at: Some(now_secs),
     };
 
     // Save tokens to disk
@@ -397,12 +398,12 @@ async fn oauth_callback(
         }
     }
 
-    // Signal the adapter via watch channel
-    if let Some(ref notifiers) = state.oauth_token_notifiers {
-        let notifiers = notifiers.read().await;
-        if let Some(tx) = notifiers.get(&flow.endpoint_name) {
-            let _ = tx.send(Some(access_token));
-            info!(endpoint = %flow.endpoint_name, "Token notification sent to adapter");
+    // Apply tokens to the adapter's shared inner state
+    if let Some(ref inners) = state.oauth_adapter_inners {
+        let inners = inners.read().await;
+        if let Some(inner) = inners.get(&flow.endpoint_name) {
+            inner.apply_tokens(token_set.clone()).await;
+            info!(endpoint = %flow.endpoint_name, "Tokens applied to OAuth adapter");
         }
     }
 

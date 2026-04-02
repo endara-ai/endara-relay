@@ -252,6 +252,7 @@ mod tests {
             }
         }
 
+        #[allow(dead_code)]
         fn healthy_with_type(tools: Vec<ToolInfo>, st: &str) -> Self {
             Self {
                 health: HealthStatus::Healthy,
