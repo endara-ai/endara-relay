@@ -50,7 +50,7 @@ async fn setup_js_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         meta_tool_handler: Arc::new(MetaToolHandler::new(registry_arc, Duration::from_secs(30))),
         oauth_flow_manager: None,
         token_manager: None,
-        oauth_token_notifiers: None,
+        oauth_adapter_inners: None,
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();

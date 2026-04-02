@@ -4,6 +4,36 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+use crate::token_manager::TokenError;
+
+/// Dedicated error type for OAuth-specific failures.
+#[derive(Debug, thiserror::Error)]
+pub enum OAuthError {
+    #[error("No refresh token available for endpoint '{endpoint}'")]
+    NoRefreshToken { endpoint: String },
+
+    #[error("Token refresh failed — {status}: {body}")]
+    RefreshFailed {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+
+    #[error("Token exchange failed — {status}: {body}")]
+    ExchangeFailed {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+
+    #[error("HTTP request failed: {0}")]
+    Http(#[from] reqwest::Error),
+
+    #[error("JSON parse error: {0}")]
+    Json(#[from] serde_json::Error),
+
+    #[error("Token storage error: {0}")]
+    Storage(#[from] TokenError),
+}
+
 /// PKCE (Proof Key for Code Exchange) challenge pair for OAuth 2.0 S256.
 pub struct PkceChallenge {
     /// The code verifier: 43-char URL-safe base64 string from 32 random bytes.

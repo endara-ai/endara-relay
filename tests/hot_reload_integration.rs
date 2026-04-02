@@ -129,10 +129,10 @@ async fn test_config_diff_add_endpoint() {
     // Apply the diff
     let tmp = tempfile::tempdir().unwrap();
     let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
-    let oauth_token_notifiers: Arc<
-        RwLock<HashMap<String, tokio::sync::watch::Sender<Option<String>>>>,
+    let oauth_adapter_inners: Arc<
+        RwLock<HashMap<String, Arc<endara_relay::adapter::oauth::OAuthAdapterInner>>>,
     > = Arc::new(RwLock::new(HashMap::new()));
-    watcher::apply_diff(&diff, &registry, &token_manager, &oauth_token_notifiers).await;
+    watcher::apply_diff(&diff, &registry, &token_manager, &oauth_adapter_inners).await;
 
     // Wait for background initialization to complete
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -263,10 +263,10 @@ async fn test_config_diff_remove_endpoint() {
 
     let tmp2 = tempfile::tempdir().unwrap();
     let token_manager2 = Arc::new(TokenManager::new(tmp2.path().to_path_buf()));
-    let oauth_token_notifiers2: Arc<
-        RwLock<HashMap<String, tokio::sync::watch::Sender<Option<String>>>>,
+    let oauth_adapter_inners2: Arc<
+        RwLock<HashMap<String, Arc<endara_relay::adapter::oauth::OAuthAdapterInner>>>,
     > = Arc::new(RwLock::new(HashMap::new()));
-    watcher::apply_diff(&diff, &registry, &token_manager2, &oauth_token_notifiers2).await;
+    watcher::apply_diff(&diff, &registry, &token_manager2, &oauth_adapter_inners2).await;
 
     // Verify the endpoint was removed
     let catalog = registry.merged_catalog().await;

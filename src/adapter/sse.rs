@@ -202,7 +202,10 @@ impl SseAdapter {
                 if e.is_connect() {
                     AdapterError::ConnectionFailed(format!("{}: {}", self.config.url, e))
                 } else {
-                    AdapterError::HttpError(e.to_string())
+                    AdapterError::HttpError {
+                        status: 0,
+                        body: e.to_string(),
+                    }
                 }
             })?;
 
@@ -357,7 +360,10 @@ impl SseAdapter {
                 } else if e.is_connect() {
                     AdapterError::ConnectionFailed(format!("{}: {}", endpoint, e))
                 } else {
-                    AdapterError::HttpError(e.to_string())
+                    AdapterError::HttpError {
+                        status: 0,
+                        body: e.to_string(),
+                    }
                 }
             })?;
 

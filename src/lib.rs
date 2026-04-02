@@ -12,10 +12,11 @@ pub mod token_manager;
 pub mod token_security;
 pub mod watcher;
 
+use adapter::oauth::OAuthAdapterInner;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// Per-endpoint OAuth token notifiers: endpoint_name → watch::Sender.
-pub type OAuthTokenNotifiers =
-    Arc<RwLock<HashMap<String, tokio::sync::watch::Sender<Option<String>>>>>;
+/// Per-endpoint shared OAuth adapter inner states, keyed by endpoint name.
+/// Used by the callback handler to apply tokens to the correct adapter.
+pub type OAuthAdapterInners = Arc<RwLock<HashMap<String, Arc<OAuthAdapterInner>>>>;

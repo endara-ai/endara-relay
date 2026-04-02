@@ -12,7 +12,7 @@ mod registry;
 mod server;
 mod shell_env;
 
-use adapter::oauth::OAuthAdapter;
+use adapter::oauth::{OAuthAdapter, OAuthAdapterConfig, OAuthAdapterInner};
 use adapter::{FailedAdapter, McpAdapter, StartingAdapter};
 use clap::{Parser, Subcommand};
 use js_sandbox::MetaToolHandler;
@@ -29,9 +29,9 @@ use token_manager::TokenManager;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-/// Per-endpoint OAuth token notifiers: endpoint_name → watch::Sender.
-pub type OAuthTokenNotifiers =
-    Arc<RwLock<HashMap<String, tokio::sync::watch::Sender<Option<String>>>>>;
+/// Per-endpoint shared OAuth adapter inner states, keyed by endpoint name.
+/// Used by the callback handler to apply tokens to the correct adapter.
+pub type OAuthAdapterInners = Arc<RwLock<HashMap<String, Arc<OAuthAdapterInner>>>>;
 use watcher::ConfigWatcher;
 
 #[derive(Parser)]
@@ -176,7 +176,7 @@ async fn main() {
                 };
             let token_manager = Arc::new(TokenManager::new(token_dir));
             let oauth_flow_manager = Arc::new(OAuthFlowManager::new());
-            let oauth_token_notifiers: OAuthTokenNotifiers = Arc::new(RwLock::new(HashMap::new()));
+            let oauth_adapter_inners: OAuthAdapterInners = Arc::new(RwLock::new(HashMap::new()));
 
             // Create adapter registry
             let registry = AdapterRegistry::new();
@@ -217,22 +217,24 @@ async fn main() {
 
                 // OAuth endpoints initialize inline (always fast)
                 if ep.transport == config::Transport::Oauth {
-                    let url = ep.url.clone().unwrap_or_default();
-                    let (tx, rx) = tokio::sync::watch::channel(None);
-                    oauth_token_notifiers
+                    let oauth_config = OAuthAdapterConfig {
+                        endpoint_name: ep.name.clone(),
+                        url: ep.url.clone().unwrap_or_default(),
+                        token_endpoint_url: format!(
+                            "{}/token",
+                            ep.oauth_server_url.as_deref().unwrap_or_default()
+                        ),
+                        client_id: ep.client_id.clone().unwrap_or_default(),
+                        client_secret: ep.client_secret.clone(),
+                    };
+
+                    let mut adapter = OAuthAdapter::new(oauth_config, token_manager.clone());
+                    let shared_inner = adapter.shared_inner();
+                    oauth_adapter_inners
                         .write()
                         .await
-                        .insert(ep.name.clone(), tx);
+                        .insert(ep.name.clone(), shared_inner);
 
-                    if let Ok(Some(token_set)) = token_manager.load(&ep.name).await {
-                        info!(endpoint = %ep.name, "Loaded existing OAuth tokens from disk");
-                        let notifiers = oauth_token_notifiers.read().await;
-                        if let Some(tx) = notifiers.get(&ep.name) {
-                            let _ = tx.send(Some(token_set.access_token));
-                        }
-                    }
-
-                    let mut adapter = OAuthAdapter::new(ep.name.clone(), url, rx);
                     adapter.initialize().await.ok();
                     info!(endpoint = %ep.name, "OAuth adapter initialized");
                     registry
@@ -283,9 +285,9 @@ async fn main() {
             for ep in deferred_init {
                 let reg = registry.clone();
                 let tm = token_manager.clone();
-                let otn = oauth_token_notifiers.clone();
+                let oai = oauth_adapter_inners.clone();
                 tokio::spawn(async move {
-                    let adapter = watcher::create_adapter(&ep, &tm, &otn).await;
+                    let adapter = watcher::create_adapter(&ep, &tm, &oai).await;
                     let mut entries = reg.entries().write().await;
                     if let Some(entry) = entries.get_mut(ep.name.as_str()) {
                         entry.adapter = adapter;
@@ -309,7 +311,7 @@ async fn main() {
                 meta_tool_handler,
                 oauth_flow_manager: Some(oauth_flow_manager.clone()),
                 token_manager: Some(token_manager.clone()),
-                oauth_token_notifiers: Some(oauth_token_notifiers.clone()),
+                oauth_adapter_inners: Some(oauth_adapter_inners.clone()),
             };
             let mgmt_state = management::ManagementState {
                 registry: registry.clone(),
@@ -318,6 +320,7 @@ async fn main() {
                 config_path: Some(config_path.clone()),
                 oauth_flow_manager: Some(oauth_flow_manager.clone()),
                 relay_port: port,
+                oauth_adapter_inners: Some(oauth_adapter_inners.clone()),
             };
             let router = build_router(state).merge(management::management_routes(mgmt_state));
             let addr: SocketAddr = ([0, 0, 0, 0], port).into();
@@ -334,7 +337,7 @@ async fn main() {
                         js_execution_mode.clone(),
                         token_manager.clone(),
                         oauth_flow_manager.clone(),
-                        oauth_token_notifiers.clone(),
+                        oauth_adapter_inners.clone(),
                     );
 
                     handle.await.ok();
