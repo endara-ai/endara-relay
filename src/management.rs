@@ -21,6 +21,7 @@ use crate::adapter::sse::{SseAdapter, SseConfig};
 use crate::adapter::stdio::{StdioAdapter, StdioConfig};
 use crate::adapter::HealthStatus;
 use crate::config::Config;
+use crate::oauth::{OAuthFlowManager, PkceChallenge};
 use crate::registry::AdapterRegistry;
 
 // ---------------------------------------------------------------------------
@@ -35,6 +36,10 @@ pub struct ManagementState {
     pub start_time: Instant,
     /// Path to the TOML config file on disk (used by DELETE endpoint).
     pub config_path: Option<PathBuf>,
+    /// OAuth flow manager (shared across management routes).
+    pub oauth_flow_manager: Option<Arc<OAuthFlowManager>>,
+    /// Port the relay is listening on (used to construct redirect_uri).
+    pub relay_port: u16,
 }
 
 // ---------------------------------------------------------------------------
@@ -477,9 +482,7 @@ async fn persist_disabled_state(state: &ManagementState) {
 ///
 /// Creates a temporary adapter from the provided config, initializes it,
 /// lists tools, then shuts it down. Returns success with tool info or an error.
-async fn test_connection(
-    Json(req): Json<TestConnectionRequest>,
-) -> impl IntoResponse {
+async fn test_connection(Json(req): Json<TestConnectionRequest>) -> impl IntoResponse {
     let transport = req.transport.to_lowercase();
 
     // Create a temporary adapter based on transport type
@@ -579,6 +582,135 @@ async fn test_connection(
 }
 
 // ---------------------------------------------------------------------------
+// OAuth route handlers
+// ---------------------------------------------------------------------------
+
+/// Response for POST /api/endpoints/:name/oauth/start
+#[derive(Serialize)]
+struct OAuthStartResponse {
+    authorize_url: String,
+}
+
+/// Response for GET /api/endpoints/:name/oauth/status
+#[derive(Serialize)]
+struct OAuthStatusResponse {
+    status: String,
+}
+
+/// POST /api/endpoints/:name/oauth/start
+///
+/// Generates a PKCE challenge, registers a pending flow, and returns the
+/// authorization URL that the user should open in a browser.
+async fn oauth_start(
+    State(state): State<ManagementState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    // Look up endpoint config
+    let config = state.config.read().await;
+    let ep = config.endpoints.iter().find(|e| e.name == name);
+    let Some(ep) = ep else {
+        return endpoint_not_found(&name).into_response();
+    };
+
+    let oauth_server_url = match &ep.oauth_server_url {
+        Some(url) => url.clone(),
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "endpoint is not configured for OAuth",
+                Some("Missing oauth_server_url in endpoint config"),
+            )
+            .into_response();
+        }
+    };
+    let client_id = match &ep.client_id {
+        Some(id) => id.clone(),
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "endpoint is not configured for OAuth",
+                Some("Missing client_id in endpoint config"),
+            )
+            .into_response();
+        }
+    };
+    let client_secret = ep.client_secret.clone();
+    let scopes = ep.scopes.clone();
+    drop(config);
+
+    let Some(ref flow_mgr) = state.oauth_flow_manager else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "OAuth not configured",
+            Some("OAuth flow manager not initialized"),
+        )
+        .into_response();
+    };
+
+    let pkce = PkceChallenge::generate();
+    let code_challenge = pkce.code_challenge.clone();
+
+    let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", state.relay_port);
+
+    let state_param = flow_mgr
+        .start_flow(
+            &name,
+            &oauth_server_url,
+            &client_id,
+            client_secret.as_deref(),
+            pkce,
+            &redirect_uri,
+        )
+        .await;
+
+    // Build the authorization URL
+    let mut authorize_url = format!(
+        "{}/authorize?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
+        oauth_server_url.trim_end_matches('/'),
+        urlencoding(&client_id),
+        urlencoding(&redirect_uri),
+        urlencoding(&state_param),
+        urlencoding(&code_challenge),
+    );
+
+    if let Some(ref scopes) = scopes {
+        let scope_str = scopes.join(" ");
+        authorize_url.push_str(&format!("&scope={}", urlencoding(&scope_str)));
+    }
+
+    Json(OAuthStartResponse { authorize_url }).into_response()
+}
+
+/// Simple URL encoding helper (percent-encode special chars).
+fn urlencoding(s: &str) -> String {
+    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+/// GET /api/endpoints/:name/oauth/status
+///
+/// Returns whether the endpoint is authenticated or needs login.
+async fn oauth_status(
+    State(state): State<ManagementState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let entries = state.registry.entries().read().await;
+    let Some(entry) = entries.get(&name) else {
+        return endpoint_not_found(&name).into_response();
+    };
+
+    let status = match entry.adapter.health() {
+        HealthStatus::Healthy => "authorized",
+        HealthStatus::Unhealthy(ref msg) if msg == "needs login" => "needs_login",
+        _ => "unhealthy",
+    };
+
+    Json(OAuthStatusResponse {
+        status: status.to_string(),
+    })
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Router builder
 // ---------------------------------------------------------------------------
 
@@ -602,6 +734,8 @@ pub fn management_routes(state: ManagementState) -> Router {
             "/api/endpoints/{name}/tools/{tool_name}/enable",
             post(enable_tool),
         )
+        .route("/api/endpoints/{name}/oauth/start", post(oauth_start))
+        .route("/api/endpoints/{name}/oauth/status", get(oauth_status))
         .route("/api/catalog", get(get_catalog))
         .route("/api/config", get(get_config))
         .route("/api/config/reload", post(reload_config))
@@ -646,6 +780,7 @@ async fn get_endpoint_tools(
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ToolInfoWithStatus {
     name: String,
     description: Option<String>,
@@ -859,6 +994,7 @@ mod tests {
             relay: RelayConfig {
                 machine_name: "test-machine".to_string(),
                 local_js_execution: None,
+                token_dir: None,
             },
             endpoints: vec![EndpointConfig {
                 name: "echo".to_string(),
@@ -875,6 +1011,10 @@ mod tests {
                 headers: None,
                 disabled: false,
                 disabled_tools: Vec::new(),
+                oauth_server_url: None,
+                client_id: None,
+                client_secret: None,
+                scopes: None,
             }],
         }
     }
@@ -883,7 +1023,13 @@ mod tests {
         let registry = AdapterRegistry::new();
         for (name, adapter) in adapters {
             registry
-                .register(name.to_string(), Box::new(adapter), "stdio".to_string(), None, Some(name.to_string()))
+                .register(
+                    name.to_string(),
+                    Box::new(adapter),
+                    "stdio".to_string(),
+                    None,
+                    Some(name.to_string()),
+                )
                 .await;
         }
         ManagementState {
@@ -891,6 +1037,8 @@ mod tests {
             config: Arc::new(RwLock::new(test_config())),
             start_time: Instant::now(),
             config_path: None,
+            oauth_flow_manager: None,
+            relay_port: 9400,
         }
     }
 
@@ -985,6 +1133,14 @@ mod tests {
         let arr = body.as_array().unwrap();
         assert_eq!(arr.len(), 1);
         assert_eq!(arr[0]["name"], "read_file");
+        assert!(
+            arr[0].get("inputSchema").is_some(),
+            "should use camelCase inputSchema"
+        );
+        assert!(
+            arr[0].get("input_schema").is_none(),
+            "should NOT use snake_case input_schema"
+        );
     }
 
     #[tokio::test]
@@ -1375,6 +1531,14 @@ command = "echo"
         let arr = body.as_array().unwrap();
         let read_tool = arr.iter().find(|t| t["name"] == "read").unwrap();
         assert_eq!(read_tool["disabled"], true);
+        assert!(
+            read_tool.get("inputSchema").is_some(),
+            "should use camelCase inputSchema"
+        );
+        assert!(
+            read_tool.get("input_schema").is_none(),
+            "should NOT use snake_case input_schema"
+        );
         let write_tool = arr.iter().find(|t| t["name"] == "write").unwrap();
         assert_eq!(write_tool["disabled"], false);
     }
@@ -1447,7 +1611,10 @@ command = "echo"
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let body = body_json(resp).await;
         assert_eq!(body["success"], false);
-        assert!(body["error"].as_str().unwrap().contains("Unknown transport"));
+        assert!(body["error"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown transport"));
     }
 
     #[tokio::test]

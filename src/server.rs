@@ -1,24 +1,29 @@
 use crate::js_sandbox::MetaToolHandler;
+use crate::oauth::OAuthFlowManager;
 use crate::registry::AdapterRegistry;
+use crate::token_manager::TokenManager;
+use crate::OAuthTokenNotifiers;
 use axum::{
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive},
-        Sse,
+        Html, Sse,
     },
     routing::{get, post},
     Json, Router,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
+
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::CorsLayer;
-use tracing::info;
+use tracing::{error, info, warn};
 
 /// Application state shared across all routes.
 #[derive(Clone)]
@@ -26,6 +31,12 @@ pub struct AppState {
     pub registry: AdapterRegistry,
     pub js_execution_mode: Arc<AtomicBool>,
     pub meta_tool_handler: Arc<MetaToolHandler>,
+    /// OAuth flow manager (shared with management routes).
+    pub oauth_flow_manager: Option<Arc<OAuthFlowManager>>,
+    /// Token manager for persisting OAuth tokens.
+    pub token_manager: Option<Arc<TokenManager>>,
+    /// Per-endpoint token notifiers: endpoint_name -> watch::Sender.
+    pub oauth_token_notifiers: Option<OAuthTokenNotifiers>,
 }
 
 /// JSON-RPC request body expected by MCP routes.
@@ -234,6 +245,173 @@ async fn mcp_sse() -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infalli
     Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
 }
 
+/// Query params for the OAuth callback.
+#[derive(Deserialize)]
+struct OAuthCallbackParams {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+/// GET /oauth/callback
+///
+/// The OAuth authorization server redirects the user's browser here after login.
+/// Exchanges the authorization code for tokens, saves them, and signals the adapter.
+async fn oauth_callback(
+    State(state): State<AppState>,
+    Query(params): Query<OAuthCallbackParams>,
+) -> Html<String> {
+    // Handle OAuth error
+    if let Some(ref err) = params.error {
+        warn!(error = %err, "OAuth callback received error");
+        return Html(format!(
+            "<html><body><h1>OAuth Error</h1><p>{}</p><p>You can close this window.</p></body></html>",
+            err
+        ));
+    }
+
+    let code = match params.code {
+        Some(c) => c,
+        None => {
+            return Html(
+                "<html><body><h1>OAuth Error</h1><p>Missing authorization code.</p><p>You can close this window.</p></body></html>"
+                    .to_string(),
+            );
+        }
+    };
+    let state_param = match params.state {
+        Some(s) => s,
+        None => {
+            return Html(
+                "<html><body><h1>OAuth Error</h1><p>Missing state parameter.</p><p>You can close this window.</p></body></html>"
+                    .to_string(),
+            );
+        }
+    };
+
+    let Some(ref flow_mgr) = state.oauth_flow_manager else {
+        return Html(
+            "<html><body><h1>OAuth Error</h1><p>OAuth not configured.</p></body></html>"
+                .to_string(),
+        );
+    };
+
+    let flow = match flow_mgr.consume_flow(&state_param).await {
+        Some(f) => f,
+        None => {
+            warn!(state = %state_param, "Invalid or expired OAuth state");
+            return Html(
+                "<html><body><h1>OAuth Error</h1><p>Invalid or expired login session. Please try again.</p><p>You can close this window.</p></body></html>"
+                    .to_string(),
+            );
+        }
+    };
+
+    // Exchange authorization code for tokens
+    let client = reqwest::Client::new();
+    let mut form_parts: Vec<(String, String)> = vec![
+        ("grant_type".into(), "authorization_code".into()),
+        ("code".into(), code),
+        ("redirect_uri".into(), flow.redirect_uri.clone()),
+        ("client_id".into(), flow.client_id.clone()),
+        ("code_verifier".into(), flow.code_verifier.clone()),
+    ];
+    if let Some(ref secret) = flow.client_secret {
+        form_parts.push(("client_secret".into(), secret.clone()));
+    }
+
+    let form_body: String = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(form_parts.iter())
+        .finish();
+
+    let token_response: reqwest::Response = match client
+        .post(&flow.token_endpoint)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(form_body)
+        .send()
+        .await
+    {
+        Ok(resp) => resp,
+        Err(e) => {
+            error!(error = %e, "Failed to exchange authorization code");
+            return Html(format!(
+                "<html><body><h1>OAuth Error</h1><p>Failed to exchange code: {}</p><p>You can close this window.</p></body></html>",
+                e
+            ));
+        }
+    };
+
+    if !token_response.status().is_success() {
+        let status = token_response.status();
+        let body = token_response.text().await.unwrap_or_default();
+        error!(%status, body = %body, "Token endpoint returned error");
+        return Html(format!(
+            "<html><body><h1>OAuth Error</h1><p>Token endpoint returned {}: {}</p><p>You can close this window.</p></body></html>",
+            status, body
+        ));
+    }
+
+    let token_json: serde_json::Value = match token_response.json().await {
+        Ok(v) => v,
+        Err(e) => {
+            error!(error = %e, "Failed to parse token response");
+            return Html(format!(
+                "<html><body><h1>OAuth Error</h1><p>Invalid token response: {}</p><p>You can close this window.</p></body></html>",
+                e
+            ));
+        }
+    };
+
+    let access_token = token_json["access_token"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    if access_token.is_empty() {
+        return Html(
+            "<html><body><h1>OAuth Error</h1><p>No access_token in response.</p><p>You can close this window.</p></body></html>"
+                .to_string(),
+        );
+    }
+
+    let token_set = crate::token_manager::TokenSet {
+        access_token: access_token.clone(),
+        refresh_token: token_json["refresh_token"].as_str().map(|s| s.to_string()),
+        expires_at: token_json["expires_in"].as_u64().map(|secs| {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                + secs
+        }),
+        token_type: token_json["token_type"]
+            .as_str()
+            .unwrap_or("Bearer")
+            .to_string(),
+        scope: token_json["scope"].as_str().map(|s| s.to_string()),
+    };
+
+    // Save tokens to disk
+    if let Some(ref tm) = state.token_manager {
+        if let Err(e) = tm.save(&flow.endpoint_name, &token_set).await {
+            error!(endpoint = %flow.endpoint_name, error = %e, "Failed to save tokens");
+        }
+    }
+
+    // Signal the adapter via watch channel
+    if let Some(ref notifiers) = state.oauth_token_notifiers {
+        let notifiers = notifiers.read().await;
+        if let Some(tx) = notifiers.get(&flow.endpoint_name) {
+            let _ = tx.send(Some(access_token));
+            info!(endpoint = %flow.endpoint_name, "Token notification sent to adapter");
+        }
+    }
+
+    Html(format!(
+        "<html><body><h1>Login Successful</h1><p>Endpoint <strong>{}</strong> is now authenticated.</p><p>You can close this window.</p></body></html>",
+        flow.endpoint_name
+    ))
+}
+
 /// Build the axum Router with all MCP routes.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
@@ -241,6 +419,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/mcp/tools/list", post(mcp_tools_list))
         .route("/mcp/tools/call", post(mcp_tools_call))
         .route("/mcp/sse", get(mcp_sse))
+        .route("/oauth/callback", get(oauth_callback))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }

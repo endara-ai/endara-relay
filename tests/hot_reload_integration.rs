@@ -7,9 +7,12 @@ use endara_relay::adapter::stdio::{StdioAdapter, StdioConfig};
 use endara_relay::adapter::McpAdapter;
 use endara_relay::config;
 use endara_relay::registry::AdapterRegistry;
+use endara_relay::token_manager::TokenManager;
 use endara_relay::watcher;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 fn echo_script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -35,7 +38,13 @@ async fn test_config_diff_add_endpoint() {
     let mut echo_adapter = StdioAdapter::new(echo_config);
     echo_adapter.initialize().await.expect("echo init failed");
     registry
-        .register("echo-ep".into(), Box::new(echo_adapter), "stdio".into(), None, Some("echo_ep".into()))
+        .register(
+            "echo-ep".into(),
+            Box::new(echo_adapter),
+            "stdio".into(),
+            None,
+            Some("echo_ep".into()),
+        )
         .await;
 
     // Verify initial state: 1 endpoint
@@ -47,11 +56,12 @@ async fn test_config_diff_add_endpoint() {
         relay: config::RelayConfig {
             machine_name: "testmachine".to_string(),
             local_js_execution: None,
+            token_dir: None,
         },
         endpoints: vec![config::EndpointConfig {
             name: "echo-ep".to_string(),
-                description: None,
-                tool_prefix: None,
+            description: None,
+            tool_prefix: None,
             transport: config::Transport::Stdio,
             command: Some("bash".to_string()),
             args: Some(vec![echo_script_path().to_string_lossy().to_string()]),
@@ -60,6 +70,10 @@ async fn test_config_diff_add_endpoint() {
             headers: None,
             disabled: false,
             disabled_tools: Vec::new(),
+            oauth_server_url: None,
+            client_id: None,
+            client_secret: None,
+            scopes: None,
         }],
     };
 
@@ -67,6 +81,7 @@ async fn test_config_diff_add_endpoint() {
         relay: config::RelayConfig {
             machine_name: "testmachine".to_string(),
             local_js_execution: None,
+            token_dir: None,
         },
         endpoints: vec![
             config::EndpointConfig {
@@ -81,6 +96,10 @@ async fn test_config_diff_add_endpoint() {
                 headers: None,
                 disabled: false,
                 disabled_tools: Vec::new(),
+                oauth_server_url: None,
+                client_id: None,
+                client_secret: None,
+                scopes: None,
             },
             config::EndpointConfig {
                 name: "multi-ep".to_string(),
@@ -94,6 +113,10 @@ async fn test_config_diff_add_endpoint() {
                 headers: None,
                 disabled: false,
                 disabled_tools: Vec::new(),
+                oauth_server_url: None,
+                client_id: None,
+                client_secret: None,
+                scopes: None,
             },
         ],
     };
@@ -104,7 +127,15 @@ async fn test_config_diff_add_endpoint() {
     assert_eq!(diff.unchanged.len(), 1);
 
     // Apply the diff
-    watcher::apply_diff(&diff, &registry).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+    let oauth_token_notifiers: Arc<
+        RwLock<HashMap<String, tokio::sync::watch::Sender<Option<String>>>>,
+    > = Arc::new(RwLock::new(HashMap::new()));
+    watcher::apply_diff(&diff, &registry, &token_manager, &oauth_token_notifiers).await;
+
+    // Wait for background initialization to complete
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     // Verify the new endpoint was added
     let catalog = registry.merged_catalog().await;
@@ -127,7 +158,13 @@ async fn test_config_diff_remove_endpoint() {
     let mut echo_adapter = StdioAdapter::new(echo_config);
     echo_adapter.initialize().await.expect("echo init failed");
     registry
-        .register("echo-ep".into(), Box::new(echo_adapter), "stdio".into(), None, Some("echo_ep".into()))
+        .register(
+            "echo-ep".into(),
+            Box::new(echo_adapter),
+            "stdio".into(),
+            None,
+            Some("echo_ep".into()),
+        )
         .await;
 
     let multi_config = StdioConfig {
@@ -138,7 +175,13 @@ async fn test_config_diff_remove_endpoint() {
     let mut multi_adapter = StdioAdapter::new(multi_config);
     multi_adapter.initialize().await.expect("multi init failed");
     registry
-        .register("multi-ep".into(), Box::new(multi_adapter), "stdio".into(), None, Some("multi_ep".into()))
+        .register(
+            "multi-ep".into(),
+            Box::new(multi_adapter),
+            "stdio".into(),
+            None,
+            Some("multi_ep".into()),
+        )
         .await;
 
     let catalog = registry.merged_catalog().await;
@@ -149,6 +192,7 @@ async fn test_config_diff_remove_endpoint() {
         relay: config::RelayConfig {
             machine_name: "testmachine".to_string(),
             local_js_execution: None,
+            token_dir: None,
         },
         endpoints: vec![
             config::EndpointConfig {
@@ -163,6 +207,10 @@ async fn test_config_diff_remove_endpoint() {
                 headers: None,
                 disabled: false,
                 disabled_tools: Vec::new(),
+                oauth_server_url: None,
+                client_id: None,
+                client_secret: None,
+                scopes: None,
             },
             config::EndpointConfig {
                 name: "multi-ep".to_string(),
@@ -176,6 +224,10 @@ async fn test_config_diff_remove_endpoint() {
                 headers: None,
                 disabled: false,
                 disabled_tools: Vec::new(),
+                oauth_server_url: None,
+                client_id: None,
+                client_secret: None,
+                scopes: None,
             },
         ],
     };
@@ -184,11 +236,12 @@ async fn test_config_diff_remove_endpoint() {
         relay: config::RelayConfig {
             machine_name: "testmachine".to_string(),
             local_js_execution: None,
+            token_dir: None,
         },
         endpoints: vec![config::EndpointConfig {
             name: "echo-ep".to_string(),
-                description: None,
-                tool_prefix: None,
+            description: None,
+            tool_prefix: None,
             transport: config::Transport::Stdio,
             command: Some("bash".to_string()),
             args: Some(vec![echo_script_path().to_string_lossy().to_string()]),
@@ -197,6 +250,10 @@ async fn test_config_diff_remove_endpoint() {
             headers: None,
             disabled: false,
             disabled_tools: Vec::new(),
+            oauth_server_url: None,
+            client_id: None,
+            client_secret: None,
+            scopes: None,
         }],
     };
 
@@ -204,7 +261,12 @@ async fn test_config_diff_remove_endpoint() {
     assert_eq!(diff.removed.len(), 1);
     assert_eq!(diff.removed[0], "multi-ep");
 
-    watcher::apply_diff(&diff, &registry).await;
+    let tmp2 = tempfile::tempdir().unwrap();
+    let token_manager2 = Arc::new(TokenManager::new(tmp2.path().to_path_buf()));
+    let oauth_token_notifiers2: Arc<
+        RwLock<HashMap<String, tokio::sync::watch::Sender<Option<String>>>>,
+    > = Arc::new(RwLock::new(HashMap::new()));
+    watcher::apply_diff(&diff, &registry, &token_manager2, &oauth_token_notifiers2).await;
 
     // Verify the endpoint was removed
     let catalog = registry.merged_catalog().await;

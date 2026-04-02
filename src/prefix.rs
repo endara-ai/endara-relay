@@ -47,9 +47,9 @@ pub fn decode_tool_name(prefixed: &str) -> Result<(String, Option<String>, Strin
         .next()
         .ok_or_else(|| PrefixError::InvalidFormat("empty string".to_string()))?;
 
-    let second = parts.next().ok_or_else(|| {
-        PrefixError::InvalidFormat(format!("missing segment in '{}'", prefixed))
-    })?;
+    let second = parts
+        .next()
+        .ok_or_else(|| PrefixError::InvalidFormat(format!("missing segment in '{}'", prefixed)))?;
 
     if server_type.is_empty() || second.is_empty() {
         return Err(PrefixError::InvalidFormat(format!(
@@ -105,10 +105,7 @@ mod tests {
 
     #[test]
     fn test_encode_without_instance() {
-        assert_eq!(
-            encode_tool_name("echo_mcp", None, "echo"),
-            "echo_mcp__echo"
-        );
+        assert_eq!(encode_tool_name("echo_mcp", None, "echo"), "echo_mcp__echo");
     }
 
     #[test]
@@ -201,18 +198,12 @@ mod tests {
 
     #[test]
     fn test_sanitize_name_special_chars() {
-        assert_eq!(
-            sanitize_name("server@v2.0!"),
-            Some("serverv20".to_string())
-        );
+        assert_eq!(sanitize_name("server@v2.0!"), Some("serverv20".to_string()));
     }
 
     #[test]
     fn test_sanitize_name_uppercase() {
-        assert_eq!(
-            sanitize_name("MyServer"),
-            Some("myserver".to_string())
-        );
+        assert_eq!(sanitize_name("MyServer"), Some("myserver".to_string()));
     }
 
     #[test]

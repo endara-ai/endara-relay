@@ -1,6 +1,7 @@
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::jsonrpc::{self, JsonRpcResponse};
 use crate::prefix;
+use crate::shell_env;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -183,10 +184,21 @@ impl StdioAdapter {
 
         let mut cmd = Command::new(&self.config.command);
         cmd.args(&self.config.args)
-            .envs(&self.config.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        // Inject the user's login-shell PATH so that commands installed via
+        // nvm, Homebrew, pyenv, etc. are discoverable even when the relay
+        // runs as a Tauri sidecar with a minimal inherited environment.
+        if let Some(shell_path) = shell_env::resolve_shell_path() {
+            if !self.config.env.contains_key("PATH") {
+                cmd.env("PATH", shell_path);
+            }
+        }
+
+        // User-specified env vars always win (applied after shell PATH).
+        cmd.envs(&self.config.env);
 
         let mut child = cmd.spawn().map_err(|e| {
             AdapterError::ProcessSpawnFailed(format!("{}: {}", self.config.command, e))

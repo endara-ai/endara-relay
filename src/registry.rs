@@ -29,7 +29,6 @@ impl Default for AdapterRegistry {
     }
 }
 
-
 impl AdapterRegistry {
     /// Create a new, empty adapter registry.
     pub fn new() -> Self {
@@ -844,9 +843,7 @@ mod tests {
             .await;
 
         // Single server → no prefix
-        let result = registry
-            .route_tool_call("read", json!({}))
-            .await;
+        let result = registry.route_tool_call("read", json!({})).await;
         assert!(result.is_err());
         let err_msg = format!("{}", result.unwrap_err());
         assert!(err_msg.contains("unavailable"));
@@ -892,10 +889,7 @@ mod tests {
         assert!(names.contains(&"fs-remote__read"));
         assert!(names.contains(&"fs-remote__write"));
 
-        let local_read = catalog
-            .iter()
-            .find(|t| t.name == "fs-local__read")
-            .unwrap();
+        let local_read = catalog.iter().find(|t| t.name == "fs-local__read").unwrap();
         assert_eq!(
             local_read.description.as_deref(),
             Some("[Local FS] read tool")
@@ -936,16 +930,10 @@ mod tests {
         let catalog = registry.merged_catalog().await;
         assert_eq!(catalog.len(), 2);
 
-        let ok_tool = catalog
-            .iter()
-            .find(|t| t.name == "fs-ok__read")
-            .unwrap();
+        let ok_tool = catalog.iter().find(|t| t.name == "fs-ok__read").unwrap();
         assert_eq!(ok_tool.description.as_deref(), Some("[fs-ok] read tool"));
 
-        let down_tool = catalog
-            .iter()
-            .find(|t| t.name == "fs-down__read")
-            .unwrap();
+        let down_tool = catalog.iter().find(|t| t.name == "fs-down__read").unwrap();
         assert_eq!(
             down_tool.description.as_deref(),
             Some("[⚠️ UNAVAILABLE] [fs-down] read tool")

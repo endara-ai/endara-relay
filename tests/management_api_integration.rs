@@ -82,6 +82,7 @@ fn test_config() -> Config {
         relay: RelayConfig {
             machine_name: "test-machine".to_string(),
             local_js_execution: None,
+            token_dir: None,
         },
         endpoints: vec![EndpointConfig {
             name: "echo".to_string(),
@@ -95,6 +96,10 @@ fn test_config() -> Config {
             headers: None,
             disabled: false,
             disabled_tools: Vec::new(),
+            oauth_server_url: None,
+            client_id: None,
+            client_secret: None,
+            scopes: None,
         }],
     }
 }
@@ -105,7 +110,13 @@ async fn start_management_server(
     let registry = AdapterRegistry::new();
     for (name, adapter) in adapters {
         registry
-            .register(name.to_string(), Box::new(adapter), "stdio".to_string(), None, Some(name.to_string()))
+            .register(
+                name.to_string(),
+                Box::new(adapter),
+                "stdio".to_string(),
+                None,
+                Some(name.to_string()),
+            )
             .await;
     }
     let registry = Arc::new(registry);
@@ -114,6 +125,8 @@ async fn start_management_server(
         config: Arc::new(tokio::sync::RwLock::new(test_config())),
         start_time: Instant::now(),
         config_path: None,
+        oauth_flow_manager: None,
+        relay_port: 9400,
     };
 
     let app = management_routes(state);
@@ -282,7 +295,13 @@ async fn start_management_server_with_config(
     let registry = AdapterRegistry::new();
     for (name, adapter) in adapters {
         registry
-            .register(name.to_string(), Box::new(adapter), "stdio".to_string(), None, Some(name.to_string()))
+            .register(
+                name.to_string(),
+                Box::new(adapter),
+                "stdio".to_string(),
+                None,
+                Some(name.to_string()),
+            )
             .await;
     }
     let registry = Arc::new(registry);
@@ -291,6 +310,8 @@ async fn start_management_server_with_config(
         config: Arc::new(tokio::sync::RwLock::new(test_config())),
         start_time: Instant::now(),
         config_path: Some(config_path),
+        oauth_flow_manager: None,
+        relay_port: 9400,
     };
 
     let app = management_routes(state);
@@ -418,18 +439,14 @@ async fn test_management_api_catalog() {
         .expect("write_file entry not found");
 
     // Check prefixed names: no collision, so format is {endpoint}__{tool}
-    assert!(
-        read_entry["name"]
-            .as_str()
-            .unwrap()
-            .contains("fs-ep__read_file")
-    );
-    assert!(
-        write_entry["name"]
-            .as_str()
-            .unwrap()
-            .contains("fs-ep__write_file")
-    );
+    assert!(read_entry["name"]
+        .as_str()
+        .unwrap()
+        .contains("fs-ep__read_file"));
+    assert!(write_entry["name"]
+        .as_str()
+        .unwrap()
+        .contains("fs-ep__write_file"));
 
     // Check source endpoint
     assert_eq!(read_entry["endpoint"], "fs-ep");
@@ -466,7 +483,10 @@ async fn test_management_api_test_connection_unknown_transport() {
     assert_eq!(resp.status().as_u16(), 400);
     let body: Value = resp.json().await.unwrap();
     assert_eq!(body["success"], false);
-    assert!(body["error"].as_str().unwrap().contains("Unknown transport"));
+    assert!(body["error"]
+        .as_str()
+        .unwrap()
+        .contains("Unknown transport"));
 }
 
 #[tokio::test]
@@ -489,7 +509,6 @@ async fn test_management_api_test_connection_bad_command() {
     assert_eq!(body["success"], false);
     assert!(body["error"].is_string());
 }
-
 
 #[tokio::test]
 async fn test_management_api_catalog_with_unhealthy_endpoints() {
@@ -533,7 +552,12 @@ async fn test_management_api_catalog_with_unhealthy_endpoints() {
     let arr = body.as_array().unwrap();
 
     // All tools should be present: 1 healthy + 2 unhealthy = 3
-    assert_eq!(arr.len(), 3, "expected 3 catalog entries, got {}", arr.len());
+    assert_eq!(
+        arr.len(),
+        3,
+        "expected 3 catalog entries, got {}",
+        arr.len()
+    );
 
     // Find the healthy tool
     let read_entry = arr
@@ -550,7 +574,10 @@ async fn test_management_api_catalog_with_unhealthy_endpoints() {
         .expect("ping entry not found");
     assert_eq!(ping_entry["available"], false);
     assert_eq!(ping_entry["endpoint"], "sick-ep");
-    assert_eq!(ping_entry["description"], "[⚠️ UNAVAILABLE] [sick-ep] Ping server");
+    assert_eq!(
+        ping_entry["description"],
+        "[⚠️ UNAVAILABLE] [sick-ep] Ping server"
+    );
 
     let status_entry = arr
         .iter()
@@ -569,11 +596,8 @@ async fn test_management_api_catalog_description_enriched() {
         input_schema: json!({"type": "object"}),
         annotations: None,
     }];
-    let (addr, _handle) = start_management_server(vec![(
-        "fs-ep",
-        MockAdapter::healthy_with_tools(tools),
-    )])
-    .await;
+    let (addr, _handle) =
+        start_management_server(vec![("fs-ep", MockAdapter::healthy_with_tools(tools))]).await;
     let client = reqwest::Client::new();
 
     let resp = client

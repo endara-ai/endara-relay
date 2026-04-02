@@ -29,7 +29,13 @@ async fn setup_server() -> (SocketAddr, AdapterRegistry, tokio::task::JoinHandle
     let mut adapter = StdioAdapter::new(config);
     adapter.initialize().await.expect("adapter init failed");
     registry
-        .register("echo-ep".into(), Box::new(adapter), "stdio".into(), None, Some("echo_ep".into()))
+        .register(
+            "echo-ep".into(),
+            Box::new(adapter),
+            "stdio".into(),
+            None,
+            Some("echo_ep".into()),
+        )
         .await;
 
     let registry_arc = Arc::new(registry.clone());
@@ -37,6 +43,9 @@ async fn setup_server() -> (SocketAddr, AdapterRegistry, tokio::task::JoinHandle
         registry: registry.clone(),
         js_execution_mode: Arc::new(AtomicBool::new(false)),
         meta_tool_handler: Arc::new(MetaToolHandler::new(registry_arc, Duration::from_secs(30))),
+        oauth_flow_manager: None,
+        token_manager: None,
+        oauth_token_notifiers: None,
     };
     let router = build_router(state);
     // Bind to port 0 to get a random available port
