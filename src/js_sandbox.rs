@@ -354,22 +354,47 @@ impl MetaToolHandler {
         serde_json::to_value(resp).map_err(|e| JsSandboxError::Internal(e.to_string()))
     }
 
-    /// `search_tools` — keyword search in name/description.
+    /// `search_tools` — token-based keyword search in name/description/endpoint.
     pub async fn search_tools(
         &self,
         query: &str,
         limit: Option<usize>,
     ) -> Result<Value, JsSandboxError> {
-        let catalog = self.registry.merged_catalog().await;
+        let (catalog, lookup) = self.registry.merged_catalog_with_lookup().await;
         let query_lower = query.to_lowercase();
+        let tokens: Vec<&str> = query_lower.split_whitespace().collect();
         let limit = limit.unwrap_or(20).min(200);
+
+        if tokens.is_empty() {
+            // Empty query returns first `limit` tools
+            let page: Vec<ToolInfoSlim> = catalog.iter().take(limit).map(Into::into).collect();
+            return serde_json::to_value(&page)
+                .map_err(|e| JsSandboxError::Internal(e.to_string()));
+        }
+
         let matches: Vec<ToolInfoSlim> = catalog
             .iter()
             .filter(|t| {
-                t.name.to_lowercase().contains(&query_lower)
-                    || t.description
-                        .as_ref()
-                        .is_some_and(|d| d.to_lowercase().contains(&query_lower))
+                let name_lower = t.name.to_lowercase();
+                let desc_lower = t
+                    .description
+                    .as_ref()
+                    .map(|d| d.to_lowercase())
+                    .unwrap_or_default();
+                // Also get endpoint name from lookup
+                let endpoint_lower = lookup
+                    .get(&t.name)
+                    .map(|(ep, _)| ep.to_lowercase())
+                    .unwrap_or_default();
+
+                // ALL tokens must match somewhere
+                tokens.iter().all(|token| {
+                    name_lower.contains(token)
+                        || desc_lower.contains(token)
+                        || endpoint_lower.contains(token)
+                        // Also check __ segments of the name
+                        || name_lower.split("__").any(|seg| seg.contains(token))
+                })
             })
             .take(limit)
             .map(Into::into)
@@ -516,6 +541,70 @@ mod tests {
         let result = handler.search_tools("ECHO", None).await.unwrap();
         let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
         assert_eq!(tools.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_search_tools_by_endpoint_name() {
+        // Multi-endpoint registry so tools get prefixed
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "todoist_mcp".into(),
+                Box::new(MockAdapter::new(vec![
+                    make_tool("get_tasks", "List tasks"),
+                    make_tool("create_task", "Create a task"),
+                ])),
+                "stdio".into(),
+                None,
+                Some("todoist_mcp".into()),
+            )
+            .await;
+        registry
+            .register(
+                "github_mcp".into(),
+                Box::new(MockAdapter::new(vec![make_tool(
+                    "list_issues",
+                    "List issues",
+                )])),
+                "stdio".into(),
+                None,
+                Some("github_mcp".into()),
+            )
+            .await;
+        let reg = Arc::new(registry);
+        let handler = MetaToolHandler::new(reg, Duration::from_secs(5));
+
+        // Search "todoist" should match tools from todoist_mcp endpoint
+        let result = handler.search_tools("todoist", None).await.unwrap();
+        let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
+        assert_eq!(tools.len(), 2);
+        assert!(tools.iter().all(|t| t.name.contains("todoist_mcp")));
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_search_tools_multi_word_query() {
+        let reg = make_registry().await;
+        let handler = MetaToolHandler::new(reg, Duration::from_secs(5));
+        // "echo tool" should match the echo tool (name contains "echo", desc contains "tool")
+        let result = handler.search_tools("echo tool", None).await.unwrap();
+        let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert!(tools[0].name.contains("echo"));
+
+        // "echo numbers" should NOT match anything (no single tool has both)
+        let result = handler.search_tools("echo numbers", None).await.unwrap();
+        let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
+        assert_eq!(tools.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_search_tools_empty_query() {
+        let reg = make_registry().await;
+        let handler = MetaToolHandler::new(reg, Duration::from_secs(5));
+        let result = handler.search_tools("", None).await.unwrap();
+        let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
+        // Empty query returns all tools (first page)
+        assert_eq!(tools.len(), 3);
     }
 
     // --- JS execution tests ---
