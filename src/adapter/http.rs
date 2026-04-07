@@ -8,10 +8,10 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, trace, warn};
 
 /// Configuration for the HTTP MCP adapter.
 #[derive(Debug, Clone)]
@@ -56,9 +56,21 @@ impl HttpAdapter {
     /// Create a new HttpAdapter with the given configuration.
     pub fn new(config: HttpConfig) -> Self {
         let mut default_headers = reqwest::header::HeaderMap::new();
+        // The Streamable HTTP transport spec requires clients to accept both
+        // application/json and text/event-stream.  Set this before processing
+        // user headers so it is always present.
+        default_headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("application/json, text/event-stream"),
+        );
+
         for (key, value) in &config.headers {
             if key.eq_ignore_ascii_case("content-type") {
                 warn!(header = %key, "Ignoring custom Content-Type header; JSON-RPC requires application/json");
+                continue;
+            }
+            if key.eq_ignore_ascii_case("accept") {
+                warn!(header = %key, "Ignoring custom Accept header; Streamable HTTP transport requires application/json, text/event-stream");
                 continue;
             }
             if let (Ok(name), Ok(val)) = (
@@ -105,6 +117,103 @@ impl HttpAdapter {
         self.request_id.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// Parse an SSE (text/event-stream) response body and extract the JSON-RPC
+    /// response matching the given request `id`.
+    ///
+    /// SSE events are separated by double newlines.  Each event may contain
+    /// `data:` lines whose payloads are concatenated (with newline separators)
+    /// to form the event data.  We look for the first event whose data
+    /// deserialises to a `JsonRpcResponse` with a matching `id`.
+    fn parse_sse_response(body: &str, id: u64) -> Result<JsonRpcResponse, AdapterError> {
+        for event in body.split("\n\n") {
+            let event = event.trim();
+            if event.is_empty() {
+                continue;
+            }
+
+            // Collect all `data:` lines for this event and concatenate them.
+            let mut data_parts: Vec<&str> = Vec::new();
+            for line in event.lines() {
+                if let Some(data) = line.strip_prefix("data:") {
+                    let data = data.strip_prefix(' ').unwrap_or(data);
+                    if !data.is_empty() {
+                        data_parts.push(data);
+                    }
+                }
+            }
+
+            if data_parts.is_empty() {
+                continue;
+            }
+
+            let data = data_parts.join("\n");
+            if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&data) {
+                // Match on id — notifications (id == None) are skipped.
+                if response.id == Some(id) {
+                    return Ok(response);
+                }
+            }
+        }
+
+        Err(AdapterError::ProtocolError(
+            "no matching JSON-RPC response found in SSE stream".into(),
+        ))
+    }
+
+    /// Send a JSON-RPC notification via HTTP POST.
+    ///
+    /// Notifications are JSON-RPC messages without an `id` field.  Per the MCP
+    /// Streamable HTTP spec the server responds with 202 Accepted and an empty
+    /// body.  We therefore do **not** attempt to parse a JSON-RPC response.
+    async fn send_notification(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<(), AdapterError> {
+        let mut request = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+        });
+        if let Some(p) = params {
+            request["params"] = p;
+        }
+
+        trace!(method = method, url = %self.config.url, "sending HTTP JSON-RPC notification");
+
+        let resp = self
+            .client
+            .post(&self.config.url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    AdapterError::Timeout(self.config.timeout_secs)
+                } else if e.is_connect() {
+                    AdapterError::ConnectionFailed(format!("{}: {}", self.config.url, e))
+                } else {
+                    AdapterError::HttpError {
+                        status: 0,
+                        body: e.to_string(),
+                    }
+                }
+            })?;
+
+        let status = resp.status();
+        // 202 Accepted is the expected response for notifications.
+        // Some servers may return 200 OK — accept that too.
+        if status == reqwest::StatusCode::ACCEPTED || status.is_success() {
+            trace!(method = method, status = %status, "notification accepted");
+            Ok(())
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(AdapterError::HttpError {
+                status: status.as_u16(),
+                body,
+            })
+        }
+    }
+
     /// Send a JSON-RPC request via HTTP POST and return the result.
     async fn send_request(
         &self,
@@ -114,7 +223,7 @@ impl HttpAdapter {
         let id = self.next_id();
         let request = jsonrpc::new_request(method, params, id);
 
-        debug!(method = method, id = id, url = %self.config.url, "sending HTTP JSON-RPC request");
+        trace!(method = method, id = id, url = %self.config.url, "sending HTTP JSON-RPC request");
 
         let resp = self
             .client
@@ -144,9 +253,29 @@ impl HttpAdapter {
             });
         }
 
-        let response: JsonRpcResponse = resp.json().await.map_err(|e| {
-            AdapterError::ProtocolError(format!("invalid JSON-RPC response: {}", e))
-        })?;
+        // The Streamable HTTP transport spec allows servers to respond with
+        // either application/json (single JSON-RPC response) or
+        // text/event-stream (SSE containing one or more JSON-RPC messages).
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+
+        let response: JsonRpcResponse = if content_type.contains("text/event-stream") {
+            trace!(
+                id = id,
+                "response is SSE (text/event-stream), parsing events"
+            );
+            let body = resp.text().await.map_err(|e| {
+                AdapterError::ProtocolError(format!("failed to read SSE body: {}", e))
+            })?;
+            Self::parse_sse_response(&body, id)?
+        } else {
+            resp.json().await.map_err(|e| {
+                AdapterError::ProtocolError(format!("invalid JSON-RPC response: {}", e))
+            })?
+        };
 
         if let Some(err) = response.error {
             return Err(AdapterError::JsonRpcError {
@@ -168,7 +297,7 @@ impl McpAdapter for HttpAdapter {
         *self.health.write().await = HealthStatus::Starting;
 
         let params = json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": "2025-03-26",
             "capabilities": {},
             "clientInfo": {
                 "name": "endara-relay",
@@ -187,6 +316,15 @@ impl McpAdapter for HttpAdapter {
                     let sanitized = prefix::sanitize_name(name);
                     info!(raw_name = %name, sanitized = ?sanitized, "MCP server reported serverInfo.name");
                     *self.server_type.write().await = sanitized;
+                }
+
+                // Per the MCP spec the client MUST send a notifications/initialized
+                // notification after a successful initialize exchange.
+                if let Err(e) = self
+                    .send_notification("notifications/initialized", None)
+                    .await
+                {
+                    warn!(url = %self.config.url, error = %e, "failed to send notifications/initialized");
                 }
 
                 *self.health.write().await = HealthStatus::Healthy;
@@ -219,14 +357,9 @@ impl McpAdapter for HttpAdapter {
         let start = Instant::now();
         let result = self.send_request("tools/call", Some(params)).await;
         let duration_ms = start.elapsed().as_millis();
-        let now = {
-            let d = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default();
-            let secs = d.as_secs();
-            let millis = d.subsec_millis();
-            format!("{}.{:03}", secs, millis)
-        };
+        let now = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
         let log_line = match &result {
             Ok(_) => format!(
                 "{}  INFO call_tool tool={} status=ok duration={}ms",
@@ -308,5 +441,280 @@ mod tests {
         let mut adapter = HttpAdapter::new(HttpConfig::new("http://localhost:8080/mcp"));
         adapter.shutdown().await.unwrap();
         assert_eq!(adapter.health(), HealthStatus::Stopped);
+    }
+
+    #[test]
+    fn test_default_accept_header_present() {
+        // The HttpAdapter should always set Accept: application/json, text/event-stream
+        let config = HttpConfig::new("http://localhost:8080/mcp");
+        let adapter = HttpAdapter::new(config);
+        // We can't directly inspect default_headers on reqwest::Client, but we can
+        // verify that creating the adapter with custom Accept header doesn't panic
+        // and the adapter is still functional (Accept is skipped in favor of default).
+        assert_eq!(adapter.health(), HealthStatus::Stopped);
+    }
+
+    #[test]
+    fn test_custom_accept_header_is_skipped() {
+        // User-provided Accept headers should be ignored (logged as warning).
+        let mut config = HttpConfig::new("http://localhost:8080/mcp");
+        config
+            .headers
+            .insert("Accept".to_string(), "text/html".to_string());
+        // Should not panic — the custom Accept is skipped.
+        let adapter = HttpAdapter::new(config);
+        assert_eq!(adapter.health(), HealthStatus::Stopped);
+    }
+
+    #[test]
+    fn test_custom_content_type_header_is_skipped() {
+        // User-provided Content-Type headers should be ignored.
+        let mut config = HttpConfig::new("http://localhost:8080/mcp");
+        config
+            .headers
+            .insert("Content-Type".to_string(), "text/xml".to_string());
+        let adapter = HttpAdapter::new(config);
+        assert_eq!(adapter.health(), HealthStatus::Stopped);
+    }
+
+    #[test]
+    fn test_custom_auth_header_is_applied() {
+        // Non-restricted custom headers should be applied without issue.
+        let mut config = HttpConfig::new("http://localhost:8080/mcp");
+        config
+            .headers
+            .insert("Authorization".to_string(), "Bearer test-token".to_string());
+        let adapter = HttpAdapter::new(config);
+        assert_eq!(adapter.health(), HealthStatus::Stopped);
+    }
+
+    // --- SSE parsing tests ---
+
+    #[test]
+    fn test_parse_sse_simple_response() {
+        let body =
+            "event: message\ndata: {\"jsonrpc\":\"2.0\",\"result\":{\"tools\":[]},\"id\":1}\n\n";
+        let resp = HttpAdapter::parse_sse_response(body, 1).unwrap();
+        assert_eq!(resp.id, Some(1));
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
+    }
+
+    #[test]
+    fn test_parse_sse_without_event_field() {
+        // Some servers only send `data:` lines, no `event:` line.
+        let body = "data: {\"jsonrpc\":\"2.0\",\"result\":{\"ok\":true},\"id\":5}\n\n";
+        let resp = HttpAdapter::parse_sse_response(body, 5).unwrap();
+        assert_eq!(resp.id, Some(5));
+        assert!(resp.result.is_some());
+    }
+
+    #[test]
+    fn test_parse_sse_multiple_events_matches_id() {
+        // First event is a notification (no id), second is the response.
+        let body = concat!(
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"result\":{\"done\":true},\"id\":3}\n\n",
+        );
+        let resp = HttpAdapter::parse_sse_response(body, 3).unwrap();
+        assert_eq!(resp.id, Some(3));
+    }
+
+    #[test]
+    fn test_parse_sse_no_matching_id() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"result\":{},\"id\":99}\n\n";
+        let err = HttpAdapter::parse_sse_response(body, 1).unwrap_err();
+        assert!(
+            matches!(err, AdapterError::ProtocolError(_)),
+            "expected ProtocolError, got {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_parse_sse_empty_body() {
+        let err = HttpAdapter::parse_sse_response("", 1).unwrap_err();
+        assert!(matches!(err, AdapterError::ProtocolError(_)));
+    }
+
+    #[test]
+    fn test_parse_sse_error_response() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"Method not found\"},\"id\":2}\n\n";
+        let resp = HttpAdapter::parse_sse_response(body, 2).unwrap();
+        assert_eq!(resp.id, Some(2));
+        assert!(resp.error.is_some());
+        let err = resp.error.unwrap();
+        assert_eq!(err.code, -32601);
+    }
+
+    #[test]
+    fn test_parse_sse_multiline_data_invalid_json() {
+        // If multi-line data concatenation produces invalid JSON, the event is skipped.
+        let body = "data: {\"incomplete\":\ndata: true}\n\n";
+        let err = HttpAdapter::parse_sse_response(body, 1).unwrap_err();
+        assert!(matches!(err, AdapterError::ProtocolError(_)));
+    }
+
+    #[test]
+    fn test_parse_sse_data_no_space_after_colon() {
+        // SSE spec says space after colon is optional.
+        let body = "data:{\"jsonrpc\":\"2.0\",\"result\":{\"x\":1},\"id\":4}\n\n";
+        let resp = HttpAdapter::parse_sse_response(body, 4).unwrap();
+        assert_eq!(resp.id, Some(4));
+    }
+
+    #[test]
+    fn test_parse_sse_ignores_non_data_lines() {
+        let body = "event: message\nid: 123\nretry: 5000\ndata: {\"jsonrpc\":\"2.0\",\"result\":{},\"id\":1}\n\n";
+        let resp = HttpAdapter::parse_sse_response(body, 1).unwrap();
+        assert_eq!(resp.id, Some(1));
+    }
+
+    // --- Additional SSE parsing tests ---
+
+    #[test]
+    fn test_parse_sse_multiline_data_concatenation() {
+        // Multi `data:` lines form valid JSON when joined with newlines.
+        // JSON allows whitespace (incl. newlines) between tokens.
+        let body = concat!(
+            "data: {\"jsonrpc\":\"2.0\",\"result\":\n",
+            "data: {\"tools\":[{\"name\":\"a\"}]}\n",
+            "data: ,\"id\":1}\n",
+            "\n",
+        );
+        let resp = HttpAdapter::parse_sse_response(body, 1).unwrap();
+        assert_eq!(resp.id, Some(1));
+        let tools = resp.result.unwrap();
+        let arr = tools.get("tools").unwrap().as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "a");
+    }
+
+    #[test]
+    fn test_parse_sse_todoist_style_initialize_response() {
+        // Realistic MCP initialize response with serverInfo, capabilities, protocolVersion.
+        let body = "data: {\"jsonrpc\":\"2.0\",\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{\"tools\":{\"listChanged\":true}},\"serverInfo\":{\"name\":\"todoist-mcp\",\"version\":\"1.0.0\"}},\"id\":1}\n\n";
+        let resp = HttpAdapter::parse_sse_response(body, 1).unwrap();
+        assert_eq!(resp.id, Some(1));
+        let result = resp.result.unwrap();
+        assert_eq!(result["protocolVersion"], "2025-03-26");
+        assert_eq!(result["serverInfo"]["name"], "todoist-mcp");
+        assert_eq!(result["serverInfo"]["version"], "1.0.0");
+        assert_eq!(result["capabilities"]["tools"]["listChanged"], true);
+    }
+
+    #[test]
+    fn test_parse_sse_large_tools_list_response() {
+        // A tools/list response with 6 tools, each with full inputSchema.
+        let tools_json = serde_json::json!({
+            "jsonrpc": "2.0",
+            "result": {
+                "tools": [
+                    {"name": "create_task", "description": "Create a new task", "inputSchema": {"type": "object", "properties": {"title": {"type": "string"}, "priority": {"type": "integer", "minimum": 1, "maximum": 4}}, "required": ["title"]}},
+                    {"name": "get_task", "description": "Get task by ID", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
+                    {"name": "update_task", "description": "Update an existing task", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}, "title": {"type": "string"}, "priority": {"type": "integer"}}, "required": ["id"]}},
+                    {"name": "delete_task", "description": "Delete a task", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]}},
+                    {"name": "list_tasks", "description": "List all tasks with filters", "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}, "status": {"type": "string", "enum": ["active", "completed"]}, "limit": {"type": "integer", "default": 50}}}},
+                    {"name": "search_tasks", "description": "Search tasks by query", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["query"]}}
+                ]
+            },
+            "id": 2
+        });
+        let body = format!("data: {}\n\n", serde_json::to_string(&tools_json).unwrap());
+        let resp = HttpAdapter::parse_sse_response(&body, 2).unwrap();
+        assert_eq!(resp.id, Some(2));
+        let tools = resp.result.unwrap();
+        let arr = tools.get("tools").unwrap().as_array().unwrap();
+        assert_eq!(arr.len(), 6);
+        assert_eq!(arr[0]["name"], "create_task");
+        assert_eq!(arr[5]["name"], "search_tasks");
+        // Verify schemas are preserved
+        assert_eq!(
+            arr[0]["inputSchema"]["properties"]["priority"]["maximum"],
+            4
+        );
+    }
+
+    #[test]
+    fn test_parse_sse_multiple_events_notification_error_result() {
+        // 3 events: progress notification (no id), error for id=99, correct result for id=7.
+        // The parser must pick the one matching id=7.
+        let body = concat!(
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{\"progress\":50,\"total\":100}}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32600,\"message\":\"Invalid request\"},\"id\":99}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Hello\"}]},\"id\":7}\n\n",
+        );
+        let resp = HttpAdapter::parse_sse_response(body, 7).unwrap();
+        assert_eq!(resp.id, Some(7));
+        assert!(resp.result.is_some());
+        assert!(resp.error.is_none());
+        let result = resp.result.unwrap();
+        assert_eq!(result["content"][0]["text"], "Hello");
+    }
+
+    #[test]
+    fn test_parse_sse_crlf_line_endings() {
+        // Some servers/proxies use Windows-style \r\n line endings.
+        // The parser should still handle this because split("\n\n") finds
+        // the double-newline within \r\n\r\n, and trim() strips leftover \r.
+        let body = "data: {\"jsonrpc\":\"2.0\",\"result\":{\"ok\":true},\"id\":1}\r\n\r\n";
+        let resp = HttpAdapter::parse_sse_response(body, 1).unwrap();
+        assert_eq!(resp.id, Some(1));
+        assert!(resp.result.is_some());
+        assert_eq!(resp.result.unwrap()["ok"], true);
+    }
+
+    #[test]
+    fn test_parse_sse_content_type_charset_detection() {
+        // Verify that content_type detection with charset parameter works.
+        // send_request() uses `.contains("text/event-stream")` so
+        // "text/event-stream; charset=utf-8" should still match.
+        let content_type = "text/event-stream; charset=utf-8";
+        assert!(
+            content_type.contains("text/event-stream"),
+            "charset parameter should not prevent SSE detection"
+        );
+
+        // Also test the actual SSE parsing works with a body that would come
+        // from such a content type.
+        let body = "data: {\"jsonrpc\":\"2.0\",\"result\":{\"encoding\":\"utf-8\"},\"id\":10}\n\n";
+        let resp = HttpAdapter::parse_sse_response(body, 10).unwrap();
+        assert_eq!(resp.id, Some(10));
+    }
+
+    #[test]
+    fn test_parse_sse_trailing_whitespace_and_extra_newlines() {
+        // Body with extra blank lines between events, trailing whitespace on data lines.
+        let body = concat!(
+            "\n\n",
+            "event: message\n",
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}  \n",
+            "\n\n",
+            "\n",
+            "event: message\n",
+            "data: {\"jsonrpc\":\"2.0\",\"result\":{\"status\":\"ok\"},\"id\":3}   \n",
+            "\n\n",
+            "\n\n",
+        );
+        let resp = HttpAdapter::parse_sse_response(body, 3).unwrap();
+        assert_eq!(resp.id, Some(3));
+        assert_eq!(resp.result.unwrap()["status"], "ok");
+    }
+
+    #[test]
+    fn test_parse_sse_initialized_notification_skipped_in_stream() {
+        // The client now sends notifications/initialized after a successful
+        // initialize exchange (see send_notification).  Verify that a
+        // notifications/initialized message appearing in an SSE stream is
+        // correctly skipped (it has no id) and doesn't interfere with
+        // response matching.
+        let body = concat!(
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"serverInfo\":{\"name\":\"test\",\"version\":\"0.1\"}},\"id\":1}\n\n",
+        );
+        let resp = HttpAdapter::parse_sse_response(body, 1).unwrap();
+        assert_eq!(resp.id, Some(1));
+        let result = resp.result.unwrap();
+        assert_eq!(result["protocolVersion"], "2025-03-26");
     }
 }

@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -457,14 +457,9 @@ impl McpAdapter for SseAdapter {
         let start = Instant::now();
         let result = self.send_request("tools/call", Some(params)).await;
         let duration_ms = start.elapsed().as_millis();
-        let now = {
-            let d = SystemTime::now()
-                .duration_since(SystemTime::UNIX_EPOCH)
-                .unwrap_or_default();
-            let secs = d.as_secs();
-            let millis = d.subsec_millis();
-            format!("{}.{:03}", secs, millis)
-        };
+        let now = chrono::Utc::now()
+            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+            .to_string();
         let log_line = match &result {
             Ok(_) => format!(
                 "{}  INFO call_tool tool={} status=ok duration={}ms",
