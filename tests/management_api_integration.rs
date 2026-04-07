@@ -100,6 +100,7 @@ fn test_config() -> Config {
             client_id: None,
             client_secret: None,
             scopes: None,
+            token_endpoint: None,
         }],
     }
 }
@@ -128,6 +129,8 @@ async fn start_management_server(
         oauth_flow_manager: None,
         relay_port: 9400,
         oauth_adapter_inners: None,
+        token_manager: None,
+        setup_manager: None,
     };
 
     let app = management_routes(state);
@@ -314,6 +317,8 @@ async fn start_management_server_with_config(
         oauth_flow_manager: None,
         relay_port: 9400,
         oauth_adapter_inners: None,
+        token_manager: None,
+        setup_manager: None,
     };
 
     let app = management_routes(state);
@@ -326,6 +331,80 @@ async fn start_management_server_with_config(
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     (addr, handle)
+}
+
+#[tokio::test]
+async fn test_management_api_config_reload() {
+    // Write a temp config file with one endpoint
+    let dir = std::env::temp_dir().join(format!("relay-integ-reload-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config_file = dir.join("config.toml");
+    let initial_toml = r#"[relay]
+machine_name = "test-machine"
+
+[[endpoints]]
+name = "echo-ep"
+transport = "stdio"
+command = "echo"
+args = ["hello"]
+"#;
+    std::fs::write(&config_file, initial_toml).unwrap();
+
+    let (addr, _handle) = start_management_server_with_config(
+        vec![("echo-ep", MockAdapter::healthy_with_tools(vec![]))],
+        config_file.clone(),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    // Modify config file on disk to add a second endpoint
+    let updated_toml = r#"[relay]
+machine_name = "test-machine"
+
+[[endpoints]]
+name = "echo-ep"
+transport = "stdio"
+command = "echo"
+args = ["hello"]
+
+[[endpoints]]
+name = "new-ep"
+transport = "stdio"
+command = "cat"
+"#;
+    std::fs::write(&config_file, updated_toml).unwrap();
+
+    // POST /api/config/reload
+    let resp = client
+        .post(format!("http://{}/api/config/reload", addr))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+    assert_eq!(body["message"], "config reloaded");
+
+    // Allow a moment for the adapter to initialize
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // GET /api/endpoints — should now include the new endpoint
+    let resp = client
+        .get(format!("http://{}/api/endpoints", addr))
+        .send()
+        .await
+        .expect("request failed");
+    assert!(resp.status().is_success());
+    let endpoints: Value = resp.json().await.unwrap();
+    let arr = endpoints.as_array().unwrap();
+    let names: Vec<&str> = arr.iter().filter_map(|e| e["name"].as_str()).collect();
+    assert!(
+        names.contains(&"new-ep"),
+        "Expected new-ep in endpoints, got: {:?}",
+        names
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

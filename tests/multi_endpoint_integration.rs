@@ -82,6 +82,7 @@ async fn setup_multi_endpoint_server() -> (SocketAddr, AdapterRegistry, tokio::t
         oauth_flow_manager: None,
         token_manager: None,
         oauth_adapter_inners: None,
+        setup_manager: None,
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
@@ -203,7 +204,7 @@ async fn test_multi_endpoint_overlapping_tool_names() {
         adapter
             .initialize()
             .await
-            .expect(&format!("{} adapter init failed", ep_name));
+            .unwrap_or_else(|_| panic!("{} adapter init failed", ep_name));
         registry
             .register(
                 ep_name.to_string(),
@@ -223,6 +224,7 @@ async fn test_multi_endpoint_overlapping_tool_names() {
         oauth_flow_manager: None,
         token_manager: None,
         oauth_adapter_inners: None,
+        setup_manager: None,
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();

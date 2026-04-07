@@ -46,6 +46,7 @@ async fn setup_server() -> (SocketAddr, AdapterRegistry, tokio::task::JoinHandle
         oauth_flow_manager: None,
         token_manager: None,
         oauth_adapter_inners: None,
+        setup_manager: None,
     };
     let router = build_router(state);
     // Bind to port 0 to get a random available port
@@ -68,7 +69,7 @@ async fn test_mcp_initialize() {
             "jsonrpc": "2.0",
             "method": "initialize",
             "params": {
-                "protocolVersion": "2024-11-05",
+                "protocolVersion": "2025-03-26",
                 "capabilities": {},
                 "clientInfo": { "name": "test", "version": "0.1" }
             },
@@ -81,7 +82,7 @@ async fn test_mcp_initialize() {
     assert!(resp.status().is_success());
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["jsonrpc"], "2.0");
-    assert_eq!(body["result"]["protocolVersion"], "2024-11-05");
+    assert_eq!(body["result"]["protocolVersion"], "2025-03-26");
     assert!(body["result"]["serverInfo"]["name"].as_str().is_some());
 }
 
