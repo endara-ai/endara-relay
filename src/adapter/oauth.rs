@@ -89,6 +89,12 @@ impl OAuthAdapterInner {
             .timeout(Duration::from_secs(30))
             .default_headers({
                 let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert(
+                    reqwest::header::ACCEPT,
+                    reqwest::header::HeaderValue::from_static(
+                        "application/json, text/event-stream",
+                    ),
+                );
                 if let Ok(val) =
                     reqwest::header::HeaderValue::from_str(&format!("Bearer {}", access_token))
                 {
@@ -244,10 +250,13 @@ impl OAuthAdapterInner {
         // 4. Update in-memory tokens
         let issued_at_secs = token_set.issued_at;
         let expires_at_secs = token_set.expires_at;
+        let has_refresh_token = token_set.refresh_token.is_some();
         *self.tokens.write().await = Some(token_set);
 
-        // 5. Schedule proactive refresh if we have expiry info
-        if let (Some(issued), Some(expires)) = (issued_at_secs, expires_at_secs) {
+        // 5. Schedule proactive refresh if we have a refresh token and expiry info
+        if !has_refresh_token {
+            info!(endpoint = %endpoint, "No refresh token, skipping proactive refresh");
+        } else if let (Some(issued), Some(expires)) = (issued_at_secs, expires_at_secs) {
             if expires > issued {
                 let now_secs = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -318,9 +327,14 @@ impl OAuthAdapterInner {
         // Clear in-memory tokens
         *self.tokens.write().await = None;
 
-        // Delete from disk
+        // Delete tokens from disk
         if let Err(e) = self.token_manager.delete(endpoint).await {
             error!(endpoint = %endpoint, error = %e, "Failed to delete tokens from disk");
+        }
+
+        // Delete DCR credentials from disk
+        if let Err(e) = self.token_manager.delete_dcr(endpoint).await {
+            error!(endpoint = %endpoint, error = %e, "Failed to delete DCR credentials from disk");
         }
 
         // Set state
@@ -727,7 +741,7 @@ mod tests {
 
     #[test]
     fn oauth_state_variants_are_distinct() {
-        let states = vec![
+        let states = [
             OAuthState::NeedsLogin,
             OAuthState::Authenticated,
             OAuthState::Refreshing,

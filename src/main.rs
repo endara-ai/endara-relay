@@ -16,7 +16,7 @@ use adapter::oauth::{OAuthAdapter, OAuthAdapterConfig, OAuthAdapterInner};
 use adapter::{FailedAdapter, McpAdapter, StartingAdapter};
 use clap::{Parser, Subcommand};
 use js_sandbox::MetaToolHandler;
-use oauth::OAuthFlowManager;
+use oauth::{OAuthFlowManager, OAuthSetupManager};
 use registry::AdapterRegistry;
 use server::{build_router, start_server, AppState};
 use std::collections::HashMap;
@@ -62,6 +62,12 @@ enum Commands {
 fn init_tracing(log_format: &str) {
     use tracing_subscriber::fmt;
     use tracing_subscriber::prelude::*;
+    use tracing_subscriber::EnvFilter;
+
+    // Default: info for all crates, debug for endara_relay.
+    // Overridable via RUST_LOG env var.
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,endara_relay=debug"));
 
     // File logging to ~/.endara/logs/ with daily rotation
     let log_dir = dirs::home_dir()
@@ -78,6 +84,7 @@ fn init_tracing(log_format: &str) {
         "json" => {
             let stdout_layer = fmt::layer().json().with_ansi(false).boxed();
             tracing_subscriber::registry()
+                .with(filter)
                 .with(stdout_layer)
                 .with(file_layer)
                 .init();
@@ -85,6 +92,7 @@ fn init_tracing(log_format: &str) {
         _ => {
             let stdout_layer = fmt::layer().with_ansi(false).boxed();
             tracing_subscriber::registry()
+                .with(filter)
                 .with(stdout_layer)
                 .with(file_layer)
                 .init();
@@ -217,13 +225,14 @@ async fn main() {
 
                 // OAuth endpoints initialize inline (always fast)
                 if ep.transport == config::Transport::Oauth {
+                    let base = ep.oauth_server_url.as_deref().unwrap_or_default();
                     let oauth_config = OAuthAdapterConfig {
                         endpoint_name: ep.name.clone(),
                         url: ep.url.clone().unwrap_or_default(),
-                        token_endpoint_url: format!(
-                            "{}/token",
-                            ep.oauth_server_url.as_deref().unwrap_or_default()
-                        ),
+                        token_endpoint_url: ep
+                            .token_endpoint
+                            .clone()
+                            .unwrap_or_else(|| format!("{}/token", base)),
                         client_id: ep.client_id.clone().unwrap_or_default(),
                         client_secret: ep.client_secret.clone(),
                     };
@@ -305,6 +314,7 @@ async fn main() {
                 registry.clone(),
                 Duration::from_secs(30),
             ));
+            let setup_manager = Arc::new(OAuthSetupManager::new());
             let state = AppState {
                 registry: (*registry).clone(),
                 js_execution_mode: js_execution_mode.clone(),
@@ -312,6 +322,7 @@ async fn main() {
                 oauth_flow_manager: Some(oauth_flow_manager.clone()),
                 token_manager: Some(token_manager.clone()),
                 oauth_adapter_inners: Some(oauth_adapter_inners.clone()),
+                setup_manager: Some(setup_manager.clone()),
             };
             let mgmt_state = management::ManagementState {
                 registry: registry.clone(),
@@ -321,6 +332,8 @@ async fn main() {
                 oauth_flow_manager: Some(oauth_flow_manager.clone()),
                 relay_port: port,
                 oauth_adapter_inners: Some(oauth_adapter_inners.clone()),
+                token_manager: Some(token_manager.clone()),
+                setup_manager: Some(setup_manager.clone()),
             };
             let router = build_router(state).merge(management::management_routes(mgmt_state));
             let addr: SocketAddr = ([0, 0, 0, 0], port).into();

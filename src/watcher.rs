@@ -520,10 +520,12 @@ pub(crate) async fn create_adapter(
             let oauth_config = OAuthAdapterConfig {
                 endpoint_name: ep.name.clone(),
                 url: ep.url.clone().unwrap_or_default(),
-                token_endpoint_url: format!(
-                    "{}/token",
-                    ep.oauth_server_url.as_deref().unwrap_or_default()
-                ),
+                token_endpoint_url: ep.token_endpoint.clone().unwrap_or_else(|| {
+                    format!(
+                        "{}/token",
+                        ep.oauth_server_url.as_deref().unwrap_or_default()
+                    )
+                }),
                 client_id: ep.client_id.clone().unwrap_or_default(),
                 client_secret: ep.client_secret.clone(),
             };
@@ -717,6 +719,7 @@ mod tests {
             client_id: None,
             client_secret: None,
             scopes: None,
+            token_endpoint: None,
         };
         let diff = ConfigDiff {
             changed: vec![("ep".to_string(), changed_ep)],
@@ -750,6 +753,7 @@ mod tests {
             client_id: None,
             client_secret: None,
             scopes: None,
+            token_endpoint: None,
         };
         let diff = ConfigDiff {
             added: vec![new_ep],
@@ -841,6 +845,7 @@ mod tests {
             client_id: Some("client123".to_string()),
             client_secret: None,
             scopes: None,
+            token_endpoint: None,
         };
         let diff = ConfigDiff {
             added: vec![new_ep],
