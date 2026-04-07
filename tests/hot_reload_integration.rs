@@ -74,6 +74,7 @@ async fn test_config_diff_add_endpoint() {
             client_id: None,
             client_secret: None,
             scopes: None,
+            token_endpoint: None,
         }],
     };
 
@@ -100,6 +101,7 @@ async fn test_config_diff_add_endpoint() {
                 client_id: None,
                 client_secret: None,
                 scopes: None,
+                token_endpoint: None,
             },
             config::EndpointConfig {
                 name: "multi-ep".to_string(),
@@ -117,6 +119,7 @@ async fn test_config_diff_add_endpoint() {
                 client_id: None,
                 client_secret: None,
                 scopes: None,
+                token_endpoint: None,
             },
         ],
     };
@@ -211,6 +214,7 @@ async fn test_config_diff_remove_endpoint() {
                 client_id: None,
                 client_secret: None,
                 scopes: None,
+                token_endpoint: None,
             },
             config::EndpointConfig {
                 name: "multi-ep".to_string(),
@@ -228,6 +232,7 @@ async fn test_config_diff_remove_endpoint() {
                 client_id: None,
                 client_secret: None,
                 scopes: None,
+                token_endpoint: None,
             },
         ],
     };
@@ -254,6 +259,7 @@ async fn test_config_diff_remove_endpoint() {
             client_id: None,
             client_secret: None,
             scopes: None,
+            token_endpoint: None,
         }],
     };
 

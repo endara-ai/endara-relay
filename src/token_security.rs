@@ -180,4 +180,62 @@ mod tests {
         let result = ensure_token_dir_secure(&file_path);
         assert!(result.is_err());
     }
+
+    #[test]
+    fn creates_nested_dirs_if_not_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("a").join("b").join("tokens");
+        assert!(!nested.exists());
+        let result = ensure_token_dir_secure(&nested).unwrap();
+        assert!(result.exists());
+        assert!(result.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_dir_leaf_has_0700() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let nested = tmp.path().join("x").join("y").join("tokens");
+        ensure_token_dir_secure(&nested).unwrap();
+        let mode = fs::metadata(&nested).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "Leaf directory expected 0700, got {:o}",
+            mode & 0o777
+        );
+    }
+
+    #[test]
+    fn idempotent_on_existing_secure_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let token_dir = tmp.path().join("tokens");
+        // Call twice — both should succeed
+        let r1 = ensure_token_dir_secure(&token_dir).unwrap();
+        let r2 = ensure_token_dir_secure(&token_dir).unwrap();
+        assert_eq!(r1, r2);
+    }
+
+    #[test]
+    fn concurrent_ensure_does_not_panic() {
+        use std::sync::Arc;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = Arc::new(tmp.path().to_path_buf());
+
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let base = Arc::clone(&base);
+                std::thread::spawn(move || {
+                    let dir = base.join("concurrent_tokens");
+                    ensure_token_dir_secure(&dir)
+                })
+            })
+            .collect();
+
+        for h in handles {
+            // All threads should succeed (no panics, no errors)
+            h.join().unwrap().unwrap();
+        }
+    }
 }

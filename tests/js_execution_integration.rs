@@ -51,6 +51,7 @@ async fn setup_js_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         oauth_flow_manager: None,
         token_manager: None,
         oauth_adapter_inners: None,
+        setup_manager: None,
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
@@ -119,12 +120,16 @@ async fn test_list_tools_meta_tool() {
 
     assert!(resp.status().is_success());
     let body: serde_json::Value = resp.json().await.unwrap();
-    let result = &body["result"];
+    // Result should be wrapped in MCP content array format
+    let content = body["result"]["content"].as_array().expect("content array");
+    assert_eq!(content[0]["type"], "text");
+    let inner: serde_json::Value =
+        serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
     assert!(
-        result["total"].as_u64().unwrap() >= 1,
+        inner["total"].as_u64().unwrap() >= 1,
         "expected at least 1 tool"
     );
-    let tools = result["tools"].as_array().unwrap();
+    let tools = inner["tools"].as_array().unwrap();
     assert!(!tools.is_empty());
 }
 
@@ -147,8 +152,12 @@ async fn test_search_tools_meta_tool() {
 
     assert!(resp.status().is_success());
     let body: serde_json::Value = resp.json().await.unwrap();
-    let result = &body["result"];
-    let tools = result.as_array().unwrap();
+    // Result should be wrapped in MCP content array format
+    let content = body["result"]["content"].as_array().expect("content array");
+    assert_eq!(content[0]["type"], "text");
+    let tools: serde_json::Value =
+        serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+    let tools = tools.as_array().unwrap();
     assert!(!tools.is_empty(), "search for 'echo' should find tools");
     assert!(
         tools[0]["name"].as_str().unwrap().contains("echo"),

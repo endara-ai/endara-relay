@@ -13,6 +13,7 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["json"] }
 base64 = "0.22"
 boa_engine = "0.20"
+chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 dirs = "6.0.0"
 futures-util = "0.3.32"
@@ -31,8 +32,9 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }
 tracing = "0.1"
 tracing-appender = "0.2.4"
-tracing-subscriber = { version = "0.3", features = ["json"] }
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 url = "2.5.8"
+uuid = { version = "1.23.0", features = ["v4"] }
 
 [[bin]]
 name = "fixture-slow-server"

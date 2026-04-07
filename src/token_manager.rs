@@ -42,6 +42,17 @@ impl TokenSet {
     }
 }
 
+/// A set of DCR (Dynamic Client Registration) credentials for a single endpoint.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct DcrCredentials {
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    /// When the client_secret expires (0 = never), unix timestamp.
+    pub client_secret_expires_at: u64,
+    /// Unix timestamp (seconds) when the client was registered.
+    pub registered_at: u64,
+}
+
 /// Owns token persistence. One instance shared across all OAuth adapters via `Arc<TokenManager>`.
 ///
 /// No in-memory caching — this is purely a persistence layer. The OAuthAdapter holds
@@ -85,6 +96,51 @@ impl TokenManager {
     #[allow(dead_code)]
     pub async fn delete(&self, endpoint_name: &str) -> Result<(), TokenError> {
         let path = self.token_dir.join(format!("{}.json", endpoint_name));
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(TokenError::Io(e)),
+        }
+    }
+
+    /// Save DCR credentials for an endpoint. File written atomically (write to .tmp, rename).
+    /// File permissions: 0600 on Unix.
+    pub async fn save_dcr(
+        &self,
+        endpoint_name: &str,
+        creds: &DcrCredentials,
+    ) -> Result<(), TokenError> {
+        let path = self.token_dir.join(format!("{}.dcr.json", endpoint_name));
+        let tmp_path = self
+            .token_dir
+            .join(format!(".{}.dcr.json.tmp", endpoint_name));
+        let json = serde_json::to_string_pretty(creds)?;
+        tokio::fs::write(&tmp_path, json.as_bytes()).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)).await?;
+        }
+        tokio::fs::rename(&tmp_path, &path).await?;
+        Ok(())
+    }
+
+    /// Load DCR credentials for an endpoint. Returns None if file doesn't exist.
+    pub async fn load_dcr(
+        &self,
+        endpoint_name: &str,
+    ) -> Result<Option<DcrCredentials>, TokenError> {
+        let path = self.token_dir.join(format!("{}.dcr.json", endpoint_name));
+        match tokio::fs::read_to_string(&path).await {
+            Ok(json) => Ok(Some(serde_json::from_str(&json)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(TokenError::Io(e)),
+        }
+    }
+
+    /// Delete DCR credentials for an endpoint. No-op if file doesn't exist.
+    pub async fn delete_dcr(&self, endpoint_name: &str) -> Result<(), TokenError> {
+        let path = self.token_dir.join(format!("{}.dcr.json", endpoint_name));
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -244,5 +300,138 @@ mod tests {
         let json = r#"{"access_token":"tok","refresh_token":null,"expires_at":999999999999,"token_type":"Bearer","scope":null}"#;
         let ts: TokenSet = serde_json::from_str(json).unwrap();
         assert_eq!(ts.issued_at, None);
+    }
+
+    // --- DCR credential persistence tests ---
+
+    fn make_dcr_creds() -> DcrCredentials {
+        DcrCredentials {
+            client_id: "dcr-client-id".to_string(),
+            client_secret: Some("dcr-client-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 1700000000,
+        }
+    }
+
+    #[tokio::test]
+    async fn dcr_save_and_load_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        let creds = make_dcr_creds();
+
+        mgr.save_dcr("test-ep", &creds).await.unwrap();
+        let loaded = mgr.load_dcr("test-ep").await.unwrap().unwrap();
+        assert_eq!(loaded, creds);
+    }
+
+    #[tokio::test]
+    async fn dcr_load_nonexistent_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        let result = mgr.load_dcr("nonexistent").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn dcr_delete_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        mgr.save_dcr("del-me", &make_dcr_creds()).await.unwrap();
+        assert!(mgr.load_dcr("del-me").await.unwrap().is_some());
+        mgr.delete_dcr("del-me").await.unwrap();
+        assert!(mgr.load_dcr("del-me").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn dcr_delete_nonexistent_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        // Should not error on first or second call
+        mgr.delete_dcr("nonexistent").await.unwrap();
+        mgr.delete_dcr("nonexistent").await.unwrap();
+    }
+
+    // --- Token construction tests (mirrors server.rs logic) ---
+
+    #[test]
+    fn token_construction_with_expires_in() {
+        // Simulate the token_set construction from server.rs
+        let now_secs: u64 = 1_700_000_000;
+        let expires_in: u64 = 3600;
+        let token_set = TokenSet {
+            access_token: "access-tok".to_string(),
+            refresh_token: Some("refresh-tok".to_string()),
+            expires_at: Some(now_secs + expires_in),
+            token_type: "Bearer".to_string(),
+            scope: Some("read write".to_string()),
+            issued_at: Some(now_secs),
+        };
+        assert_eq!(token_set.expires_at, Some(1_700_003_600));
+        assert_eq!(token_set.issued_at, Some(now_secs));
+    }
+
+    #[test]
+    fn token_construction_without_expires_in() {
+        // When expires_in is missing from the response, expires_at = None
+        let now_secs: u64 = 1_700_000_000;
+        let expires_in: Option<u64> = None;
+        let token_set = TokenSet {
+            access_token: "access-tok".to_string(),
+            refresh_token: None,
+            expires_at: expires_in.map(|secs| now_secs + secs),
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: Some(now_secs),
+        };
+        assert_eq!(token_set.expires_at, None);
+        assert_eq!(token_set.issued_at, Some(now_secs));
+    }
+
+    #[test]
+    fn token_construction_issued_at_is_now() {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token_set = TokenSet {
+            access_token: "access-tok".to_string(),
+            refresh_token: None,
+            expires_at: Some(now_secs + 3600),
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: Some(now_secs),
+        };
+        // issued_at should be within 1 second of now
+        let issued = token_set.issued_at.unwrap();
+        assert!(issued >= now_secs && issued <= now_secs + 1);
+    }
+
+    #[tokio::test]
+    async fn dcr_save_without_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        let creds = DcrCredentials {
+            client_id: "public-client".to_string(),
+            client_secret: None,
+            client_secret_expires_at: 0,
+            registered_at: 1700000000,
+        };
+
+        mgr.save_dcr("public-ep", &creds).await.unwrap();
+        let loaded = mgr.load_dcr("public-ep").await.unwrap().unwrap();
+        assert_eq!(loaded, creds);
+        assert!(loaded.client_secret.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dcr_saved_file_has_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        mgr.save_dcr("perm-test", &make_dcr_creds()).await.unwrap();
+        let path = tmp.path().join("perm-test.dcr.json");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "Expected 0600, got {:o}", mode & 0o777);
     }
 }

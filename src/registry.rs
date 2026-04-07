@@ -17,10 +17,14 @@ pub struct RegisteredAdapter {
     pub disabled_tools: HashSet<String>,
 }
 
+/// Cached catalog type: `(tool_list, reverse_lookup_map)`.
+type CatalogCache = (Vec<ToolInfo>, HashMap<String, (String, String)>);
+
 /// Thread-safe registry of MCP adapters keyed by endpoint name.
 #[derive(Clone)]
 pub struct AdapterRegistry {
     adapters: Arc<RwLock<HashMap<String, RegisteredAdapter>>>,
+    catalog_cache: Arc<RwLock<Option<CatalogCache>>>,
 }
 
 impl Default for AdapterRegistry {
@@ -34,6 +38,7 @@ impl AdapterRegistry {
     pub fn new() -> Self {
         Self {
             adapters: Arc::new(RwLock::new(HashMap::new())),
+            catalog_cache: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -59,11 +64,21 @@ impl AdapterRegistry {
                 disabled_tools: HashSet::new(),
             },
         );
+        self.invalidate_catalog_cache().await;
     }
 
     /// Remove an adapter by endpoint name.
     pub async fn remove(&self, name: &str) -> Option<RegisteredAdapter> {
-        self.adapters.write().await.remove(name)
+        let result = self.adapters.write().await.remove(name);
+        if result.is_some() {
+            self.invalidate_catalog_cache().await;
+        }
+        result
+    }
+
+    /// Invalidate the cached catalog so the next read rebuilds it.
+    pub async fn invalidate_catalog_cache(&self) {
+        *self.catalog_cache.write().await = None;
     }
 
     /// List endpoint names of healthy adapters.
@@ -107,9 +122,29 @@ impl AdapterRegistry {
     ///
     /// Returns `(catalog, lookup)` where `lookup` maps each prefixed tool name
     /// to `(endpoint_name, raw_tool_name)`.
+    ///
+    /// Results are cached; call [`invalidate_catalog_cache`] after mutations
+    /// that affect the catalog (register/remove/disable/enable).
     pub async fn merged_catalog_with_lookup(
         &self,
     ) -> (Vec<ToolInfo>, HashMap<String, (String, String)>) {
+        // Fast path: return cached value if available
+        if let Some(cached) = self.catalog_cache.read().await.as_ref() {
+            return cached.clone();
+        }
+        // Build and cache
+        self.refresh_catalog().await
+    }
+
+    /// Rebuild the catalog, store it in the cache, and return a clone.
+    pub async fn refresh_catalog(&self) -> (Vec<ToolInfo>, HashMap<String, (String, String)>) {
+        let result = self.build_catalog().await;
+        *self.catalog_cache.write().await = Some(result.clone());
+        result
+    }
+
+    /// Internal: build the merged catalog from all adapters.
+    async fn build_catalog(&self) -> (Vec<ToolInfo>, HashMap<String, (String, String)>) {
         let adapters = self.adapters.read().await;
 
         // Count non-disabled adapters for single-server no-prefix mode
@@ -179,6 +214,7 @@ impl AdapterRegistry {
             }
         }
 
+        catalog.sort_by(|a, b| a.name.cmp(&b.name));
         (catalog, lookup)
     }
 
@@ -938,6 +974,74 @@ mod tests {
         assert_eq!(
             down_tool.description.as_deref(),
             Some("[⚠️ UNAVAILABLE] [fs-down] read tool")
+        );
+    }
+
+    // --- Alphabetical sorting ---
+
+    #[tokio::test]
+    async fn test_merged_catalog_sorted_alphabetically() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![
+                    make_tool("zebra"),
+                    make_tool("alpha"),
+                    make_tool("mango"),
+                ])),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        let catalog = registry.merged_catalog().await;
+        assert_eq!(catalog.len(), 3);
+        let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "mango", "zebra"]);
+    }
+
+    #[tokio::test]
+    async fn test_merged_catalog_multi_endpoint_sorted() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "zserver".into(),
+                Box::new(MockAdapter::healthy(vec![
+                    make_tool("beta"),
+                    make_tool("alpha"),
+                ])),
+                "stdio".into(),
+                None,
+                Some("zserver".into()),
+            )
+            .await;
+        registry
+            .register(
+                "aserver".into(),
+                Box::new(MockAdapter::healthy(vec![
+                    make_tool("delta"),
+                    make_tool("gamma"),
+                ])),
+                "stdio".into(),
+                None,
+                Some("aserver".into()),
+            )
+            .await;
+
+        let catalog = registry.merged_catalog().await;
+        assert_eq!(catalog.len(), 4);
+        let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
+        // Sorted by prefixed name: aserver__delta, aserver__gamma, zserver__alpha, zserver__beta
+        assert_eq!(
+            names,
+            vec![
+                "aserver__delta",
+                "aserver__gamma",
+                "zserver__alpha",
+                "zserver__beta"
+            ]
         );
     }
 }

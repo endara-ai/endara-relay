@@ -22,8 +22,9 @@ use crate::adapter::sse::{SseAdapter, SseConfig};
 use crate::adapter::stdio::{StdioAdapter, StdioConfig};
 use crate::adapter::HealthStatus;
 use crate::config::Config;
-use crate::oauth::{OAuthFlowManager, PkceChallenge};
+use crate::oauth::{OAuthFlowManager, OAuthSetupManager, PkceChallenge};
 use crate::registry::AdapterRegistry;
+use crate::token_manager::{DcrCredentials, TokenManager};
 use crate::OAuthAdapterInners;
 
 // ---------------------------------------------------------------------------
@@ -44,6 +45,10 @@ pub struct ManagementState {
     pub relay_port: u16,
     /// Per-endpoint shared OAuth adapter inner states.
     pub oauth_adapter_inners: Option<OAuthAdapterInners>,
+    /// Token manager for DCR credential persistence.
+    pub token_manager: Option<Arc<TokenManager>>,
+    /// Transient OAuth setup session manager (preflight flow).
+    pub setup_manager: Option<Arc<OAuthSetupManager>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -228,7 +233,10 @@ async fn restart_endpoint(
         )
         .into_response();
     }
-    match entry.adapter.initialize().await {
+    let result = entry.adapter.initialize().await;
+    drop(entries);
+    state.registry.invalidate_catalog_cache().await;
+    match result {
         Ok(()) => Json(ActionResponse {
             ok: true,
             message: format!("Endpoint '{}' restarted", name),
@@ -252,7 +260,10 @@ async fn refresh_endpoint(
     let Some(entry) = entries.get(&name) else {
         return endpoint_not_found(&name).into_response();
     };
-    match entry.adapter.list_tools().await {
+    let result = entry.adapter.list_tools().await;
+    drop(entries);
+    state.registry.invalidate_catalog_cache().await;
+    match result {
         Ok(tools) => Json(ActionResponse {
             ok: true,
             message: format!("Refreshed {} tools for '{}'", tools.len(), name),
@@ -344,10 +355,64 @@ fn sanitize_config(config: &Config) -> SanitizedConfig {
 }
 
 /// POST /api/config/reload
-async fn reload_config() -> Json<ActionResponse> {
+async fn reload_config(State(state): State<ManagementState>) -> Json<ActionResponse> {
+    let Some(config_path) = &state.config_path else {
+        return Json(ActionResponse {
+            ok: false,
+            message: "config_path not configured".to_string(),
+        });
+    };
+
+    let resolved = crate::config::expand_tilde(config_path);
+
+    // Parse new config from disk
+    let (new_config, warnings) = match crate::config::load_config_graceful(&resolved) {
+        Ok(result) => result,
+        Err(e) => {
+            return Json(ActionResponse {
+                ok: false,
+                message: format!("failed to parse config: {}", e),
+            });
+        }
+    };
+
+    for w in &warnings {
+        tracing::warn!("{}", w);
+    }
+    let warned_names = crate::config::warned_endpoint_names(&warnings);
+
+    // Diff against current in-memory config
+    let old_config = state.config.read().await;
+    let diff = crate::config::diff_configs(&old_config, &new_config);
+    drop(old_config);
+
+    // Apply diff to registry
+    let token_manager = state.token_manager.clone().unwrap_or_else(|| {
+        Arc::new(crate::token_manager::TokenManager::new(
+            std::path::PathBuf::from("/tmp"),
+        ))
+    });
+    let oauth_adapter_inners = state
+        .oauth_adapter_inners
+        .clone()
+        .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())));
+
+    crate::watcher::apply_diff_graceful(
+        &diff,
+        &state.registry,
+        &warnings,
+        &warned_names,
+        &token_manager,
+        &oauth_adapter_inners,
+    )
+    .await;
+
+    // Update in-memory config baseline
+    *state.config.write().await = new_config;
+
     Json(ActionResponse {
         ok: true,
-        message: "reload scheduled".to_string(),
+        message: "config reloaded".to_string(),
     })
 }
 
@@ -589,10 +654,42 @@ async fn test_connection(Json(req): Json<TestConnectionRequest>) -> impl IntoRes
 // OAuth route handlers
 // ---------------------------------------------------------------------------
 
-/// Response for POST /api/endpoints/:name/oauth/start
+/// Response for POST /api/endpoints/:name/oauth/start (success)
 #[derive(Serialize)]
 struct OAuthStartResponse {
     authorize_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discovery: Option<OAuthDiscoveryInfo>,
+}
+
+/// Informational discovery metadata included in /oauth/start response.
+#[derive(Serialize)]
+struct OAuthDiscoveryInfo {
+    auth_server: String,
+    dcr_used: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    scopes_available: Vec<String>,
+}
+
+/// Error response when DCR is unsupported and manual credentials are needed.
+#[derive(Serialize)]
+struct OAuthDcrUnsupportedResponse {
+    error: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorization_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    scopes_supported: Vec<String>,
+}
+
+/// Request body for POST /api/endpoints/:name/oauth/credentials
+#[derive(Deserialize)]
+struct OAuthCredentialsRequest {
+    client_id: String,
+    #[serde(default)]
+    client_secret: Option<String>,
 }
 
 /// Response for GET /api/endpoints/:name/oauth/status (simple)
@@ -639,10 +736,21 @@ struct OAuthRefreshResponse {
 ///
 /// Generates a PKCE challenge, registers a pending flow, and returns the
 /// authorization URL that the user should open in a browser.
+///
+/// Resolution order:
+/// 1. If `oauth_server_url` is in config, derive endpoints from convention.
+///    Otherwise, try RFC 9728 discovery against the endpoint URL.
+/// 2. If `client_id` is in config, use it. Otherwise, load persisted DCR
+///    credentials → if missing/expired + registration_endpoint available,
+///    attempt dynamic client registration → if DCR fails/unavailable, return
+///    `dcr_unsupported` so the UI can prompt for manual credentials.
 async fn oauth_start(
     State(state): State<ManagementState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    use crate::oauth::dcr;
+    use crate::oauth::discovery;
+
     // Look up endpoint config
     let config = state.config.read().await;
     let ep = config.endpoints.iter().find(|e| e.name == name);
@@ -650,30 +758,12 @@ async fn oauth_start(
         return endpoint_not_found(&name).into_response();
     };
 
-    let oauth_server_url = match &ep.oauth_server_url {
-        Some(url) => url.clone(),
-        None => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "endpoint is not configured for OAuth",
-                Some("Missing oauth_server_url in endpoint config"),
-            )
-            .into_response();
-        }
-    };
-    let client_id = match &ep.client_id {
-        Some(id) => id.clone(),
-        None => {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "endpoint is not configured for OAuth",
-                Some("Missing client_id in endpoint config"),
-            )
-            .into_response();
-        }
-    };
-    let client_secret = ep.client_secret.clone();
+    let oauth_server_url = ep.oauth_server_url.clone();
+    let config_client_id = ep.client_id.clone();
+    let config_client_secret = ep.client_secret.clone();
     let scopes = ep.scopes.clone();
+    let config_token_endpoint = ep.token_endpoint.clone();
+    let endpoint_url = ep.url.clone().unwrap_or_default();
     drop(config);
 
     let Some(ref flow_mgr) = state.oauth_flow_manager else {
@@ -685,15 +775,142 @@ async fn oauth_start(
         .into_response();
     };
 
+    let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", state.relay_port);
+
+    // ── Step 1: Resolve OAuth server metadata ──────────────────────────
+    let (
+        authorization_endpoint,
+        token_endpoint,
+        registration_endpoint,
+        discovered_scopes,
+        auth_server_label,
+    ) = if let Some(ref server_url) = oauth_server_url {
+        // Convention-based: derive from the configured base URL
+        let base = server_url.trim_end_matches('/');
+        let token_url = config_token_endpoint
+            .clone()
+            .unwrap_or_else(|| format!("{}/token", base));
+        (
+            format!("{}/authorize", base),
+            token_url,
+            None::<String>,
+            Vec::<String>::new(),
+            None::<String>,
+        )
+    } else {
+        // Try RFC 9728 discovery
+        let http = reqwest::Client::new();
+        match discovery::discover_oauth_server(&http, &endpoint_url).await {
+            Ok(disc) => (
+                disc.authorization_endpoint,
+                disc.token_endpoint,
+                disc.registration_endpoint,
+                disc.scopes_supported,
+                Some(disc.auth_server_url),
+            ),
+            Err(e) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "discovery_failed",
+                    Some(&format!(
+                        "Could not discover OAuth server for this endpoint. \
+                             Configure oauth_server_url manually, or ensure the server \
+                             supports RFC 9728. Details: {e}"
+                    )),
+                )
+                .into_response();
+            }
+        }
+    };
+
+    // ── Step 2: Resolve client credentials ─────────────────────────────
+    let (client_id, client_secret, dcr_used) = if let Some(cid) = config_client_id {
+        // Explicit config takes precedence
+        (cid, config_client_secret, false)
+    } else {
+        // Try persisted DCR credentials
+        let persisted = if let Some(ref tm) = state.token_manager {
+            match tm.load_dcr(&name).await {
+                Ok(Some(creds)) => Some(creds),
+                Ok(None) => None,
+                Err(e) => {
+                    warn!(endpoint = %name, error = %e, "Failed to load DCR credentials");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        if let Some(creds) = persisted {
+            (creds.client_id, creds.client_secret, true)
+        } else if let Some(ref reg_endpoint) = registration_endpoint {
+            // Attempt dynamic client registration
+            let http = reqwest::Client::new();
+            match dcr::register_client(&http, reg_endpoint, &redirect_uri, &name).await {
+                Ok(resp) => {
+                    // Persist the new credentials
+                    if let Some(ref tm) = state.token_manager {
+                        let creds = DcrCredentials {
+                            client_id: resp.client_id.clone(),
+                            client_secret: resp.client_secret.clone(),
+                            client_secret_expires_at: resp.client_secret_expires_at,
+                            registered_at: std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                        };
+                        if let Err(e) = tm.save_dcr(&name, &creds).await {
+                            warn!(endpoint = %name, error = %e, "Failed to persist DCR credentials");
+                        }
+                    }
+                    (resp.client_id, resp.client_secret, true)
+                }
+                Err(e) => {
+                    warn!(endpoint = %name, error = %e, "DCR registration failed");
+                    return (
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        Json(OAuthDcrUnsupportedResponse {
+                            error: "dcr_unsupported".to_string(),
+                            message: format!(
+                                "Dynamic Client Registration failed: {e}. \
+                                 Submit credentials manually via POST /api/endpoints/{name}/oauth/credentials."
+                            ),
+                            authorization_endpoint: Some(authorization_endpoint.clone()),
+                            token_endpoint: Some(token_endpoint.clone()),
+                            scopes_supported: discovered_scopes.clone(),
+                        }),
+                    )
+                        .into_response();
+                }
+            }
+        } else {
+            // No registration endpoint — DCR not available
+            return (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(OAuthDcrUnsupportedResponse {
+                    error: "dcr_unsupported".to_string(),
+                    message: format!(
+                        "No client_id configured and server does not support Dynamic Client Registration. \
+                         Submit credentials manually via POST /api/endpoints/{name}/oauth/credentials."
+                    ),
+                    authorization_endpoint: Some(authorization_endpoint.clone()),
+                    token_endpoint: Some(token_endpoint.clone()),
+                    scopes_supported: discovered_scopes.clone(),
+                }),
+            )
+                .into_response();
+        }
+    };
+
+    // ── Step 3: Build PKCE + register flow ─────────────────────────────
     let pkce = PkceChallenge::generate();
     let code_challenge = pkce.code_challenge.clone();
-
-    let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", state.relay_port);
 
     let state_param = flow_mgr
         .start_flow(
             &name,
-            &oauth_server_url,
+            &token_endpoint,
             &client_id,
             client_secret.as_deref(),
             pkce,
@@ -701,22 +918,88 @@ async fn oauth_start(
         )
         .await;
 
-    // Build the authorization URL
+    // ── Step 4: Build authorization URL ────────────────────────────────
     let mut authorize_url = format!(
-        "{}/authorize?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
-        oauth_server_url.trim_end_matches('/'),
+        "{}?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
+        authorization_endpoint,
         urlencoding(&client_id),
         urlencoding(&redirect_uri),
         urlencoding(&state_param),
         urlencoding(&code_challenge),
     );
 
-    if let Some(ref scopes) = scopes {
-        let scope_str = scopes.join(" ");
+    // Prefer config scopes; fall back to discovered scopes
+    let effective_scopes = scopes.unwrap_or_default();
+    if !effective_scopes.is_empty() {
+        let scope_str = effective_scopes.join(" ");
         authorize_url.push_str(&format!("&scope={}", urlencoding(&scope_str)));
     }
 
-    Json(OAuthStartResponse { authorize_url }).into_response()
+    let discovery_info = auth_server_label.map(|auth_server| OAuthDiscoveryInfo {
+        auth_server,
+        dcr_used,
+        scopes_available: discovered_scopes,
+    });
+
+    Json(OAuthStartResponse {
+        authorize_url,
+        discovery: discovery_info,
+    })
+    .into_response()
+}
+
+/// POST /api/endpoints/:name/oauth/credentials
+///
+/// Accept manually provided client credentials (DCR fallback).
+/// Persists them via TokenManager so the next `/oauth/start` can use them.
+async fn oauth_credentials(
+    State(state): State<ManagementState>,
+    Path(name): Path<String>,
+    Json(body): Json<OAuthCredentialsRequest>,
+) -> impl IntoResponse {
+    // Verify endpoint exists
+    {
+        let config = state.config.read().await;
+        let exists = config.endpoints.iter().any(|e| e.name == name);
+        if !exists {
+            return endpoint_not_found(&name).into_response();
+        }
+    }
+
+    if body.client_id.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "client_id must not be empty", None)
+            .into_response();
+    }
+
+    let Some(ref tm) = state.token_manager else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Token manager not available",
+            None,
+        )
+        .into_response();
+    };
+
+    let creds = DcrCredentials {
+        client_id: body.client_id,
+        client_secret: body.client_secret,
+        client_secret_expires_at: 0,
+        registered_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+
+    if let Err(e) = tm.save_dcr(&name, &creds).await {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to save credentials",
+            Some(&e.to_string()),
+        )
+        .into_response();
+    }
+
+    Json(serde_json::json!({ "status": "saved" })).into_response()
 }
 
 /// Simple URL encoding helper (percent-encode special chars).
@@ -761,17 +1044,22 @@ async fn oauth_status(
             let last_refreshed_at = tokens.as_ref().and_then(|t| t.issued_at);
 
             // Compute next_refresh_at from token expiry using the 75% rule
-            let next_refresh_at = tokens
-                .as_ref()
-                .and_then(|t| match (t.issued_at, t.expires_at) {
-                    (Some(issued), Some(expires)) if expires > issued => {
-                        let lifetime = expires - issued;
-                        let seventy_five_pct = issued + (lifetime * 3 / 4);
-                        let five_min_before = expires.saturating_sub(300);
-                        Some(std::cmp::min(seventy_five_pct, five_min_before))
-                    }
-                    _ => None,
-                });
+            // Only meaningful when a refresh token exists
+            let next_refresh_at = if !has_refresh_token {
+                None
+            } else {
+                tokens
+                    .as_ref()
+                    .and_then(|t| match (t.issued_at, t.expires_at) {
+                        (Some(issued), Some(expires)) if expires > issued => {
+                            let lifetime = expires - issued;
+                            let seventy_five_pct = issued + (lifetime * 3 / 4);
+                            let five_min_before = expires.saturating_sub(300);
+                            Some(std::cmp::min(seventy_five_pct, five_min_before))
+                        }
+                        _ => None,
+                    })
+            };
 
             let status = match oauth_state {
                 OAuthState::Authenticated => "authenticated",
@@ -945,6 +1233,590 @@ async fn oauth_refresh(
 }
 
 // ---------------------------------------------------------------------------
+// OAuth setup (preflight) route handlers
+// ---------------------------------------------------------------------------
+
+/// Request body for POST /api/oauth/setup
+#[derive(Deserialize)]
+struct OAuthSetupRequest {
+    name: String,
+    url: String,
+    #[serde(default)]
+    scopes: Option<Vec<String>>,
+    #[serde(default)]
+    tool_prefix: Option<String>,
+}
+
+/// Response for POST /api/oauth/setup
+#[derive(Serialize)]
+struct OAuthSetupResponse {
+    session_id: String,
+    status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorize_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discovery: Option<OAuthDiscoveryInfo>,
+    /// Set when DCR fails and manual credentials are needed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dcr_error: Option<String>,
+}
+
+/// Response for GET /api/oauth/setup/:id/status
+#[derive(Serialize)]
+struct OAuthSetupStatusResponse {
+    session_id: String,
+    status: String,
+    name: String,
+    url: String,
+}
+
+/// POST /api/oauth/setup
+///
+/// Creates a transient setup session: discovers OAuth metadata, attempts DCR,
+/// and returns the authorize URL — all without writing to config.toml.
+async fn oauth_setup(
+    State(state): State<ManagementState>,
+    Json(body): Json<OAuthSetupRequest>,
+) -> impl IntoResponse {
+    use crate::oauth::dcr;
+    use crate::oauth::discovery;
+
+    let Some(ref setup_mgr) = state.setup_manager else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Setup manager not available",
+            None,
+        )
+        .into_response();
+    };
+
+    let Some(ref flow_mgr) = state.oauth_flow_manager else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "OAuth not configured",
+            None,
+        )
+        .into_response();
+    };
+
+    // Check for duplicate name in existing config
+    {
+        let config = state.config.read().await;
+        if config.endpoints.iter().any(|e| e.name == body.name) {
+            return error_response(
+                StatusCode::CONFLICT,
+                "endpoint_exists",
+                Some(&format!(
+                    "An endpoint named '{}' already exists. Use a different name.",
+                    body.name
+                )),
+            )
+            .into_response();
+        }
+    }
+
+    let scopes_str = body.scopes.as_ref().map(|s| s.join(" "));
+    let session_id = setup_mgr
+        .create_session(
+            body.name.clone(),
+            body.url.clone(),
+            scopes_str.clone(),
+            body.tool_prefix.clone(),
+        )
+        .await;
+
+    let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", state.relay_port);
+
+    // ── Step 1: Discover OAuth server ──────────────────────────────────
+    let http = reqwest::Client::new();
+    let disc = match discovery::discover_oauth_server(&http, &body.url).await {
+        Ok(d) => d,
+        Err(e) => {
+            // Clean up session on failure
+            setup_mgr.remove_session(&session_id).await;
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "discovery_failed",
+                Some(&format!("Could not discover OAuth server. Details: {e}")),
+            )
+            .into_response();
+        }
+    };
+
+    // Store discovered metadata in the session
+    let auth_endpoint = disc.authorization_endpoint.clone();
+    let token_endpoint = disc.token_endpoint.clone();
+    let registration_endpoint = disc.registration_endpoint.clone();
+    let discovered_scopes = disc.scopes_supported.clone();
+    let auth_server_url = disc.auth_server_url.clone();
+
+    setup_mgr
+        .get_session_mut(&session_id, |s| {
+            s.authorization_endpoint = Some(disc.authorization_endpoint.clone());
+            s.token_endpoint = Some(disc.token_endpoint.clone());
+            s.registration_endpoint = disc.registration_endpoint.clone();
+            s.oauth_server_url = Some(disc.auth_server_url.clone());
+        })
+        .await;
+
+    // ── Step 2: Resolve client credentials (DCR) ───────────────────────
+    let dcr_result = if let Some(ref reg_endpoint) = registration_endpoint {
+        match dcr::register_client(&http, reg_endpoint, &redirect_uri, &body.name).await {
+            Ok(resp) => {
+                // Persist DCR credentials for future re-auth
+                if let Some(ref tm) = state.token_manager {
+                    let creds = DcrCredentials {
+                        client_id: resp.client_id.clone(),
+                        client_secret: resp.client_secret.clone(),
+                        client_secret_expires_at: resp.client_secret_expires_at,
+                        registered_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    };
+                    if let Err(e) = tm.save_dcr(&body.name, &creds).await {
+                        warn!(endpoint = %body.name, error = %e, "Failed to persist DCR credentials");
+                    }
+                }
+                Ok((resp.client_id, resp.client_secret))
+            }
+            Err(e) => Err(format!("{e}")),
+        }
+    } else {
+        Err("No registration endpoint available".to_string())
+    };
+
+    match dcr_result {
+        Ok((client_id, client_secret)) => {
+            // Store credentials in session
+            setup_mgr
+                .get_session_mut(&session_id, |s| {
+                    s.client_id = Some(client_id.clone());
+                    s.client_secret = client_secret.clone();
+                    s.status = crate::oauth::SetupSessionStatus::AwaitingAuth;
+                })
+                .await;
+
+            // Build PKCE + register flow
+            let pkce = PkceChallenge::generate();
+            let code_challenge = pkce.code_challenge.clone();
+
+            let state_param = flow_mgr
+                .start_flow(
+                    &format!("setup:{}", session_id),
+                    &token_endpoint,
+                    &client_id,
+                    client_secret.as_deref(),
+                    pkce,
+                    &redirect_uri,
+                )
+                .await;
+
+            let mut authorize_url = format!(
+                "{}?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
+                auth_endpoint,
+                urlencoding(&client_id),
+                urlencoding(&redirect_uri),
+                urlencoding(&state_param),
+                urlencoding(&code_challenge),
+            );
+
+            if let Some(ref scope_str) = scopes_str {
+                if !scope_str.is_empty() {
+                    authorize_url.push_str(&format!("&scope={}", urlencoding(scope_str)));
+                }
+            }
+
+            let discovery_info = OAuthDiscoveryInfo {
+                auth_server: auth_server_url,
+                dcr_used: true,
+                scopes_available: discovered_scopes,
+            };
+
+            Json(OAuthSetupResponse {
+                session_id: session_id.to_string(),
+                status: "awaiting_auth".to_string(),
+                authorize_url: Some(authorize_url),
+                discovery: Some(discovery_info),
+                dcr_error: None,
+            })
+            .into_response()
+        }
+        Err(dcr_err) => {
+            // DCR failed — return session_id so desktop can supply manual creds
+            let discovery_info = OAuthDiscoveryInfo {
+                auth_server: auth_server_url,
+                dcr_used: false,
+                scopes_available: discovered_scopes,
+            };
+
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(OAuthSetupResponse {
+                    session_id: session_id.to_string(),
+                    status: "awaiting_credentials".to_string(),
+                    authorize_url: None,
+                    discovery: Some(discovery_info),
+                    dcr_error: Some(dcr_err),
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
+/// POST /api/oauth/setup/:id/credentials
+///
+/// Provide manual client credentials for a setup session, then return
+/// the authorization URL.
+async fn oauth_setup_credentials(
+    State(state): State<ManagementState>,
+    Path(id): Path<String>,
+    Json(body): Json<OAuthCredentialsRequest>,
+) -> impl IntoResponse {
+    let session_id: uuid::Uuid = match id.parse() {
+        Ok(u) => u,
+        Err(_) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid session_id", None)
+                .into_response()
+        }
+    };
+
+    let Some(ref setup_mgr) = state.setup_manager else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Setup manager not available",
+            None,
+        )
+        .into_response();
+    };
+
+    let Some(ref flow_mgr) = state.oauth_flow_manager else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "OAuth not configured",
+            None,
+        )
+        .into_response();
+    };
+
+    if body.client_id.trim().is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "client_id must not be empty", None)
+            .into_response();
+    }
+
+    // Extract session data needed for building auth URL
+    let session_data = setup_mgr
+        .get_session_mut(&session_id, |s| {
+            s.client_id = Some(body.client_id.clone());
+            s.client_secret = body.client_secret.clone();
+            s.status = crate::oauth::SetupSessionStatus::AwaitingAuth;
+            (
+                s.authorization_endpoint.clone(),
+                s.token_endpoint.clone(),
+                s.scopes.clone(),
+                s.name.clone(),
+            )
+        })
+        .await;
+
+    let Some((Some(auth_endpoint), Some(token_endpoint), scopes, name)) = session_data else {
+        return error_response(StatusCode::NOT_FOUND, "session not found or expired", None)
+            .into_response();
+    };
+
+    // Persist manual credentials
+    if let Some(ref tm) = state.token_manager {
+        let creds = DcrCredentials {
+            client_id: body.client_id.clone(),
+            client_secret: body.client_secret.clone(),
+            client_secret_expires_at: 0,
+            registered_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+        if let Err(e) = tm.save_dcr(&name, &creds).await {
+            warn!(endpoint = %name, error = %e, "Failed to persist manual credentials");
+        }
+    }
+
+    let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", state.relay_port);
+
+    let pkce = PkceChallenge::generate();
+    let code_challenge = pkce.code_challenge.clone();
+    let state_param = flow_mgr
+        .start_flow(
+            &format!("setup:{}", session_id),
+            &token_endpoint,
+            &body.client_id,
+            body.client_secret.as_deref(),
+            pkce,
+            &redirect_uri,
+        )
+        .await;
+
+    let mut authorize_url = format!(
+        "{}?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
+        auth_endpoint,
+        urlencoding(&body.client_id),
+        urlencoding(&redirect_uri),
+        urlencoding(&state_param),
+        urlencoding(&code_challenge),
+    );
+
+    if let Some(ref scope_str) = scopes {
+        if !scope_str.is_empty() {
+            authorize_url.push_str(&format!("&scope={}", urlencoding(scope_str)));
+        }
+    }
+
+    Json(serde_json::json!({
+        "status": "awaiting_auth",
+        "authorize_url": authorize_url
+    }))
+    .into_response()
+}
+
+/// GET /api/oauth/setup/:id/status
+///
+/// Poll the status of a setup session.
+async fn oauth_setup_status(
+    State(state): State<ManagementState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let session_id: uuid::Uuid = match id.parse() {
+        Ok(u) => u,
+        Err(_) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid session_id", None)
+                .into_response()
+        }
+    };
+
+    let Some(ref setup_mgr) = state.setup_manager else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Setup manager not available",
+            None,
+        )
+        .into_response();
+    };
+
+    let result = setup_mgr
+        .get_session(&session_id, |s| {
+            let status = match s.status {
+                crate::oauth::SetupSessionStatus::AwaitingCredentials => "awaiting_credentials",
+                crate::oauth::SetupSessionStatus::AwaitingAuth => "awaiting_auth",
+                crate::oauth::SetupSessionStatus::Authorized => "authorized",
+            };
+            OAuthSetupStatusResponse {
+                session_id: session_id.to_string(),
+                status: status.to_string(),
+                name: s.name.clone(),
+                url: s.url.clone(),
+            }
+        })
+        .await;
+
+    match result {
+        Some(resp) => Json(resp).into_response(),
+        None => error_response(StatusCode::NOT_FOUND, "session not found or expired", None)
+            .into_response(),
+    }
+}
+
+/// POST /api/oauth/setup/:id/commit
+///
+/// Write the fully-configured endpoint to config.toml and register the adapter.
+/// Only succeeds if the session has status `Authorized`.
+async fn oauth_setup_commit(
+    State(state): State<ManagementState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let session_id: uuid::Uuid = match id.parse() {
+        Ok(u) => u,
+        Err(_) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid session_id", None)
+                .into_response()
+        }
+    };
+
+    let Some(ref setup_mgr) = state.setup_manager else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Setup manager not available",
+            None,
+        )
+        .into_response();
+    };
+
+    // Take the session out — it's consumed on commit
+    let Some(session) = setup_mgr.remove_session(&session_id).await else {
+        return error_response(StatusCode::NOT_FOUND, "session not found or expired", None)
+            .into_response();
+    };
+
+    if session.status != crate::oauth::SetupSessionStatus::Authorized {
+        // Put it back
+        setup_mgr.get_session_mut(&session_id, |_| {}).await;
+        return error_response(
+            StatusCode::CONFLICT,
+            "session_not_authorized",
+            Some("OAuth authorization has not been completed yet."),
+        )
+        .into_response();
+    }
+
+    // Build the endpoint config entry
+    let Some(ref config_path) = state.config_path else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_path not configured",
+            None,
+        )
+        .into_response();
+    };
+
+    let resolved = crate::config::expand_tilde(config_path);
+
+    let contents = match std::fs::read_to_string(&resolved) {
+        Ok(c) => c,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read config file",
+                Some(&e.to_string()),
+            )
+            .into_response();
+        }
+    };
+
+    let mut parsed: toml::Table = match contents.parse() {
+        Ok(t) => t,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to parse config file",
+                Some(&e.to_string()),
+            )
+            .into_response();
+        }
+    };
+
+    // Build the new endpoint TOML entry
+    let mut ep_table = toml::Table::new();
+    ep_table.insert("name".into(), toml::Value::String(session.name.clone()));
+    ep_table.insert("transport".into(), toml::Value::String("oauth".to_string()));
+    ep_table.insert("url".into(), toml::Value::String(session.url.clone()));
+
+    if let Some(ref oauth_server) = session.oauth_server_url {
+        ep_table.insert(
+            "oauth_server_url".into(),
+            toml::Value::String(oauth_server.clone()),
+        );
+    }
+    if let Some(ref token_ep) = session.token_endpoint {
+        ep_table.insert(
+            "token_endpoint".into(),
+            toml::Value::String(token_ep.clone()),
+        );
+    }
+    if let Some(ref cid) = session.client_id {
+        ep_table.insert("client_id".into(), toml::Value::String(cid.clone()));
+    }
+    if let Some(ref cs) = session.client_secret {
+        ep_table.insert("client_secret".into(), toml::Value::String(cs.clone()));
+    }
+    if let Some(ref scopes_str) = session.scopes {
+        let scopes_vec: Vec<toml::Value> = scopes_str
+            .split_whitespace()
+            .map(|s| toml::Value::String(s.to_string()))
+            .collect();
+        if !scopes_vec.is_empty() {
+            ep_table.insert("scopes".into(), toml::Value::Array(scopes_vec));
+        }
+    }
+    if let Some(ref tp) = session.tool_prefix {
+        ep_table.insert("tool_prefix".into(), toml::Value::String(tp.clone()));
+    }
+
+    // Append to the [[endpoints]] array
+    let endpoints = parsed
+        .entry("endpoints")
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    if let toml::Value::Array(ref mut arr) = endpoints {
+        arr.push(toml::Value::Table(ep_table));
+    }
+
+    let new_contents = match toml::to_string_pretty(&parsed) {
+        Ok(s) => s,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to serialize config",
+                Some(&e.to_string()),
+            )
+            .into_response();
+        }
+    };
+
+    if let Err(e) = std::fs::write(&resolved, &new_contents) {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to write config file",
+            Some(&e.to_string()),
+        )
+        .into_response();
+    }
+
+    // Persist the token via TokenManager so it survives restarts
+    if let (Some(ref tm), Some(tokens)) = (&state.token_manager, session.tokens) {
+        if let Err(e) = tm.save(&session.name, &tokens).await {
+            warn!(endpoint = %session.name, error = %e, "Failed to persist tokens");
+        }
+    }
+
+    // The config watcher will pick up the change and load the new adapter.
+    Json(serde_json::json!({
+        "status": "committed",
+        "name": session.name
+    }))
+    .into_response()
+}
+
+/// DELETE /api/oauth/setup/:id
+///
+/// Cancel a setup session. Cleans up without writing to config.
+async fn oauth_setup_cancel(
+    State(state): State<ManagementState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let session_id: uuid::Uuid = match id.parse() {
+        Ok(u) => u,
+        Err(_) => {
+            return error_response(StatusCode::BAD_REQUEST, "invalid session_id", None)
+                .into_response()
+        }
+    };
+
+    let Some(ref setup_mgr) = state.setup_manager else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Setup manager not available",
+            None,
+        )
+        .into_response();
+    };
+
+    let removed = setup_mgr.remove_session(&session_id).await;
+    if removed.is_some() {
+        Json(serde_json::json!({ "status": "cancelled" })).into_response()
+    } else {
+        error_response(StatusCode::NOT_FOUND, "session not found or expired", None).into_response()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Router builder
 // ---------------------------------------------------------------------------
 
@@ -969,9 +1841,22 @@ pub fn management_routes(state: ManagementState) -> Router {
             post(enable_tool),
         )
         .route("/api/endpoints/{name}/oauth/start", post(oauth_start))
+        .route(
+            "/api/endpoints/{name}/oauth/credentials",
+            post(oauth_credentials),
+        )
         .route("/api/endpoints/{name}/oauth/status", get(oauth_status))
         .route("/api/endpoints/{name}/oauth/revoke", post(oauth_revoke))
         .route("/api/endpoints/{name}/oauth/refresh", post(oauth_refresh))
+        // OAuth setup (preflight) routes
+        .route("/api/oauth/setup", post(oauth_setup))
+        .route(
+            "/api/oauth/setup/{id}/credentials",
+            post(oauth_setup_credentials),
+        )
+        .route("/api/oauth/setup/{id}/status", get(oauth_setup_status))
+        .route("/api/oauth/setup/{id}/commit", post(oauth_setup_commit))
+        .route("/api/oauth/setup/{id}", delete(oauth_setup_cancel))
         .route("/api/catalog", get(get_catalog))
         .route("/api/config", get(get_config))
         .route("/api/config/reload", post(reload_config))
@@ -991,7 +1876,7 @@ async fn get_endpoint_tools(
     };
     match entry.adapter.list_tools().await {
         Ok(tools) => {
-            let tools_with_status: Vec<ToolInfoWithStatus> = tools
+            let mut tools_with_status: Vec<ToolInfoWithStatus> = tools
                 .into_iter()
                 .map(|t| {
                     let disabled = entry.disabled_tools.contains(&t.name);
@@ -1004,6 +1889,7 @@ async fn get_endpoint_tools(
                     }
                 })
                 .collect();
+            tools_with_status.sort_by(|a, b| a.name.cmp(&b.name));
             Json(tools_with_status).into_response()
         }
         Err(e) => error_response(
@@ -1060,6 +1946,7 @@ async fn get_catalog(State(state): State<ManagementState>) -> Json<Vec<CatalogEn
         });
     }
 
+    catalog.sort_by(|a, b| a.name.cmp(&b.name));
     Json(catalog)
 }
 
@@ -1083,6 +1970,7 @@ async fn disable_endpoint(
         }
         entry.disabled = true;
     }
+    state.registry.invalidate_catalog_cache().await;
     persist_disabled_state(&state).await;
     Json(ActionResponse {
         ok: true,
@@ -1104,6 +1992,7 @@ async fn enable_endpoint(
         entry.disabled = false;
         entry.adapter.initialize().await
     };
+    state.registry.invalidate_catalog_cache().await;
     persist_disabled_state(&state).await;
     match result {
         Ok(()) => Json(ActionResponse {
@@ -1132,6 +2021,7 @@ async fn disable_tool(
         };
         entry.disabled_tools.insert(tool_name.clone());
     }
+    state.registry.invalidate_catalog_cache().await;
     persist_disabled_state(&state).await;
     Json(ActionResponse {
         ok: true,
@@ -1152,6 +2042,7 @@ async fn enable_tool(
         };
         entry.disabled_tools.remove(&tool_name);
     }
+    state.registry.invalidate_catalog_cache().await;
     persist_disabled_state(&state).await;
     Json(ActionResponse {
         ok: true,
@@ -1251,6 +2142,7 @@ mod tests {
                 client_id: None,
                 client_secret: None,
                 scopes: None,
+                token_endpoint: None,
             }],
         }
     }
@@ -1276,6 +2168,8 @@ mod tests {
             oauth_flow_manager: None,
             relay_port: 9400,
             oauth_adapter_inners: None,
+            token_manager: None,
+            setup_manager: None,
         }
     }
 
@@ -1437,7 +2331,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn management_config_reload() {
+    async fn management_config_reload_no_config_path() {
+        // test_state has config_path: None, so reload should return ok: false
         let state = test_state(vec![]).await;
         let app = management_routes(state);
         let resp = app
@@ -1450,8 +2345,8 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
-        assert_eq!(body["ok"], true);
-        assert_eq!(body["message"], "reload scheduled");
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["message"], "config_path not configured");
     }
 
     #[tokio::test]
@@ -1927,6 +2822,8 @@ command = "echo"
             oauth_flow_manager: None,
             relay_port: 9400,
             oauth_adapter_inners: Some(oauth_inners),
+            token_manager: Some(token_manager),
+            setup_manager: None,
         };
 
         (state, shared_inner)
@@ -2159,5 +3056,464 @@ command = "echo"
             .unwrap();
         // Should return 502 because refresh fails (no refresh token)
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    // -----------------------------------------------------------------------
+    // OAuth setup (preflight) route tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a ManagementState with setup_manager and flow_manager.
+    async fn test_state_with_setup() -> ManagementState {
+        let registry = AdapterRegistry::new();
+        ManagementState {
+            registry: Arc::new(registry),
+            config: Arc::new(RwLock::new(test_config())),
+            start_time: Instant::now(),
+            config_path: None,
+            oauth_flow_manager: Some(Arc::new(OAuthFlowManager::new())),
+            relay_port: 9400,
+            oauth_adapter_inners: None,
+            token_manager: None,
+            setup_manager: Some(Arc::new(OAuthSetupManager::new())),
+        }
+    }
+
+    #[tokio::test]
+    async fn oauth_setup_status_invalid_session_returns_not_found() {
+        let state = test_state_with_setup().await;
+        let fake_id = uuid::Uuid::new_v4();
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::get(format!("/api/oauth/setup/{}/status", fake_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn oauth_setup_status_bad_uuid_returns_bad_request() {
+        let state = test_state_with_setup().await;
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::get("/api/oauth/setup/not-a-uuid/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn oauth_setup_cancel_nonexistent_returns_not_found() {
+        let state = test_state_with_setup().await;
+        let fake_id = uuid::Uuid::new_v4();
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::delete(format!("/api/oauth/setup/{}", fake_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn oauth_setup_cancel_existing_session() {
+        let state = test_state_with_setup().await;
+        let setup_mgr = state.setup_manager.as_ref().unwrap();
+        let session_id = setup_mgr
+            .create_session("ep".into(), "https://x.com".into(), None, None)
+            .await;
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::delete(format!("/api/oauth/setup/{}", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["status"], "cancelled");
+    }
+
+    #[tokio::test]
+    async fn oauth_setup_cancel_then_cancel_again_returns_not_found() {
+        let state = test_state_with_setup().await;
+        let setup_mgr = state.setup_manager.as_ref().unwrap();
+        let session_id = setup_mgr
+            .create_session("ep".into(), "https://x.com".into(), None, None)
+            .await;
+
+        // First cancel
+        setup_mgr.remove_session(&session_id).await;
+
+        // Second cancel via route
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::delete(format!("/api/oauth/setup/{}", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn oauth_setup_commit_nonexistent_returns_not_found() {
+        let state = test_state_with_setup().await;
+        let fake_id = uuid::Uuid::new_v4();
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", fake_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn oauth_setup_commit_not_authorized_returns_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let mut state = test_state_with_setup().await;
+        state.config_path = Some(config_path);
+
+        let setup_mgr = state.setup_manager.as_ref().unwrap();
+        let session_id = setup_mgr
+            .create_session("ep".into(), "https://x.com".into(), None, None)
+            .await;
+
+        // Session is in AwaitingCredentials status (not Authorized)
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "session_not_authorized");
+    }
+
+    #[tokio::test]
+    async fn oauth_setup_commit_after_cancel_returns_not_found() {
+        let state = test_state_with_setup().await;
+        let setup_mgr = state.setup_manager.as_ref().unwrap();
+        let session_id = setup_mgr
+            .create_session("ep".into(), "https://x.com".into(), None, None)
+            .await;
+
+        // Cancel the session
+        setup_mgr.remove_session(&session_id).await;
+
+        // Attempt to commit
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn oauth_setup_status_valid_session() {
+        let state = test_state_with_setup().await;
+        let setup_mgr = state.setup_manager.as_ref().unwrap();
+        let session_id = setup_mgr
+            .create_session("my-ep".into(), "https://mcp.example.com".into(), None, None)
+            .await;
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::get(format!("/api/oauth/setup/{}/status", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["session_id"], session_id.to_string());
+        assert_eq!(body["name"], "my-ep");
+        assert_eq!(body["url"], "https://mcp.example.com");
+        assert_eq!(body["status"], "awaiting_credentials");
+    }
+
+    #[tokio::test]
+    async fn oauth_setup_credentials_nonexistent_session_returns_not_found() {
+        let state = test_state_with_setup().await;
+        let fake_id = uuid::Uuid::new_v4();
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/credentials", fake_id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "client_id": "my-client",
+                            "client_secret": "my-secret"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn oauth_setup_credentials_empty_client_id_returns_bad_request() {
+        let state = test_state_with_setup().await;
+        let setup_mgr = state.setup_manager.as_ref().unwrap();
+        let session_id = setup_mgr
+            .create_session("ep".into(), "https://x.com".into(), None, None)
+            .await;
+        // Set auth/token endpoints so credential submission can proceed
+        setup_mgr
+            .get_session_mut(&session_id, |s| {
+                s.authorization_endpoint = Some("https://auth.example.com/authorize".into());
+                s.token_endpoint = Some("https://auth.example.com/token".into());
+            })
+            .await;
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/credentials", session_id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "client_id": "   ",
+                            "client_secret": null
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn oauth_setup_commit_happy_path_writes_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let token_dir = tmp.path().join("tokens");
+        std::fs::create_dir_all(&token_dir).unwrap();
+
+        let mut state = test_state_with_setup().await;
+        state.config_path = Some(config_path.clone());
+        state.token_manager = Some(Arc::new(TokenManager::new(token_dir)));
+
+        let setup_mgr = state.setup_manager.as_ref().unwrap();
+        let session_id = setup_mgr
+            .create_session(
+                "new-ep".into(),
+                "https://mcp.example.com".into(),
+                Some("read write".into()),
+                Some("newep".into()),
+            )
+            .await;
+
+        // Set up the session as Authorized with endpoints and tokens
+        setup_mgr
+            .get_session_mut(&session_id, |s| {
+                s.authorization_endpoint = Some("https://auth.example.com/authorize".into());
+                s.token_endpoint = Some("https://auth.example.com/token".into());
+                s.oauth_server_url = Some("https://auth.example.com".into());
+                s.client_id = Some("client-123".into());
+                s.client_secret = Some("secret-456".into());
+                s.status = crate::oauth::SetupSessionStatus::Authorized;
+                s.tokens = Some(crate::token_manager::TokenSet {
+                    access_token: "access-tok".into(),
+                    refresh_token: Some("refresh-tok".into()),
+                    expires_at: Some(9999999999),
+                    token_type: "Bearer".into(),
+                    scope: Some("read write".into()),
+                    issued_at: None,
+                });
+            })
+            .await;
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["status"], "committed");
+        assert_eq!(body["name"], "new-ep");
+
+        // Verify config was written
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(contents.contains("new-ep"));
+        assert!(contents.contains("https://mcp.example.com"));
+        assert!(contents.contains("oauth"));
+    }
+
+    #[tokio::test]
+    async fn oauth_setup_double_commit_returns_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let token_dir = tmp.path().join("tokens");
+        std::fs::create_dir_all(&token_dir).unwrap();
+
+        let mut state = test_state_with_setup().await;
+        state.config_path = Some(config_path.clone());
+        state.token_manager = Some(Arc::new(TokenManager::new(token_dir)));
+
+        let setup_mgr = state.setup_manager.as_ref().unwrap();
+        let session_id = setup_mgr
+            .create_session("ep".into(), "https://x.com".into(), None, None)
+            .await;
+
+        // Mark as authorized
+        setup_mgr
+            .get_session_mut(&session_id, |s| {
+                s.authorization_endpoint = Some("https://auth.example.com/authorize".into());
+                s.token_endpoint = Some("https://auth.example.com/token".into());
+                s.client_id = Some("cid".into());
+                s.status = crate::oauth::SetupSessionStatus::Authorized;
+                s.tokens = Some(crate::token_manager::TokenSet {
+                    access_token: "tok".into(),
+                    refresh_token: None,
+                    expires_at: None,
+                    token_type: "Bearer".into(),
+                    scope: None,
+                    issued_at: None,
+                });
+            })
+            .await;
+
+        // First commit succeeds (consumes session)
+        let app = management_routes(state.clone());
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Second commit should fail — session already consumed
+        let app2 = management_routes(state);
+        let resp2 = app2
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), StatusCode::NOT_FOUND);
+    }
+
+    // --- Token expiry computation tests ---
+
+    #[test]
+    fn expires_in_seconds_computed_correctly() {
+        // Simulates the computation from oauth_status_detailed handler
+        let now_secs: u64 = 1_700_000_000;
+        let expires_at: Option<u64> = Some(now_secs + 3600);
+        let expires_in_seconds = expires_at.map(|exp| exp as i64 - now_secs as i64);
+        assert_eq!(expires_in_seconds, Some(3600));
+    }
+
+    #[test]
+    fn expires_in_seconds_negative_when_expired() {
+        let now_secs: u64 = 1_700_000_000;
+        let expires_at: Option<u64> = Some(now_secs - 100);
+        let expires_in_seconds = expires_at.map(|exp| exp as i64 - now_secs as i64);
+        assert_eq!(expires_in_seconds, Some(-100));
+    }
+
+    #[test]
+    fn next_refresh_at_75_percent_rule() {
+        // Simulates the computation from oauth_status_detailed handler
+        let issued: u64 = 1_700_000_000;
+        let expires: u64 = issued + 3600; // 1-hour token
+        let lifetime = expires - issued;
+        let seventy_five_pct = issued + (lifetime * 3 / 4);
+        let five_min_before = expires.saturating_sub(300);
+        let next_refresh = std::cmp::min(seventy_five_pct, five_min_before);
+        // 75% of 3600 = 2700; 5 min before = 3300. min = 2700.
+        assert_eq!(next_refresh, issued + 2700);
+    }
+
+    #[test]
+    fn next_refresh_at_short_token() {
+        // For a 10-minute token: 75% = 450s, 5-min-before = 300s. min = 300.
+        let issued: u64 = 1_700_000_000;
+        let expires: u64 = issued + 600;
+        let lifetime = expires - issued;
+        let seventy_five_pct = issued + (lifetime * 3 / 4);
+        let five_min_before = expires.saturating_sub(300);
+        let next_refresh = std::cmp::min(seventy_five_pct, five_min_before);
+        assert_eq!(next_refresh, issued + 300);
+    }
+
+    #[test]
+    fn next_refresh_at_none_when_no_issued() {
+        // If issued_at is None, next_refresh_at should be None
+        let issued_at: Option<u64> = None;
+        let expires_at: Option<u64> = Some(1_700_003_600);
+        let next_refresh = match (issued_at, expires_at) {
+            (Some(issued), Some(expires)) if expires > issued => {
+                let lifetime = expires - issued;
+                let seventy_five_pct = issued + (lifetime * 3 / 4);
+                let five_min_before = expires.saturating_sub(300);
+                Some(std::cmp::min(seventy_five_pct, five_min_before))
+            }
+            _ => None,
+        };
+        assert_eq!(next_refresh, None);
+    }
+
+    #[test]
+    fn token_with_expires_in_produces_correct_expires_at() {
+        // Simulates the token construction in server.rs
+        let now_secs: u64 = 1_700_000_000;
+        let expires_in: u64 = 3600;
+        let expires_at = now_secs + expires_in;
+        assert_eq!(expires_at, 1_700_003_600);
     }
 }

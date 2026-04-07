@@ -71,6 +71,8 @@ pub struct EndpointConfig {
     pub client_secret: Option<String>,
     #[serde(default)]
     pub scopes: Option<Vec<String>>,
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
 }
 
 impl EndpointConfig {
@@ -499,18 +501,6 @@ impl Config {
                             ep.name
                         ));
                     }
-                    if ep.client_id.is_none() || ep.client_id.as_deref() == Some("") {
-                        errors.push(format!(
-                            "Endpoint '{}': oauth transport requires a 'client_id' field",
-                            ep.name
-                        ));
-                    }
-                    if ep.oauth_server_url.is_none() || ep.oauth_server_url.as_deref() == Some("") {
-                        errors.push(format!(
-                            "Endpoint '{}': oauth transport requires an 'oauth_server_url' field",
-                            ep.name
-                        ));
-                    }
                 }
             }
         }
@@ -606,19 +596,6 @@ fn validate_graceful(config: &Config, warnings: &mut Vec<EndpointValidationWarni
                         warnings.push(EndpointValidationWarning {
                             endpoint_name: ep.name.clone(),
                             message: "oauth transport requires a 'url' field".to_string(),
-                        });
-                    }
-                    if ep.client_id.is_none() || ep.client_id.as_deref() == Some("") {
-                        warnings.push(EndpointValidationWarning {
-                            endpoint_name: ep.name.clone(),
-                            message: "oauth transport requires a 'client_id' field".to_string(),
-                        });
-                    }
-                    if ep.oauth_server_url.is_none() || ep.oauth_server_url.as_deref() == Some("") {
-                        warnings.push(EndpointValidationWarning {
-                            endpoint_name: ep.name.clone(),
-                            message: "oauth transport requires an 'oauth_server_url' field"
-                                .to_string(),
                         });
                     }
                 }
@@ -1079,6 +1056,7 @@ command = "echo"
             client_id: None,
             client_secret: None,
             scopes: None,
+            token_endpoint: None,
         }
     }
 
@@ -1099,6 +1077,7 @@ command = "echo"
             client_id: None,
             client_secret: None,
             scopes: None,
+            token_endpoint: None,
         }
     }
 
@@ -1388,7 +1367,8 @@ scopes = ["read", "write"]
     }
 
     #[test]
-    fn oauth_missing_client_id_is_error() {
+    fn oauth_missing_client_id_is_valid() {
+        // client_id is now optional — can be auto-registered via DCR
         let toml_str = r#"
 [relay]
 machine_name = "test"
@@ -1399,21 +1379,13 @@ transport = "oauth"
 url = "http://localhost:5000/mcp"
 oauth_server_url = "https://auth.example.com"
 "#;
-        let err = parse_and_validate(toml_str).unwrap_err();
-        match err {
-            ConfigError::ValidationError(msg) => {
-                assert!(
-                    msg.contains("client_id"),
-                    "Error should mention client_id: {}",
-                    msg
-                );
-            }
-            other => panic!("Expected ValidationError, got: {:?}", other),
-        }
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(config.endpoints[0].client_id, None);
     }
 
     #[test]
-    fn oauth_missing_server_url_is_error() {
+    fn oauth_missing_server_url_is_valid() {
+        // oauth_server_url is now optional — can be auto-discovered via RFC 9728
         let toml_str = r#"
 [relay]
 machine_name = "test"
@@ -1424,21 +1396,13 @@ transport = "oauth"
 url = "http://localhost:5000/mcp"
 client_id = "my-client-id"
 "#;
-        let err = parse_and_validate(toml_str).unwrap_err();
-        match err {
-            ConfigError::ValidationError(msg) => {
-                assert!(
-                    msg.contains("oauth_server_url"),
-                    "Error should mention oauth_server_url: {}",
-                    msg
-                );
-            }
-            other => panic!("Expected ValidationError, got: {:?}", other),
-        }
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(config.endpoints[0].oauth_server_url, None);
     }
 
     #[test]
-    fn oauth_no_fields_reports_all_missing() {
+    fn oauth_no_fields_reports_missing_url_only() {
+        // Only url is required for OAuth transport now
         let toml_str = r#"
 [relay]
 machine_name = "test"
@@ -1452,13 +1416,13 @@ transport = "oauth"
             ConfigError::ValidationError(msg) => {
                 assert!(msg.contains("url"), "Error should mention url: {}", msg);
                 assert!(
-                    msg.contains("client_id"),
-                    "Error should mention client_id: {}",
+                    !msg.contains("client_id"),
+                    "Error should NOT mention client_id: {}",
                     msg
                 );
                 assert!(
-                    msg.contains("oauth_server_url"),
-                    "Error should mention oauth_server_url: {}",
+                    !msg.contains("oauth_server_url"),
+                    "Error should NOT mention oauth_server_url: {}",
                     msg
                 );
             }
@@ -1547,6 +1511,7 @@ scopes = ["openid", "profile", "email"]
             client_id: Some("old-client".to_string()),
             client_secret: None,
             scopes: None,
+            token_endpoint: None,
         };
 
         let mut ep2 = ep1.clone();
