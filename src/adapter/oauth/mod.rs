@@ -1,3 +1,10 @@
+mod heartbeat;
+mod state;
+
+// Re-export submodule public items so external callers are unaffected.
+pub use heartbeat::{heartbeat_loop, probe_inner};
+pub use state::{refresh_deadline, OAuthState};
+
 use super::http::{HttpAdapter, HttpConfig};
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::oauth::OAuthError;
@@ -11,43 +18,6 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
-
-/// Internal state of an OAuth-authenticated endpoint.
-///
-/// Maps to `HealthStatus` in the `health()` method but carries richer
-/// semantic meaning for lifecycle management (refresh scheduling,
-/// startup restore, management API responses).
-#[derive(Debug, Clone, PartialEq)]
-pub enum OAuthState {
-    /// No tokens, never authenticated.
-    NeedsLogin,
-    /// Valid tokens, inner adapter healthy.
-    Authenticated,
-    /// Proactive or reactive refresh in progress.
-    Refreshing,
-    /// Refresh failed, needs re-login.
-    AuthRequired,
-    /// Token valid but MCP server unreachable.
-    ConnectionFailed,
-    /// User explicitly disconnected.
-    Disconnected,
-}
-
-/// Compute the deadline at which a proactive token refresh should fire.
-///
-/// Returns the earlier of:
-/// - 75 % of token lifetime after `issued_at`
-/// - 5 minutes before `expires_at`
-///
-/// If `expires_at` is unknown (server didn't return `expires_in`), returns
-/// `None` — the caller should skip proactive refresh and rely on 401 retry.
-pub fn refresh_deadline(issued_at: Instant, expires_at: Instant) -> Instant {
-    let lifetime = expires_at - issued_at;
-    let seventy_five_pct = issued_at + (lifetime * 3 / 4);
-    let five_min_before = expires_at - Duration::from_secs(300);
-    std::cmp::min(seventy_five_pct, five_min_before)
-}
-
 /// Configuration for an OAuth-authenticated MCP endpoint.
 #[derive(Debug, Clone)]
 pub struct OAuthAdapterConfig {
@@ -80,6 +50,10 @@ pub struct OAuthAdapterInner {
     http_client: Client,
     /// Handle to the proactive refresh background task.
     refresh_task_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Health of the wrapped inner adapter (updated by heartbeat probe).
+    pub inner_health: RwLock<HealthStatus>,
+    /// Handle to the heartbeat background task.
+    heartbeat_task_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl OAuthAdapterInner {
@@ -441,6 +415,11 @@ impl McpAdapter for OAuthAdapter {
             *self.inner.state.write().await = OAuthState::NeedsLogin;
         }
 
+        // Spawn the heartbeat probe loop
+        let weak = Arc::downgrade(&self.inner);
+        let handle = tokio::spawn(heartbeat::heartbeat_loop(weak));
+        self.inner.heartbeat_task_handle.lock().await.replace(handle);
+
         Ok(()) // initialize always succeeds for OAuth
     }
 
@@ -551,6 +530,13 @@ impl McpAdapter for OAuthAdapter {
     }
 
     async fn shutdown(&mut self) -> Result<(), AdapterError> {
+        // Abort heartbeat task
+        {
+            let mut handle = self.inner.heartbeat_task_handle.lock().await;
+            if let Some(h) = handle.take() {
+                h.abort();
+            }
+        }
         // Abort refresh task
         {
             let mut handle = self.inner.refresh_task_handle.lock().await;
@@ -569,10 +555,15 @@ impl McpAdapter for OAuthAdapter {
     }
 
     fn health(&self) -> HealthStatus {
-        match self.inner.state.try_read() {
-            Ok(s) => Self::map_health(&s),
+        let state = match self.inner.state.try_read() {
+            Ok(s) => s.clone(),
+            Err(_) => return HealthStatus::Starting,
+        };
+        let inner = match self.inner.inner_health.try_read() {
+            Ok(h) => h.clone(),
             Err(_) => HealthStatus::Starting,
-        }
+        };
+        derive_health(&state, &inner)
     }
 
     async fn activity_log(&self) -> Vec<String> {
@@ -595,6 +586,7 @@ mod tests {
             token_endpoint_url: "http://localhost/token".to_string(),
             client_id: "test-client".to_string(),
             client_secret: None,
+            heartbeat_interval_secs: 30,
         }
     }
 
@@ -709,31 +701,30 @@ mod tests {
     }
 
     #[test]
-    fn health_mapping() {
-        assert_eq!(
-            OAuthAdapter::map_health(&OAuthState::NeedsLogin),
-            HealthStatus::Unhealthy("needs login".to_string())
-        );
-        assert_eq!(
-            OAuthAdapter::map_health(&OAuthState::Authenticated),
-            HealthStatus::Healthy
-        );
-        assert_eq!(
-            OAuthAdapter::map_health(&OAuthState::Refreshing),
-            HealthStatus::Healthy
-        );
-        assert_eq!(
-            OAuthAdapter::map_health(&OAuthState::AuthRequired),
-            HealthStatus::Unhealthy("authentication required".to_string())
-        );
-        assert_eq!(
-            OAuthAdapter::map_health(&OAuthState::ConnectionFailed),
-            HealthStatus::Unhealthy("connection failed".to_string())
-        );
-        assert_eq!(
-            OAuthAdapter::map_health(&OAuthState::Disconnected),
-            HealthStatus::Stopped
-        );
+    fn derive_health_table() {
+        let cases = [
+            // Authenticated propagates inner
+            (OAuthState::Authenticated, HealthStatus::Healthy, HealthStatus::Healthy),
+            (OAuthState::Authenticated, HealthStatus::Starting, HealthStatus::Starting),
+            (
+                OAuthState::Authenticated,
+                HealthStatus::Unhealthy("upstream timeout".into()),
+                HealthStatus::Unhealthy("upstream timeout".into()),
+            ),
+            (OAuthState::Authenticated, HealthStatus::Stopped, HealthStatus::Stopped),
+            // Refreshing always wins
+            (OAuthState::Refreshing, HealthStatus::Healthy, HealthStatus::Starting),
+            (OAuthState::Refreshing, HealthStatus::Stopped, HealthStatus::Starting),
+            // Hard-error states ignore inner
+            (OAuthState::AuthRequired, HealthStatus::Healthy, HealthStatus::Unhealthy("auth required".into())),
+            (OAuthState::ConnectionFailed, HealthStatus::Healthy, HealthStatus::Unhealthy("connection failed".into())),
+            (OAuthState::NeedsLogin, HealthStatus::Healthy, HealthStatus::Unhealthy("needs login".into())),
+            (OAuthState::Disconnected, HealthStatus::Healthy, HealthStatus::Stopped),
+        ];
+        for (state, inner, expected) in cases {
+            let got = derive_health(&state, &inner);
+            assert_eq!(got, expected, "state={:?} inner={:?}", state, inner);
+        }
     }
 
     // --- OAuthState enum tests ---
