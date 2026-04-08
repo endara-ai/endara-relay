@@ -1,9 +1,11 @@
 mod heartbeat;
+pub mod metrics;
 mod state;
 
 // Re-export submodule public items so external callers are unaffected.
 pub use state::{derive_health, do_transition, refresh_deadline, OAuthState, TransitionRecord};
 
+use self::metrics::{generate_correlation_id, OAuthMetrics};
 use super::http::{HttpAdapter, HttpConfig};
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::oauth::OAuthError;
@@ -58,6 +60,10 @@ pub struct OAuthAdapterInner {
     heartbeat_task_handle: Mutex<Option<JoinHandle<()>>>,
     /// Ring buffer of recent state transitions (max TRANSITION_RING_BUFFER_CAPACITY).
     pub transition_history: RwLock<VecDeque<TransitionRecord>>,
+    /// In-process metric counters.
+    pub metrics: OAuthMetrics,
+    /// Guards concurrent refresh attempts so only one proceeds at a time.
+    refresh_mutex: Mutex<()>,
 }
 
 impl OAuthAdapterInner {
@@ -95,10 +101,12 @@ impl OAuthAdapterInner {
         let mut state = self.state.write().await;
         let mut history = self.transition_history.write().await;
         let old = do_transition(&mut state, new_state.clone(), reason, &mut history);
+        self.metrics.inc_state_transition();
         info!(
             endpoint = %self.config.endpoint_name,
             from = ?old,
             to = ?new_state,
+            oauth_state = ?new_state,
             reason = %reason,
             "OAuth state transition"
         );
@@ -110,19 +118,55 @@ impl OAuthAdapterInner {
     /// On success, calls `apply_tokens_inner` with the new token set.
     /// On failure, transitions to `AuthRequired`.
     pub async fn do_token_refresh(self: &Arc<Self>) -> Result<TokenSet, OAuthError> {
+        // Snapshot the current access token before acquiring the mutex.
+        // If it changes while we wait, another concurrent refresh succeeded.
+        let pre_token = {
+            let tokens = self.tokens.read().await;
+            tokens.as_ref().map(|t| t.access_token.clone())
+        };
+
+        // Coalesce concurrent refresh attempts: only one thread does the actual
+        // HTTP POST; others wait and then return the already-refreshed tokens.
+        let _guard = self.refresh_mutex.lock().await;
+
+        // Check if another concurrent caller already refreshed successfully
+        // while we were waiting for the mutex (token changed → skip refresh).
+        {
+            let tokens = self.tokens.read().await;
+            if let Some(ref t) = *tokens {
+                if Some(&t.access_token) != pre_token.as_ref() {
+                    // Token was refreshed by another concurrent caller.
+                    return Ok(t.clone());
+                }
+            }
+        }
+
+        let correlation_id = generate_correlation_id();
         let refresh_token = {
             let tokens = self.tokens.read().await;
             match tokens.as_ref().and_then(|t| t.refresh_token.clone()) {
                 Some(rt) => rt,
                 None => {
+                    warn!(
+                        endpoint = %self.config.endpoint_name,
+                        correlation_id = %correlation_id,
+                        "No refresh token available"
+                    );
                     self.transition_to(OAuthState::AuthRequired, "no refresh token")
                         .await;
+                    self.metrics.inc_refresh_failure();
                     return Err(OAuthError::NoRefreshToken {
                         endpoint: self.config.endpoint_name.clone(),
                     });
                 }
             }
         };
+
+        info!(
+            endpoint = %self.config.endpoint_name,
+            correlation_id = %correlation_id,
+            "Starting token refresh"
+        );
 
         // Mark as refreshing
         self.transition_to(OAuthState::Refreshing, "starting token refresh")
@@ -150,6 +194,7 @@ impl OAuthAdapterInner {
             .await
             .map_err(|e| {
                 // Network error during refresh
+                self.metrics.inc_refresh_failure();
                 OAuthError::Http(e)
             })?;
 
@@ -158,10 +203,12 @@ impl OAuthAdapterInner {
             let body = resp.text().await.unwrap_or_default();
             error!(
                 endpoint = %self.config.endpoint_name,
+                correlation_id = %correlation_id,
                 %status,
                 body = %body,
                 "Token refresh failed"
             );
+            self.metrics.inc_refresh_failure();
             self.transition_to(OAuthState::AuthRequired, "token refresh failed")
                 .await;
             return Err(OAuthError::RefreshFailed { status, body });
@@ -200,7 +247,12 @@ impl OAuthAdapterInner {
             issued_at: Some(now_secs),
         };
 
-        info!(endpoint = %self.config.endpoint_name, "Token refresh successful");
+        self.metrics.inc_refresh_success();
+        info!(
+            endpoint = %self.config.endpoint_name,
+            correlation_id = %correlation_id,
+            "Token refresh successful"
+        );
         Ok(new_token_set)
     }
 
@@ -371,6 +423,8 @@ impl OAuthAdapter {
                 inner_health: RwLock::new(HealthStatus::Starting),
                 heartbeat_task_handle: Mutex::new(None),
                 transition_history: RwLock::new(VecDeque::new()),
+                metrics: OAuthMetrics::new(),
+                refresh_mutex: Mutex::new(()),
             }),
         }
     }

@@ -1254,6 +1254,42 @@ async fn oauth_refresh(
     }
 }
 
+/// GET /api/endpoints/:name/oauth/metrics
+///
+/// Returns in-process metric counters for the OAuth adapter (JSON).
+async fn oauth_metrics(
+    State(state): State<ManagementState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    {
+        let entries = state.registry.entries().read().await;
+        if !entries.contains_key(&name) {
+            return endpoint_not_found(&name).into_response();
+        }
+    }
+
+    let Some(ref inners) = state.oauth_adapter_inners else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "endpoint is not configured for OAuth",
+            Some("No OAuth adapter inners available"),
+        )
+        .into_response();
+    };
+
+    let inners_guard = inners.read().await;
+    let Some(inner) = inners_guard.get(&name) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "endpoint is not configured for OAuth",
+            Some(&format!("Endpoint '{}' is not an OAuth endpoint", name)),
+        )
+        .into_response();
+    };
+
+    Json(inner.metrics.snapshot()).into_response()
+}
+
 // ---------------------------------------------------------------------------
 // OAuth setup (preflight) route handlers
 // ---------------------------------------------------------------------------
@@ -1870,6 +1906,7 @@ pub fn management_routes(state: ManagementState) -> Router {
         .route("/api/endpoints/{name}/oauth/status", get(oauth_status))
         .route("/api/endpoints/{name}/oauth/revoke", post(oauth_revoke))
         .route("/api/endpoints/{name}/oauth/refresh", post(oauth_refresh))
+        .route("/api/endpoints/{name}/oauth/metrics", get(oauth_metrics))
         // OAuth setup (preflight) routes
         .route("/api/oauth/setup", post(oauth_setup))
         .route(

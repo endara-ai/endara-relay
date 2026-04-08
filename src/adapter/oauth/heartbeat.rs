@@ -59,18 +59,38 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
         }
 
         let endpoint = &adapter.config.endpoint_name;
+        let oauth_state = adapter.state.read().await.clone();
         match probe_inner(&adapter).await {
             Ok(()) => {
                 *adapter.inner_health.write().await = HealthStatus::Healthy;
-                debug!(endpoint = %endpoint, "heartbeat probe succeeded");
+                adapter.metrics.inc_heartbeat_healthy();
+                debug!(
+                    endpoint = %endpoint,
+                    oauth_state = ?oauth_state,
+                    result = "healthy",
+                    "heartbeat probe succeeded"
+                );
             }
             Err(ProbeError::Network(reason)) => {
                 *adapter.inner_health.write().await =
                     HealthStatus::Unhealthy("upstream unreachable".into());
-                warn!(endpoint = %endpoint, reason = %reason, "heartbeat probe failed");
+                adapter.metrics.inc_heartbeat_unhealthy();
+                warn!(
+                    endpoint = %endpoint,
+                    oauth_state = ?oauth_state,
+                    result = "unhealthy",
+                    reason = %reason,
+                    "heartbeat probe failed"
+                );
             }
             Err(ProbeError::Auth) => {
-                warn!(endpoint = %endpoint, "heartbeat probe got 401, transitioning to AuthRequired");
+                adapter.metrics.inc_heartbeat_unhealthy();
+                warn!(
+                    endpoint = %endpoint,
+                    oauth_state = ?oauth_state,
+                    result = "unhealthy",
+                    "heartbeat probe got 401, transitioning to AuthRequired"
+                );
                 *adapter.state.write().await = OAuthState::AuthRequired;
             }
         }

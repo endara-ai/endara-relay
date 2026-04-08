@@ -10,6 +10,7 @@ struct EndpointEntry {
     args: Vec<String>,
     url: Option<String>,
     oauth_server_url: Option<String>,
+    client_id: Option<String>,
     env: Vec<(String, String)>,
 }
 
@@ -36,6 +37,7 @@ impl ConfigBuilder {
             args: args.iter().map(|s| s.to_string()).collect(),
             url: None,
             oauth_server_url: None,
+            client_id: None,
             env: Vec::new(),
         });
         self
@@ -56,6 +58,7 @@ impl ConfigBuilder {
             args: args.iter().map(|s| s.to_string()).collect(),
             url: None,
             oauth_server_url: None,
+            client_id: None,
             env: env
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
@@ -73,6 +76,7 @@ impl ConfigBuilder {
             args: Vec::new(),
             url: Some(url.to_string()),
             oauth_server_url: None,
+            client_id: None,
             env: Vec::new(),
         });
         self
@@ -87,6 +91,7 @@ impl ConfigBuilder {
             args: Vec::new(),
             url: Some(url.to_string()),
             oauth_server_url: None,
+            client_id: None,
             env: Vec::new(),
         });
         self
@@ -101,6 +106,28 @@ impl ConfigBuilder {
             args: Vec::new(),
             url: Some(url.to_string()),
             oauth_server_url: oauth_server_url.map(|s| s.to_string()),
+            client_id: None,
+            env: Vec::new(),
+        });
+        self
+    }
+
+    /// Add an OAuth transport endpoint with a client_id.
+    pub fn add_oauth_with_client(
+        mut self,
+        name: &str,
+        url: &str,
+        oauth_server_url: Option<&str>,
+        client_id: &str,
+    ) -> Self {
+        self.endpoints.push(EndpointEntry {
+            name: name.to_string(),
+            transport: "oauth".to_string(),
+            command: None,
+            args: Vec::new(),
+            url: Some(url.to_string()),
+            oauth_server_url: oauth_server_url.map(|s| s.to_string()),
+            client_id: Some(client_id.to_string()),
             env: Vec::new(),
         });
         self
@@ -138,6 +165,9 @@ impl ConfigBuilder {
             }
             if let Some(ref oauth_url) = ep.oauth_server_url {
                 out.push_str(&format!("oauth_server_url = \"{}\"\n", oauth_url));
+            }
+            if let Some(ref cid) = ep.client_id {
+                out.push_str(&format!("client_id = \"{}\"\n", cid));
             }
             if !ep.env.is_empty() {
                 out.push_str("env = { ");
