@@ -269,6 +269,7 @@ impl AdapterRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::StartingAdapter;
     use async_trait::async_trait;
     use serde_json::json;
 
@@ -1043,5 +1044,159 @@ mod tests {
                 "zserver__beta"
             ]
         );
+    }
+
+    // --- Catalog cache invalidation after adapter replacement ---
+
+    #[tokio::test]
+    async fn test_catalog_stale_after_direct_replacement_without_invalidation() {
+        let registry = AdapterRegistry::new();
+        // Register a StartingAdapter (list_tools returns empty vec)
+        registry
+            .register(
+                "ep".into(),
+                Box::new(StartingAdapter),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        // Build catalog → should be empty (StartingAdapter returns no tools)
+        let catalog = registry.merged_catalog().await;
+        assert!(catalog.is_empty(), "StartingAdapter should have no tools");
+
+        // Replace the adapter directly via entries().write() (bypasses cache invalidation)
+        {
+            let mut entries = registry.entries().write().await;
+            let entry = entries.get_mut("ep").unwrap();
+            entry.adapter = Box::new(MockAdapter::healthy(vec![make_tool("gmail_send")]));
+        }
+
+        // Catalog should still be empty because cache was not invalidated
+        let catalog = registry.merged_catalog().await;
+        assert!(
+            catalog.is_empty(),
+            "Cache should be stale after direct replacement"
+        );
+
+        // Now invalidate the cache
+        registry.invalidate_catalog_cache().await;
+
+        // Catalog should now reflect the new adapter's tools
+        let catalog = registry.merged_catalog().await;
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].name, "gmail_send");
+    }
+
+    #[tokio::test]
+    async fn test_register_auto_invalidates_cache() {
+        let registry = AdapterRegistry::new();
+        // Register adapter A with tool "alpha"
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("alpha")])),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        let catalog = registry.merged_catalog().await;
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].name, "alpha");
+
+        // Register adapter B under the SAME name with tool "beta"
+        // register() should auto-invalidate the cache
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("beta")])),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        // Catalog should reflect adapter B's tools without manual invalidation
+        let catalog = registry.merged_catalog().await;
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].name, "beta");
+    }
+
+    #[tokio::test]
+    async fn test_multiple_rapid_replacements() {
+        let registry = AdapterRegistry::new();
+        // Register StartingAdapter, build catalog (empty, cached)
+        registry
+            .register(
+                "ep".into(),
+                Box::new(StartingAdapter),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+        let catalog = registry.merged_catalog().await;
+        assert!(catalog.is_empty());
+
+        // Replace 3 times via entries().write() with different tool sets
+        let replacements = vec![
+            vec![make_tool("v1_tool")],
+            vec![make_tool("v2_a"), make_tool("v2_b")],
+            vec![
+                make_tool("final_x"),
+                make_tool("final_y"),
+                make_tool("final_z"),
+            ],
+        ];
+
+        for tools in &replacements {
+            {
+                let mut entries = registry.entries().write().await;
+                let entry = entries.get_mut("ep").unwrap();
+                entry.adapter = Box::new(MockAdapter::healthy(tools.clone()));
+            }
+            registry.invalidate_catalog_cache().await;
+        }
+
+        // Final merged_catalog() should reflect only the last replacement's tools
+        let catalog = registry.merged_catalog().await;
+        assert_eq!(catalog.len(), 3);
+        let names: Vec<&str> = catalog.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"final_x"));
+        assert!(names.contains(&"final_y"));
+        assert!(names.contains(&"final_z"));
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_cache_with_nonexistent_entry() {
+        let registry = AdapterRegistry::new();
+
+        // Write a new entry directly to entries() for a name that was never registered
+        {
+            let mut entries = registry.entries().write().await;
+            entries.insert(
+                "new_ep".to_string(),
+                RegisteredAdapter {
+                    adapter: Box::new(MockAdapter::healthy(vec![make_tool("surprise")])),
+                    transport: "stdio".to_string(),
+                    description: None,
+                    tool_prefix: Some("new_ep".to_string()),
+                    last_activity: None,
+                    disabled: false,
+                    disabled_tools: HashSet::new(),
+                },
+            );
+        }
+
+        // Invalidate cache — should not panic
+        registry.invalidate_catalog_cache().await;
+
+        // Verify merged_catalog() includes the new entry's tools
+        let catalog = registry.merged_catalog().await;
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].name, "surprise");
     }
 }
