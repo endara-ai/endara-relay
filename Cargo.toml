@@ -57,4 +57,8 @@ name = "fixture-http-server"
 path = "tests/fixtures/http_server.rs"
 
 [dev-dependencies]
+futures-util = "0.3"
+reqwest = { version = "0.13", features = ["json", "stream"] }
+serde_json = "1"
 tempfile = "3.27.0"
+which = "7"

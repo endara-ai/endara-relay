@@ -11,19 +11,31 @@ permissions:
 jobs:
   check:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: Pre-warm npx cache
+        run: |
+          npx -y @modelcontextprotocol/server-everything --help || true
+          npx -y @modelcontextprotocol/server-filesystem --help || true
+          npx -y @modelcontextprotocol/server-memory --help || true
       - name: Format check
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy -- -D warnings
       - name: Unit tests
-        run: cargo test
+        run: cargo test --lib
       - name: Integration tests
-        run: cargo test --test '*'
+        run: cargo test --test '*' -- --test-threads=4
 
   build:
     needs: check

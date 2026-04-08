@@ -1,0 +1,9 @@
+[relay]
+machine_name = "integration-test"
+
+[[endpoints]]
+name = "everything"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-everything"]
+
