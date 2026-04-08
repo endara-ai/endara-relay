@@ -2,8 +2,7 @@ mod heartbeat;
 mod state;
 
 // Re-export submodule public items so external callers are unaffected.
-pub use heartbeat::{heartbeat_loop, probe_inner};
-pub use state::{refresh_deadline, OAuthState};
+pub use state::{derive_health, do_transition, refresh_deadline, OAuthState, TransitionRecord};
 
 use super::http::{HttpAdapter, HttpConfig};
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
@@ -12,6 +11,7 @@ use crate::token_manager::{TokenManager, TokenSet};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
@@ -31,6 +31,8 @@ pub struct OAuthAdapterConfig {
     pub client_id: String,
     /// OAuth client secret (optional for public clients).
     pub client_secret: Option<String>,
+    /// Heartbeat probe interval in seconds (default: 30).
+    pub heartbeat_interval_secs: u64,
 }
 
 /// Shared inner state for an OAuth adapter, wrapped in `Arc` so it can be
@@ -54,6 +56,8 @@ pub struct OAuthAdapterInner {
     pub inner_health: RwLock<HealthStatus>,
     /// Handle to the heartbeat background task.
     heartbeat_task_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Ring buffer of recent state transitions (max TRANSITION_RING_BUFFER_CAPACITY).
+    pub transition_history: RwLock<VecDeque<TransitionRecord>>,
 }
 
 impl OAuthAdapterInner {
@@ -81,6 +85,25 @@ impl OAuthAdapterInner {
         HttpAdapter::new_with_client(HttpConfig::new(url), client)
     }
 
+    /// Transition to a new `OAuthState`.
+    ///
+    /// This is the **single writer** of `self.state`. It acquires the state
+    /// write lock, validates the transition via `assert_legal_transition`,
+    /// records it in the ring buffer, emits a tracing event, and updates
+    /// the state.
+    pub async fn transition_to(&self, new_state: OAuthState, reason: &str) {
+        let mut state = self.state.write().await;
+        let mut history = self.transition_history.write().await;
+        let old = do_transition(&mut state, new_state.clone(), reason, &mut history);
+        info!(
+            endpoint = %self.config.endpoint_name,
+            from = ?old,
+            to = ?new_state,
+            reason = %reason,
+            "OAuth state transition"
+        );
+    }
+
     /// Perform a token refresh using the refresh_token grant.
     ///
     /// POSTs to the token endpoint with grant_type=refresh_token.
@@ -92,7 +115,8 @@ impl OAuthAdapterInner {
             match tokens.as_ref().and_then(|t| t.refresh_token.clone()) {
                 Some(rt) => rt,
                 None => {
-                    *self.state.write().await = OAuthState::AuthRequired;
+                    self.transition_to(OAuthState::AuthRequired, "no refresh token")
+                        .await;
                     return Err(OAuthError::NoRefreshToken {
                         endpoint: self.config.endpoint_name.clone(),
                     });
@@ -101,8 +125,8 @@ impl OAuthAdapterInner {
         };
 
         // Mark as refreshing
-        *self.state.write().await = OAuthState::Refreshing;
-        info!(endpoint = %self.config.endpoint_name, "Starting token refresh");
+        self.transition_to(OAuthState::Refreshing, "starting token refresh")
+            .await;
 
         let mut form_parts: Vec<(&str, String)> = vec![
             ("grant_type", "refresh_token".to_string()),
@@ -138,7 +162,8 @@ impl OAuthAdapterInner {
                 body = %body,
                 "Token refresh failed"
             );
-            *self.state.write().await = OAuthState::AuthRequired;
+            self.transition_to(OAuthState::AuthRequired, "token refresh failed")
+                .await;
             return Err(OAuthError::RefreshFailed { status, body });
         }
 
@@ -211,13 +236,19 @@ impl OAuthAdapterInner {
         match adapter.initialize().await {
             Ok(()) => {
                 *self.inner_adapter.write().await = Some(adapter);
-                *self.state.write().await = OAuthState::Authenticated;
-                info!(endpoint = %endpoint, "Inner adapter rebuilt with new token");
+                self.transition_to(
+                    OAuthState::Authenticated,
+                    "tokens applied, inner adapter ready",
+                )
+                .await;
             }
             Err(e) => {
                 *self.inner_adapter.write().await = None;
-                *self.state.write().await = OAuthState::ConnectionFailed;
-                warn!(endpoint = %endpoint, error = %e, "Inner adapter init failed after token apply");
+                self.transition_to(
+                    OAuthState::ConnectionFailed,
+                    &format!("inner adapter init failed: {}", e),
+                )
+                .await;
             }
         }
 
@@ -312,8 +343,8 @@ impl OAuthAdapterInner {
         }
 
         // Set state
-        *self.state.write().await = OAuthState::Disconnected;
-        info!(endpoint = %endpoint, "OAuth adapter disconnected");
+        self.transition_to(OAuthState::Disconnected, "user disconnected")
+            .await;
     }
 }
 
@@ -337,6 +368,9 @@ impl OAuthAdapter {
                 token_manager,
                 http_client: Client::new(),
                 refresh_task_handle: Mutex::new(None),
+                inner_health: RwLock::new(HealthStatus::Starting),
+                heartbeat_task_handle: Mutex::new(None),
+                transition_history: RwLock::new(VecDeque::new()),
             }),
         }
     }
@@ -344,22 +378,6 @@ impl OAuthAdapter {
     /// Get a clone of the shared inner state (for use by callback handlers).
     pub fn shared_inner(&self) -> Arc<OAuthAdapterInner> {
         self.inner.clone()
-    }
-
-    /// Map OAuthState → HealthStatus.
-    fn map_health(state: &OAuthState) -> HealthStatus {
-        match state {
-            OAuthState::NeedsLogin => HealthStatus::Unhealthy("needs login".to_string()),
-            OAuthState::Authenticated => HealthStatus::Healthy,
-            OAuthState::Refreshing => HealthStatus::Healthy, // still serving with current token
-            OAuthState::AuthRequired => {
-                HealthStatus::Unhealthy("authentication required".to_string())
-            }
-            OAuthState::ConnectionFailed => {
-                HealthStatus::Unhealthy("connection failed".to_string())
-            }
-            OAuthState::Disconnected => HealthStatus::Stopped,
-        }
     }
 }
 
@@ -397,28 +415,33 @@ impl McpAdapter for OAuthAdapter {
                             error = %e,
                             "Token refresh at startup failed"
                         );
-                        *self.inner.state.write().await = OAuthState::AuthRequired;
+                        self.inner
+                            .transition_to(OAuthState::AuthRequired, "startup refresh failed")
+                            .await;
                     }
                 }
             } else {
-                info!(
-                    endpoint = %self.inner.config.endpoint_name,
-                    "Loaded expired tokens without refresh token"
-                );
-                *self.inner.state.write().await = OAuthState::AuthRequired;
+                self.inner
+                    .transition_to(
+                        OAuthState::AuthRequired,
+                        "expired tokens without refresh token",
+                    )
+                    .await;
             }
         } else {
-            info!(
-                endpoint = %self.inner.config.endpoint_name,
-                "No existing OAuth tokens, awaiting login"
-            );
-            *self.inner.state.write().await = OAuthState::NeedsLogin;
+            self.inner
+                .transition_to(OAuthState::NeedsLogin, "no existing tokens at startup")
+                .await;
         }
 
         // Spawn the heartbeat probe loop
         let weak = Arc::downgrade(&self.inner);
         let handle = tokio::spawn(heartbeat::heartbeat_loop(weak));
-        self.inner.heartbeat_task_handle.lock().await.replace(handle);
+        self.inner
+            .heartbeat_task_handle
+            .lock()
+            .await
+            .replace(handle);
 
         Ok(()) // initialize always succeeds for OAuth
     }
@@ -454,7 +477,12 @@ impl McpAdapter for OAuthAdapter {
                                     error = %e,
                                     "Token refresh after 401 on list_tools failed"
                                 );
-                                *self.inner.state.write().await = OAuthState::AuthRequired;
+                                self.inner
+                                    .transition_to(
+                                        OAuthState::AuthRequired,
+                                        "401 on list_tools, refresh failed",
+                                    )
+                                    .await;
                                 Err(AdapterError::AuthenticationRequired {
                                     endpoint: self.inner.config.endpoint_name.clone(),
                                     message: "Token expired and refresh failed. Re-authenticate in Endara Desktop.".to_string(),
@@ -509,7 +537,12 @@ impl McpAdapter for OAuthAdapter {
                             error = %e,
                             "Token refresh after 401 failed"
                         );
-                        *self.inner.state.write().await = OAuthState::AuthRequired;
+                        self.inner
+                            .transition_to(
+                                OAuthState::AuthRequired,
+                                "401 on call_tool, refresh failed",
+                            )
+                            .await;
                         Err(AdapterError::AuthenticationRequired {
                             endpoint: self.inner.config.endpoint_name.clone(),
                             message: "Token expired and refresh failed. Re-authenticate in Endara Desktop.".to_string(),
@@ -549,8 +582,9 @@ impl McpAdapter for OAuthAdapter {
             adapter.shutdown().await?;
         }
         *guard = None;
-        *self.inner.state.write().await = OAuthState::Disconnected;
-        info!(endpoint = %self.inner.config.endpoint_name, "OAuth adapter shut down");
+        self.inner
+            .transition_to(OAuthState::Disconnected, "shutdown")
+            .await;
         Ok(())
     }
 
@@ -704,22 +738,58 @@ mod tests {
     fn derive_health_table() {
         let cases = [
             // Authenticated propagates inner
-            (OAuthState::Authenticated, HealthStatus::Healthy, HealthStatus::Healthy),
-            (OAuthState::Authenticated, HealthStatus::Starting, HealthStatus::Starting),
+            (
+                OAuthState::Authenticated,
+                HealthStatus::Healthy,
+                HealthStatus::Healthy,
+            ),
+            (
+                OAuthState::Authenticated,
+                HealthStatus::Starting,
+                HealthStatus::Starting,
+            ),
             (
                 OAuthState::Authenticated,
                 HealthStatus::Unhealthy("upstream timeout".into()),
                 HealthStatus::Unhealthy("upstream timeout".into()),
             ),
-            (OAuthState::Authenticated, HealthStatus::Stopped, HealthStatus::Stopped),
+            (
+                OAuthState::Authenticated,
+                HealthStatus::Stopped,
+                HealthStatus::Stopped,
+            ),
             // Refreshing always wins
-            (OAuthState::Refreshing, HealthStatus::Healthy, HealthStatus::Starting),
-            (OAuthState::Refreshing, HealthStatus::Stopped, HealthStatus::Starting),
+            (
+                OAuthState::Refreshing,
+                HealthStatus::Healthy,
+                HealthStatus::Starting,
+            ),
+            (
+                OAuthState::Refreshing,
+                HealthStatus::Stopped,
+                HealthStatus::Starting,
+            ),
             // Hard-error states ignore inner
-            (OAuthState::AuthRequired, HealthStatus::Healthy, HealthStatus::Unhealthy("auth required".into())),
-            (OAuthState::ConnectionFailed, HealthStatus::Healthy, HealthStatus::Unhealthy("connection failed".into())),
-            (OAuthState::NeedsLogin, HealthStatus::Healthy, HealthStatus::Unhealthy("needs login".into())),
-            (OAuthState::Disconnected, HealthStatus::Healthy, HealthStatus::Stopped),
+            (
+                OAuthState::AuthRequired,
+                HealthStatus::Healthy,
+                HealthStatus::Unhealthy("auth required".into()),
+            ),
+            (
+                OAuthState::ConnectionFailed,
+                HealthStatus::Healthy,
+                HealthStatus::Unhealthy("connection failed".into()),
+            ),
+            (
+                OAuthState::NeedsLogin,
+                HealthStatus::Healthy,
+                HealthStatus::Unhealthy("needs login".into()),
+            ),
+            (
+                OAuthState::Disconnected,
+                HealthStatus::Healthy,
+                HealthStatus::Stopped,
+            ),
         ];
         for (state, inner, expected) in cases {
             let got = derive_health(&state, &inner);

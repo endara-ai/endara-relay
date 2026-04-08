@@ -68,14 +68,21 @@ pub fn assert_legal_transition(from: &OAuthState, to: &OAuthState) {
             (from, to),
             (NeedsLogin, Refreshing)
                 | (NeedsLogin, AuthRequired)
+                | (NeedsLogin, Authenticated)
+                | (NeedsLogin, ConnectionFailed)
+                | (NeedsLogin, Disconnected)
                 | (Refreshing, Authenticated)
                 | (Refreshing, AuthRequired)
+                | (Refreshing, ConnectionFailed)
+                | (Refreshing, Disconnected)
                 | (Authenticated, Refreshing)
                 | (Authenticated, ConnectionFailed)
                 | (Authenticated, AuthRequired)
                 | (Authenticated, Disconnected)
                 | (ConnectionFailed, Authenticated)
+                | (ConnectionFailed, Refreshing)
                 | (ConnectionFailed, AuthRequired)
+                | (ConnectionFailed, Disconnected)
                 | (AuthRequired, Refreshing)
                 | (AuthRequired, Disconnected)
                 | (Disconnected, NeedsLogin)
@@ -143,23 +150,47 @@ mod tests {
     fn derive_health_exhaustive_table() {
         let cases: Vec<(OAuthState, HealthStatus, HealthStatus)> = vec![
             // ── Authenticated: propagates inner verbatim ──
-            (OAuthState::Authenticated, HealthStatus::Healthy, HealthStatus::Healthy),
-            (OAuthState::Authenticated, HealthStatus::Starting, HealthStatus::Starting),
+            (
+                OAuthState::Authenticated,
+                HealthStatus::Healthy,
+                HealthStatus::Healthy,
+            ),
+            (
+                OAuthState::Authenticated,
+                HealthStatus::Starting,
+                HealthStatus::Starting,
+            ),
             (
                 OAuthState::Authenticated,
                 HealthStatus::Unhealthy("upstream timeout".into()),
                 HealthStatus::Unhealthy("upstream timeout".into()),
             ),
-            (OAuthState::Authenticated, HealthStatus::Stopped, HealthStatus::Stopped),
+            (
+                OAuthState::Authenticated,
+                HealthStatus::Stopped,
+                HealthStatus::Stopped,
+            ),
             // ── Refreshing: always Starting ──
-            (OAuthState::Refreshing, HealthStatus::Healthy, HealthStatus::Starting),
-            (OAuthState::Refreshing, HealthStatus::Starting, HealthStatus::Starting),
+            (
+                OAuthState::Refreshing,
+                HealthStatus::Healthy,
+                HealthStatus::Starting,
+            ),
+            (
+                OAuthState::Refreshing,
+                HealthStatus::Starting,
+                HealthStatus::Starting,
+            ),
             (
                 OAuthState::Refreshing,
                 HealthStatus::Unhealthy("upstream timeout".into()),
                 HealthStatus::Starting,
             ),
-            (OAuthState::Refreshing, HealthStatus::Stopped, HealthStatus::Starting),
+            (
+                OAuthState::Refreshing,
+                HealthStatus::Stopped,
+                HealthStatus::Starting,
+            ),
             // ── AuthRequired: always Unhealthy("auth required") ──
             (
                 OAuthState::AuthRequired,
@@ -224,18 +255,34 @@ mod tests {
                 HealthStatus::Unhealthy("needs login".into()),
             ),
             // ── Disconnected: always Stopped ──
-            (OAuthState::Disconnected, HealthStatus::Healthy, HealthStatus::Stopped),
-            (OAuthState::Disconnected, HealthStatus::Starting, HealthStatus::Stopped),
+            (
+                OAuthState::Disconnected,
+                HealthStatus::Healthy,
+                HealthStatus::Stopped,
+            ),
+            (
+                OAuthState::Disconnected,
+                HealthStatus::Starting,
+                HealthStatus::Stopped,
+            ),
             (
                 OAuthState::Disconnected,
                 HealthStatus::Unhealthy("upstream timeout".into()),
                 HealthStatus::Stopped,
             ),
-            (OAuthState::Disconnected, HealthStatus::Stopped, HealthStatus::Stopped),
+            (
+                OAuthState::Disconnected,
+                HealthStatus::Stopped,
+                HealthStatus::Stopped,
+            ),
         ];
 
         // Verify we have exactly 24 cases (6 states × 4 inner variants)
-        assert_eq!(cases.len(), 24, "expected 24 test cases (6 states × 4 inner)");
+        assert_eq!(
+            cases.len(),
+            24,
+            "expected 24 test cases (6 states × 4 inner)"
+        );
 
         for (state, inner, expected) in &cases {
             let got = derive_health(state, inner);
@@ -249,14 +296,21 @@ mod tests {
         let legal_pairs = [
             (OAuthState::NeedsLogin, OAuthState::Refreshing),
             (OAuthState::NeedsLogin, OAuthState::AuthRequired),
+            (OAuthState::NeedsLogin, OAuthState::Authenticated),
+            (OAuthState::NeedsLogin, OAuthState::ConnectionFailed),
+            (OAuthState::NeedsLogin, OAuthState::Disconnected),
             (OAuthState::Refreshing, OAuthState::Authenticated),
             (OAuthState::Refreshing, OAuthState::AuthRequired),
+            (OAuthState::Refreshing, OAuthState::ConnectionFailed),
+            (OAuthState::Refreshing, OAuthState::Disconnected),
             (OAuthState::Authenticated, OAuthState::Refreshing),
             (OAuthState::Authenticated, OAuthState::ConnectionFailed),
             (OAuthState::Authenticated, OAuthState::AuthRequired),
             (OAuthState::Authenticated, OAuthState::Disconnected),
             (OAuthState::ConnectionFailed, OAuthState::Authenticated),
+            (OAuthState::ConnectionFailed, OAuthState::Refreshing),
             (OAuthState::ConnectionFailed, OAuthState::AuthRequired),
+            (OAuthState::ConnectionFailed, OAuthState::Disconnected),
             (OAuthState::AuthRequired, OAuthState::Refreshing),
             (OAuthState::AuthRequired, OAuthState::Disconnected),
             (OAuthState::Disconnected, OAuthState::NeedsLogin),
@@ -288,16 +342,9 @@ mod tests {
     #[cfg(debug_assertions)]
     fn illegal_transitions_panic() {
         let illegal_pairs = [
-            (OAuthState::NeedsLogin, OAuthState::Authenticated),
-            (OAuthState::NeedsLogin, OAuthState::ConnectionFailed),
-            (OAuthState::NeedsLogin, OAuthState::Disconnected),
             (OAuthState::Refreshing, OAuthState::NeedsLogin),
-            (OAuthState::Refreshing, OAuthState::ConnectionFailed),
-            (OAuthState::Refreshing, OAuthState::Disconnected),
             (OAuthState::Authenticated, OAuthState::NeedsLogin),
             (OAuthState::ConnectionFailed, OAuthState::NeedsLogin),
-            (OAuthState::ConnectionFailed, OAuthState::Refreshing),
-            (OAuthState::ConnectionFailed, OAuthState::Disconnected),
             (OAuthState::AuthRequired, OAuthState::NeedsLogin),
             (OAuthState::AuthRequired, OAuthState::Authenticated),
             (OAuthState::AuthRequired, OAuthState::ConnectionFailed),
@@ -312,7 +359,8 @@ mod tests {
             assert!(
                 result.is_err(),
                 "expected panic for {:?} -> {:?} but it didn't panic",
-                from, to
+                from,
+                to
             );
         }
     }
@@ -323,7 +371,12 @@ mod tests {
         let mut state = OAuthState::NeedsLogin;
         let mut history = VecDeque::with_capacity(TRANSITION_RING_BUFFER_CAPACITY);
 
-        let old = do_transition(&mut state, OAuthState::AuthRequired, "test reason", &mut history);
+        let old = do_transition(
+            &mut state,
+            OAuthState::AuthRequired,
+            "test reason",
+            &mut history,
+        );
         assert_eq!(old, OAuthState::NeedsLogin);
         assert_eq!(state, OAuthState::AuthRequired);
         assert_eq!(history.len(), 1);
@@ -341,7 +394,12 @@ mod tests {
         // Fill beyond capacity by toggling Authenticated <-> Refreshing
         for i in 0..(TRANSITION_RING_BUFFER_CAPACITY + 4) {
             if i % 2 == 0 {
-                do_transition(&mut state, OAuthState::Refreshing, "proactive", &mut history);
+                do_transition(
+                    &mut state,
+                    OAuthState::Refreshing,
+                    "proactive",
+                    &mut history,
+                );
             } else {
                 do_transition(
                     &mut state,

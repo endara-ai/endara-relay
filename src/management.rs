@@ -2784,6 +2784,7 @@ command = "echo"
             token_endpoint_url: "http://127.0.0.1:19999/token".to_string(),
             client_id: "test-client".to_string(),
             client_secret: None,
+            heartbeat_interval_secs: 30,
         }
     }
 

@@ -235,6 +235,7 @@ async fn main() {
                             .unwrap_or_else(|| format!("{}/token", base)),
                         client_id: ep.client_id.clone().unwrap_or_default(),
                         client_secret: ep.client_secret.clone(),
+                        heartbeat_interval_secs: 30,
                     };
 
                     let mut adapter = OAuthAdapter::new(oauth_config, token_manager.clone());
