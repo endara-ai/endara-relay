@@ -1,0 +1,21 @@
+[relay]
+machine_name = "integration-test"
+
+[[endpoints]]
+name = "everything"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-everything"]
+
+[[endpoints]]
+name = "filesystem"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+
+[[endpoints]]
+name = "memory"
+transport = "stdio"
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-memory"]
+
