@@ -457,4 +457,246 @@ mod tests {
         assert!(deadline >= expected - Duration::from_millis(1));
         assert!(deadline <= expected + Duration::from_millis(1));
     }
+
+    // ── Token lifecycle scenario tests (§3.3) ──
+    //
+    // These simulate multi-step state machine walks that correspond to real
+    // OAuth token lifecycle flows. Each test uses `do_transition` to drive
+    // the state machine and `derive_health` to verify the composite health
+    // at each step.
+
+    /// Helper: create a fresh VecDeque for transition history.
+    fn new_history() -> VecDeque<TransitionRecord> {
+        VecDeque::with_capacity(TRANSITION_RING_BUFFER_CAPACITY)
+    }
+
+    /// Row 1: Fresh login — NeedsLogin → Authenticated (tokens arrive).
+    #[test]
+    fn lifecycle_fresh_login() {
+        let mut state = OAuthState::NeedsLogin;
+        let mut history = new_history();
+
+        // Before login: health is Unhealthy
+        assert_eq!(
+            derive_health(&state, &HealthStatus::Starting),
+            HealthStatus::Unhealthy("needs login".into()),
+        );
+
+        // Tokens arrive → Authenticated
+        let old = do_transition(
+            &mut state,
+            OAuthState::Authenticated,
+            "tokens arrived",
+            &mut history,
+        );
+        assert_eq!(old, OAuthState::NeedsLogin);
+        assert_eq!(state, OAuthState::Authenticated);
+
+        // After login: health propagates inner
+        assert_eq!(
+            derive_health(&state, &HealthStatus::Healthy),
+            HealthStatus::Healthy,
+        );
+        assert_eq!(history.len(), 1);
+    }
+
+    /// Row 2: Proactive refresh — Authenticated → Refreshing → Authenticated.
+    #[test]
+    fn lifecycle_proactive_refresh() {
+        let mut state = OAuthState::Authenticated;
+        let mut history = new_history();
+
+        // Start refresh
+        do_transition(
+            &mut state,
+            OAuthState::Refreshing,
+            "proactive refresh timer",
+            &mut history,
+        );
+        assert_eq!(state, OAuthState::Refreshing);
+
+        // During refresh: health is Starting regardless of inner
+        assert_eq!(
+            derive_health(&state, &HealthStatus::Healthy),
+            HealthStatus::Starting,
+        );
+
+        // Refresh succeeds
+        do_transition(
+            &mut state,
+            OAuthState::Authenticated,
+            "refresh succeeded",
+            &mut history,
+        );
+        assert_eq!(state, OAuthState::Authenticated);
+        assert_eq!(
+            derive_health(&state, &HealthStatus::Healthy),
+            HealthStatus::Healthy,
+        );
+        assert_eq!(history.len(), 2);
+    }
+
+    /// Row 3: Reactive 401 refresh — Authenticated → Refreshing → Authenticated.
+    #[test]
+    fn lifecycle_reactive_401_refresh() {
+        let mut state = OAuthState::Authenticated;
+        let mut history = new_history();
+
+        // 401 triggers refresh
+        do_transition(
+            &mut state,
+            OAuthState::Refreshing,
+            "401 from upstream",
+            &mut history,
+        );
+        assert_eq!(state, OAuthState::Refreshing);
+
+        // Refresh succeeds → back to Authenticated
+        do_transition(
+            &mut state,
+            OAuthState::Authenticated,
+            "refresh after 401 succeeded",
+            &mut history,
+        );
+        assert_eq!(state, OAuthState::Authenticated);
+        assert_eq!(
+            derive_health(&state, &HealthStatus::Healthy),
+            HealthStatus::Healthy,
+        );
+    }
+
+    /// Row 4: Refresh fails — Refreshing → AuthRequired.
+    #[test]
+    fn lifecycle_refresh_fails() {
+        let mut state = OAuthState::Authenticated;
+        let mut history = new_history();
+
+        // Start refresh
+        do_transition(
+            &mut state,
+            OAuthState::Refreshing,
+            "proactive refresh",
+            &mut history,
+        );
+
+        // Refresh fails → AuthRequired
+        do_transition(
+            &mut state,
+            OAuthState::AuthRequired,
+            "refresh returned 400",
+            &mut history,
+        );
+        assert_eq!(state, OAuthState::AuthRequired);
+        assert_eq!(
+            derive_health(&state, &HealthStatus::Healthy),
+            HealthStatus::Unhealthy("auth required".into()),
+        );
+    }
+
+    /// Row 5: User disconnects — Authenticated → Disconnected.
+    #[test]
+    fn lifecycle_user_disconnects() {
+        let mut state = OAuthState::Authenticated;
+        let mut history = new_history();
+
+        do_transition(
+            &mut state,
+            OAuthState::Disconnected,
+            "user disconnected",
+            &mut history,
+        );
+        assert_eq!(state, OAuthState::Disconnected);
+        assert_eq!(
+            derive_health(&state, &HealthStatus::Healthy),
+            HealthStatus::Stopped,
+        );
+    }
+
+    /// Row 6: Re-login after disconnect — Disconnected → NeedsLogin → Authenticated.
+    #[test]
+    fn lifecycle_relogin_after_disconnect() {
+        let mut state = OAuthState::Disconnected;
+        let mut history = new_history();
+
+        // User initiates re-login
+        do_transition(
+            &mut state,
+            OAuthState::NeedsLogin,
+            "user re-enabled",
+            &mut history,
+        );
+        assert_eq!(state, OAuthState::NeedsLogin);
+        assert_eq!(
+            derive_health(&state, &HealthStatus::Starting),
+            HealthStatus::Unhealthy("needs login".into()),
+        );
+
+        // Tokens arrive
+        do_transition(
+            &mut state,
+            OAuthState::Authenticated,
+            "tokens arrived",
+            &mut history,
+        );
+        assert_eq!(state, OAuthState::Authenticated);
+        assert_eq!(
+            derive_health(&state, &HealthStatus::Healthy),
+            HealthStatus::Healthy,
+        );
+        assert_eq!(history.len(), 2);
+    }
+
+    /// Row 7: Proactive refresh while inner is unhealthy — derive_health
+    /// returns Starting (Refreshing takes precedence over inner).
+    #[test]
+    fn lifecycle_refresh_with_unhealthy_inner() {
+        let mut state = OAuthState::Authenticated;
+        let mut history = new_history();
+        let inner_unhealthy = HealthStatus::Unhealthy("upstream timeout".into());
+
+        // While Authenticated + inner unhealthy, health propagates inner
+        assert_eq!(
+            derive_health(&state, &inner_unhealthy),
+            HealthStatus::Unhealthy("upstream timeout".into()),
+        );
+
+        // Start refresh — health should be Starting, NOT Unhealthy
+        do_transition(
+            &mut state,
+            OAuthState::Refreshing,
+            "proactive refresh",
+            &mut history,
+        );
+        assert_eq!(
+            derive_health(&state, &inner_unhealthy),
+            HealthStatus::Starting,
+            "Refreshing should override inner_health to Starting",
+        );
+    }
+
+    /// Row 8: Token restored from disk — NeedsLogin → Authenticated (via
+    /// transition_to on startup when persisted tokens are loaded).
+    #[test]
+    fn lifecycle_token_restored_from_disk() {
+        let mut state = OAuthState::NeedsLogin;
+        let mut history = new_history();
+
+        // Simulate startup: tokens loaded from disk → Authenticated
+        let old = do_transition(
+            &mut state,
+            OAuthState::Authenticated,
+            "loaded valid tokens from disk",
+            &mut history,
+        );
+        assert_eq!(old, OAuthState::NeedsLogin);
+        assert_eq!(state, OAuthState::Authenticated);
+        assert_eq!(
+            derive_health(&state, &HealthStatus::Healthy),
+            HealthStatus::Healthy,
+        );
+
+        // Verify the transition was recorded with the right reason
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].reason, "loaded valid tokens from disk");
+    }
 }
