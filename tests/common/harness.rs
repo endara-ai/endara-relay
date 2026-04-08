@@ -41,8 +41,8 @@ impl RelayHarness {
             ])
             .env("ENDARA_TOKEN_DIR", &token_dir)
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .expect("failed to spawn relay binary");
 

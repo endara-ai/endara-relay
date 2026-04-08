@@ -698,6 +698,15 @@ struct OAuthStatusResponse {
     status: String,
 }
 
+/// A single entry in the transition history returned by the management API.
+#[derive(Serialize)]
+struct TransitionHistoryEntry {
+    from: String,
+    to: String,
+    reason: String,
+    ago_ms: u64,
+}
+
 /// Enhanced response for GET /api/endpoints/:name/oauth/status
 #[derive(Serialize)]
 struct OAuthStatusDetailedResponse {
@@ -713,6 +722,7 @@ struct OAuthStatusDetailedResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     next_refresh_at: Option<u64>,
     state: String,
+    transition_history: Vec<TransitionHistoryEntry>,
 }
 
 /// Response for POST /api/endpoints/:name/oauth/revoke
@@ -1072,6 +1082,17 @@ async fn oauth_status(
 
             let state_str = format!("{:?}", oauth_state);
 
+            let history = inner.transition_history.read().await;
+            let transition_history: Vec<TransitionHistoryEntry> = history
+                .iter()
+                .map(|r| TransitionHistoryEntry {
+                    from: format!("{:?}", r.from),
+                    to: format!("{:?}", r.to),
+                    reason: r.reason.clone(),
+                    ago_ms: r.timestamp.elapsed().as_millis() as u64,
+                })
+                .collect();
+
             return Json(OAuthStatusDetailedResponse {
                 status: status.to_string(),
                 has_access_token,
@@ -1081,6 +1102,7 @@ async fn oauth_status(
                 last_refreshed_at,
                 next_refresh_at,
                 state: state_str,
+                transition_history,
             })
             .into_response();
         }
@@ -1230,6 +1252,42 @@ async fn oauth_refresh(
         )
         .into_response(),
     }
+}
+
+/// GET /api/endpoints/:name/oauth/metrics
+///
+/// Returns in-process metric counters for the OAuth adapter (JSON).
+async fn oauth_metrics(
+    State(state): State<ManagementState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    {
+        let entries = state.registry.entries().read().await;
+        if !entries.contains_key(&name) {
+            return endpoint_not_found(&name).into_response();
+        }
+    }
+
+    let Some(ref inners) = state.oauth_adapter_inners else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "endpoint is not configured for OAuth",
+            Some("No OAuth adapter inners available"),
+        )
+        .into_response();
+    };
+
+    let inners_guard = inners.read().await;
+    let Some(inner) = inners_guard.get(&name) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "endpoint is not configured for OAuth",
+            Some(&format!("Endpoint '{}' is not an OAuth endpoint", name)),
+        )
+        .into_response();
+    };
+
+    Json(inner.metrics.snapshot()).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1848,6 +1906,7 @@ pub fn management_routes(state: ManagementState) -> Router {
         .route("/api/endpoints/{name}/oauth/status", get(oauth_status))
         .route("/api/endpoints/{name}/oauth/revoke", post(oauth_revoke))
         .route("/api/endpoints/{name}/oauth/refresh", post(oauth_refresh))
+        .route("/api/endpoints/{name}/oauth/metrics", get(oauth_metrics))
         // OAuth setup (preflight) routes
         .route("/api/oauth/setup", post(oauth_setup))
         .route(
@@ -2784,6 +2843,7 @@ command = "echo"
             token_endpoint_url: "http://127.0.0.1:19999/token".to_string(),
             client_id: "test-client".to_string(),
             client_secret: None,
+            heartbeat_interval_secs: 30,
         }
     }
 
@@ -2906,6 +2966,68 @@ command = "echo"
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn oauth_status_empty_transition_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _inner) = test_state_with_oauth("oauth-ep", tmp.path()).await;
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::get("/api/endpoints/oauth-ep/oauth/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let history = body["transition_history"].as_array().unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[tokio::test]
+    async fn oauth_status_with_transition_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, inner) = test_state_with_oauth("oauth-ep", tmp.path()).await;
+
+        // Trigger some transitions via the public API (must follow legal transitions)
+        // NeedsLogin -> AuthRequired is legal
+        inner
+            .transition_to(OAuthState::AuthRequired, "test: force auth required")
+            .await;
+        // AuthRequired -> Refreshing is legal
+        inner
+            .transition_to(OAuthState::Refreshing, "test: retry refresh")
+            .await;
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::get("/api/endpoints/oauth-ep/oauth/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let history = body["transition_history"].as_array().unwrap();
+        assert_eq!(history.len(), 2);
+
+        // First transition: NeedsLogin -> AuthRequired
+        assert_eq!(history[0]["from"], "NeedsLogin");
+        assert_eq!(history[0]["to"], "AuthRequired");
+        assert_eq!(history[0]["reason"], "test: force auth required");
+        assert!(history[0]["ago_ms"].is_number());
+
+        // Second transition: AuthRequired -> Refreshing
+        assert_eq!(history[1]["from"], "AuthRequired");
+        assert_eq!(history[1]["to"], "Refreshing");
+        assert_eq!(history[1]["reason"], "test: retry refresh");
+        assert!(history[1]["ago_ms"].is_number());
     }
 
     #[tokio::test]

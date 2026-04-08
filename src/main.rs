@@ -171,9 +171,14 @@ async fn main() {
             };
 
             // Initialize OAuth infrastructure
-            let token_dir_path = dirs::home_dir()
-                .map(|h| h.join(".endara").join("tokens"))
-                .unwrap_or_else(|| std::env::temp_dir().join("endara-tokens"));
+            // ENDARA_TOKEN_DIR env var allows integration tests to isolate token storage.
+            let token_dir_path = std::env::var("ENDARA_TOKEN_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| {
+                    dirs::home_dir()
+                        .map(|h| h.join(".endara").join("tokens"))
+                        .unwrap_or_else(|| std::env::temp_dir().join("endara-tokens"))
+                });
             let token_dir =
                 match endara_relay::token_security::ensure_token_dir_secure(&token_dir_path) {
                     Ok(path) => path,
@@ -235,6 +240,7 @@ async fn main() {
                             .unwrap_or_else(|| format!("{}/token", base)),
                         client_id: ep.client_id.clone().unwrap_or_default(),
                         client_secret: ep.client_secret.clone(),
+                        heartbeat_interval_secs: 30,
                     };
 
                     let mut adapter = OAuthAdapter::new(oauth_config, token_manager.clone());

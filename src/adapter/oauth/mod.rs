@@ -1,3 +1,11 @@
+mod heartbeat;
+pub mod metrics;
+mod state;
+
+// Re-export submodule public items so external callers are unaffected.
+pub use state::{derive_health, do_transition, refresh_deadline, OAuthState, TransitionRecord};
+
+use self::metrics::{generate_correlation_id, OAuthMetrics};
 use super::http::{HttpAdapter, HttpConfig};
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::oauth::OAuthError;
@@ -5,49 +13,13 @@ use crate::token_manager::{TokenManager, TokenSet};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
-
-/// Internal state of an OAuth-authenticated endpoint.
-///
-/// Maps to `HealthStatus` in the `health()` method but carries richer
-/// semantic meaning for lifecycle management (refresh scheduling,
-/// startup restore, management API responses).
-#[derive(Debug, Clone, PartialEq)]
-pub enum OAuthState {
-    /// No tokens, never authenticated.
-    NeedsLogin,
-    /// Valid tokens, inner adapter healthy.
-    Authenticated,
-    /// Proactive or reactive refresh in progress.
-    Refreshing,
-    /// Refresh failed, needs re-login.
-    AuthRequired,
-    /// Token valid but MCP server unreachable.
-    ConnectionFailed,
-    /// User explicitly disconnected.
-    Disconnected,
-}
-
-/// Compute the deadline at which a proactive token refresh should fire.
-///
-/// Returns the earlier of:
-/// - 75 % of token lifetime after `issued_at`
-/// - 5 minutes before `expires_at`
-///
-/// If `expires_at` is unknown (server didn't return `expires_in`), returns
-/// `None` — the caller should skip proactive refresh and rely on 401 retry.
-pub fn refresh_deadline(issued_at: Instant, expires_at: Instant) -> Instant {
-    let lifetime = expires_at - issued_at;
-    let seventy_five_pct = issued_at + (lifetime * 3 / 4);
-    let five_min_before = expires_at - Duration::from_secs(300);
-    std::cmp::min(seventy_five_pct, five_min_before)
-}
-
 /// Configuration for an OAuth-authenticated MCP endpoint.
 #[derive(Debug, Clone)]
 pub struct OAuthAdapterConfig {
@@ -61,6 +33,8 @@ pub struct OAuthAdapterConfig {
     pub client_id: String,
     /// OAuth client secret (optional for public clients).
     pub client_secret: Option<String>,
+    /// Heartbeat probe interval in seconds (default: 30).
+    pub heartbeat_interval_secs: u64,
 }
 
 /// Shared inner state for an OAuth adapter, wrapped in `Arc` so it can be
@@ -80,6 +54,16 @@ pub struct OAuthAdapterInner {
     http_client: Client,
     /// Handle to the proactive refresh background task.
     refresh_task_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Health of the wrapped inner adapter (updated by heartbeat probe).
+    pub inner_health: RwLock<HealthStatus>,
+    /// Handle to the heartbeat background task.
+    heartbeat_task_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Ring buffer of recent state transitions (max TRANSITION_RING_BUFFER_CAPACITY).
+    pub transition_history: RwLock<VecDeque<TransitionRecord>>,
+    /// In-process metric counters.
+    pub metrics: OAuthMetrics,
+    /// Guards concurrent refresh attempts so only one proceeds at a time.
+    refresh_mutex: Mutex<()>,
 }
 
 impl OAuthAdapterInner {
@@ -107,18 +91,70 @@ impl OAuthAdapterInner {
         HttpAdapter::new_with_client(HttpConfig::new(url), client)
     }
 
+    /// Transition to a new `OAuthState`.
+    ///
+    /// This is the **single writer** of `self.state`. It acquires the state
+    /// write lock, validates the transition via `assert_legal_transition`,
+    /// records it in the ring buffer, emits a tracing event, and updates
+    /// the state.
+    pub async fn transition_to(&self, new_state: OAuthState, reason: &str) {
+        let mut state = self.state.write().await;
+        let mut history = self.transition_history.write().await;
+        let old = do_transition(&mut state, new_state.clone(), reason, &mut history);
+        self.metrics.inc_state_transition();
+        info!(
+            endpoint = %self.config.endpoint_name,
+            from = ?old,
+            to = ?new_state,
+            oauth_state = ?new_state,
+            reason = %reason,
+            "OAuth state transition"
+        );
+    }
+
     /// Perform a token refresh using the refresh_token grant.
     ///
     /// POSTs to the token endpoint with grant_type=refresh_token.
     /// On success, calls `apply_tokens_inner` with the new token set.
     /// On failure, transitions to `AuthRequired`.
     pub async fn do_token_refresh(self: &Arc<Self>) -> Result<TokenSet, OAuthError> {
+        // Snapshot the current access token before acquiring the mutex.
+        // If it changes while we wait, another concurrent refresh succeeded.
+        let pre_token = {
+            let tokens = self.tokens.read().await;
+            tokens.as_ref().map(|t| t.access_token.clone())
+        };
+
+        // Coalesce concurrent refresh attempts: only one thread does the actual
+        // HTTP POST; others wait and then return the already-refreshed tokens.
+        let _guard = self.refresh_mutex.lock().await;
+
+        // Check if another concurrent caller already refreshed successfully
+        // while we were waiting for the mutex (token changed → skip refresh).
+        {
+            let tokens = self.tokens.read().await;
+            if let Some(ref t) = *tokens {
+                if Some(&t.access_token) != pre_token.as_ref() {
+                    // Token was refreshed by another concurrent caller.
+                    return Ok(t.clone());
+                }
+            }
+        }
+
+        let correlation_id = generate_correlation_id();
         let refresh_token = {
             let tokens = self.tokens.read().await;
             match tokens.as_ref().and_then(|t| t.refresh_token.clone()) {
                 Some(rt) => rt,
                 None => {
-                    *self.state.write().await = OAuthState::AuthRequired;
+                    warn!(
+                        endpoint = %self.config.endpoint_name,
+                        correlation_id = %correlation_id,
+                        "No refresh token available"
+                    );
+                    self.transition_to(OAuthState::AuthRequired, "no refresh token")
+                        .await;
+                    self.metrics.inc_refresh_failure();
                     return Err(OAuthError::NoRefreshToken {
                         endpoint: self.config.endpoint_name.clone(),
                     });
@@ -126,9 +162,15 @@ impl OAuthAdapterInner {
             }
         };
 
+        info!(
+            endpoint = %self.config.endpoint_name,
+            correlation_id = %correlation_id,
+            "Starting token refresh"
+        );
+
         // Mark as refreshing
-        *self.state.write().await = OAuthState::Refreshing;
-        info!(endpoint = %self.config.endpoint_name, "Starting token refresh");
+        self.transition_to(OAuthState::Refreshing, "starting token refresh")
+            .await;
 
         let mut form_parts: Vec<(&str, String)> = vec![
             ("grant_type", "refresh_token".to_string()),
@@ -152,6 +194,7 @@ impl OAuthAdapterInner {
             .await
             .map_err(|e| {
                 // Network error during refresh
+                self.metrics.inc_refresh_failure();
                 OAuthError::Http(e)
             })?;
 
@@ -160,11 +203,14 @@ impl OAuthAdapterInner {
             let body = resp.text().await.unwrap_or_default();
             error!(
                 endpoint = %self.config.endpoint_name,
+                correlation_id = %correlation_id,
                 %status,
                 body = %body,
                 "Token refresh failed"
             );
-            *self.state.write().await = OAuthState::AuthRequired;
+            self.metrics.inc_refresh_failure();
+            self.transition_to(OAuthState::AuthRequired, "token refresh failed")
+                .await;
             return Err(OAuthError::RefreshFailed { status, body });
         }
 
@@ -201,7 +247,12 @@ impl OAuthAdapterInner {
             issued_at: Some(now_secs),
         };
 
-        info!(endpoint = %self.config.endpoint_name, "Token refresh successful");
+        self.metrics.inc_refresh_success();
+        info!(
+            endpoint = %self.config.endpoint_name,
+            correlation_id = %correlation_id,
+            "Token refresh successful"
+        );
         Ok(new_token_set)
     }
 
@@ -237,13 +288,19 @@ impl OAuthAdapterInner {
         match adapter.initialize().await {
             Ok(()) => {
                 *self.inner_adapter.write().await = Some(adapter);
-                *self.state.write().await = OAuthState::Authenticated;
-                info!(endpoint = %endpoint, "Inner adapter rebuilt with new token");
+                self.transition_to(
+                    OAuthState::Authenticated,
+                    "tokens applied, inner adapter ready",
+                )
+                .await;
             }
             Err(e) => {
                 *self.inner_adapter.write().await = None;
-                *self.state.write().await = OAuthState::ConnectionFailed;
-                warn!(endpoint = %endpoint, error = %e, "Inner adapter init failed after token apply");
+                self.transition_to(
+                    OAuthState::ConnectionFailed,
+                    &format!("inner adapter init failed: {}", e),
+                )
+                .await;
             }
         }
 
@@ -338,8 +395,8 @@ impl OAuthAdapterInner {
         }
 
         // Set state
-        *self.state.write().await = OAuthState::Disconnected;
-        info!(endpoint = %endpoint, "OAuth adapter disconnected");
+        self.transition_to(OAuthState::Disconnected, "user disconnected")
+            .await;
     }
 }
 
@@ -363,6 +420,11 @@ impl OAuthAdapter {
                 token_manager,
                 http_client: Client::new(),
                 refresh_task_handle: Mutex::new(None),
+                inner_health: RwLock::new(HealthStatus::Starting),
+                heartbeat_task_handle: Mutex::new(None),
+                transition_history: RwLock::new(VecDeque::new()),
+                metrics: OAuthMetrics::new(),
+                refresh_mutex: Mutex::new(()),
             }),
         }
     }
@@ -370,22 +432,6 @@ impl OAuthAdapter {
     /// Get a clone of the shared inner state (for use by callback handlers).
     pub fn shared_inner(&self) -> Arc<OAuthAdapterInner> {
         self.inner.clone()
-    }
-
-    /// Map OAuthState → HealthStatus.
-    fn map_health(state: &OAuthState) -> HealthStatus {
-        match state {
-            OAuthState::NeedsLogin => HealthStatus::Unhealthy("needs login".to_string()),
-            OAuthState::Authenticated => HealthStatus::Healthy,
-            OAuthState::Refreshing => HealthStatus::Healthy, // still serving with current token
-            OAuthState::AuthRequired => {
-                HealthStatus::Unhealthy("authentication required".to_string())
-            }
-            OAuthState::ConnectionFailed => {
-                HealthStatus::Unhealthy("connection failed".to_string())
-            }
-            OAuthState::Disconnected => HealthStatus::Stopped,
-        }
     }
 }
 
@@ -423,23 +469,33 @@ impl McpAdapter for OAuthAdapter {
                             error = %e,
                             "Token refresh at startup failed"
                         );
-                        *self.inner.state.write().await = OAuthState::AuthRequired;
+                        self.inner
+                            .transition_to(OAuthState::AuthRequired, "startup refresh failed")
+                            .await;
                     }
                 }
             } else {
-                info!(
-                    endpoint = %self.inner.config.endpoint_name,
-                    "Loaded expired tokens without refresh token"
-                );
-                *self.inner.state.write().await = OAuthState::AuthRequired;
+                self.inner
+                    .transition_to(
+                        OAuthState::AuthRequired,
+                        "expired tokens without refresh token",
+                    )
+                    .await;
             }
         } else {
-            info!(
-                endpoint = %self.inner.config.endpoint_name,
-                "No existing OAuth tokens, awaiting login"
-            );
-            *self.inner.state.write().await = OAuthState::NeedsLogin;
+            self.inner
+                .transition_to(OAuthState::NeedsLogin, "no existing tokens at startup")
+                .await;
         }
+
+        // Spawn the heartbeat probe loop
+        let weak = Arc::downgrade(&self.inner);
+        let handle = tokio::spawn(heartbeat::heartbeat_loop(weak));
+        self.inner
+            .heartbeat_task_handle
+            .lock()
+            .await
+            .replace(handle);
 
         Ok(()) // initialize always succeeds for OAuth
     }
@@ -475,7 +531,12 @@ impl McpAdapter for OAuthAdapter {
                                     error = %e,
                                     "Token refresh after 401 on list_tools failed"
                                 );
-                                *self.inner.state.write().await = OAuthState::AuthRequired;
+                                self.inner
+                                    .transition_to(
+                                        OAuthState::AuthRequired,
+                                        "401 on list_tools, refresh failed",
+                                    )
+                                    .await;
                                 Err(AdapterError::AuthenticationRequired {
                                     endpoint: self.inner.config.endpoint_name.clone(),
                                     message: "Token expired and refresh failed. Re-authenticate in Endara Desktop.".to_string(),
@@ -530,7 +591,12 @@ impl McpAdapter for OAuthAdapter {
                             error = %e,
                             "Token refresh after 401 failed"
                         );
-                        *self.inner.state.write().await = OAuthState::AuthRequired;
+                        self.inner
+                            .transition_to(
+                                OAuthState::AuthRequired,
+                                "401 on call_tool, refresh failed",
+                            )
+                            .await;
                         Err(AdapterError::AuthenticationRequired {
                             endpoint: self.inner.config.endpoint_name.clone(),
                             message: "Token expired and refresh failed. Re-authenticate in Endara Desktop.".to_string(),
@@ -551,6 +617,13 @@ impl McpAdapter for OAuthAdapter {
     }
 
     async fn shutdown(&mut self) -> Result<(), AdapterError> {
+        // Abort heartbeat task
+        {
+            let mut handle = self.inner.heartbeat_task_handle.lock().await;
+            if let Some(h) = handle.take() {
+                h.abort();
+            }
+        }
         // Abort refresh task
         {
             let mut handle = self.inner.refresh_task_handle.lock().await;
@@ -563,16 +636,22 @@ impl McpAdapter for OAuthAdapter {
             adapter.shutdown().await?;
         }
         *guard = None;
-        *self.inner.state.write().await = OAuthState::Disconnected;
-        info!(endpoint = %self.inner.config.endpoint_name, "OAuth adapter shut down");
+        self.inner
+            .transition_to(OAuthState::Disconnected, "shutdown")
+            .await;
         Ok(())
     }
 
     fn health(&self) -> HealthStatus {
-        match self.inner.state.try_read() {
-            Ok(s) => Self::map_health(&s),
+        let state = match self.inner.state.try_read() {
+            Ok(s) => s.clone(),
+            Err(_) => return HealthStatus::Starting,
+        };
+        let inner = match self.inner.inner_health.try_read() {
+            Ok(h) => h.clone(),
             Err(_) => HealthStatus::Starting,
-        }
+        };
+        derive_health(&state, &inner)
     }
 
     async fn activity_log(&self) -> Vec<String> {
@@ -595,6 +674,7 @@ mod tests {
             token_endpoint_url: "http://localhost/token".to_string(),
             client_id: "test-client".to_string(),
             client_secret: None,
+            heartbeat_interval_secs: 30,
         }
     }
 
@@ -709,31 +789,66 @@ mod tests {
     }
 
     #[test]
-    fn health_mapping() {
-        assert_eq!(
-            OAuthAdapter::map_health(&OAuthState::NeedsLogin),
-            HealthStatus::Unhealthy("needs login".to_string())
-        );
-        assert_eq!(
-            OAuthAdapter::map_health(&OAuthState::Authenticated),
-            HealthStatus::Healthy
-        );
-        assert_eq!(
-            OAuthAdapter::map_health(&OAuthState::Refreshing),
-            HealthStatus::Healthy
-        );
-        assert_eq!(
-            OAuthAdapter::map_health(&OAuthState::AuthRequired),
-            HealthStatus::Unhealthy("authentication required".to_string())
-        );
-        assert_eq!(
-            OAuthAdapter::map_health(&OAuthState::ConnectionFailed),
-            HealthStatus::Unhealthy("connection failed".to_string())
-        );
-        assert_eq!(
-            OAuthAdapter::map_health(&OAuthState::Disconnected),
-            HealthStatus::Stopped
-        );
+    fn derive_health_table() {
+        let cases = [
+            // Authenticated propagates inner
+            (
+                OAuthState::Authenticated,
+                HealthStatus::Healthy,
+                HealthStatus::Healthy,
+            ),
+            (
+                OAuthState::Authenticated,
+                HealthStatus::Starting,
+                HealthStatus::Starting,
+            ),
+            (
+                OAuthState::Authenticated,
+                HealthStatus::Unhealthy("upstream timeout".into()),
+                HealthStatus::Unhealthy("upstream timeout".into()),
+            ),
+            (
+                OAuthState::Authenticated,
+                HealthStatus::Stopped,
+                HealthStatus::Stopped,
+            ),
+            // Refreshing always wins
+            (
+                OAuthState::Refreshing,
+                HealthStatus::Healthy,
+                HealthStatus::Starting,
+            ),
+            (
+                OAuthState::Refreshing,
+                HealthStatus::Stopped,
+                HealthStatus::Starting,
+            ),
+            // Hard-error states ignore inner
+            (
+                OAuthState::AuthRequired,
+                HealthStatus::Healthy,
+                HealthStatus::Unhealthy("auth required".into()),
+            ),
+            (
+                OAuthState::ConnectionFailed,
+                HealthStatus::Healthy,
+                HealthStatus::Unhealthy("connection failed".into()),
+            ),
+            (
+                OAuthState::NeedsLogin,
+                HealthStatus::Healthy,
+                HealthStatus::Unhealthy("needs login".into()),
+            ),
+            (
+                OAuthState::Disconnected,
+                HealthStatus::Healthy,
+                HealthStatus::Stopped,
+            ),
+        ];
+        for (state, inner, expected) in cases {
+            let got = derive_health(&state, &inner);
+            assert_eq!(got, expected, "state={:?} inner={:?}", state, inner);
+        }
     }
 
     // --- OAuthState enum tests ---
