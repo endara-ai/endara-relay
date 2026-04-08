@@ -230,6 +230,8 @@ pub async fn apply_diff(
                     let _ = entry.adapter.shutdown().await;
                 }
             }
+            drop(entries);
+            reg.invalidate_catalog_cache().await;
             info!(endpoint = %name_clone, "Changed endpoint initialized");
         });
     }
@@ -270,6 +272,8 @@ pub async fn apply_diff(
                     let _ = entry.adapter.shutdown().await;
                 }
             }
+            drop(entries);
+            reg.invalidate_catalog_cache().await;
             info!(endpoint = %ep_clone.name, "New endpoint initialized");
         });
     }
@@ -391,6 +395,8 @@ pub async fn apply_diff_graceful(
                     let _ = entry.adapter.shutdown().await;
                 }
             }
+            drop(entries);
+            reg.invalidate_catalog_cache().await;
             info!(endpoint = %name_clone, "Changed endpoint initialized");
         });
     }
@@ -455,6 +461,8 @@ pub async fn apply_diff_graceful(
                     let _ = entry.adapter.shutdown().await;
                 }
             }
+            drop(entries);
+            reg.invalidate_catalog_cache().await;
             info!(endpoint = %ep_clone.name, "New endpoint initialized");
         });
     }

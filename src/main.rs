@@ -304,6 +304,8 @@ async fn main() {
                             let _ = entry.adapter.shutdown().await;
                         }
                     }
+                    drop(entries);
+                    reg.invalidate_catalog_cache().await;
                     info!(endpoint = %ep.name, "Adapter initialized");
                 });
             }
