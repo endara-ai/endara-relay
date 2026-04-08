@@ -139,12 +139,15 @@ pub fn calculate_backoff(consecutive_crashes: u32) -> Duration {
     Duration::from_secs(secs)
 }
 
+/// Map of pending JSON-RPC request IDs to their oneshot response senders.
+type PendingRequests = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<String>>>>;
+
 /// STDIO MCP adapter — spawns a child process and communicates via stdin/stdout.
 pub struct StdioAdapter {
     config: StdioConfig,
     child: Arc<Mutex<Option<Child>>>,
     stdin_writer: Arc<Mutex<Option<tokio::process::ChildStdin>>>,
-    stdout_lines: Arc<Mutex<Option<tokio::sync::mpsc::Receiver<String>>>>,
+    pending_requests: PendingRequests,
     stderr_buffer: Arc<RwLock<RingBuffer>>,
     health: Arc<RwLock<HealthStatus>>,
     request_id: AtomicU64,
@@ -163,7 +166,7 @@ impl StdioAdapter {
             config,
             child: Arc::new(Mutex::new(None)),
             stdin_writer: Arc::new(Mutex::new(None)),
-            stdout_lines: Arc::new(Mutex::new(None)),
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
             stderr_buffer: Arc::new(RwLock::new(RingBuffer::new(1000))),
             health: Arc::new(RwLock::new(HealthStatus::Stopped)),
             request_id: AtomicU64::new(1),
@@ -217,15 +220,48 @@ impl StdioAdapter {
             .take()
             .ok_or_else(|| AdapterError::ProcessSpawnFailed("failed to capture stderr".into()))?;
 
-        // Set up stdout line reader via channel
-        let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
+        // Set up stdout line reader that dispatches by JSON-RPC response ID
+        let pending = self.pending_requests.clone();
         let stdout_handle = tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                if tx.send(line).await.is_err() {
-                    break;
+                // Try to parse as JSON and extract the "id" field
+                let parsed: Result<Value, _> = serde_json::from_str(&line);
+                match parsed {
+                    Ok(obj) => {
+                        if let Some(id) = obj.get("id").and_then(|v| v.as_u64()) {
+                            // Response with an id — dispatch to the waiting caller
+                            let sender = pending.lock().await.remove(&id);
+                            match sender {
+                                Some(tx) => {
+                                    if tx.send(line).is_err() {
+                                        debug!(id = id, "pending request receiver dropped");
+                                    }
+                                }
+                                None => {
+                                    warn!(id = id, "received response for unknown request id");
+                                }
+                            }
+                        } else {
+                            // Server notification (no id) — log and drop
+                            debug!(line = %line, "MCP server notification (no id), dropping");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, line = %line, "non-JSON line from MCP server stdout");
+                    }
                 }
+            }
+            // Stdout closed (process exited) — drop all pending senders so
+            // waiters immediately get a RecvError instead of hanging until timeout.
+            let mut map = pending.lock().await;
+            if !map.is_empty() {
+                debug!(
+                    count = map.len(),
+                    "stdout closed, dropping pending requests"
+                );
+                map.clear();
             }
         });
 
@@ -242,7 +278,6 @@ impl StdioAdapter {
 
         *self.child.lock().await = Some(child);
         *self.stdin_writer.lock().await = Some(stdin);
-        *self.stdout_lines.lock().await = Some(rx);
         *self._stdout_handle.lock().await = Some(stdout_handle);
         *self._stderr_handle.lock().await = Some(stderr_handle);
 
@@ -261,28 +296,53 @@ impl StdioAdapter {
         let mut line = serde_json::to_string(&request)?;
         line.push('\n');
 
+        // Create a oneshot channel for this request's response
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+
+        // Register the pending request before writing to stdin
+        self.pending_requests.lock().await.insert(id, tx);
+
         // Write to stdin
         {
             let mut writer_guard = self.stdin_writer.lock().await;
-            let writer = writer_guard.as_mut().ok_or(AdapterError::NotInitialized)?;
-            writer
-                .write_all(line.as_bytes())
-                .await
-                .map_err(|e| AdapterError::ProcessCrashed(format!("stdin write failed: {}", e)))?;
-            writer
-                .flush()
-                .await
-                .map_err(|e| AdapterError::ProcessCrashed(format!("stdin flush failed: {}", e)))?;
+            let writer = writer_guard.as_mut().ok_or_else(|| {
+                // Clean up pending entry on error
+                let pending = self.pending_requests.clone();
+                let req_id = id;
+                tokio::spawn(async move {
+                    pending.lock().await.remove(&req_id);
+                });
+                AdapterError::NotInitialized
+            })?;
+            if let Err(e) = writer.write_all(line.as_bytes()).await {
+                self.pending_requests.lock().await.remove(&id);
+                return Err(AdapterError::ProcessCrashed(format!(
+                    "stdin write failed: {}",
+                    e
+                )));
+            }
+            if let Err(e) = writer.flush().await {
+                self.pending_requests.lock().await.remove(&id);
+                return Err(AdapterError::ProcessCrashed(format!(
+                    "stdin flush failed: {}",
+                    e
+                )));
+            }
         }
 
-        // Read response from stdout with timeout
-        let response_line = {
-            let mut rx_guard = self.stdout_lines.lock().await;
-            let rx = rx_guard.as_mut().ok_or(AdapterError::NotInitialized)?;
-            tokio::time::timeout(Duration::from_secs(30), rx.recv())
-                .await
-                .map_err(|_| AdapterError::Timeout(30))?
-                .ok_or_else(|| AdapterError::ProcessCrashed("stdout channel closed".into()))?
+        // Await the response with timeout (lock is NOT held during await)
+        let response_line = match tokio::time::timeout(Duration::from_secs(30), rx).await {
+            Ok(Ok(line)) => line,
+            Ok(Err(_)) => {
+                // Sender was dropped (stdout reader shut down)
+                self.pending_requests.lock().await.remove(&id);
+                return Err(AdapterError::ProcessCrashed("stdout channel closed".into()));
+            }
+            Err(_) => {
+                // Timeout — clean up the pending entry
+                self.pending_requests.lock().await.remove(&id);
+                return Err(AdapterError::Timeout(30));
+            }
         };
 
         let response: JsonRpcResponse = serde_json::from_str(&response_line).map_err(|e| {
@@ -388,8 +448,15 @@ impl McpAdapter for StdioAdapter {
             drop(stdin);
         }
 
-        // Drop stdout receiver
-        self.stdout_lines.lock().await.take();
+        // Drop all pending request senders — waiting callers will get RecvError
+        {
+            let mut pending = self.pending_requests.lock().await;
+            let count = pending.len();
+            pending.clear();
+            if count > 0 {
+                debug!(count = count, "dropped pending requests during shutdown");
+            }
+        }
 
         // Try to kill the child process
         if let Some(mut child) = self.child.lock().await.take() {
@@ -540,5 +607,294 @@ mod tests {
         tracker.record_crash();
         tracker.reset();
         assert_eq!(tracker.backoff_duration(), Duration::from_secs(1));
+    }
+
+    // -----------------------------------------------------------------------
+    // Pending-requests dispatch tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a pending-requests map and insert senders for the given IDs.
+    /// Returns the map and the corresponding receivers.
+    async fn make_pending(
+        ids: &[u64],
+    ) -> (
+        PendingRequests,
+        Vec<(u64, tokio::sync::oneshot::Receiver<String>)>,
+    ) {
+        let map: PendingRequests = Arc::new(Mutex::new(HashMap::new()));
+        let mut rxs = Vec::new();
+        for &id in ids {
+            let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+            map.lock().await.insert(id, tx);
+            rxs.push((id, rx));
+        }
+        (map, rxs)
+    }
+
+    /// Simulate the stdout reader dispatch logic for a single line.
+    async fn dispatch_line(pending: &PendingRequests, line: &str) -> DispatchResult {
+        let parsed: Result<Value, _> = serde_json::from_str(line);
+        match parsed {
+            Ok(obj) => {
+                if let Some(id) = obj.get("id").and_then(|v| v.as_u64()) {
+                    let sender = pending.lock().await.remove(&id);
+                    match sender {
+                        Some(tx) => {
+                            let _ = tx.send(line.to_string());
+                            DispatchResult::Dispatched(id)
+                        }
+                        None => DispatchResult::UnknownId(id),
+                    }
+                } else {
+                    DispatchResult::Notification
+                }
+            }
+            Err(_) => DispatchResult::InvalidJson,
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum DispatchResult {
+        Dispatched(u64),
+        UnknownId(u64),
+        Notification,
+        InvalidJson,
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_matching_id() {
+        let (pending, mut rxs) = make_pending(&[1, 2]).await;
+        let line = r#"{"jsonrpc":"2.0","result":{"ok":true},"id":1}"#;
+        let result = dispatch_line(&pending, line).await;
+        assert_eq!(result, DispatchResult::Dispatched(1));
+
+        // Receiver for id=1 should have the line
+        let (_, rx1) = rxs.remove(0);
+        assert_eq!(rx1.await.unwrap(), line);
+
+        // id=2 should still be pending
+        assert!(pending.lock().await.contains_key(&2));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_notification_no_id() {
+        let (pending, _rxs) = make_pending(&[1]).await;
+        let line = r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
+        let result = dispatch_line(&pending, line).await;
+        assert_eq!(result, DispatchResult::Notification);
+
+        // Pending map should be unchanged
+        assert!(pending.lock().await.contains_key(&1));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_unknown_id() {
+        let (pending, _rxs) = make_pending(&[1]).await;
+        let line = r#"{"jsonrpc":"2.0","result":{},"id":999}"#;
+        let result = dispatch_line(&pending, line).await;
+        assert_eq!(result, DispatchResult::UnknownId(999));
+
+        // id=1 still pending
+        assert!(pending.lock().await.contains_key(&1));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_malformed_json() {
+        let (pending, _rxs) = make_pending(&[1]).await;
+        let line = "this is not json at all";
+        let result = dispatch_line(&pending, line).await;
+        assert_eq!(result, DispatchResult::InvalidJson);
+        assert!(pending.lock().await.contains_key(&1));
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_null_id_treated_as_notification() {
+        let (pending, _rxs) = make_pending(&[1]).await;
+        let line = r#"{"jsonrpc":"2.0","result":{},"id":null}"#;
+        let result = dispatch_line(&pending, line).await;
+        // null id → as_u64() returns None → treated as notification
+        assert_eq!(result, DispatchResult::Notification);
+    }
+
+    // -----------------------------------------------------------------------
+    // Integration tests using a real StdioAdapter with a mock echo server
+    // -----------------------------------------------------------------------
+
+    /// Create a StdioAdapter that launches a Python echo server.
+    /// The server reads JSON-RPC requests from stdin and responds with
+    /// a result containing the method name and request id.
+    fn make_echo_adapter() -> StdioAdapter {
+        let script = r#"
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+        resp = {"jsonrpc": "2.0", "result": {"echo_method": req.get("method"), "echo_id": req.get("id")}, "id": req.get("id")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
+"#;
+        StdioAdapter::new(StdioConfig {
+            command: "python3".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: HashMap::new(),
+        })
+    }
+
+    #[tokio::test]
+    async fn test_stdio_concurrent_requests_return_correct_responses() {
+        let mut adapter = make_echo_adapter();
+        adapter.spawn_process().await.unwrap();
+
+        // Give the Python process a moment to start
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Send two concurrent requests
+        let adapter_ref = &adapter;
+        let (r1, r2) = tokio::join!(
+            adapter_ref.send_request("tools/list", None),
+            adapter_ref.send_request("tools/call", Some(serde_json::json!({"name": "test"}))),
+        );
+
+        let v1 = r1.unwrap();
+        let v2 = r2.unwrap();
+
+        // Each response should echo back its OWN method — this is the exact
+        // race condition bug: without ID matching, they could be swapped.
+        assert_eq!(v1["echo_method"], "tools/list");
+        assert_eq!(v2["echo_method"], "tools/call");
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stdio_many_concurrent_requests() {
+        let mut adapter = make_echo_adapter();
+        adapter.spawn_process().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Launch 10 concurrent requests, each with a unique method name
+        let adapter_ref = &adapter;
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let method = format!("method_{}", i);
+            handles.push(async move {
+                let result = adapter_ref.send_request(&method, None).await.unwrap();
+                (method, result)
+            });
+        }
+
+        let results = futures_util::future::join_all(handles).await;
+        for (method, result) in &results {
+            assert_eq!(
+                result["echo_method"].as_str().unwrap(),
+                method,
+                "response mismatch for {}",
+                method
+            );
+        }
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stdio_sequential_requests_all_correct() {
+        let mut adapter = make_echo_adapter();
+        adapter.spawn_process().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        for i in 0..5 {
+            let method = format!("seq_{}", i);
+            let result = adapter.send_request(&method, None).await.unwrap();
+            assert_eq!(result["echo_method"].as_str().unwrap(), method);
+        }
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stdio_timeout_when_no_response() {
+        // Use a server that never responds
+        let mut adapter = StdioAdapter::new(StdioConfig {
+            command: "python3".to_string(),
+            args: vec!["-c".to_string(), "import time; time.sleep(120)".to_string()],
+            env: HashMap::new(),
+        });
+        adapter.spawn_process().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Use a short timeout by sending request (default is 30s, but we just
+        // verify the error type)
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), adapter.send_request("test", None)).await;
+
+        // Either our wrapper times out or the inner 30s timeout fires —
+        // either way, we don't hang forever.
+        match result {
+            Ok(Err(AdapterError::Timeout(_))) => {} // inner timeout
+            Err(_) => {}                            // our 2s timeout
+            other => panic!("unexpected result: {:?}", other),
+        }
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stdio_shutdown_drops_pending_requests() {
+        let mut adapter = make_echo_adapter();
+        adapter.spawn_process().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Insert a pending request manually
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        adapter.pending_requests.lock().await.insert(9999, tx);
+
+        // Shutdown should clear pending map
+        adapter.shutdown().await.unwrap();
+
+        // The receiver should get an error (sender dropped)
+        assert!(rx.await.is_err());
+        assert!(adapter.pending_requests.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stdio_server_notification_doesnt_corrupt_requests() {
+        // Server that sends a notification before each response
+        let script = r#"
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+        # Send a notification first (no id)
+        notif = {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
+        sys.stdout.write(json.dumps(notif) + "\n")
+        sys.stdout.flush()
+        # Then send the actual response
+        resp = {"jsonrpc": "2.0", "result": {"echo_method": req.get("method")}, "id": req.get("id")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
+"#;
+        let mut adapter = StdioAdapter::new(StdioConfig {
+            command: "python3".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: HashMap::new(),
+        });
+        adapter.spawn_process().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The notification should be silently dropped, not returned as a response
+        let result = adapter.send_request("tools/list", None).await.unwrap();
+        assert_eq!(result["echo_method"], "tools/list");
+
+        adapter.shutdown().await.unwrap();
     }
 }
