@@ -32,6 +32,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: build-${{ matrix.target }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Install cross-compilation tools
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
