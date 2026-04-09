@@ -45,9 +45,13 @@ struct Cli {
 enum Commands {
     /// Start the relay agent
     Start {
-        /// Path to TOML configuration file
-        #[arg(long, default_value = "~/.endara/config.toml")]
-        config: PathBuf,
+        /// Base data directory for config, logs, and tokens
+        #[arg(long, default_value = "~/.endara")]
+        data_dir: String,
+
+        /// Path to TOML configuration file (overrides <data-dir>/config.toml)
+        #[arg(long)]
+        config: Option<PathBuf>,
 
         /// Port to listen on
         #[arg(long, default_value = "9400")]
@@ -59,7 +63,20 @@ enum Commands {
     },
 }
 
-fn init_tracing(log_format: &str) {
+/// Expand a path string, replacing a leading `~` with the user's home directory.
+fn expand_tilde(path: &str) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(rest)
+    } else if path == "~" {
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        PathBuf::from(path)
+    }
+}
+
+fn init_tracing(log_format: &str, log_dir: &std::path::Path) {
     use tracing_subscriber::fmt;
     use tracing_subscriber::prelude::*;
     use tracing_subscriber::EnvFilter;
@@ -68,11 +85,6 @@ fn init_tracing(log_format: &str) {
     // Overridable via RUST_LOG env var.
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,endara_relay=debug"));
-
-    // File logging to ~/.endara/logs/ with daily rotation
-    let log_dir = dirs::home_dir()
-        .map(|h| h.join(".endara").join("logs"))
-        .unwrap_or_else(|| std::env::temp_dir().join("endara-logs"));
 
     let file_appender = tracing_appender::rolling::daily(&log_dir, "relay.log");
     let file_layer = fmt::layer()
@@ -106,12 +118,60 @@ async fn main() {
 
     match cli.command {
         Commands::Start {
-            config: config_path,
+            data_dir,
+            config,
             port,
             log_format,
         } => {
-            init_tracing(&log_format);
-            info!(config = %config_path.display(), "Starting endara-relay");
+            let data_dir_path = expand_tilde(&data_dir);
+            let log_dir = data_dir_path.join("logs");
+            let config_explicit = config.is_some();
+            let config_path = config.unwrap_or_else(|| data_dir_path.join("config.toml"));
+
+            init_tracing(&log_format, &log_dir);
+            info!(config = %config_path.display(), data_dir = %data_dir_path.display(), "Starting endara-relay");
+
+            // First-run config copy: when using a non-default data dir without an
+            // explicit --config, copy the production config so dev instances inherit
+            // the same endpoint setup.
+            let default_data_dir = dirs::home_dir()
+                .map(|h| h.join(".endara"))
+                .unwrap_or_default();
+            if !config_explicit && data_dir_path != default_data_dir {
+                let resolved_config = config::expand_tilde(&config_path);
+                if !resolved_config.exists() {
+                    let production_config = default_data_dir.join("config.toml");
+                    if production_config.exists() {
+                        // Ensure the data dir and standard subdirs exist
+                        if let Err(e) = std::fs::create_dir_all(&data_dir_path) {
+                            warn!(error = %e, path = %data_dir_path.display(), "Failed to create data directory");
+                        }
+                        for sub in &["logs", "tokens"] {
+                            let sub_path = data_dir_path.join(sub);
+                            if let Err(e) = std::fs::create_dir_all(&sub_path) {
+                                warn!(error = %e, path = %sub_path.display(), "Failed to create subdirectory");
+                            }
+                        }
+                        match std::fs::copy(&production_config, &resolved_config) {
+                            Ok(_) => {
+                                info!(
+                                    src = %production_config.display(),
+                                    dst = %resolved_config.display(),
+                                    "Copied production config to dev data directory"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    src = %production_config.display(),
+                                    dst = %resolved_config.display(),
+                                    "Failed to copy production config"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
 
             let (cfg, validation_warnings) = match config::load_config_graceful(&config_path) {
                 Ok((cfg, warnings)) => {
@@ -174,11 +234,7 @@ async fn main() {
             // ENDARA_TOKEN_DIR env var allows integration tests to isolate token storage.
             let token_dir_path = std::env::var("ENDARA_TOKEN_DIR")
                 .map(PathBuf::from)
-                .unwrap_or_else(|_| {
-                    dirs::home_dir()
-                        .map(|h| h.join(".endara").join("tokens"))
-                        .unwrap_or_else(|| std::env::temp_dir().join("endara-tokens"))
-                });
+                .unwrap_or_else(|_| data_dir_path.join("tokens"));
             let token_dir =
                 match endara_relay::token_security::ensure_token_dir_secure(&token_dir_path) {
                     Ok(path) => path,
