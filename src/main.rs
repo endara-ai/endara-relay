@@ -86,7 +86,7 @@ fn init_tracing(log_format: &str, log_dir: &std::path::Path) {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,endara_relay=debug"));
 
-    let file_appender = tracing_appender::rolling::daily(&log_dir, "relay.log");
+    let file_appender = tracing_appender::rolling::daily(log_dir, "relay.log");
     let file_layer = fmt::layer()
         .with_writer(file_appender)
         .with_ansi(false)
