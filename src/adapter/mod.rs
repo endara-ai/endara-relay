@@ -1,5 +1,6 @@
 pub mod http;
 pub mod oauth;
+pub mod server_name;
 pub mod sse;
 pub mod stdio;
 

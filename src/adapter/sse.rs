@@ -1,7 +1,7 @@
+use super::server_name::{sanitize_server_name, ServerNameError};
 use super::stdio::RingBuffer;
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::jsonrpc::{self, JsonRpcResponse};
-use crate::prefix;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -413,31 +413,44 @@ impl McpAdapter for SseAdapter {
             }
         });
 
-        match self.send_request("initialize", Some(params)).await {
-            Ok(result) => {
-                // Capture serverInfo.name from the initialize response
-                if let Some(name) = result
-                    .get("serverInfo")
-                    .and_then(|si| si.get("name"))
-                    .and_then(|n| n.as_str())
-                {
-                    let sanitized = prefix::sanitize_name(name);
-                    info!(raw_name = %name, sanitized = ?sanitized, "MCP server reported serverInfo.name");
-                    *self.server_type.write().await = sanitized;
-                }
-
-                *self.health.write().await = HealthStatus::Healthy;
-                self.crash_tracker.lock().await.reset();
-                info!(url = %self.config.url, "SSE MCP adapter initialized");
-                Ok(())
-            }
+        let result = match self.send_request("initialize", Some(params)).await {
+            Ok(r) => r,
             Err(e) => {
                 let msg = e.to_string();
                 *self.health.write().await = HealthStatus::Unhealthy(msg);
                 error!(url = %self.config.url, error = %e, "SSE MCP adapter initialization failed");
-                Err(e)
+                return Err(e);
             }
-        }
+        };
+
+        // Extract serverInfo.name — REQUIRED per MCP spec enforcement
+        let raw_name = result
+            .get("serverInfo")
+            .and_then(|si| si.get("name"))
+            .and_then(|n| n.as_str())
+            .ok_or_else(|| {
+                let err = ServerNameError::Missing;
+                let msg = err.to_string();
+                error!(url = %self.config.url, error = %msg, "MCP server did not provide serverInfo.name");
+                *self.health.blocking_write() = HealthStatus::Unhealthy(msg.clone());
+                AdapterError::ProtocolError(msg)
+            })?;
+
+        // Validate and sanitize the server name
+        let sanitized = sanitize_server_name(raw_name).map_err(|e| {
+            let msg = e.to_string();
+            error!(url = %self.config.url, raw_name = %raw_name, error = %msg, "serverInfo.name validation failed");
+            *self.health.blocking_write() = HealthStatus::Unhealthy(msg.clone());
+            AdapterError::ProtocolError(msg)
+        })?;
+
+        info!(url = %self.config.url, raw_name = %raw_name, sanitized = %sanitized, "MCP server reported serverInfo.name");
+        *self.server_type.write().await = Some(sanitized);
+
+        *self.health.write().await = HealthStatus::Healthy;
+        self.crash_tracker.lock().await.reset();
+        info!(url = %self.config.url, "SSE MCP adapter initialized");
+        Ok(())
     }
 
     async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
