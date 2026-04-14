@@ -1,6 +1,6 @@
+use super::server_name::{sanitize_server_name, ServerNameError};
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::jsonrpc::{self, JsonRpcResponse};
-use crate::prefix;
 use crate::shell_env;
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -363,6 +363,10 @@ impl StdioAdapter {
     }
 
     /// Perform the MCP initialize handshake.
+    ///
+    /// This method enforces that the server MUST provide a valid `serverInfo.name`
+    /// in the initialize response. If the name is missing, empty, or reduces to
+    /// empty after sanitization, the handshake fails with a ProtocolError.
     async fn mcp_initialize(&self) -> Result<(), AdapterError> {
         let params = json!({
             "protocolVersion": "2024-11-05",
@@ -375,16 +379,25 @@ impl StdioAdapter {
 
         let result = self.send_request("initialize", Some(params)).await?;
 
-        // Capture serverInfo.name from the initialize response
-        if let Some(name) = result
+        // Extract serverInfo.name — REQUIRED per MCP spec enforcement
+        let raw_name = result
             .get("serverInfo")
             .and_then(|si| si.get("name"))
             .and_then(|n| n.as_str())
-        {
-            let sanitized = prefix::sanitize_name(name);
-            info!(raw_name = %name, sanitized = ?sanitized, "MCP server reported serverInfo.name");
-            *self.server_type.write().await = sanitized;
-        }
+            .ok_or_else(|| {
+                let err = ServerNameError::Missing;
+                error!(error = %err, "MCP server did not provide serverInfo.name");
+                AdapterError::ProtocolError(err.to_string())
+            })?;
+
+        // Validate and sanitize the server name
+        let sanitized = sanitize_server_name(raw_name).map_err(|e| {
+            error!(raw_name = %raw_name, error = %e, "serverInfo.name validation failed");
+            AdapterError::ProtocolError(e.to_string())
+        })?;
+
+        info!(raw_name = %raw_name, sanitized = %sanitized, "MCP server reported serverInfo.name");
+        *self.server_type.write().await = Some(sanitized);
 
         info!("MCP initialize handshake complete");
         Ok(())

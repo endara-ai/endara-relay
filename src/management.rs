@@ -63,6 +63,36 @@ pub struct StatusResponse {
     pub healthy_count: usize,
 }
 
+/// Lifecycle state for an adapter, surfaced in the management API.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "state")]
+pub enum Lifecycle {
+    /// Adapter is initializing (handshake in progress).
+    Initializing,
+    /// Adapter is ready and healthy.
+    Ready {
+        /// Sanitized server name from MCP serverInfo.name.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server_name: Option<String>,
+    },
+    /// Adapter failed to initialize or is unhealthy.
+    Failed {
+        /// Error details.
+        error: LifecycleError,
+    },
+    /// Adapter is stopped/disabled.
+    Stopped,
+}
+
+/// Error details for a failed adapter.
+#[derive(Debug, Clone, Serialize)]
+pub struct LifecycleError {
+    /// Error kind (e.g., "ServerName", "Transport", "Protocol").
+    pub kind: String,
+    /// Human-readable error detail.
+    pub detail: String,
+}
+
 #[derive(Serialize)]
 pub struct EndpointInfo {
     pub name: String,
@@ -75,6 +105,8 @@ pub struct EndpointInfo {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_prefix: Option<String>,
+    /// Lifecycle state of the adapter.
+    pub lifecycle: Lifecycle,
 }
 
 #[derive(Serialize)]
@@ -186,20 +218,39 @@ async fn get_endpoints(State(state): State<ManagementState>) -> Json<Vec<Endpoin
     let now = Instant::now();
     let mut endpoints: Vec<EndpointInfo> = Vec::new();
     for (name, entry) in entries.iter() {
-        let (health, tool_count, error) = if entry.disabled {
-            ("stopped".to_string(), 0, None)
-        } else if matches!(entry.adapter.health(), HealthStatus::Healthy) {
-            let count = entry
-                .adapter
-                .list_tools()
-                .await
-                .map(|t| t.len())
-                .unwrap_or(0);
-            (entry.adapter.health().to_string(), count, None)
-        } else if let HealthStatus::Unhealthy(reason) = entry.adapter.health() {
-            ("offline".to_string(), 0, Some(reason))
+        let (health, tool_count, error, lifecycle) = if entry.disabled {
+            ("stopped".to_string(), 0, None, Lifecycle::Stopped)
         } else {
-            (entry.adapter.health().to_string(), 0, None)
+            match entry.adapter.health() {
+                HealthStatus::Healthy => {
+                    let count = entry
+                        .adapter
+                        .list_tools()
+                        .await
+                        .map(|t| t.len())
+                        .unwrap_or(0);
+                    let server_name = entry.adapter.server_type();
+                    (
+                        "healthy".to_string(),
+                        count,
+                        None,
+                        Lifecycle::Ready { server_name },
+                    )
+                }
+                HealthStatus::Unhealthy(reason) => {
+                    let lifecycle = Lifecycle::Failed {
+                        error: LifecycleError {
+                            kind: categorize_error(&reason),
+                            detail: reason.clone(),
+                        },
+                    };
+                    ("offline".to_string(), 0, Some(reason), lifecycle)
+                }
+                HealthStatus::Starting => {
+                    ("starting".to_string(), 0, None, Lifecycle::Initializing)
+                }
+                HealthStatus::Stopped => ("stopped".to_string(), 0, None, Lifecycle::Stopped),
+            }
         };
         endpoints.push(EndpointInfo {
             name: name.clone(),
@@ -210,10 +261,29 @@ async fn get_endpoints(State(state): State<ManagementState>) -> Json<Vec<Endpoin
             disabled: entry.disabled,
             error,
             tool_prefix: entry.tool_prefix.clone(),
+            lifecycle,
         });
     }
     endpoints.sort_by(|a, b| a.name.cmp(&b.name));
     Json(endpoints)
+}
+
+/// Categorize an error message into a kind for the lifecycle response.
+fn categorize_error(reason: &str) -> String {
+    if reason.contains("serverInfo.name") || reason.contains("ServerNameError") {
+        "ServerName".to_string()
+    } else if reason.contains("transport")
+        || reason.contains("connection")
+        || reason.contains("Connection")
+    {
+        "Transport".to_string()
+    } else if reason.contains("timeout") || reason.contains("Timeout") {
+        "Timeout".to_string()
+    } else if reason.contains("protocol") || reason.contains("Protocol") {
+        "Protocol".to_string()
+    } else {
+        "Unknown".to_string()
+    }
 }
 
 /// POST /api/endpoints/:name/restart
