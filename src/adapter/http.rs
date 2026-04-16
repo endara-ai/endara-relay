@@ -316,25 +316,31 @@ impl McpAdapter for HttpAdapter {
         };
 
         // Extract serverInfo.name — REQUIRED per MCP spec enforcement
-        let raw_name = result
+        let raw_name = match result
             .get("serverInfo")
             .and_then(|si| si.get("name"))
             .and_then(|n| n.as_str())
-            .ok_or_else(|| {
+        {
+            Some(name) => name,
+            None => {
                 let err = ServerNameError::Missing;
                 let msg = err.to_string();
                 error!(url = %self.config.url, error = %msg, "MCP server did not provide serverInfo.name");
-                *self.health.blocking_write() = HealthStatus::Unhealthy(msg.clone());
-                AdapterError::ProtocolError(msg)
-            })?;
+                *self.health.write().await = HealthStatus::Unhealthy(msg.clone());
+                return Err(AdapterError::ProtocolError(msg));
+            }
+        };
 
         // Validate and sanitize the server name
-        let sanitized = sanitize_server_name(raw_name).map_err(|e| {
-            let msg = e.to_string();
-            error!(url = %self.config.url, raw_name = %raw_name, error = %msg, "serverInfo.name validation failed");
-            *self.health.blocking_write() = HealthStatus::Unhealthy(msg.clone());
-            AdapterError::ProtocolError(msg)
-        })?;
+        let sanitized = match sanitize_server_name(raw_name) {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = e.to_string();
+                error!(url = %self.config.url, raw_name = %raw_name, error = %msg, "serverInfo.name validation failed");
+                *self.health.write().await = HealthStatus::Unhealthy(msg.clone());
+                return Err(AdapterError::ProtocolError(msg));
+            }
+        };
 
         info!(url = %self.config.url, raw_name = %raw_name, sanitized = %sanitized, "MCP server reported serverInfo.name");
         *self.server_type.write().await = Some(sanitized);

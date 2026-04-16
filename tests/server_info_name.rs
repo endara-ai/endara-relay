@@ -6,55 +6,12 @@
 mod common;
 
 use common::config::ConfigBuilder;
-use common::harness::RelayHarness;
+use common::harness::{wait_for_lifecycle_state, RelayHarness};
 use serde_json::Value;
 use std::time::Duration;
 
 fn bad_server_bin() -> String {
     env!("CARGO_BIN_EXE_fixture-bad-server").to_string()
-}
-
-/// Helper: poll /api/endpoints until we see a specific lifecycle state for an endpoint.
-async fn wait_for_lifecycle_state(
-    harness: &RelayHarness,
-    endpoint_name: &str,
-    expected_state: &str,
-    timeout: Duration,
-) -> Result<Value, String> {
-    let client = reqwest::Client::new();
-    let url = format!("{}/api/endpoints", harness.base_url());
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut last_state: Option<String> = None;
-    let mut last_body: Option<Value> = None;
-
-    loop {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "Timeout waiting for endpoint '{}' to reach state '{}'. Last state: {:?}, Last body: {:?}",
-                endpoint_name, expected_state, last_state, last_body
-            ));
-        }
-
-        if let Ok(resp) = client.get(&url).send().await {
-            if let Ok(body) = resp.json::<Value>().await {
-                last_body = Some(body.clone());
-                if let Some(endpoints) = body.as_array() {
-                    for ep in endpoints {
-                        if ep["name"].as_str() == Some(endpoint_name) {
-                            last_state = ep["lifecycle"]["state"].as_str().map(|s| s.to_string());
-                            if let Some(state) = ep["lifecycle"]["state"].as_str() {
-                                if state == expected_state {
-                                    return Ok(ep.clone());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
 }
 
 /// Test 1: STDIO adapter with server that omits serverInfo.name → adapter enters Failed state

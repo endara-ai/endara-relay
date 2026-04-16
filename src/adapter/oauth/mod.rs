@@ -295,6 +295,8 @@ impl OAuthAdapterInner {
                 .await;
             }
             Err(e) => {
+                // Capture inner adapter's health before clearing it
+                *self.inner_health.write().await = adapter.health();
                 *self.inner_adapter.write().await = None;
                 self.transition_to(
                     OAuthState::ConnectionFailed,
@@ -719,7 +721,8 @@ mod tests {
     #[tokio::test]
     async fn health_with_token_but_unreachable_is_connection_failed() {
         // If we have a token but the upstream server is unreachable,
-        // the adapter should report connection failed after apply_tokens
+        // the adapter should report connection failed after apply_tokens,
+        // preserving the inner adapter's error details (not just hardcoded text).
         let mut config = make_config();
         config.url = "http://127.0.0.1:19999/mcp".to_string();
         let mut adapter = make_adapter(config);
@@ -737,9 +740,23 @@ mod tests {
 
         match adapter.health() {
             HealthStatus::Unhealthy(msg) => {
-                assert!(msg.contains("connection failed"));
+                // The inner adapter's error should be preserved, which includes
+                // "connection failed" and the URL from the actual inner error.
+                assert!(
+                    msg.contains("connection failed"),
+                    "expected 'connection failed' in message, got: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("127.0.0.1:19999"),
+                    "expected inner error URL details in message, got: {}",
+                    msg
+                );
             }
-            other => panic!("expected Unhealthy('connection failed'), got {:?}", other),
+            other => panic!(
+                "expected Unhealthy with inner error details, got {:?}",
+                other
+            ),
         }
     }
 

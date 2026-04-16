@@ -51,7 +51,10 @@ pub fn derive_health(oauth_state: &OAuthState, inner_health: &HealthStatus) -> H
         OAuthState::Refreshing => HealthStatus::Starting,
         // Hard-error / terminal states override inner health.
         OAuthState::AuthRequired => HealthStatus::Unhealthy("auth required".into()),
-        OAuthState::ConnectionFailed => HealthStatus::Unhealthy("connection failed".into()),
+        OAuthState::ConnectionFailed => match inner_health {
+            HealthStatus::Unhealthy(_) => inner_health.clone(),
+            _ => HealthStatus::Unhealthy("connection failed".into()),
+        },
         OAuthState::NeedsLogin => HealthStatus::Unhealthy("needs login".into()),
         OAuthState::Disconnected => HealthStatus::Stopped,
     }
@@ -212,7 +215,7 @@ mod tests {
                 HealthStatus::Stopped,
                 HealthStatus::Unhealthy("auth required".into()),
             ),
-            // ── ConnectionFailed: always Unhealthy("connection failed") ──
+            // ── ConnectionFailed: propagates Unhealthy, otherwise "connection failed" ──
             (
                 OAuthState::ConnectionFailed,
                 HealthStatus::Healthy,
@@ -226,7 +229,7 @@ mod tests {
             (
                 OAuthState::ConnectionFailed,
                 HealthStatus::Unhealthy("upstream timeout".into()),
-                HealthStatus::Unhealthy("connection failed".into()),
+                HealthStatus::Unhealthy("upstream timeout".into()),
             ),
             (
                 OAuthState::ConnectionFailed,
