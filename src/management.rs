@@ -291,33 +291,78 @@ async fn restart_endpoint(
     State(state): State<ManagementState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let mut entries = state.registry.entries().write().await;
-    let Some(entry) = entries.get_mut(&name) else {
-        return endpoint_not_found(&name).into_response();
-    };
-    if let Err(e) = entry.adapter.shutdown().await {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to shutdown adapter",
-            Some(&e.to_string()),
-        )
-        .into_response();
+    // First, check if endpoint exists and shut it down
+    {
+        let mut entries = state.registry.entries().write().await;
+        let Some(entry) = entries.get_mut(&name) else {
+            return endpoint_not_found(&name).into_response();
+        };
+        if let Err(e) = entry.adapter.shutdown().await {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to shutdown adapter",
+                Some(&e.to_string()),
+            )
+            .into_response();
+        }
     }
-    let result = entry.adapter.initialize().await;
-    drop(entries);
-    state.registry.invalidate_catalog_cache().await;
-    match result {
-        Ok(()) => Json(ActionResponse {
+    // Lock released here so we can call create_adapter (async)
+
+    // Try to find the endpoint in config to rebuild from scratch
+    let config = state.config.read().await;
+    let ep_config = config.endpoints.iter().find(|ep| ep.name == name).cloned();
+    drop(config);
+
+    if let Some(ep_config) = ep_config {
+        // Rebuild adapter from config (handles FailedAdapter case properly)
+        let token_manager = state.token_manager.clone().unwrap_or_else(|| {
+            Arc::new(crate::token_manager::TokenManager::new(PathBuf::from(
+                "/tmp",
+            )))
+        });
+        let oauth_adapter_inners = state
+            .oauth_adapter_inners
+            .clone()
+            .unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new())));
+
+        let new_adapter =
+            crate::watcher::create_adapter(&ep_config, &token_manager, &oauth_adapter_inners).await;
+
+        // Replace the adapter in the registry
+        let mut entries = state.registry.entries().write().await;
+        if let Some(entry) = entries.get_mut(&name) {
+            entry.adapter = new_adapter;
+        }
+        drop(entries);
+        state.registry.invalidate_catalog_cache().await;
+
+        Json(ActionResponse {
             ok: true,
             message: format!("Endpoint '{}' restarted", name),
         })
-        .into_response(),
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to restart adapter",
-            Some(&e.to_string()),
-        )
-        .into_response(),
+        .into_response()
+    } else {
+        // Endpoint not in config - fall back to existing behavior (re-initialize in place)
+        let mut entries = state.registry.entries().write().await;
+        let Some(entry) = entries.get_mut(&name) else {
+            return endpoint_not_found(&name).into_response();
+        };
+        let result = entry.adapter.initialize().await;
+        drop(entries);
+        state.registry.invalidate_catalog_cache().await;
+        match result {
+            Ok(()) => Json(ActionResponse {
+                ok: true,
+                message: format!("Endpoint '{}' restarted", name),
+            })
+            .into_response(),
+            Err(e) => error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to restart adapter",
+                Some(&e.to_string()),
+            )
+            .into_response(),
+        }
     }
 }
 
@@ -2183,7 +2228,7 @@ async fn enable_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
+    use crate::adapter::{AdapterError, FailedAdapter, HealthStatus, McpAdapter, ToolInfo};
     use crate::config::{Config, EndpointConfig, RelayConfig, Transport};
     use async_trait::async_trait;
     use axum::body::Body;
@@ -2533,6 +2578,77 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn management_restart_failed_endpoint() {
+        // Register a FailedAdapter under name "echo" (which exists in test_config)
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "echo".to_string(),
+                Box::new(FailedAdapter::new("original init error".to_string())),
+                "stdio".to_string(),
+                None,
+                Some("echo".to_string()),
+            )
+            .await;
+        let state = ManagementState {
+            registry: Arc::new(registry),
+            config: Arc::new(RwLock::new(test_config())),
+            start_time: Instant::now(),
+            config_path: None,
+            oauth_flow_manager: None,
+            relay_port: 9400,
+            oauth_adapter_inners: None,
+            token_manager: None,
+            setup_manager: None,
+        };
+        let app = management_routes(state);
+
+        // Restart should succeed (rebuilds from config)
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/echo/restart")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Should return 200 OK (the rebuild itself succeeds, even if the new adapter
+        // ends up as FailedAdapter because "echo" isn't a real MCP server)
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["ok"], true);
+        assert!(body["message"].as_str().unwrap().contains("restarted"));
+    }
+
+    #[tokio::test]
+    async fn management_restart_endpoint_not_in_config() {
+        // Register a MockAdapter under name "notinconfig" (NOT in test_config)
+        let state = test_state(vec![(
+            "notinconfig",
+            MockAdapter::healthy_with_tools(vec![]),
+        )])
+        .await;
+        let app = management_routes(state);
+
+        // Restart should fall back to existing behavior (shutdown + initialize)
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/notinconfig/restart")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // MockAdapter::initialize returns Ok, so this should succeed
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["ok"], true);
+        assert!(body["message"].as_str().unwrap().contains("restarted"));
     }
 
     #[tokio::test]
