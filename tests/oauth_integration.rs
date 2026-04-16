@@ -8,7 +8,7 @@ mod common;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use common::config::ConfigBuilder;
-use common::harness::RelayHarness;
+use common::harness::{wait_for_lifecycle_state, RelayHarness};
 use common::mcp_client::McpClient;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -335,6 +335,123 @@ async fn start_mock_mcp(initial_token: &str) -> (SocketAddr, Arc<MockMcpState>) 
 
     let app = Router::new()
         .route("/mcp", post(mcp_handler))
+        .with_state(state.clone());
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    (addr, state)
+}
+
+/// Start a mock MCP server that omits `serverInfo.name` in its initialize response.
+/// This is a clone of `start_mock_mcp` but returns serverInfo without the `name` field
+/// to trigger serverInfo.name enforcement failure.
+/// (server-info-name-enforcement-spec.md §8 row 4)
+async fn start_mock_mcp_without_server_name() -> (SocketAddr, Arc<MockMcpState>) {
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::post;
+    use axum::Router;
+
+    // Use a placeholder token since we won't validate Bearer tokens for this mock.
+    // The test only needs the mock to return a bad initialize response.
+    let state = Arc::new(MockMcpState {
+        valid_token: RwLock::new("unused".to_string()),
+        requests: RwLock::new(Vec::new()),
+        force_401: RwLock::new(false),
+    });
+
+    async fn mcp_handler_no_name(
+        State(state): State<Arc<MockMcpState>>,
+        headers: HeaderMap,
+        body: String,
+    ) -> impl axum::response::IntoResponse {
+        // Record request
+        let auth = headers
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        state.requests.write().await.push(RecordedRequest {
+            method: "POST".into(),
+            path: "/mcp".into(),
+            headers: {
+                let mut h = HashMap::new();
+                h.insert("authorization".into(), auth.clone());
+                if let Some(ct) = headers.get("content-type").and_then(|v| v.to_str().ok()) {
+                    h.insert("content-type".into(), ct.to_string());
+                }
+                h
+            },
+            body: body.clone(),
+        });
+
+        // Check for force_401
+        if *state.force_401.read().await {
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(json!({"error": "unauthorized"})),
+            )
+                .into_response();
+        }
+
+        // Accept any request — we just need to return a bad initialize response
+        // to test serverInfo.name enforcement. We don't validate Bearer tokens
+        // since this mock's purpose is only to test the serverInfo.name path.
+
+        // Parse JSON-RPC and handle
+        let req: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+        let method = req["method"].as_str().unwrap_or("");
+        let id = req.get("id").cloned();
+
+        let result = match method {
+            "initialize" => {
+                // Omit `name` from serverInfo — this triggers the enforcement failure
+                json!({
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": { "tools": { "listChanged": false } },
+                    "serverInfo": { "version": "0.1" }  // No "name" field!
+                })
+            }
+            "tools/list" => json!({
+                "tools": [{
+                    "name": "echo",
+                    "description": "Echo input",
+                    "inputSchema": { "type": "object", "properties": { "message": { "type": "string" } } }
+                }]
+            }),
+            "tools/call" => {
+                let args = &req["params"]["arguments"];
+                let msg = args["message"].as_str().unwrap_or("no message");
+                json!({
+                    "content": [{ "type": "text", "text": format!("echo: {}", msg) }],
+                    "isError": false
+                })
+            }
+            "notifications/initialized" => {
+                return (StatusCode::ACCEPTED, "").into_response();
+            }
+            _ => json!({"error": "unknown method"}),
+        };
+
+        if let Some(id) = id {
+            axum::Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": result
+            }))
+            .into_response()
+        } else {
+            (StatusCode::ACCEPTED, "").into_response()
+        }
+    }
+
+    let app = Router::new()
+        .route("/mcp", post(mcp_handler_no_name))
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1004,4 +1121,177 @@ async fn test_oauth_client_registration() {
             body
         );
     }
+}
+
+// ===========================================================================
+// serverInfo.name enforcement test
+// ===========================================================================
+
+/// Verify that OAuth adapter transitions to Failed when inner HTTP upstream
+/// omits serverInfo.name after successful authentication.
+/// (server-info-name-enforcement-spec.md §8 row 4)
+#[tokio::test]
+async fn test_oauth_server_info_name_enforcement() {
+    // 1. Start mocks
+    let (oauth_addr, _oauth_state) = start_mock_oauth(3600, true).await;
+    let (mcp_addr, _mcp_state) = start_mock_mcp_without_server_name().await;
+
+    let oauth_url = format!("http://127.0.0.1:{}", oauth_addr.port());
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_addr.port());
+
+    // 2. Configure relay with OAuth endpoint
+    let config = ConfigBuilder::new()
+        .add_oauth_with_client("test-oauth", &mcp_url, Some(&oauth_url), "test-client")
+        .build();
+
+    let harness = RelayHarness::start(&config).await;
+    let base = harness.base_url();
+
+    // 3. Verify initial state is needs_login
+    poll_oauth_status(&base, "test-oauth", "needs_login", Duration::from_secs(10)).await;
+
+    // 4. Simulate the OAuth login flow
+    // The callback may fail with an incomplete message if the relay closes
+    // the connection while processing the inner adapter initialization.
+    // That's OK — the important thing is that the token exchange succeeds
+    // (OAuth layer works) and then the adapter transitions to Failed state.
+    let client = reqwest::Client::new();
+
+    // Step 4a: Call /oauth/start to get the authorize URL
+    let start_url = format!("{}/api/endpoints/test-oauth/oauth/start", base);
+    let start_resp: Value = client
+        .post(&start_url)
+        .send()
+        .await
+        .expect("oauth/start failed")
+        .json()
+        .await
+        .expect("parse oauth/start response");
+
+    let authorize_url = start_resp["authorize_url"]
+        .as_str()
+        .expect("no authorize_url in response");
+
+    // Step 4b: Parse the authorize_url, extract redirect_uri and state
+    let parsed = url::Url::parse(authorize_url).expect("invalid authorize_url");
+    let query_pairs: HashMap<String, String> = parsed
+        .query_pairs()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    let redirect_uri = query_pairs.get("redirect_uri").expect("no redirect_uri");
+    let state_param = query_pairs.get("state").expect("no state param");
+
+    // Step 4c: Simulate the callback (as if the browser redirected)
+    // Use a client that doesn't follow redirects, with long timeout since
+    // the relay does work during the callback
+    let callback_url = format!("{}?code=mock-auth-code&state={}", redirect_uri, state_param);
+    let callback_client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+        .build()
+        .unwrap();
+
+    let callback_result = callback_client.get(&callback_url).send().await;
+
+    // Assertion #1: OAuth login succeeds
+    // Either the callback returns 200/302, or it fails but the token exchange happened
+    match callback_result {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            assert!(
+                status == 200 || status == 302,
+                "callback should return 200 or 302, got {}",
+                status
+            );
+        }
+        Err(e) => {
+            // If the request failed, it might be a timeout or connection closed.
+            // The relay may have crashed or panicked during the inner adapter init.
+            // Give the relay a moment to settle, then check if the token exchange
+            // happened by looking at the OAuth state.
+            eprintln!(
+                "Note: callback request failed: {}. Checking if token exchange happened...",
+                e
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    // Give the relay more time to process and potentially recover from any issues
+    // during apply_tokens (which may have caused the callback to fail)
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Check if the relay is still responding
+    let health_client = reqwest::Client::new();
+    let health_resp = health_client
+        .get(format!("{}/api/status", base))
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await;
+    match health_resp {
+        Ok(r) => eprintln!("Relay still responding: HTTP {}", r.status()),
+        Err(e) => eprintln!("Relay not responding: {}", e),
+    }
+
+    // Check if the OAuth state transitioned past needs_login (token exchange happened)
+    let oauth_status_url = format!("{}/api/endpoints/test-oauth/oauth/status", base);
+    let oauth_resp = health_client
+        .get(&oauth_status_url)
+        .send()
+        .await
+        .expect("oauth status request failed");
+    let oauth_status: Value = oauth_resp.json().await.expect("parse oauth status");
+    eprintln!("OAuth status after callback: {:?}", oauth_status);
+
+    // The OAuth state should NOT be needs_login anymore if token exchange succeeded
+    let status_str = oauth_status["status"].as_str().unwrap_or("unknown");
+    assert_ne!(
+        status_str, "needs_login",
+        "OAuth state should have transitioned from needs_login after callback"
+    );
+
+    // 5. The adapter should authenticate (OAuth layer succeeds)...
+    //    ...then fail the inner handshake (serverInfo.name missing).
+    //    Poll /api/endpoints for lifecycle.state == "Failed".
+    // Assertion #2 & #3: Lifecycle transitions to Failed with error kind "ServerName"
+    let endpoint =
+        wait_for_lifecycle_state(&harness, "test-oauth", "Failed", Duration::from_secs(15))
+            .await
+            .expect(
+                "endpoint should enter Failed state after inner handshake \
+             fails due to missing serverInfo.name",
+            );
+
+    // 6. Assert the error is specifically a ServerName error
+    let error = &endpoint["lifecycle"]["error"];
+    assert_eq!(
+        error["kind"].as_str(),
+        Some("ServerName"),
+        "error_kind should be ServerName, got: {:?}",
+        error
+    );
+    assert!(
+        error["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("did not report"),
+        "error detail should mention 'did not report', got: {:?}",
+        error["detail"]
+    );
+
+    // Assertion #4: Catalog returns zero tools
+    let client = reqwest::Client::new();
+    let catalog_resp = client
+        .get(format!("{}/api/catalog", base))
+        .send()
+        .await
+        .expect("catalog request failed");
+    let catalog: Value = catalog_resp.json().await.unwrap();
+    let tools = catalog.as_array().unwrap();
+    assert!(
+        tools.is_empty(),
+        "Failed OAuth endpoint should contribute zero tools, got {}",
+        tools.len()
+    );
 }

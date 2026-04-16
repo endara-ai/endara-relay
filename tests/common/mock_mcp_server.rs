@@ -34,12 +34,23 @@ struct MockMcpStateInner {
     force_401: RwLock<bool>,
     /// Count of requests received.
     request_count: RwLock<usize>,
+    /// When true, omits `name` from `serverInfo` in initialize response.
+    omit_server_info_name: bool,
 }
 
 #[allow(dead_code)]
 impl MockMcpServer {
     /// Start a mock MCP server on a random free port.
     pub async fn start() -> Self {
+        Self::start_inner(false).await
+    }
+
+    /// Start a mock MCP server that omits `name` from `serverInfo`.
+    pub async fn start_without_server_name() -> Self {
+        Self::start_inner(true).await
+    }
+
+    async fn start_inner(omit_server_info_name: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("failed to bind mock MCP server");
@@ -49,6 +60,7 @@ impl MockMcpServer {
             inner: Arc::new(MockMcpStateInner {
                 force_401: RwLock::new(false),
                 request_count: RwLock::new(0),
+                omit_server_info_name,
             }),
         };
 
@@ -132,15 +144,23 @@ async fn handle_mcp(
     let params = body.get("params").cloned().unwrap_or(json!({}));
 
     let response = match method {
-        "initialize" => json!({
-            "jsonrpc": "2.0",
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "mock-oauth-mcp", "version": "0.1.0"}
-            },
-            "id": id
-        }),
+        "initialize" => {
+            let server_info = if state.inner.omit_server_info_name {
+                // Omit `name` entirely from serverInfo
+                json!({"version": "0.1.0"})
+            } else {
+                json!({"name": "mock-oauth-mcp", "version": "0.1.0"})
+            };
+            json!({
+                "jsonrpc": "2.0",
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": server_info
+                },
+                "id": id
+            })
+        }
         "tools/list" => json!({
             "jsonrpc": "2.0",
             "result": {
