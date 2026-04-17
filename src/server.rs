@@ -131,13 +131,17 @@ fn meta_tool_definitions() -> Vec<Value> {
                 "Tools are available as `tools[\"tool_name\"]({...})`. ",
                 "Multi-server tool names use `prefix__name` format (double underscore); single-server mode has no prefix. ",
                 "Each tool call returns an MCP result with `content` (array of `{type, text}`) and/or `structuredContent`. ",
-                "To get structured data: `result.structuredContent || JSON.parse(result.content[0].text)`. ",
+                "Prefer `structuredContent` when present — it is the server's structured output. ",
+                "`content[0].text` is provider-defined and is NOT guaranteed to be JSON: it may be prose, a partial summary, empty, or truncated. ",
+                "Only call `JSON.parse` on it after a guard such as `typeof t === \"string\" && /^\\s*[\\[{]/.test(t)`. ",
                 "Use `return` to send data back.\n\n",
                 "Examples:\n",
                 "```js\n",
-                "// List tasks from a Todoist MCP server\n",
-                "const result = await tools[\"todoist__get-tasks\"]({ limit: 5 });\n",
-                "return result.structuredContent || JSON.parse(result.content[0].text);\n",
+                "// Safe pattern: prefer structuredContent, only JSON.parse after a guard\n",
+                "const r = await tools[\"todoist__get-tasks\"]({ limit: 5 });\n",
+                "if (r.structuredContent) return r.structuredContent;\n",
+                "const t = r.content && r.content[0] && r.content[0].text;\n",
+                "return typeof t === \"string\" && /^\\s*[\\[{]/.test(t) ? JSON.parse(t) : t;\n",
                 "```\n",
                 "```js\n",
                 "// Chain two tool calls\n",
@@ -1116,6 +1120,27 @@ mod tests {
         assert!(
             exec_desc.contains("await"),
             "execute_tools description should include at least one code example with await"
+        );
+        assert!(
+            exec_desc.contains("NOT guaranteed to be JSON"),
+            "execute_tools description should warn that content[0].text is not guaranteed to be JSON"
+        );
+        assert!(
+            exec_desc.contains("Prefer `structuredContent`"),
+            "execute_tools description should prefer structuredContent over content[0].text"
+        );
+        assert!(
+            exec_desc.contains(r#"/^\s*[\[{]/"#),
+            "execute_tools description should show a regex guard before JSON.parse"
+        );
+        assert!(
+            exec_desc.contains("if (r.structuredContent) return r.structuredContent"),
+            "execute_tools description should include the safe-guard example preferring structuredContent"
+        );
+        assert!(
+            exec_desc
+                .contains(r#"typeof t === "string" && /^\s*[\[{]/.test(t) ? JSON.parse(t) : t"#),
+            "execute_tools description should include the typeof + regex guard before JSON.parse"
         );
     }
 

@@ -118,6 +118,7 @@ fn run_js(script: &str, catalog: &[ToolInfo]) -> Result<Value, JsSandboxError> {
 
     register_call_tool(&mut context)?;
     register_tools_object(&mut context, catalog)?;
+    register_json_parse_wrapper(&mut context)?;
 
     let wrapped = format!(
         "var __sandbox_result;\n\
@@ -226,6 +227,51 @@ fn register_tools_object(
     context
         .eval(Source::from_bytes(js_src.as_bytes()))
         .map_err(|e| JsSandboxError::Internal(format!("failed to create tools object: {}", e)))?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Replace `JSON.parse` with a wrapper that produces actionable errors.
+//
+// On failure, rethrows a `SyntaxError` whose message identifies the
+// `JSON.parse` call, the kind and length of the input, and a short
+// preview of the coerced input — while preserving the original serde_json
+// error text. Behavior on success is unchanged.
+// ---------------------------------------------------------------------------
+
+fn register_json_parse_wrapper(context: &mut Context) -> Result<(), JsSandboxError> {
+    const SRC: &str = r#"
+(function() {
+  var __origParse = JSON.parse;
+  JSON.parse = function(text, reviver) {
+    try {
+      return __origParse(text, reviver);
+    } catch (e) {
+      var kind = (typeof text === 'string') ? 'string' : typeof text;
+      var coerced;
+      try { coerced = String(text); } catch (_) { coerced = '<uncoercible>'; }
+      var len = coerced.length;
+      var MAX = 80;
+      var preview;
+      if (len > MAX) {
+        preview = JSON.stringify(coerced.slice(0, MAX)) + '\u2026';
+      } else {
+        preview = JSON.stringify(coerced);
+      }
+      var origMsg = (e && e.message) ? e.message : String(e);
+      throw new SyntaxError(
+        'JSON.parse failed: ' + origMsg +
+        '; input (' + kind + ', len=' + len + '): ' + preview
+      );
+    }
+  };
+})();
+"#;
+    context
+        .eval(Source::from_bytes(SRC.as_bytes()))
+        .map_err(|e| {
+            JsSandboxError::Internal(format!("failed to install JSON.parse wrapper: {}", e))
+        })?;
     Ok(())
 }
 
@@ -1266,5 +1312,94 @@ mod tests {
         assert_eq!(result["echo_result"]["called"], "echo");
         assert_eq!(result["add_result"]["called"], "add");
         assert_eq!(result["echo_result"]["args"]["text"], "first");
+    }
+
+    // --- JSON.parse wrapper tests ---
+
+    #[tokio::test]
+    async fn test_json_parse_error_includes_preview_and_marker() {
+        let reg = make_registry().await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox.execute(r#"return JSON.parse("not json");"#).await;
+        assert!(result.is_err(), "expected JSON.parse to fail");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("SyntaxError"),
+            "missing SyntaxError: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("JSON.parse"),
+            "missing JSON.parse marker: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("not json"),
+            "missing input preview: {}",
+            err_msg
+        );
+        // Original serde_json text preserved. Depending on the input,
+        // serde_json may produce either "expected value" or "expected ident"
+        // (e.g. "not json" starts with 'n' so it tries to parse `null`).
+        // Either way the canonical "expected " and position info survive.
+        assert!(
+            err_msg.contains("expected ") && err_msg.contains("line 1"),
+            "missing original serde_json text: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_json_parse_error_with_long_input_truncates_preview() {
+        let reg = make_registry().await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let script = r#"
+            var s = "";
+            for (var i = 0; i < 500; i++) s += "a";
+            return JSON.parse(s);
+        "#;
+        let result = sandbox.execute(script).await;
+        assert!(result.is_err(), "expected JSON.parse to fail");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains('\u{2026}') || err_msg.contains("..."),
+            "missing truncation marker: {}",
+            err_msg
+        );
+        assert!(
+            !err_msg.contains(&"a".repeat(500)),
+            "full 500-char input should not be present in the error message: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_json_parse_error_with_non_string_input() {
+        let reg = make_registry().await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox.execute(r#"return JSON.parse(undefined);"#).await;
+        assert!(result.is_err(), "expected JSON.parse to fail");
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains("JSON.parse"),
+            "missing JSON.parse marker: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains("undefined"),
+            "missing coerced form: {}",
+            err_msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_json_parse_success_unchanged() {
+        let reg = make_registry().await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return JSON.parse('{"a":1}');"#)
+            .await
+            .unwrap();
+        assert_eq!(result, json!({"a": 1}));
     }
 }
