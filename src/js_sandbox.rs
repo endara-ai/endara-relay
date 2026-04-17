@@ -11,6 +11,7 @@ use boa_engine::property::Attribute;
 use boa_engine::{Context, JsError, JsNativeError, JsResult, JsValue, NativeFunction, Source};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::RwLock;
 
 use crate::adapter::ToolInfo;
 use crate::registry::AdapterRegistry;
@@ -398,6 +399,11 @@ fn fuzzy_threshold(len: usize) -> usize {
     }
 }
 
+/// Cached search index shared between `search_tools` calls: a
+/// `(generation, docs)` pair where `generation` is the registry's
+/// `catalog_generation` at the time `docs` was built.
+type SearchIndexCache = Option<(u64, Arc<Vec<ToolDoc>>)>;
+
 /// Precomputed per-tool search document.
 struct ToolDoc {
     name_lower: String,
@@ -552,6 +558,18 @@ impl From<&ToolInfo> for ToolInfoSlim {
 pub struct MetaToolHandler {
     registry: Arc<AdapterRegistry>,
     sandbox_timeout: Duration,
+    /// Memoized per-tool search index reused across `search_tools` calls.
+    /// Holds `(generation, docs)` where `generation` is the registry's
+    /// `catalog_generation` at the time the docs were built. The `Arc` lets
+    /// scoring proceed after releasing the cache lock. Generation — not
+    /// length — is the authoritative invariant: two different mutations could
+    /// yield catalogs of equal length, and the counter rules that out.
+    search_index_cache: Arc<RwLock<SearchIndexCache>>,
+    /// Test-only counter incremented on every rebuild of the search index.
+    /// Used by tests to assert cache hit/miss behavior without needing to
+    /// inspect the cache contents directly.
+    #[cfg(test)]
+    search_index_rebuild_count: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl MetaToolHandler {
@@ -559,7 +577,18 @@ impl MetaToolHandler {
         Self {
             registry,
             sandbox_timeout,
+            search_index_cache: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            search_index_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Test-only accessor returning the number of times the search index has
+    /// been rebuilt. Used to assert cache hit/miss behavior.
+    #[cfg(test)]
+    pub(crate) fn search_index_rebuild_count(&self) -> usize {
+        self.search_index_rebuild_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// `list_tools` — paginated catalog.
@@ -590,13 +619,20 @@ impl MetaToolHandler {
     /// `search_tools` — fuzzy, ranked search across name, description, endpoint,
     /// and input-schema property names.
     ///
-    /// TODO(perf): piggyback on `AdapterRegistry::merged_catalog` caching to
-    /// memoize the built `ToolDoc` vector across calls.
+    /// The built `Vec<ToolDoc>` is memoized in `search_index_cache` and reused
+    /// across calls while the registry's catalog generation is unchanged.
     pub async fn search_tools(
         &self,
         query: &str,
         limit: Option<usize>,
     ) -> Result<Value, JsSandboxError> {
+        // Read the registry generation BEFORE fetching the catalog. If the
+        // generation bumps between here and the catalog fetch, we may stamp
+        // an older generation onto newer docs — the worst case is a wasted
+        // rebuild on the next call (stale label → mismatch → rebuild), never
+        // incorrect results. Reading generation *after* the catalog would be
+        // unsafe because it could stamp a newer generation onto stale docs.
+        let current_gen = self.registry.catalog_generation();
         let catalog = self.registry.merged_catalog().await;
         let limit = limit.unwrap_or(20).min(200);
 
@@ -609,7 +645,32 @@ impl MetaToolHandler {
                 .map_err(|e| JsSandboxError::Internal(e.to_string()));
         }
 
-        let docs: Vec<ToolDoc> = catalog.iter().map(ToolDoc::from_tool).collect();
+        // Cache fast path: reuse docs when the generation is unchanged and the
+        // cached vector aligns 1:1 with the catalog (length check is a cheap
+        // safety belt; the generation is the authoritative invariant).
+        let docs: Arc<Vec<ToolDoc>> = {
+            let cached = self.search_index_cache.read().await;
+            match cached.as_ref() {
+                Some((gen, docs)) if *gen == current_gen && docs.len() == catalog.len() => {
+                    Arc::clone(docs)
+                }
+                _ => {
+                    drop(cached);
+                    // Miss: rebuild. Racing readers may each rebuild
+                    // independently (no single-flight). This is safe because
+                    // each writer builds docs for the same `current_gen` (or
+                    // for a successive generation, where last-write-wins).
+                    let new_docs: Arc<Vec<ToolDoc>> =
+                        Arc::new(catalog.iter().map(ToolDoc::from_tool).collect());
+                    #[cfg(test)]
+                    self.search_index_rebuild_count
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut w = self.search_index_cache.write().await;
+                    *w = Some((current_gen, Arc::clone(&new_docs)));
+                    new_docs
+                }
+            }
+        };
 
         let mut scored: Vec<(f64, &ToolInfo)> = Vec::with_capacity(docs.len());
         for (doc, tool) in docs.iter().zip(catalog.iter()) {
@@ -1401,5 +1462,224 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, json!({"a": 1}));
+    }
+
+    // --- search index cache tests ---
+
+    #[tokio::test]
+    async fn test_search_index_cache_reuses_docs() {
+        // Two sequential search_tools calls on an unchanged registry should
+        // trigger exactly one rebuild of the ToolDoc vector.
+        let reg = make_registry().await;
+        let handler = MetaToolHandler::new(reg, Duration::from_secs(5));
+        assert_eq!(handler.search_index_rebuild_count(), 0);
+
+        let _ = handler.search_tools("echo", None).await.unwrap();
+        assert_eq!(
+            handler.search_index_rebuild_count(),
+            1,
+            "first search_tools call must rebuild the index"
+        );
+
+        let _ = handler.search_tools("greet", None).await.unwrap();
+        assert_eq!(
+            handler.search_index_rebuild_count(),
+            1,
+            "second call on unchanged registry must NOT rebuild"
+        );
+
+        // A third call with yet a different query must also reuse.
+        let _ = handler.search_tools("add", None).await.unwrap();
+        assert_eq!(handler.search_index_rebuild_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_search_index_cache_invalidated_on_registry_change() {
+        // After registering a new adapter, the next search_tools call must
+        // rebuild, and the newly-registered tool must appear in results.
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "ep1".into(),
+                Box::new(MockAdapter::new(vec![make_tool("echo", "Echo tool")])),
+                "stdio".into(),
+                None,
+                Some("ep1".into()),
+            )
+            .await;
+        let reg = Arc::new(registry);
+        let handler = MetaToolHandler::new(Arc::clone(&reg), Duration::from_secs(5));
+
+        let _ = handler.search_tools("echo", None).await.unwrap();
+        assert_eq!(handler.search_index_rebuild_count(), 1);
+
+        // Register a second adapter with a distinct tool. This triggers
+        // invalidate_catalog_cache internally.
+        reg.register(
+            "ep2".into(),
+            Box::new(MockAdapter::new(vec![make_tool("zephyr", "Zephyr helper")])),
+            "stdio".into(),
+            None,
+            Some("ep2".into()),
+        )
+        .await;
+
+        let result = handler.search_tools("zephyr", None).await.unwrap();
+        let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
+        assert!(
+            tools.iter().any(|t| t.name.contains("zephyr")),
+            "newly-registered tool must surface in results, got {:?}",
+            tools
+        );
+        assert_eq!(
+            handler.search_index_rebuild_count(),
+            2,
+            "rebuild must happen after registry change"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_index_cache_rebuilds_after_invalidate_catalog_cache() {
+        // Explicit invalidate_catalog_cache must force a rebuild on the next
+        // call even though the actual catalog contents are unchanged.
+        let reg = make_registry().await;
+        let handler = MetaToolHandler::new(Arc::clone(&reg), Duration::from_secs(5));
+
+        let _ = handler.search_tools("echo", None).await.unwrap();
+        assert_eq!(handler.search_index_rebuild_count(), 1);
+
+        reg.invalidate_catalog_cache().await;
+
+        let _ = handler.search_tools("echo", None).await.unwrap();
+        assert_eq!(
+            handler.search_index_rebuild_count(),
+            2,
+            "explicit invalidate_catalog_cache must force rebuild"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_index_cache_correctness_parity() {
+        // Running the same queries with a cold cache and then with a warm
+        // cache must produce bit-identical serialized results.
+        let reg = registry_with_tools(
+            "ep",
+            vec![
+                make_tool("echo", "Echo tool"),
+                make_tool("greet", "Greeting tool"),
+                make_tool("getIssues", "List issues"),
+                make_tool("list-tasks", "List tasks"),
+                make_tool("get_task", "retrieve a task"),
+                make_tool("forget_me", "unrelated"),
+            ],
+        )
+        .await;
+
+        let queries: &[(&str, Option<usize>)] = &[
+            ("echo", None),
+            ("ehco", None),       // fuzzy typo
+            ("issue", None),      // camel-case tokenization
+            ("task", None),       // kebab-case + prefix match
+            ("get", None),        // prefix beats substring
+            ("echo greet", None), // multi-token OR
+            ("", Some(5)),        // empty query, limited
+            ("zzzzzz", None),     // noise → empty
+        ];
+
+        // Cold pass: fresh handler, cache miss per call (first only).
+        let cold_handler = MetaToolHandler::new(Arc::clone(&reg), Duration::from_secs(5));
+        let mut cold_results: Vec<Value> = Vec::with_capacity(queries.len());
+        for (q, lim) in queries {
+            cold_results.push(cold_handler.search_tools(q, *lim).await.unwrap());
+        }
+
+        // Warm pass: same handler (cache is now populated). Cache stays warm
+        // for every call because the registry hasn't been mutated.
+        let mut warm_results: Vec<Value> = Vec::with_capacity(queries.len());
+        for (q, lim) in queries {
+            warm_results.push(cold_handler.search_tools(q, *lim).await.unwrap());
+        }
+
+        assert_eq!(
+            cold_results, warm_results,
+            "warm-cache results must match cold-cache results bit-for-bit"
+        );
+        // Exactly one rebuild across both passes: the very first non-empty
+        // query. The empty-query branch skips the cache entirely.
+        assert_eq!(
+            cold_handler.search_index_rebuild_count(),
+            1,
+            "rebuild count must be 1 across warm+cold passes on unchanged registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_catalog_generation_monotonic() {
+        // Generation starts at 0, strictly increases on every mutation, and
+        // back-to-back reads without mutation return the same value.
+        let registry = AdapterRegistry::new();
+        assert_eq!(registry.catalog_generation(), 0);
+        assert_eq!(
+            registry.catalog_generation(),
+            registry.catalog_generation(),
+            "back-to-back reads must be equal when no mutation happened"
+        );
+
+        // Register → generation bumps.
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::new(vec![make_tool("echo", "Echo")])),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+        let g1 = registry.catalog_generation();
+        assert!(g1 > 0);
+        assert_eq!(
+            registry.catalog_generation(),
+            g1,
+            "read without mutation must be stable"
+        );
+
+        // Register a second endpoint → bump again.
+        registry
+            .register(
+                "ep2".into(),
+                Box::new(MockAdapter::new(vec![make_tool("add", "Add")])),
+                "stdio".into(),
+                None,
+                Some("ep2".into()),
+            )
+            .await;
+        let g2 = registry.catalog_generation();
+        assert!(g2 > g1);
+
+        // Disable an adapter via entries() + invalidate_catalog_cache → bump.
+        {
+            let mut entries = registry.entries().write().await;
+            entries.get_mut("ep").unwrap().disabled = true;
+        }
+        registry.invalidate_catalog_cache().await;
+        let g3 = registry.catalog_generation();
+        assert!(g3 > g2);
+
+        // Re-enable + invalidate → bump again.
+        {
+            let mut entries = registry.entries().write().await;
+            entries.get_mut("ep").unwrap().disabled = false;
+        }
+        registry.invalidate_catalog_cache().await;
+        let g4 = registry.catalog_generation();
+        assert!(g4 > g3);
+
+        // Remove → bump (register/remove both invalidate internally).
+        let _ = registry.remove("ep2").await;
+        let g5 = registry.catalog_generation();
+        assert!(g5 > g4);
+
+        // Stable read after mutations stop.
+        assert_eq!(registry.catalog_generation(), g5);
     }
 }
