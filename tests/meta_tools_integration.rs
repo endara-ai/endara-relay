@@ -177,6 +177,37 @@ async fn test_search_tools_returns_content_array() {
     );
 }
 
+/// 4.3b — fuzzy search: a typo in the query still finds the intended tool.
+#[tokio::test]
+async fn test_search_tools_fuzzy_typo_match() {
+    if require_node().is_none() {
+        return;
+    }
+    let (_harness, client) = setup_js_on().await;
+
+    let result = client
+        .call_tool("search_tools", json!({"query": "ehco"}))
+        .await
+        .expect("call_tool search_tools failed");
+
+    let content = result["result"]["content"]
+        .as_array()
+        .expect("search_tools result must have content array");
+    assert_eq!(content[0]["type"], "text");
+
+    let text = content[0]["text"].as_str().expect("text field missing");
+    let tools: serde_json::Value =
+        serde_json::from_str(text).expect("search_tools text should be valid JSON");
+    let tools_arr = tools.as_array().expect("search result should be an array");
+    assert!(
+        tools_arr
+            .iter()
+            .any(|t| t["name"].as_str().unwrap_or("").contains("echo")),
+        "fuzzy query 'ehco' should surface a tool whose name contains 'echo', got: {:?}",
+        tools_arr
+    );
+}
+
 /// 4.4 — call execute_tools with a JS script calling echo tool, result in content array.
 #[tokio::test]
 async fn test_execute_tools_returns_content_array() {
