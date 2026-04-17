@@ -114,7 +114,7 @@ fn meta_tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "search_tools",
-            "description": "Search tools by keyword across tool name, description, and server endpoint. All query tokens must match (AND logic). Returns an array of matching tools, each with `name`, `description`, and `input_schema`.",
+            "description": "Fuzzy search across tool name, description, server endpoint, and input-schema property names. Typo-tolerant (Levenshtein), case-insensitive, and aware of camelCase / snake_case / kebab-case boundaries. Results are ranked by relevance (exact > prefix > substring > fuzzy; name > description > endpoint); tools matching more query tokens rank higher. Returns an array of matching tools, each with `name`, `description`, and `input_schema`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1082,8 +1082,12 @@ mod tests {
             "search_tools description should mention 'keyword' or 'search'"
         );
         assert!(
-            search_desc.contains("AND"),
-            "search_tools description should mention 'AND' logic"
+            search_desc.contains("fuzzy") || search_desc.contains("Fuzzy"),
+            "search_tools description should mention 'fuzzy'"
+        );
+        assert!(
+            search_desc.contains("rank") || search_desc.contains("Ranked"),
+            "search_tools description should mention 'rank'"
         );
     }
 

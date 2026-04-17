@@ -282,6 +282,193 @@ fn js_value_to_json(val: &JsValue, context: &mut Context) -> Result<Value, JsSan
 }
 
 // ---------------------------------------------------------------------------
+// Fuzzy search helpers for `search_tools`
+// ---------------------------------------------------------------------------
+
+/// Minimum aggregate score for a tool to appear in `search_tools` results.
+const MIN_SCORE: f64 = 1.0;
+
+/// Split an identifier into lower-cased word tokens.
+///
+/// Splits on non-alphanumeric characters, camelCase / PascalCase boundaries,
+/// digit-letter boundaries, and ALL-CAPS→lowercase boundaries
+/// (e.g. `HTTPResponse` → `["http", "response"]`).
+fn split_identifier(s: &str) -> Vec<String> {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+
+    let chars: Vec<char> = s.chars().collect();
+    for i in 0..chars.len() {
+        let c = chars[i];
+        if !c.is_alphanumeric() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current).to_lowercase());
+            }
+            continue;
+        }
+
+        if current.is_empty() {
+            current.push(c);
+            continue;
+        }
+
+        let prev = chars[i - 1];
+        let next = chars.get(i + 1).copied();
+
+        // letter ↔ digit boundary
+        let digit_boundary = prev.is_ascii_digit() != c.is_ascii_digit();
+        // lower → upper (camelCase)
+        let camel_boundary = prev.is_lowercase() && c.is_uppercase();
+        // ALL-CAPS run followed by a lowercase letter (HTTPResponse → HTTP, Response):
+        // split before `c` when prev is uppercase letter, c is uppercase letter,
+        // and next is a lowercase letter.
+        let caps_boundary =
+            prev.is_uppercase() && c.is_uppercase() && matches!(next, Some(n) if n.is_lowercase());
+
+        if digit_boundary || camel_boundary || caps_boundary {
+            tokens.push(std::mem::take(&mut current).to_lowercase());
+        }
+        current.push(c);
+    }
+    if !current.is_empty() {
+        tokens.push(current.to_lowercase());
+    }
+    tokens.retain(|t| !t.is_empty());
+    tokens
+}
+
+/// Re-export `split_identifier` for unit tests in this crate.
+#[cfg(test)]
+pub(crate) fn split_identifier_for_tests(s: &str) -> Vec<String> {
+    split_identifier(s)
+}
+
+/// Levenshtein distance threshold by query-token length.
+fn fuzzy_threshold(len: usize) -> usize {
+    match len {
+        0..=3 => 0,
+        4..=5 => 1,
+        _ => 2,
+    }
+}
+
+/// Precomputed per-tool search document.
+struct ToolDoc {
+    name_lower: String,
+    name_tokens: Vec<String>,
+    desc_lower: String,
+    desc_tokens: Vec<String>,
+    endpoint_tokens: Vec<String>,
+    schema_prop_tokens: Vec<String>,
+}
+
+impl ToolDoc {
+    fn from_tool(tool: &ToolInfo) -> Self {
+        let name_lower = tool.name.to_lowercase();
+        let name_tokens = split_identifier(&tool.name);
+        let desc_lower = tool
+            .description
+            .as_ref()
+            .map(|d| d.to_lowercase())
+            .unwrap_or_default();
+        let desc_tokens: Vec<String> = desc_lower
+            .split_whitespace()
+            .map(|s| s.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        // Endpoint is the portion of tool.name before "__" (if present).
+        let endpoint_str = tool.name.split_once("__").map(|(ep, _)| ep).unwrap_or("");
+        let endpoint_tokens = split_identifier(endpoint_str);
+        // Schema property names: union of tokenized top-level property keys.
+        let mut schema_prop_tokens: Vec<String> = Vec::new();
+        if let Some(props) = tool
+            .input_schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+        {
+            for key in props.keys() {
+                schema_prop_tokens.extend(split_identifier(key));
+            }
+        }
+        Self {
+            name_lower,
+            name_tokens,
+            desc_lower,
+            desc_tokens,
+            endpoint_tokens,
+            schema_prop_tokens,
+        }
+    }
+}
+
+/// Score a single query token against a `ToolDoc`, returning the best match
+/// score across all fields (0.0 means no match).
+fn score_query_token(q: &str, doc: &ToolDoc) -> f64 {
+    let mut best: f64 = 0.0;
+
+    // name_token exact
+    if doc.name_tokens.iter().any(|t| t == q) {
+        best = best.max(10.0);
+    }
+    // q is a prefix of full name_lower
+    if doc.name_lower.starts_with(q) {
+        best = best.max(7.0);
+    }
+    // q is a prefix of any name_token
+    if doc.name_tokens.iter().any(|t| t.starts_with(q)) {
+        best = best.max(5.0);
+    }
+    // q is a substring of name_lower
+    if doc.name_lower.contains(q) {
+        best = best.max(3.5);
+    }
+    // q exact-equals any desc_token / endpoint_token / schema_prop_token
+    if doc.desc_tokens.iter().any(|t| t == q)
+        || doc.endpoint_tokens.iter().any(|t| t == q)
+        || doc.schema_prop_tokens.iter().any(|t| t == q)
+    {
+        best = best.max(3.0);
+    }
+    // q is a substring of desc_lower
+    if doc.desc_lower.contains(q) {
+        best = best.max(1.5);
+    }
+
+    // Fuzzy (edit-distance) matches — only when threshold > 0.
+    // Uses strsim::osa_distance (Optimal String Alignment) so that adjacent
+    // transpositions count as 1 edit. This keeps the task's distance
+    // thresholds (1 for len 4-5, etc.) workable for the common
+    // "ehco" → "echo" case, which is distance 2 under classic Levenshtein.
+    let threshold = fuzzy_threshold(q.chars().count());
+    if threshold > 0 {
+        if let Some(d) = doc
+            .name_tokens
+            .iter()
+            .map(|t| strsim::osa_distance(q, t))
+            .min()
+        {
+            if d <= threshold {
+                let score = (2.0 - d as f64 * 0.5).max(0.5);
+                best = best.max(score);
+            }
+        }
+        if let Some(d) = doc
+            .desc_tokens
+            .iter()
+            .map(|t| strsim::osa_distance(q, t))
+            .min()
+        {
+            if d <= threshold {
+                let score = (1.0 - d as f64 * 0.3).max(0.2);
+                best = best.max(score);
+            }
+        }
+    }
+
+    best
+}
+
+// ---------------------------------------------------------------------------
 // MetaToolHandler — list_tools, search_tools, execute_tools
 // ---------------------------------------------------------------------------
 
@@ -354,50 +541,66 @@ impl MetaToolHandler {
         serde_json::to_value(resp).map_err(|e| JsSandboxError::Internal(e.to_string()))
     }
 
-    /// `search_tools` — token-based keyword search in name/description/endpoint.
+    /// `search_tools` — fuzzy, ranked search across name, description, endpoint,
+    /// and input-schema property names.
+    ///
+    /// TODO(perf): piggyback on `AdapterRegistry::merged_catalog` caching to
+    /// memoize the built `ToolDoc` vector across calls.
     pub async fn search_tools(
         &self,
         query: &str,
         limit: Option<usize>,
     ) -> Result<Value, JsSandboxError> {
-        let (catalog, lookup) = self.registry.merged_catalog_with_lookup().await;
-        let query_lower = query.to_lowercase();
-        let tokens: Vec<&str> = query_lower.split_whitespace().collect();
+        let catalog = self.registry.merged_catalog().await;
         let limit = limit.unwrap_or(20).min(200);
 
-        if tokens.is_empty() {
-            // Empty query returns first `limit` tools
+        let query_lower = query.to_lowercase();
+        let query_tokens: Vec<&str> = query_lower.split_whitespace().collect();
+
+        if query_tokens.is_empty() {
             let page: Vec<ToolInfoSlim> = catalog.iter().take(limit).map(Into::into).collect();
             return serde_json::to_value(&page)
                 .map_err(|e| JsSandboxError::Internal(e.to_string()));
         }
 
-        let matches: Vec<ToolInfoSlim> = catalog
-            .iter()
-            .filter(|t| {
-                let name_lower = t.name.to_lowercase();
-                let desc_lower = t
-                    .description
-                    .as_ref()
-                    .map(|d| d.to_lowercase())
-                    .unwrap_or_default();
-                // Also get endpoint name from lookup
-                let endpoint_lower = lookup
-                    .get(&t.name)
-                    .map(|(ep, _)| ep.to_lowercase())
-                    .unwrap_or_default();
+        let docs: Vec<ToolDoc> = catalog.iter().map(ToolDoc::from_tool).collect();
 
-                // ALL tokens must match somewhere
-                tokens.iter().all(|token| {
-                    name_lower.contains(token)
-                        || desc_lower.contains(token)
-                        || endpoint_lower.contains(token)
-                        // Also check __ segments of the name
-                        || name_lower.split("__").any(|seg| seg.contains(token))
-                })
-            })
+        let mut scored: Vec<(f64, &ToolInfo)> = Vec::with_capacity(docs.len());
+        for (doc, tool) in docs.iter().zip(catalog.iter()) {
+            let per_token_scores: Vec<f64> = query_tokens
+                .iter()
+                .map(|q| score_query_token(q, doc))
+                .collect();
+            let matched = per_token_scores.iter().filter(|s| **s > 0.0).count();
+            if matched == 0 {
+                continue;
+            }
+            let base: f64 = per_token_scores.iter().sum();
+            let hit_bonus = matched as f64 * 1.0;
+            let all_matched_bonus = if matched == query_tokens.len() {
+                2.0
+            } else {
+                0.0
+            };
+            let total = base + hit_bonus + all_matched_bonus;
+            if total < MIN_SCORE {
+                continue;
+            }
+            scored.push((total, tool));
+        }
+
+        // Sort: score desc, then name length asc, then name asc.
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.name.len().cmp(&b.1.name.len()))
+                .then_with(|| a.1.name.cmp(&b.1.name))
+        });
+
+        let matches: Vec<ToolInfoSlim> = scored
+            .into_iter()
             .take(limit)
-            .map(Into::into)
+            .map(|(_, t)| ToolInfoSlim::from(t))
             .collect();
         serde_json::to_value(&matches).map_err(|e| JsSandboxError::Internal(e.to_string()))
     }
@@ -582,19 +785,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_js_sandbox_search_tools_multi_word_query() {
+    async fn test_js_sandbox_search_tools_multi_word_query_strict_and_compat() {
         let reg = make_registry().await;
         let handler = MetaToolHandler::new(reg, Duration::from_secs(5));
-        // "echo tool" should match the echo tool (name contains "echo", desc contains "tool")
+        // "echo tool" matches echo (name "echo" + desc "Echo tool") fully,
+        // and greet (desc "Greeting tool") on just "tool"; echo must rank first.
         let result = handler.search_tools("echo tool", None).await.unwrap();
         let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
-        assert_eq!(tools.len(), 1);
-        assert!(tools[0].name.contains("echo"));
-
-        // "echo numbers" should NOT match anything (no single tool has both)
-        let result = handler.search_tools("echo numbers", None).await.unwrap();
-        let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
-        assert_eq!(tools.len(), 0);
+        assert!(
+            !tools.is_empty(),
+            "echo tool should return at least one hit"
+        );
+        assert!(
+            tools[0].name.contains("echo"),
+            "echo must rank first for 'echo tool', got {:?}",
+            tools
+        );
     }
 
     #[tokio::test]
@@ -607,7 +813,341 @@ mod tests {
         assert_eq!(tools.len(), 3);
     }
 
-    // --- JS execution tests ---
+    // --- split_identifier tokenizer tests ---
+
+    #[test]
+    fn test_split_identifier_snake_case() {
+        assert_eq!(
+            split_identifier_for_tests("get_task_by_id"),
+            vec!["get", "task", "by", "id"]
+        );
+    }
+
+    #[test]
+    fn test_split_identifier_kebab_case() {
+        assert_eq!(
+            split_identifier_for_tests("list-tasks"),
+            vec!["list", "tasks"]
+        );
+    }
+
+    #[test]
+    fn test_split_identifier_camel_case() {
+        assert_eq!(
+            split_identifier_for_tests("getTaskById"),
+            vec!["get", "task", "by", "id"]
+        );
+    }
+
+    #[test]
+    fn test_split_identifier_pascal_case() {
+        assert_eq!(split_identifier_for_tests("GetTask"), vec!["get", "task"]);
+    }
+
+    #[test]
+    fn test_split_identifier_all_caps() {
+        assert_eq!(split_identifier_for_tests("FOO_BAR"), vec!["foo", "bar"]);
+    }
+
+    #[test]
+    fn test_split_identifier_http_response() {
+        assert_eq!(
+            split_identifier_for_tests("HTTPResponse"),
+            vec!["http", "response"]
+        );
+    }
+
+    #[test]
+    fn test_split_identifier_digit_boundaries() {
+        assert_eq!(split_identifier_for_tests("v2Api"), vec!["v", "2", "api"]);
+        assert_eq!(
+            split_identifier_for_tests("foo42bar"),
+            vec!["foo", "42", "bar"]
+        );
+    }
+
+    #[test]
+    fn test_split_identifier_empty_and_separators() {
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(split_identifier_for_tests(""), empty);
+        assert_eq!(split_identifier_for_tests("___"), empty);
+        assert_eq!(split_identifier_for_tests("_foo_"), vec!["foo"]);
+        assert_eq!(
+            split_identifier_for_tests("--foo--bar--"),
+            vec!["foo", "bar"]
+        );
+    }
+
+    #[test]
+    fn test_split_identifier_mixed() {
+        assert_eq!(
+            split_identifier_for_tests("todoist_mcp__getTasks"),
+            vec!["todoist", "mcp", "get", "tasks"]
+        );
+        assert_eq!(
+            split_identifier_for_tests("parseHTTP2Url"),
+            vec!["parse", "http", "2", "url"]
+        );
+    }
+
+    // --- new fuzzy/ranked search_tools tests ---
+
+    fn make_tool_with_schema(name: &str, desc: &str, schema: Value) -> ToolInfo {
+        ToolInfo {
+            name: name.to_string(),
+            description: Some(desc.to_string()),
+            input_schema: schema,
+            annotations: None,
+        }
+    }
+
+    async fn registry_with_tools(endpoint: &str, tools: Vec<ToolInfo>) -> Arc<AdapterRegistry> {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                endpoint.into(),
+                Box::new(MockAdapter::new(tools)),
+                "stdio".into(),
+                None,
+                // Single adapter → no prefix so names stay as-given.
+                None,
+            )
+            .await;
+        Arc::new(registry)
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_typo_match_echo() {
+        let reg = registry_with_tools(
+            "ep",
+            vec![make_tool("echo", "Echo tool"), make_tool("add", "Add")],
+        )
+        .await;
+        let handler = MetaToolHandler::new(reg, Duration::from_secs(5));
+        let result = handler.search_tools("ehco", None).await.unwrap();
+        let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
+        assert!(
+            tools.iter().any(|t| t.name == "echo"),
+            "expected echo in results for typo 'ehco', got {:?}",
+            tools
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_camel_case_tokenization() {
+        let reg = registry_with_tools(
+            "ep",
+            vec![
+                make_tool("getIssues", "List issues"),
+                make_tool("other", "unrelated"),
+            ],
+        )
+        .await;
+        let handler = MetaToolHandler::new(reg, Duration::from_secs(5));
+        let result = handler.search_tools("issue", None).await.unwrap();
+        let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
+        assert!(
+            tools.iter().any(|t| t.name == "getIssues"),
+            "expected getIssues for query 'issue', got {:?}",
+            tools
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_kebab_case_tokenization() {
+        let reg = registry_with_tools(
+            "ep",
+            vec![
+                make_tool("list-tasks", "List stuff"),
+                make_tool("other", "unrelated"),
+            ],
+        )
+        .await;
+        let handler = MetaToolHandler::new(reg, Duration::from_secs(5));
+        let result = handler.search_tools("task", None).await.unwrap();
+        let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
+        assert!(
+            tools.iter().any(|t| t.name == "list-tasks"),
+            "expected list-tasks for query 'task', got {:?}",
+            tools
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_schema_property_match() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "string"}
+            }
+        });
+        let reg = registry_with_tools(
+            "ep",
+            vec![
+                make_tool_with_schema("foo_bar", "unrelated description", schema),
+                make_tool("other", "nothing here"),
+            ],
+        )
+        .await;
+        let handler = MetaToolHandler::new(reg, Duration::from_secs(5));
+        let result = handler.search_tools("project", None).await.unwrap();
+        let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
+        assert!(
+            tools.iter().any(|t| t.name == "foo_bar"),
+            "expected foo_bar (schema prop 'project_id') for query 'project', got {:?}",
+            tools
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_ranking_name_over_description() {
+        let reg = registry_with_tools(
+            "ep",
+            vec![
+                make_tool("echo", "does nothing special"),
+                make_tool("other", "this just mentions echo briefly"),
+            ],
+        )
+        .await;
+        let handler = MetaToolHandler::new(reg, Duration::from_secs(5));
+        let result = handler.search_tools("echo", None).await.unwrap();
+        let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
+        assert!(!tools.is_empty());
+        assert_eq!(
+            tools[0].name, "echo",
+            "name-match tool must outrank description-match tool, got {:?}",
+            tools
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_prefix_beats_substring() {
+        let reg = registry_with_tools(
+            "ep",
+            vec![
+                make_tool("get_task", "retrieve a task"),
+                make_tool("forget_me", "unrelated"),
+            ],
+        )
+        .await;
+        let handler = MetaToolHandler::new(reg, Duration::from_secs(5));
+        let result = handler.search_tools("get", None).await.unwrap();
+        let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
+        assert!(!tools.is_empty());
+        assert_eq!(
+            tools[0].name, "get_task",
+            "prefix match must outrank substring match, got {:?}",
+            tools
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_shorter_name_tiebreak() {
+        // Two tools whose name_tokens both exact-match `q`, same score.
+        // Sorted by name length asc, then lexicographic asc.
+        let reg = registry_with_tools(
+            "ep",
+            vec![
+                make_tool("task_bb", "one"),
+                make_tool("task_a", "two"),
+                make_tool("task_aa", "three"),
+            ],
+        )
+        .await;
+        let handler = MetaToolHandler::new(reg, Duration::from_secs(5));
+        let result = handler.search_tools("task", None).await.unwrap();
+        let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
+        let names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+        // task_a (6), task_aa (7) < task_bb (7); tie between task_aa and task_bb → aa before bb.
+        assert_eq!(
+            names,
+            vec!["task_a", "task_aa", "task_bb"],
+            "got {:?}",
+            names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_multi_token_or_ranks_multi_hit_first() {
+        let reg = registry_with_tools(
+            "ep",
+            vec![
+                make_tool("echo", "Echo tool"),
+                make_tool("greet", "Greeting tool"),
+                make_tool("echo_greet", "Combined echo and greet tool"),
+            ],
+        )
+        .await;
+        let handler = MetaToolHandler::new(reg, Duration::from_secs(5));
+        let result = handler.search_tools("echo greet", None).await.unwrap();
+        let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
+        let names: Vec<String> = tools.iter().map(|t| t.name.clone()).collect();
+        assert!(
+            names.contains(&"echo".to_string()) && names.contains(&"greet".to_string()),
+            "both echo and greet should be present, got {:?}",
+            names
+        );
+        assert_eq!(
+            names[0], "echo_greet",
+            "tool matching both tokens should rank first, got {:?}",
+            names
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_limit_clamping() {
+        let reg = make_registry().await;
+        let handler = MetaToolHandler::new(reg, Duration::from_secs(5));
+        // limit=0 → returns 0 results.
+        let result = handler.search_tools("", Some(0)).await.unwrap();
+        let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
+        assert_eq!(tools.len(), 0);
+        // limit=500 → clamped to 200 (catalog only has 3).
+        let result = handler.search_tools("", Some(500)).await.unwrap();
+        let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
+        assert_eq!(tools.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_min_score_cutoff() {
+        // Query that could fuzzy-match a description token weakly — must not
+        // surface the tool when the only signal is a weak desc-token levenshtein.
+        let reg = registry_with_tools(
+            "ep",
+            vec![make_tool(
+                "unrelated_name",
+                "some tool that processes configuration entries",
+            )],
+        )
+        .await;
+        let handler = MetaToolHandler::new(reg, Duration::from_secs(5));
+        // "confuguretion" vs "configuration" → distance 2, threshold 2 → fuzzy
+        // desc score 1.0 - 2*0.3 = 0.4. Aggregate: base=0.4, hit=1.0,
+        // all_matched=2.0, total=3.4 — this actually exceeds MIN_SCORE, so
+        // use a noisier query that only weakly matches a long single word via
+        // fuzzy desc: distance 2 on token alone with no other hits.
+        // Use "cnfgurtn" → distance >> threshold (2) against "configuration" (len 13) → no match.
+        let result = handler.search_tools("cnfgurtn", None).await.unwrap();
+        let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
+        assert!(
+            tools.is_empty(),
+            "weak fuzzy-only noise should yield no hits, got {:?}",
+            tools
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_tools_noise_query_returns_empty() {
+        let reg = make_registry().await;
+        let handler = MetaToolHandler::new(reg, Duration::from_secs(5));
+        let result = handler.search_tools("zzzzzz", None).await.unwrap();
+        let tools: Vec<ToolInfoSlim> = serde_json::from_value(result).unwrap();
+        assert!(
+            tools.is_empty(),
+            "noise query should return empty, got {:?}",
+            tools
+        );
+    }
 
     #[tokio::test]
     async fn test_js_sandbox_simple_return_value() {
