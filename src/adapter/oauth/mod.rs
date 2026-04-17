@@ -681,7 +681,7 @@ mod tests {
     }
 
     fn make_adapter(config: OAuthAdapterConfig) -> OAuthAdapter {
-        let tmp = tempfile::tempdir().unwrap().into_path();
+        let tmp = tempfile::tempdir().unwrap().keep();
         let tm = Arc::new(TokenManager::new(tmp));
         OAuthAdapter::new(config, tm)
     }
