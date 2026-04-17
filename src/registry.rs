@@ -1,6 +1,7 @@
 use crate::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::prefix;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
@@ -25,6 +26,11 @@ type CatalogCache = (Vec<ToolInfo>, HashMap<String, (String, String)>);
 pub struct AdapterRegistry {
     adapters: Arc<RwLock<HashMap<String, RegisteredAdapter>>>,
     catalog_cache: Arc<RwLock<Option<CatalogCache>>>,
+    /// Monotonically-increasing counter bumped on every catalog-affecting
+    /// mutation. Downstream consumers (e.g. `MetaToolHandler`'s search index
+    /// cache) can use this as an authoritative invalidation signal without
+    /// needing to diff catalog contents.
+    catalog_generation: Arc<AtomicU64>,
 }
 
 impl Default for AdapterRegistry {
@@ -39,6 +45,7 @@ impl AdapterRegistry {
         Self {
             adapters: Arc::new(RwLock::new(HashMap::new())),
             catalog_cache: Arc::new(RwLock::new(None)),
+            catalog_generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -76,9 +83,18 @@ impl AdapterRegistry {
         result
     }
 
-    /// Invalidate the cached catalog so the next read rebuilds it.
+    /// Invalidate the cached catalog so the next read rebuilds it, and bump
+    /// the catalog generation counter so downstream caches (e.g. search
+    /// index) can detect the change.
     pub async fn invalidate_catalog_cache(&self) {
         *self.catalog_cache.write().await = None;
+        self.catalog_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Return the current catalog generation. Starts at 0; incremented on
+    /// every catalog-affecting mutation (register/remove/disable/enable).
+    pub fn catalog_generation(&self) -> u64 {
+        self.catalog_generation.load(Ordering::Relaxed)
     }
 
     /// List endpoint names of healthy adapters.
