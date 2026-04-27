@@ -231,7 +231,7 @@ pub async fn apply_diff(
                 }
             }
             drop(entries);
-            reg.invalidate_catalog_cache().await;
+            reg.invalidate_endpoint_tool_cache(&name_clone).await;
             info!(endpoint = %name_clone, "Changed endpoint initialized");
         });
     }
@@ -273,7 +273,7 @@ pub async fn apply_diff(
                 }
             }
             drop(entries);
-            reg.invalidate_catalog_cache().await;
+            reg.invalidate_endpoint_tool_cache(&ep_clone.name).await;
             info!(endpoint = %ep_clone.name, "New endpoint initialized");
         });
     }
@@ -396,7 +396,7 @@ pub async fn apply_diff_graceful(
                 }
             }
             drop(entries);
-            reg.invalidate_catalog_cache().await;
+            reg.invalidate_endpoint_tool_cache(&name_clone).await;
             info!(endpoint = %name_clone, "Changed endpoint initialized");
         });
     }
@@ -462,7 +462,7 @@ pub async fn apply_diff_graceful(
                 }
             }
             drop(entries);
-            reg.invalidate_catalog_cache().await;
+            reg.invalidate_endpoint_tool_cache(&ep_clone.name).await;
             info!(endpoint = %ep_clone.name, "New endpoint initialized");
         });
     }
