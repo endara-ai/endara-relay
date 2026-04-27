@@ -109,6 +109,17 @@ async fn handle_message(State(state): State<AppState>, Json(body): Json<Value>) 
     Json(response)
 }
 
+/// Test-only admin endpoint: broadcast a `notifications/tools/list_changed`
+/// JSON-RPC notification (no `id`) to all connected SSE clients.
+async fn handle_notify_list_changed(State(state): State<AppState>) -> Json<Value> {
+    let notif = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/tools/list_changed"
+    });
+    let _ = state.tx.send((0, notif));
+    Json(json!({"ok": true}))
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -132,6 +143,7 @@ async fn main() {
     let app = Router::new()
         .route("/sse", get(handle_sse))
         .route("/message", post(handle_message))
+        .route("/notify-list-changed", post(handle_notify_list_changed))
         .with_state(state);
 
     let listener = TcpListener::bind(format!("127.0.0.1:{}", port))
