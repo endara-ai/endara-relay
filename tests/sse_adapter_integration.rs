@@ -92,6 +92,83 @@ async fn test_sse_adapter_full_lifecycle() {
 }
 
 #[tokio::test]
+async fn test_sse_adapter_emits_tick_on_list_changed() {
+    let (mut child, port) = start_sse_server().await;
+    let url = format!("http://127.0.0.1:{}/sse", port);
+
+    let mut adapter = SseAdapter::new(SseConfig::new(&url));
+    let mut rx = adapter
+        .subscribe_tools_changed()
+        .expect("SSE adapter should expose tools-changed receiver");
+
+    timeout(Duration::from_secs(10), adapter.initialize())
+        .await
+        .expect("initialize timed out")
+        .expect("initialize failed");
+
+    // Drain the post-handshake tick so subsequent recv() reflects only the
+    // notification.
+    timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected post-handshake tick within 2s")
+        .expect("post-handshake tick recv failed");
+
+    // Trigger the fixture to broadcast a notifications/tools/list_changed frame.
+    let notify_url = format!("http://127.0.0.1:{}/notify-list-changed", port);
+    reqwest::Client::new()
+        .post(&notify_url)
+        .send()
+        .await
+        .expect("failed to POST /notify-list-changed");
+
+    timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("expected list_changed tick within 5s")
+        .expect("list_changed tick recv failed");
+
+    adapter.shutdown().await.ok();
+    child.kill().await.ok();
+}
+
+#[tokio::test]
+async fn test_sse_adapter_reconnect_emits_tick() {
+    let (mut child, port) = start_sse_server().await;
+    let url = format!("http://127.0.0.1:{}/sse", port);
+
+    let mut adapter = SseAdapter::new(SseConfig::new(&url));
+    let mut rx = adapter
+        .subscribe_tools_changed()
+        .expect("SSE adapter should expose tools-changed receiver");
+
+    timeout(Duration::from_secs(10), adapter.initialize())
+        .await
+        .expect("initialize timed out")
+        .expect("initialize failed");
+
+    // Drain the first post-handshake tick.
+    timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("expected first post-handshake tick within 2s")
+        .expect("first tick recv failed");
+
+    // Simulate a disconnect + reconnect by tearing down the SSE listener and
+    // re-running the handshake against the same fixture.
+    adapter.shutdown().await.expect("shutdown failed");
+    timeout(Duration::from_secs(10), adapter.initialize())
+        .await
+        .expect("re-initialize timed out")
+        .expect("re-initialize failed");
+
+    timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("expected post-reconnect tick within 5s")
+        .expect("post-reconnect tick recv failed");
+
+    adapter.shutdown().await.ok();
+    child.kill().await.ok();
+}
+
+#[tokio::test]
 async fn test_sse_adapter_server_death_detection() {
     let (mut child, port) = start_sse_server().await;
     let url = format!("http://127.0.0.1:{}/sse", port);
