@@ -287,6 +287,10 @@ impl OAuthAdapterInner {
         let mut adapter = Self::build_inner_adapter(&self.config.url, &access_token);
         match adapter.initialize().await {
             Ok(()) => {
+                // Reflect the freshly initialized inner adapter's health
+                // immediately so health() reports Healthy without waiting for
+                // the next heartbeat tick.
+                *self.inner_health.write().await = HealthStatus::Healthy;
                 *self.inner_adapter.write().await = Some(adapter);
                 self.transition_to(
                     OAuthState::Authenticated,
@@ -312,53 +316,77 @@ impl OAuthAdapterInner {
         let has_refresh_token = token_set.refresh_token.is_some();
         *self.tokens.write().await = Some(token_set);
 
-        // 5. Schedule proactive refresh if we have a refresh token and expiry info
-        if !has_refresh_token {
+        // 5. Schedule proactive refresh if we have a refresh token and an
+        //    `expires_at`. We schedule even when `issued_at` is missing —
+        //    tokens persisted before `issued_at` was added will deserialize
+        //    with `issued_at: None` (it's `#[serde(default)]`), but still
+        //    deserve a proactive refresh.
+        let deadline = if !has_refresh_token {
             info!(endpoint = %endpoint, "No refresh token, skipping proactive refresh");
-        } else if let (Some(issued), Some(expires)) = (issued_at_secs, expires_at_secs) {
-            if expires > issued {
-                let now_secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let now_instant = Instant::now();
-                // Convert Unix timestamps to Instants relative to now
-                let issued_instant =
-                    now_instant - Duration::from_secs(now_secs.saturating_sub(issued));
-                let expires_instant =
-                    now_instant + Duration::from_secs(expires.saturating_sub(now_secs));
-                let deadline = refresh_deadline(issued_instant, expires_instant);
+            None
+        } else if let Some(expires) = expires_at_secs {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let now_instant = Instant::now();
+            let expires_instant =
+                now_instant + Duration::from_secs(expires.saturating_sub(now_secs));
+            match issued_at_secs {
+                Some(issued) if expires > issued => {
+                    // Both timestamps known — use the standard heuristic
+                    // (75% of lifetime, capped at 5 min before expiry).
+                    let issued_instant =
+                        now_instant - Duration::from_secs(now_secs.saturating_sub(issued));
+                    Some(refresh_deadline(issued_instant, expires_instant))
+                }
+                _ => {
+                    // No `issued_at` (or nonsensical ordering): fall back to
+                    // refreshing 5 minutes before expiry, clamped to "now"
+                    // if we're already inside that window.
+                    let five_min = Duration::from_secs(300);
+                    let target = expires_instant.checked_sub(five_min).unwrap_or(now_instant);
+                    Some(target.max(now_instant))
+                }
+            }
+        } else {
+            info!(
+                endpoint = %endpoint,
+                "No expires_at on token, skipping proactive refresh"
+            );
+            None
+        };
 
-                let inner = self.clone();
-                let handle = tokio::spawn(async move {
-                    tokio::time::sleep_until(deadline).await;
-                    info!(endpoint = %inner.config.endpoint_name, "Proactive refresh timer fired");
-                    match inner.do_token_refresh().await {
-                        Ok(new_tokens) => {
-                            // Recursively apply — this will schedule the next refresh
+        if let Some(deadline) = deadline {
+            let inner = self.clone();
+            let handle = tokio::spawn(async move {
+                tokio::time::sleep_until(deadline).await;
+                info!(endpoint = %inner.config.endpoint_name, "Proactive refresh timer fired");
+                match inner.do_token_refresh().await {
+                    Ok(new_tokens) => {
+                        // Recursively apply — this will schedule the next refresh
+                        inner.apply_tokens(new_tokens).await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            endpoint = %inner.config.endpoint_name,
+                            error = %e,
+                            "Proactive refresh failed, retrying in 60s"
+                        );
+                        // Retry once after 60 seconds
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        if let Ok(new_tokens) = inner.do_token_refresh().await {
                             inner.apply_tokens(new_tokens).await;
-                        }
-                        Err(e) => {
+                        } else {
                             warn!(
                                 endpoint = %inner.config.endpoint_name,
-                                error = %e,
-                                "Proactive refresh failed, retrying in 60s"
+                                "Proactive refresh retry also failed"
                             );
-                            // Retry once after 60 seconds
-                            tokio::time::sleep(Duration::from_secs(60)).await;
-                            if let Ok(new_tokens) = inner.do_token_refresh().await {
-                                inner.apply_tokens(new_tokens).await;
-                            } else {
-                                warn!(
-                                    endpoint = %inner.config.endpoint_name,
-                                    "Proactive refresh retry also failed"
-                                );
-                            }
                         }
                     }
-                });
-                self.refresh_task_handle.lock().await.replace(handle);
-            }
+                }
+            });
+            self.refresh_task_handle.lock().await.replace(handle);
         }
     }
 
@@ -950,5 +978,109 @@ mod tests {
         let expected = issued + Duration::from_secs(900);
         assert!(deadline >= expected - Duration::from_millis(1));
         assert!(deadline <= expected + Duration::from_millis(1));
+    }
+
+    // --- apply_tokens proactive-refresh & inner_health tests ---
+
+    /// Spawn a minimal in-process MCP server that responds to `initialize`
+    /// with a valid `serverInfo.name` and accepts `notifications/initialized`.
+    /// Returns the URL of the `/mcp` endpoint and a JoinHandle for the server.
+    async fn spawn_minimal_mcp_server() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handle(Json(body): Json<Value>) -> Json<Value> {
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            if method == "initialize" {
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "serverInfo": {"name": "test-server", "version": "0.0.1"},
+                    },
+                }))
+            } else {
+                // Notifications and anything else: empty 200 OK.
+                Json(json!({"jsonrpc": "2.0", "id": id, "result": {}}))
+            }
+        }
+
+        let router = Router::new().route("/mcp", post(handle));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        // Tiny delay to let the server start accepting connections.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}/mcp", addr.port()), handle)
+    }
+
+    /// Regression: a TokenSet with `expires_at` set but `issued_at = None`
+    /// (the shape persisted by older relay versions) must still spawn a
+    /// proactive refresh task.
+    #[tokio::test]
+    async fn apply_tokens_schedules_refresh_without_issued_at() {
+        let mut config = make_config();
+        // Point at an unreachable URL so initialize() fails quickly. The
+        // proactive-refresh scheduling must not depend on init success.
+        config.url = "http://127.0.0.1:19999/mcp".to_string();
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token_set = TokenSet {
+            access_token: "test-access".to_string(),
+            refresh_token: Some("test-refresh".to_string()),
+            expires_at: Some(now_secs + 3600),
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        };
+        adapter.inner.apply_tokens(token_set).await;
+
+        // A refresh task must be scheduled even though issued_at is None.
+        let handle = adapter.inner.refresh_task_handle.lock().await;
+        assert!(
+            handle.is_some(),
+            "expected proactive refresh task to be scheduled when expires_at is set and issued_at is None"
+        );
+    }
+
+    /// On successful re-init, `inner_health` must be set to `Healthy`
+    /// immediately so the management API doesn't show a stale `Starting`
+    /// until the next heartbeat tick.
+    #[tokio::test]
+    async fn apply_tokens_sets_inner_health_healthy_on_success() {
+        let (url, server) = spawn_minimal_mcp_server().await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+
+        let token_set = TokenSet {
+            access_token: "test-access".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        };
+        adapter.inner.apply_tokens(token_set).await;
+
+        let inner_health = adapter.inner.inner_health.read().await.clone();
+        assert_eq!(
+            inner_health,
+            HealthStatus::Healthy,
+            "inner_health should be Healthy immediately after a successful inner adapter initialize"
+        );
+
+        server.abort();
     }
 }
