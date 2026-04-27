@@ -367,6 +367,7 @@ async fn main() {
                         }
                     }
                     drop(entries);
+                    reg.rewire_tools_changed_listener(&ep.name).await;
                     reg.invalidate_catalog_cache().await;
                     info!(endpoint = %ep.name, "Adapter initialized");
                 });
