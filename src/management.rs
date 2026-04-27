@@ -3030,6 +3030,8 @@ command = "echo"
             client_id: "test-client".to_string(),
             client_secret: None,
             heartbeat_interval_secs: 30,
+            probe_timeout_secs: 10,
+            probe_failure_threshold: 3,
         }
     }
 

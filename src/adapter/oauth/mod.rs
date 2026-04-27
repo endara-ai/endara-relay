@@ -35,6 +35,12 @@ pub struct OAuthAdapterConfig {
     pub client_secret: Option<String>,
     /// Heartbeat probe interval in seconds (default: 30).
     pub heartbeat_interval_secs: u64,
+    /// Per-probe timeout in seconds (default: 10).
+    pub probe_timeout_secs: u64,
+    /// Number of consecutive probe network failures required before flipping
+    /// `inner_health` to `Unhealthy("upstream unreachable")` (default: 3).
+    /// Hysteresis to avoid flapping on a single transient timeout.
+    pub probe_failure_threshold: u32,
 }
 
 /// Shared inner state for an OAuth adapter, wrapped in `Arc` so it can be
@@ -677,6 +683,8 @@ mod tests {
             client_id: "test-client".to_string(),
             client_secret: None,
             heartbeat_interval_secs: 30,
+            probe_timeout_secs: 10,
+            probe_failure_threshold: 3,
         }
     }
 
