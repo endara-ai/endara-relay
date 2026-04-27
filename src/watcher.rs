@@ -231,6 +231,7 @@ pub async fn apply_diff(
                 }
             }
             drop(entries);
+            reg.rewire_tools_changed_listener(&name_clone).await;
             reg.invalidate_endpoint_tool_cache(&name_clone).await;
             info!(endpoint = %name_clone, "Changed endpoint initialized");
         });
@@ -273,6 +274,7 @@ pub async fn apply_diff(
                 }
             }
             drop(entries);
+            reg.rewire_tools_changed_listener(&ep_clone.name).await;
             reg.invalidate_endpoint_tool_cache(&ep_clone.name).await;
             info!(endpoint = %ep_clone.name, "New endpoint initialized");
         });
@@ -396,6 +398,7 @@ pub async fn apply_diff_graceful(
                 }
             }
             drop(entries);
+            reg.rewire_tools_changed_listener(&name_clone).await;
             reg.invalidate_endpoint_tool_cache(&name_clone).await;
             info!(endpoint = %name_clone, "Changed endpoint initialized");
         });
@@ -462,6 +465,7 @@ pub async fn apply_diff_graceful(
                 }
             }
             drop(entries);
+            reg.rewire_tools_changed_listener(&ep_clone.name).await;
             reg.invalidate_endpoint_tool_cache(&ep_clone.name).await;
             info!(endpoint = %ep_clone.name, "New endpoint initialized");
         });

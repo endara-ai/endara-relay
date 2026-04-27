@@ -126,6 +126,19 @@ pub trait McpAdapter: Send + Sync {
     fn server_type(&self) -> Option<String> {
         None
     }
+
+    /// Subscribe to MCP `notifications/tools/list_changed` ticks emitted by the
+    /// underlying server. Each `recv()` represents at least one change
+    /// notification observed since the previous receive; the registry treats
+    /// every tick as an opaque cache-invalidation signal.
+    ///
+    /// The default implementation returns `None`, indicating the adapter does
+    /// not surface tools-changed events. Adapters that handle the MCP
+    /// notification override this and return a fresh `Receiver` from a
+    /// long-lived `broadcast::Sender`.
+    fn subscribe_tools_changed(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
+        None
+    }
 }
 
 /// A placeholder adapter registered when the real adapter fails to initialize.

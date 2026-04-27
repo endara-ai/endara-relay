@@ -224,8 +224,7 @@ async fn get_endpoints(State(state): State<ManagementState>) -> Json<Vec<Endpoin
             match entry.adapter.health() {
                 HealthStatus::Healthy => {
                     let count = entry
-                        .adapter
-                        .list_tools()
+                        .cached_list_tools()
                         .await
                         .map(|t| t.len())
                         .unwrap_or(0);
@@ -334,6 +333,7 @@ async fn restart_endpoint(
             entry.adapter = new_adapter;
         }
         drop(entries);
+        state.registry.rewire_tools_changed_listener(&name).await;
         state.registry.invalidate_endpoint_tool_cache(&name).await;
 
         Json(ActionResponse {
