@@ -117,56 +117,70 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
             continue;
         }
 
-        let endpoint = &adapter.config.endpoint_name;
         let oauth_state = adapter.state.read().await.clone();
         let result = probe_inner(&adapter).await;
         let action = classify_probe_result(result, &mut consecutive_failures, threshold);
+        apply_probe_action(&adapter, action, threshold, &oauth_state).await;
+    }
+}
 
-        match action {
-            ProbeAction::MarkHealthy => {
-                *adapter.inner_health.write().await = HealthStatus::Healthy;
-                adapter.metrics.inc_heartbeat_healthy();
-                debug!(
-                    endpoint = %endpoint,
-                    oauth_state = ?oauth_state,
-                    result = "healthy",
-                    "heartbeat probe succeeded"
-                );
-            }
-            ProbeAction::BelowThreshold { failures, reason } => {
-                debug!(
-                    endpoint = %endpoint,
-                    oauth_state = ?oauth_state,
-                    result = "transient",
-                    failures = failures,
-                    threshold = threshold,
-                    reason = %reason,
-                    "heartbeat probe failed below threshold; not flipping inner_health"
-                );
-            }
-            ProbeAction::MarkUnhealthy { reason } => {
-                *adapter.inner_health.write().await =
-                    HealthStatus::Unhealthy("upstream unreachable".into());
-                adapter.metrics.inc_heartbeat_unhealthy();
-                warn!(
-                    endpoint = %endpoint,
-                    oauth_state = ?oauth_state,
-                    result = "unhealthy",
-                    threshold = threshold,
-                    reason = %reason,
-                    "heartbeat probe failed at threshold"
-                );
-            }
-            ProbeAction::AuthFailed => {
-                adapter.metrics.inc_heartbeat_unhealthy();
-                warn!(
-                    endpoint = %endpoint,
-                    oauth_state = ?oauth_state,
-                    result = "unhealthy",
-                    "heartbeat probe got 401, transitioning to AuthRequired"
-                );
-                *adapter.state.write().await = OAuthState::AuthRequired;
-            }
+/// Apply the `ProbeAction` dispatched from `classify_probe_result` to the
+/// shared adapter state (writes `inner_health`, increments metrics, may
+/// transition `OAuthState`).
+///
+/// Extracted from `heartbeat_loop` so the side-effect dispatch can be
+/// driven directly by tests without spinning a real timer or probe.
+async fn apply_probe_action(
+    adapter: &OAuthAdapterInner,
+    action: ProbeAction,
+    threshold: u32,
+    oauth_state: &OAuthState,
+) {
+    let endpoint = &adapter.config.endpoint_name;
+    match action {
+        ProbeAction::MarkHealthy => {
+            *adapter.inner_health.write().await = HealthStatus::Healthy;
+            adapter.metrics.inc_heartbeat_healthy();
+            debug!(
+                endpoint = %endpoint,
+                oauth_state = ?oauth_state,
+                result = "healthy",
+                "heartbeat probe succeeded"
+            );
+        }
+        ProbeAction::BelowThreshold { failures, reason } => {
+            debug!(
+                endpoint = %endpoint,
+                oauth_state = ?oauth_state,
+                result = "transient",
+                failures = failures,
+                threshold = threshold,
+                reason = %reason,
+                "heartbeat probe failed below threshold; not flipping inner_health"
+            );
+        }
+        ProbeAction::MarkUnhealthy { reason } => {
+            *adapter.inner_health.write().await =
+                HealthStatus::Unhealthy("upstream unreachable".into());
+            adapter.metrics.inc_heartbeat_unhealthy();
+            warn!(
+                endpoint = %endpoint,
+                oauth_state = ?oauth_state,
+                result = "unhealthy",
+                threshold = threshold,
+                reason = %reason,
+                "heartbeat probe failed at threshold"
+            );
+        }
+        ProbeAction::AuthFailed => {
+            adapter.metrics.inc_heartbeat_unhealthy();
+            warn!(
+                endpoint = %endpoint,
+                oauth_state = ?oauth_state,
+                result = "unhealthy",
+                "heartbeat probe got 401, transitioning to AuthRequired"
+            );
+            *adapter.state.write().await = OAuthState::AuthRequired;
         }
     }
 }
@@ -271,6 +285,155 @@ mod tests {
         match action {
             ProbeAction::MarkUnhealthy { reason } => assert_eq!(reason, "boom"),
             other => panic!("expected MarkUnhealthy, got {:?}", other),
+        }
+    }
+
+    // -- End-to-end harness -------------------------------------------------
+    //
+    // The tests below drive `classify_probe_result` + `apply_probe_action` on
+    // a real `OAuthAdapterInner` (constructed via the public `OAuthAdapter`
+    // ctor) so we can observe `inner_health` and `state` transitions through
+    // the same dispatch path as the production loop. The actual `probe_inner`
+    // call is bypassed — tests feed pre-canned `ProbeError`/`Ok` results.
+
+    use crate::adapter::oauth::{OAuthAdapter, OAuthAdapterConfig};
+    use crate::adapter::HealthStatus;
+    use crate::token_manager::TokenManager;
+    use std::sync::Arc;
+
+    fn make_test_config(threshold: u32) -> OAuthAdapterConfig {
+        OAuthAdapterConfig {
+            endpoint_name: "heartbeat-e2e".to_string(),
+            url: "http://localhost/mcp".to_string(),
+            token_endpoint_url: "http://localhost/token".to_string(),
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            heartbeat_interval_secs: 30,
+            probe_timeout_secs: 10,
+            probe_failure_threshold: threshold,
+        }
+    }
+
+    fn make_test_inner(threshold: u32) -> Arc<OAuthAdapterInner> {
+        let tmp = tempfile::tempdir().unwrap().keep();
+        let tm = Arc::new(TokenManager::new(tmp));
+        let adapter = OAuthAdapter::new(make_test_config(threshold), tm);
+        adapter.shared_inner()
+    }
+
+    /// Drive a single iteration of the heartbeat loop body with a canned
+    /// probe result, mirroring `heartbeat_loop` minus the timer and the
+    /// real `probe_inner` call.
+    async fn step_once(
+        adapter: &OAuthAdapterInner,
+        result: Result<(), ProbeError>,
+        failures: &mut u32,
+        threshold: u32,
+    ) {
+        let oauth_state = adapter.state.read().await.clone();
+        let action = classify_probe_result(result, failures, threshold);
+        apply_probe_action(adapter, action, threshold, &oauth_state).await;
+    }
+
+    /// Set the adapter into the `Authenticated` / `Healthy` baseline that
+    /// the heartbeat loop assumes when it actually runs (the real loop
+    /// `continue`s out of any other state).
+    async fn arm_healthy(inner: &OAuthAdapterInner) {
+        *inner.state.write().await = OAuthState::Authenticated;
+        *inner.inner_health.write().await = HealthStatus::Healthy;
+    }
+
+    #[tokio::test]
+    async fn heartbeat_below_threshold_does_not_flip_inner_health() {
+        let threshold = 3;
+        let inner = make_test_inner(threshold);
+        arm_healthy(&inner).await;
+
+        let mut failures = 0u32;
+        // N-1 = 2 consecutive failures; inner_health must remain Healthy.
+        for i in 0..(threshold - 1) {
+            step_once(&inner, net("transient"), &mut failures, threshold).await;
+            assert_eq!(failures, i + 1);
+            assert_eq!(
+                *inner.inner_health.read().await,
+                HealthStatus::Healthy,
+                "inner_health flipped after {} failures (threshold={})",
+                i + 1,
+                threshold
+            );
+        }
+        // Metrics: no healthy/unhealthy increments since BelowThreshold is
+        // a no-op on side effects other than logging.
+        let snap = inner.metrics.snapshot();
+        assert_eq!(snap.oauth_heartbeat_probe_total_healthy, 0);
+        assert_eq!(snap.oauth_heartbeat_probe_total_unhealthy, 0);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_at_threshold_flips_to_unhealthy() {
+        let threshold = 3;
+        let inner = make_test_inner(threshold);
+        arm_healthy(&inner).await;
+
+        let mut failures = 0u32;
+        for _ in 0..threshold {
+            step_once(&inner, net("dns"), &mut failures, threshold).await;
+        }
+        assert_eq!(failures, threshold);
+        match &*inner.inner_health.read().await {
+            HealthStatus::Unhealthy(reason) => {
+                assert_eq!(reason, "upstream unreachable");
+            }
+            other => panic!("expected Unhealthy, got {:?}", other),
+        }
+        // Exactly one unhealthy increment (the threshold-crossing probe).
+        let snap = inner.metrics.snapshot();
+        assert_eq!(snap.oauth_heartbeat_probe_total_unhealthy, 1);
+        assert_eq!(snap.oauth_heartbeat_probe_total_healthy, 0);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_single_ok_after_failures_recovers_to_healthy() {
+        let threshold = 3;
+        let inner = make_test_inner(threshold);
+        arm_healthy(&inner).await;
+
+        let mut failures = 0u32;
+        // Drive to Unhealthy.
+        for _ in 0..threshold {
+            step_once(&inner, net("dns"), &mut failures, threshold).await;
+        }
+        assert!(matches!(
+            *inner.inner_health.read().await,
+            HealthStatus::Unhealthy(_)
+        ));
+
+        // A single Ok probe must immediately recover to Healthy
+        // (asymmetric hysteresis: slow to fail, fast to recover).
+        step_once(&inner, ok(), &mut failures, threshold).await;
+        assert_eq!(failures, 0);
+        assert_eq!(*inner.inner_health.read().await, HealthStatus::Healthy);
+    }
+
+    #[tokio::test]
+    async fn heartbeat_alternating_ok_fail_does_not_flap() {
+        let threshold = 3;
+        let inner = make_test_inner(threshold);
+        arm_healthy(&inner).await;
+
+        let mut failures = 0u32;
+        // 8 iterations of Fail, Ok, Fail, Ok, ... — counter resets on every
+        // Ok before reaching the threshold, so inner_health must never flip
+        // to Unhealthy.
+        for i in 0..8 {
+            let result = if i % 2 == 0 { net("blip") } else { ok() };
+            step_once(&inner, result, &mut failures, threshold).await;
+            assert_eq!(
+                *inner.inner_health.read().await,
+                HealthStatus::Healthy,
+                "inner_health flapped at step {}",
+                i
+            );
         }
     }
 }
