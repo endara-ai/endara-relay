@@ -20,6 +20,20 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
+
+/// Returns the `Instant` at which a proactive refresh should fire when
+/// `issued_at` is unknown (or nonsensical relative to `expires_at`).
+///
+/// The fallback heuristic is "refresh 5 minutes before expiry", clamped to
+/// `now` if we're already inside that window so the returned deadline is
+/// always `>= now`. Uses `checked_sub` so values far in the past don't
+/// underflow `Instant` arithmetic.
+fn fallback_refresh_deadline(now: Instant, expires_at: Instant) -> Instant {
+    let five_min = Duration::from_secs(300);
+    let target = expires_at.checked_sub(five_min).unwrap_or(now);
+    target.max(now)
+}
+
 /// Configuration for an OAuth-authenticated MCP endpoint.
 #[derive(Debug, Clone)]
 pub struct OAuthAdapterConfig {
@@ -344,9 +358,7 @@ impl OAuthAdapterInner {
                     // No `issued_at` (or nonsensical ordering): fall back to
                     // refreshing 5 minutes before expiry, clamped to "now"
                     // if we're already inside that window.
-                    let five_min = Duration::from_secs(300);
-                    let target = expires_instant.checked_sub(five_min).unwrap_or(now_instant);
-                    Some(target.max(now_instant))
+                    Some(fallback_refresh_deadline(now_instant, expires_instant))
                 }
             }
         } else {
@@ -980,6 +992,71 @@ mod tests {
         assert!(deadline <= expected + Duration::from_millis(1));
     }
 
+    // --- fallback_refresh_deadline tests (issued_at unknown path) ---
+
+    /// 60 minutes of remaining lifetime: deadline should be 5 minutes before
+    /// expiry (= now + 55 min). Task 2's fallback heuristic is "5 min before
+    /// expiry", not 75% of remaining — assert what the implementation does.
+    #[test]
+    fn fallback_refresh_deadline_uses_5min_before_expiry() {
+        let now = Instant::now();
+        let expires_at = now + Duration::from_secs(3600);
+        let deadline = fallback_refresh_deadline(now, expires_at);
+        let expected = now + Duration::from_secs(3600 - 300);
+        assert!(deadline >= expected - Duration::from_millis(1));
+        assert!(deadline <= expected + Duration::from_millis(1));
+    }
+
+    /// If `expires_at` is in the past or within the 5-minute guard window,
+    /// the deadline must clamp to `now` — never panic, never underflow, and
+    /// the returned deadline must be `>= now`.
+    #[test]
+    fn fallback_refresh_deadline_clamps_to_minimum_when_expiring_soon() {
+        let now = Instant::now();
+
+        // expires_at exactly at now → 5-min subtraction underflows → clamp to now.
+        let deadline = fallback_refresh_deadline(now, now);
+        assert_eq!(
+            deadline, now,
+            "expected clamp to `now` when expires_at == now"
+        );
+
+        // expires_at within the 5-minute window (60s out) → still clamps to now.
+        let near = now + Duration::from_secs(60);
+        let deadline = fallback_refresh_deadline(now, near);
+        assert_eq!(
+            deadline, now,
+            "expected clamp to `now` when expires_at is inside the 5-min guard"
+        );
+
+        // expires_at strictly before now (1s in the past per Instant semantics)
+        // — saturating subtraction inside `checked_sub` must not panic and the
+        // clamp keeps the deadline at `now`.
+        let past = now - Duration::from_secs(1);
+        let deadline = fallback_refresh_deadline(now, past);
+        assert!(
+            deadline >= now,
+            "expected deadline >= now when expires_at is in the past, got delta = {:?}",
+            now.saturating_duration_since(deadline)
+        );
+    }
+
+    /// `expires_at` 100 years out must not panic. Tokio's `Instant` is backed
+    /// by a monotonic clock so addition can theoretically saturate, but the
+    /// helper performs a simple subtraction and `max`, both of which are safe.
+    #[test]
+    fn fallback_refresh_deadline_handles_far_future_without_overflow() {
+        let now = Instant::now();
+        // ~100 years in seconds.
+        let far = now + Duration::from_secs(100 * 365 * 24 * 3600);
+        let deadline = fallback_refresh_deadline(now, far);
+        let expected = far - Duration::from_secs(300);
+        assert_eq!(
+            deadline, expected,
+            "expected deadline to be exactly 5 min before expiry for far-future timestamps"
+        );
+    }
+
     // --- apply_tokens proactive-refresh & inner_health tests ---
 
     /// Spawn a minimal in-process MCP server that responds to `initialize`
@@ -1050,6 +1127,19 @@ mod tests {
         assert!(
             handle.is_some(),
             "expected proactive refresh task to be scheduled when expires_at is set and issued_at is None"
+        );
+        drop(handle);
+
+        // The inner adapter init failed (URL is unreachable), so inner_health
+        // must NOT be `Healthy`: the success-path branch sets it to `Healthy`,
+        // so a regression that flips the branches would leave it `Healthy`
+        // here. Failed init mirrors the inner adapter's own health, which is
+        // `Unhealthy(_)` after a connection failure.
+        let inner_health = adapter.inner.inner_health.read().await.clone();
+        assert!(
+            !matches!(inner_health, HealthStatus::Healthy),
+            "inner_health must not be Healthy after a failed inner adapter init, got {:?}",
+            inner_health
         );
     }
 
