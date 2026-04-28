@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, Notify, RwLock};
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
@@ -42,10 +42,12 @@ impl SseConfig {
 
 /// Crash tracking for exponential backoff.
 #[derive(Debug)]
-#[allow(dead_code)] // Used by try_reconnect, kept for reconnection support
 struct CrashTracker {
     timestamps: Vec<Instant>,
     consecutive_failures: u32,
+    failure_window: Duration,
+    max_failures_in_window: usize,
+    base_backoff: Duration,
 }
 
 impl CrashTracker {
@@ -53,33 +55,48 @@ impl CrashTracker {
         Self {
             timestamps: Vec::new(),
             consecutive_failures: 0,
+            failure_window: Duration::from_secs(60),
+            max_failures_in_window: 3,
+            base_backoff: Duration::from_secs(1),
         }
     }
 
-    #[allow(dead_code)] // Used by try_reconnect
+    /// Record a failure and return true when the window cap is reached.
     fn record_failure(&mut self) -> bool {
         let now = Instant::now();
         self.consecutive_failures += 1;
         self.timestamps.push(now);
-        let cutoff = now - Duration::from_secs(60);
+        let cutoff = now.checked_sub(self.failure_window).unwrap_or(now);
         self.timestamps.retain(|t| *t >= cutoff);
-        self.timestamps.len() >= 3
+        self.timestamps.len() >= self.max_failures_in_window
     }
 
-    #[allow(dead_code)] // Used by try_reconnect
     fn backoff_duration(&self) -> Duration {
-        let secs = match self.consecutive_failures {
+        let multiplier = match self.consecutive_failures {
             0 | 1 => 1,
             2 => 2,
             3 => 4,
             4 => 8,
             _ => 60,
         };
-        Duration::from_secs(secs)
+        self.base_backoff.saturating_mul(multiplier)
     }
 
     fn reset(&mut self) {
         self.consecutive_failures = 0;
+        self.timestamps.clear();
+    }
+
+    /// Build a tracker with custom timing knobs (for fast unit tests).
+    #[cfg(test)]
+    fn new_test(base_backoff: Duration, max_failures: usize, window: Duration) -> Self {
+        Self {
+            timestamps: Vec::new(),
+            consecutive_failures: 0,
+            failure_window: window,
+            max_failures_in_window: max_failures,
+            base_backoff,
+        }
     }
 }
 
@@ -88,11 +105,15 @@ impl CrashTracker {
 /// Protocol: GET /sse to receive event stream. The server sends an "endpoint"
 /// event with the URL to POST JSON-RPC messages to. Responses come back
 /// as "message" events on the SSE stream.
+///
+/// All fields are `Arc`-wrapped so the adapter can be cheaply cloned into the
+/// background reconnect supervisor task.
+#[derive(Clone)]
 pub struct SseAdapter {
     config: SseConfig,
     client: Client,
     health: Arc<RwLock<HealthStatus>>,
-    request_id: AtomicU64,
+    request_id: Arc<AtomicU64>,
     /// The POST endpoint URL received from the SSE stream.
     post_endpoint: Arc<RwLock<Option<String>>>,
     /// Pending responses indexed by request ID.
@@ -105,6 +126,12 @@ pub struct SseAdapter {
     server_type: Arc<RwLock<Option<String>>>,
     /// Ring buffer recording tool call activity.
     activity_log: Arc<RwLock<RingBuffer>>,
+    /// Handle for the background reconnect supervisor task.
+    reconnect_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Notified by the listener when the SSE stream dies and a reconnect is needed.
+    reconnect_notify: Arc<Notify>,
+    /// Notified by `shutdown()` so the supervisor can exit cleanly.
+    shutdown_notify: Arc<Notify>,
     /// Broadcast emitter for `notifications/tools/list_changed` events. Each
     /// tick is an opaque cache-invalidation signal consumed by the registry.
     tools_changed_tx: broadcast::Sender<()>,
@@ -145,13 +172,16 @@ impl SseAdapter {
             config,
             client,
             health: Arc::new(RwLock::new(HealthStatus::Stopped)),
-            request_id: AtomicU64::new(1),
+            request_id: Arc::new(AtomicU64::new(1)),
             post_endpoint: Arc::new(RwLock::new(None)),
             pending: Arc::new(Mutex::new(std::collections::HashMap::new())),
             sse_handle: Arc::new(Mutex::new(None)),
             crash_tracker: Arc::new(Mutex::new(CrashTracker::new())),
             server_type: Arc::new(RwLock::new(None)),
             activity_log: Arc::new(RwLock::new(RingBuffer::new(1000))),
+            reconnect_handle: Arc::new(Mutex::new(None)),
+            reconnect_notify: Arc::new(Notify::new()),
+            shutdown_notify: Arc::new(Notify::new()),
             tools_changed_tx,
         }
     }
@@ -227,6 +257,7 @@ impl SseAdapter {
         let pending = self.pending.clone();
         let post_endpoint = self.post_endpoint.clone();
         let health = self.health.clone();
+        let reconnect_notify = self.reconnect_notify.clone();
         let base_url = self.config.url.clone();
         let tools_changed_tx = self.tools_changed_tx.clone();
 
@@ -237,15 +268,15 @@ impl SseAdapter {
             let mut event_type = String::new();
             let mut data_lines = Vec::<String>::new();
             let mut bytes_stream = resp.bytes_stream();
+            let mut close_reason: Option<String> = None;
 
             use futures_util::StreamExt;
             while let Some(chunk_result) = bytes_stream.next().await {
                 let chunk = match chunk_result {
                     Ok(c) => c,
                     Err(e) => {
-                        error!(error = %e, "SSE stream error");
-                        *health.write().await =
-                            HealthStatus::Unhealthy(format!("SSE stream error: {}", e));
+                        warn!(error = %e, "SSE stream error");
+                        close_reason = Some(format!("SSE stream error: {}", e));
                         break;
                     }
                 };
@@ -347,7 +378,25 @@ impl SseAdapter {
                 }
             }
 
-            *health.write().await = HealthStatus::Unhealthy("SSE stream closed".into());
+            // Stream ended (Err or end-of-stream). Mark unhealthy, clear the
+            // POST endpoint so new requests fail fast, drain pending requests
+            // with errors so callers don't hang, and signal the reconnect
+            // supervisor to attempt recovery.
+            let reason =
+                close_reason.unwrap_or_else(|| "SSE stream closed, reconnecting".to_string());
+            *post_endpoint.write().await = None;
+            {
+                let mut map = pending.lock().await;
+                if !map.is_empty() {
+                    debug!(
+                        count = map.len(),
+                        "draining pending SSE requests after stream death"
+                    );
+                }
+                map.clear();
+            }
+            *health.write().await = HealthStatus::Unhealthy(reason);
+            reconnect_notify.notify_one();
         });
 
         *self.sse_handle.lock().await = Some(handle);
@@ -429,15 +478,17 @@ impl SseAdapter {
             .result
             .ok_or_else(|| AdapterError::ProtocolError("response has no result".into()))
     }
-}
 
-#[async_trait]
-impl McpAdapter for SseAdapter {
-    async fn initialize(&mut self) -> Result<(), AdapterError> {
+    /// Connect to the SSE endpoint and perform the MCP initialize handshake.
+    ///
+    /// Used by `initialize()` for the first connection and by the reconnect
+    /// supervisor task to re-establish a healthy connection. On success, sets
+    /// `health = Healthy` and resets the crash tracker. On failure, sets
+    /// `health = Unhealthy(...)` with the underlying error.
+    async fn connect_and_handshake(&self) -> Result<(), AdapterError> {
         if let Err(e) = self.connect().await {
             let msg = e.to_string();
             *self.health.write().await = HealthStatus::Unhealthy(msg);
-            error!(url = %self.config.url, error = %e, "SSE connection failed");
             return Err(e);
         }
 
@@ -455,35 +506,35 @@ impl McpAdapter for SseAdapter {
             Err(e) => {
                 let msg = e.to_string();
                 *self.health.write().await = HealthStatus::Unhealthy(msg);
-                error!(url = %self.config.url, error = %e, "SSE MCP adapter initialization failed");
                 return Err(e);
             }
         };
 
         // Extract serverInfo.name — REQUIRED per MCP spec enforcement
-        let raw_name = result
+        let raw_name = match result
             .get("serverInfo")
             .and_then(|si| si.get("name"))
             .and_then(|n| n.as_str())
-            .ok_or_else(|| {
-                let err = ServerNameError::Missing;
-                let msg = err.to_string();
-                error!(url = %self.config.url, error = %msg, "MCP server did not provide serverInfo.name");
-                *self.health.blocking_write() = HealthStatus::Unhealthy(msg.clone());
-                AdapterError::ProtocolError(msg)
-            })?;
+        {
+            Some(n) => n.to_string(),
+            None => {
+                let msg = ServerNameError::Missing.to_string();
+                *self.health.write().await = HealthStatus::Unhealthy(msg.clone());
+                return Err(AdapterError::ProtocolError(msg));
+            }
+        };
 
-        // Validate and sanitize the server name
-        let sanitized = sanitize_server_name(raw_name).map_err(|e| {
-            let msg = e.to_string();
-            error!(url = %self.config.url, raw_name = %raw_name, error = %msg, "serverInfo.name validation failed");
-            *self.health.blocking_write() = HealthStatus::Unhealthy(msg.clone());
-            AdapterError::ProtocolError(msg)
-        })?;
+        let sanitized = match sanitize_server_name(&raw_name) {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = e.to_string();
+                *self.health.write().await = HealthStatus::Unhealthy(msg.clone());
+                return Err(AdapterError::ProtocolError(msg));
+            }
+        };
 
-        info!(url = %self.config.url, raw_name = %raw_name, sanitized = %sanitized, "MCP server reported serverInfo.name");
+        debug!(url = %self.config.url, raw_name = %raw_name, sanitized = %sanitized, "MCP server reported serverInfo.name");
         *self.server_type.write().await = Some(sanitized);
-
         *self.health.write().await = HealthStatus::Healthy;
         self.crash_tracker.lock().await.reset();
         // Emit a tick after every successful (re)connect + handshake so any
@@ -491,6 +542,81 @@ impl McpAdapter for SseAdapter {
         // listener loop is idempotent; a no-op invalidation on an empty cache
         // is harmless. `SendError` (no subscribers) is harmless — drop it.
         let _ = self.tools_changed_tx.send(());
+        Ok(())
+    }
+
+    /// Spawn the background reconnect supervisor task if it isn't running.
+    async fn ensure_supervisor_running(&self) {
+        let mut guard = self.reconnect_handle.lock().await;
+        if guard.as_ref().is_some_and(|h| !h.is_finished()) {
+            return;
+        }
+        let me = self.clone();
+        let handle = tokio::spawn(async move {
+            me.run_supervisor().await;
+        });
+        *guard = Some(handle);
+    }
+
+    /// Reconnect supervisor loop — wait for stream-death notifications and
+    /// attempt to re-establish the connection with exponential backoff. Exits
+    /// when the failure cap is reached or shutdown is signaled.
+    async fn run_supervisor(&self) {
+        loop {
+            tokio::select! {
+                _ = self.shutdown_notify.notified() => return,
+                _ = self.reconnect_notify.notified() => {}
+            }
+
+            loop {
+                let (cap_reached, backoff) = {
+                    let mut tracker = self.crash_tracker.lock().await;
+                    let reached = tracker.record_failure();
+                    (reached, tracker.backoff_duration())
+                };
+
+                if cap_reached {
+                    let reason = "SSE reconnect cap reached; manual reconnect required".to_string();
+                    warn!(url = %self.config.url, "{}", reason);
+                    *self.health.write().await = HealthStatus::Unhealthy(reason);
+                    return;
+                }
+
+                info!(
+                    url = %self.config.url,
+                    backoff_ms = backoff.as_millis() as u64,
+                    "SSE reconnect: backing off before next attempt"
+                );
+
+                tokio::select! {
+                    _ = self.shutdown_notify.notified() => return,
+                    _ = tokio::time::sleep(backoff) => {}
+                }
+
+                info!(url = %self.config.url, "SSE reconnect: attempting");
+                match self.connect_and_handshake().await {
+                    Ok(()) => {
+                        info!(url = %self.config.url, "SSE reconnect succeeded");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(url = %self.config.url, error = %e, "SSE reconnect attempt failed");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl McpAdapter for SseAdapter {
+    async fn initialize(&mut self) -> Result<(), AdapterError> {
+        if let Err(e) = self.connect_and_handshake().await {
+            error!(url = %self.config.url, error = %e, "SSE MCP adapter initialization failed");
+            return Err(e);
+        }
+
+        self.ensure_supervisor_running().await;
         info!(url = %self.config.url, "SSE MCP adapter initialized");
         Ok(())
     }
@@ -547,8 +673,17 @@ impl McpAdapter for SseAdapter {
     async fn shutdown(&mut self) -> Result<(), AdapterError> {
         *self.health.write().await = HealthStatus::Stopped;
 
+        // Tell the supervisor to wake up and exit (in case it's sleeping in
+        // backoff or waiting on a reconnect notification).
+        self.shutdown_notify.notify_waiters();
+
         // Abort the SSE listener task
         if let Some(handle) = self.sse_handle.lock().await.take() {
+            handle.abort();
+        }
+
+        // Abort the reconnect supervisor task
+        if let Some(handle) = self.reconnect_handle.lock().await.take() {
             handle.abort();
         }
 
@@ -571,36 +706,6 @@ impl McpAdapter for SseAdapter {
             .map(|s| s.to_string())
             .collect()
     }
-}
-
-/// Attempt to reconnect after a failure with exponential backoff.
-#[allow(dead_code)] // Kept for future reconnection support
-pub async fn try_reconnect(adapter: &mut SseAdapter) -> Result<(), AdapterError> {
-    let should_stop = {
-        let mut tracker = adapter.crash_tracker.lock().await;
-        let unhealthy = tracker.record_failure();
-        if unhealthy {
-            true
-        } else {
-            let backoff = tracker.backoff_duration();
-            info!(
-                backoff_secs = backoff.as_secs(),
-                "backing off before SSE reconnect"
-            );
-            drop(tracker);
-            tokio::time::sleep(backoff).await;
-            false
-        }
-    };
-
-    if should_stop {
-        let reason = "3+ failures in 60 seconds".to_string();
-        *adapter.health.write().await = HealthStatus::Unhealthy(reason.clone());
-        error!("SSE adapter marked unhealthy: {}", reason);
-        return Err(AdapterError::ConnectionFailed(reason));
-    }
-
-    adapter.initialize().await
 }
 
 #[cfg(test)]
@@ -685,5 +790,529 @@ mod tests {
         tracker.record_failure();
         tracker.reset();
         assert_eq!(tracker.backoff_duration(), Duration::from_secs(1));
+    }
+
+    // -----------------------------------------------------------------
+    // Reconnect supervisor tests — exercise the full listener/supervisor
+    // loop against a tiny in-process axum SSE server.
+    // -----------------------------------------------------------------
+
+    mod reconnect {
+        use super::*;
+        use axum::extract::State;
+        use axum::http::StatusCode;
+        use axum::response::sse::{Event, KeepAlive, Sse};
+        use axum::response::IntoResponse;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+        use std::convert::Infallible;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        use tokio::net::TcpListener;
+        use tokio::sync::{broadcast, mpsc};
+
+        /// Behavior knobs for the test SSE server.
+        #[derive(Default)]
+        struct FakeServerState {
+            /// Number of GET /sse connections accepted so far.
+            connections: AtomicUsize,
+            /// When > 0, GET /sse returns 503 once `connections > healthy_until`.
+            healthy_until: AtomicUsize,
+            /// When true, /sse closes the stream right after sending endpoint.
+            close_immediately: AtomicBool,
+            /// When true, /message closes the active SSE stream on `tools/call`
+            /// without broadcasting a response.
+            close_on_tools_call: AtomicBool,
+            /// When true, /message does NOT broadcast `tools/call` responses
+            /// (used to test pending-request error propagation).
+            silent_on_tools_call: AtomicBool,
+        }
+
+        /// Handle for a running test server; aborts on drop.
+        struct FakeServer {
+            url: String,
+            state: Arc<FakeServerState>,
+            close_tx: broadcast::Sender<()>,
+            handle: tokio::task::JoinHandle<()>,
+        }
+
+        impl Drop for FakeServer {
+            fn drop(&mut self) {
+                self.handle.abort();
+            }
+        }
+
+        impl FakeServer {
+            /// Force-close all active SSE streams.
+            fn close_all_streams(&self) {
+                let _ = self.close_tx.send(());
+            }
+        }
+
+        #[derive(Clone)]
+        struct AppState {
+            fake: Arc<FakeServerState>,
+            // Broadcast channel: /message writes responses, SSE handlers forward.
+            response_tx: broadcast::Sender<Value>,
+            // Broadcast: when sent, all SSE handlers close their streams.
+            close_tx: broadcast::Sender<()>,
+        }
+
+        async fn handle_sse(State(app): State<AppState>) -> axum::response::Response {
+            let n = app.fake.connections.fetch_add(1, Ordering::SeqCst) + 1;
+            let healthy_until = app.fake.healthy_until.load(Ordering::SeqCst);
+            if healthy_until > 0 && n > healthy_until {
+                return (StatusCode::SERVICE_UNAVAILABLE, "go away").into_response();
+            }
+
+            let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(32);
+            let _ = tx
+                .send(Ok(Event::default().event("endpoint").data("/message")))
+                .await;
+
+            if app.fake.close_immediately.load(Ordering::SeqCst) {
+                drop(tx);
+                return Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+                    .keep_alive(KeepAlive::default())
+                    .into_response();
+            }
+
+            let mut response_rx = app.response_tx.subscribe();
+            let mut close_rx = app.close_tx.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = close_rx.recv() => break,
+                        msg = response_rx.recv() => match msg {
+                            Ok(value) => {
+                                let data = serde_json::to_string(&value).unwrap_or_default();
+                                if tx
+                                    .send(Ok(Event::default().event("message").data(data)))
+                                    .await
+                                    .is_err()
+                                { break; }
+                            }
+                            Err(_) => break,
+                        },
+                    }
+                }
+            });
+
+            Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+                .keep_alive(KeepAlive::default())
+                .into_response()
+        }
+
+        async fn handle_message(
+            State(app): State<AppState>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            let method = body["method"].as_str().unwrap_or("").to_string();
+            let id = body["id"].as_u64().unwrap_or(0);
+            let response = match method.as_str() {
+                "initialize" => json!({
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "fake-sse", "version": "0.0.0"}
+                    },
+                    "id": id,
+                }),
+                _ => json!({
+                    "jsonrpc": "2.0",
+                    "result": {"content": [{"type": "text", "text": "ok"}]},
+                    "id": id,
+                }),
+            };
+
+            let is_tools_call = method == "tools/call";
+            let silent = is_tools_call && app.fake.silent_on_tools_call.load(Ordering::SeqCst);
+            if !silent {
+                let _ = app.response_tx.send(response.clone());
+            }
+            if is_tools_call && app.fake.close_on_tools_call.load(Ordering::SeqCst) {
+                let _ = app.close_tx.send(());
+            }
+            Json(response)
+        }
+
+        async fn start_test_server() -> FakeServer {
+            let state = Arc::new(FakeServerState::default());
+            let (response_tx, _) = broadcast::channel::<Value>(64);
+            let (close_tx, _) = broadcast::channel::<()>(8);
+            let app_state = AppState {
+                fake: state.clone(),
+                response_tx,
+                close_tx: close_tx.clone(),
+            };
+            let app = Router::new()
+                .route("/sse", get(handle_sse))
+                .route("/message", post(handle_message))
+                .with_state(app_state);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let url = format!("http://{}/sse", addr);
+            let handle = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            FakeServer {
+                url,
+                state,
+                close_tx,
+                handle,
+            }
+        }
+
+        /// Build an adapter wired to the given URL with a fast crash tracker
+        /// (50ms base backoff, 3-failure cap in a 5s window) and a 1s
+        /// per-request timeout — keeps tests bounded to a few hundred ms.
+        async fn build_adapter(url: &str, max_failures: usize) -> SseAdapter {
+            let adapter = SseAdapter::new(SseConfig::new(url).with_timeout(1));
+            *adapter.crash_tracker.lock().await = CrashTracker::new_test(
+                Duration::from_millis(50),
+                max_failures,
+                Duration::from_secs(5),
+            );
+            adapter
+        }
+
+        /// Poll `health()` until the predicate succeeds or the budget elapses.
+        async fn wait_for_health<F: Fn(&HealthStatus) -> bool>(
+            adapter: &SseAdapter,
+            pred: F,
+            budget: Duration,
+        ) -> HealthStatus {
+            let deadline = std::time::Instant::now() + budget;
+            loop {
+                let h = adapter.health();
+                if pred(&h) {
+                    return h;
+                }
+                if std::time::Instant::now() >= deadline {
+                    return h;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn sse_auto_reconnects_after_stream_drops() {
+            let server = start_test_server().await;
+            let mut adapter = build_adapter(&server.url, 5).await;
+
+            adapter.initialize().await.expect("initial connect");
+            assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+            // Force-close the active SSE stream — the listener should die,
+            // mark unhealthy, and the supervisor should reconnect.
+            server.close_all_streams();
+
+            let h = wait_for_health(
+                &adapter,
+                |h| matches!(h, HealthStatus::Unhealthy(_)),
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(
+                matches!(h, HealthStatus::Unhealthy(_)),
+                "expected Unhealthy after stream close, got {:?}",
+                h
+            );
+
+            let h = wait_for_health(
+                &adapter,
+                |h| *h == HealthStatus::Healthy,
+                Duration::from_secs(3),
+            )
+            .await;
+            assert_eq!(
+                h,
+                HealthStatus::Healthy,
+                "expected Healthy after auto-reconnect"
+            );
+
+            // At least 2 GET /sse connections (initial + reconnect).
+            assert!(server.state.connections.load(Ordering::SeqCst) >= 2);
+            adapter.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn sse_stops_reconnecting_after_cap() {
+            let server = start_test_server().await;
+            // First connection is healthy; subsequent connections return 503.
+            server.state.healthy_until.store(1, Ordering::SeqCst);
+            let mut adapter = build_adapter(&server.url, 3).await;
+
+            adapter.initialize().await.expect("initial connect");
+            assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+            server.close_all_streams();
+
+            // Wait long enough for the cap to be hit. Backoffs are 50/50/100ms
+            // so 3 failed attempts complete well under 1.5s.
+            let h = wait_for_health(
+                &adapter,
+                |h| {
+                    matches!(
+                        h,
+                        HealthStatus::Unhealthy(reason) if reason.contains("cap reached")
+                    )
+                },
+                Duration::from_secs(3),
+            )
+            .await;
+            assert!(
+                matches!(
+                    h,
+                    HealthStatus::Unhealthy(ref reason) if reason.contains("cap reached")
+                ),
+                "expected cap-reached Unhealthy, got {:?}",
+                h
+            );
+
+            // Health remains Unhealthy — confirm by sampling again after a delay.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+
+            // Supervisor task must have terminated after hitting the cap.
+            {
+                let guard = adapter.reconnect_handle.lock().await;
+                let handle = guard
+                    .as_ref()
+                    .expect("supervisor handle should still be tracked post-cap");
+                assert!(
+                    handle.is_finished(),
+                    "supervisor should exit after failure cap"
+                );
+            }
+
+            // Subsequent stream-death notifications must NOT restart the
+            // supervisor or trigger further GET /sse attempts.
+            let connections_before = server.state.connections.load(Ordering::SeqCst);
+            adapter.reconnect_notify.notify_waiters();
+            adapter.reconnect_notify.notify_one();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                server.state.connections.load(Ordering::SeqCst),
+                connections_before,
+                "supervisor must not restart after cap"
+            );
+
+            adapter.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn sse_pending_requests_error_on_stream_death() {
+            let server = start_test_server().await;
+            // /message will not broadcast tools/call responses, and will
+            // close the SSE stream as soon as a tools/call POST arrives.
+            server
+                .state
+                .silent_on_tools_call
+                .store(true, Ordering::SeqCst);
+            server
+                .state
+                .close_on_tools_call
+                .store(true, Ordering::SeqCst);
+
+            let mut adapter = build_adapter(&server.url, 5).await;
+            adapter.initialize().await.expect("initial connect");
+
+            let start = std::time::Instant::now();
+            let res = adapter.call_tool("echo", json!({"message": "hi"})).await;
+            let elapsed = start.elapsed();
+
+            assert!(res.is_err(), "expected call_tool to error, got {:?}", res);
+            // Should be well under the 1s per-call timeout — drain happens fast.
+            assert!(
+                elapsed < Duration::from_millis(900),
+                "call_tool took too long: {:?}",
+                elapsed
+            );
+            adapter.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn sse_shutdown_aborts_reconnect_task() {
+            let server = start_test_server().await;
+            let mut adapter = build_adapter(&server.url, 10).await;
+            adapter.initialize().await.expect("initial connect");
+
+            // Capture supervisor handle before shutdown.
+            let supervisor = adapter
+                .reconnect_handle
+                .lock()
+                .await
+                .as_ref()
+                .map(|h| h.id());
+            assert!(supervisor.is_some(), "supervisor should be running");
+
+            // Close the stream so the supervisor enters its retry loop, then
+            // immediately call shutdown() — it must abort cleanly.
+            server.close_all_streams();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+
+            let start = std::time::Instant::now();
+            adapter.shutdown().await.unwrap();
+            let elapsed = start.elapsed();
+
+            assert!(
+                elapsed < Duration::from_millis(500),
+                "shutdown took too long: {:?}",
+                elapsed
+            );
+            assert!(adapter.reconnect_handle.lock().await.is_none());
+            assert!(adapter.sse_handle.lock().await.is_none());
+            assert_eq!(adapter.health(), HealthStatus::Stopped);
+        }
+
+        #[tokio::test]
+        async fn crash_tracker_reset_on_successful_reconnect() {
+            let server = start_test_server().await;
+            let mut adapter = build_adapter(&server.url, 5).await;
+            adapter.initialize().await.expect("initial connect");
+            assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+            // Drive a single failure cycle: close the stream, wait for the
+            // supervisor to flag Unhealthy, then wait for a successful
+            // auto-reconnect back to Healthy.
+            server.close_all_streams();
+            let h = wait_for_health(
+                &adapter,
+                |h| matches!(h, HealthStatus::Unhealthy(_)),
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(matches!(h, HealthStatus::Unhealthy(_)));
+            let h = wait_for_health(
+                &adapter,
+                |h| *h == HealthStatus::Healthy,
+                Duration::from_secs(3),
+            )
+            .await;
+            assert_eq!(h, HealthStatus::Healthy);
+
+            // After the successful reconnect, the crash tracker must be
+            // reset so the next failure cycle starts with a full attempt
+            // budget rather than 1 attempt left.
+            {
+                let tracker = adapter.crash_tracker.lock().await;
+                assert_eq!(
+                    tracker.consecutive_failures, 0,
+                    "tracker must reset consecutive_failures on success"
+                );
+                assert!(
+                    tracker.timestamps.is_empty(),
+                    "tracker must clear failure timestamps on success"
+                );
+            }
+
+            adapter.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn supervisor_handles_multiple_reconnect_cycles() {
+            let server = start_test_server().await;
+            let mut adapter = build_adapter(&server.url, 5).await;
+            adapter.initialize().await.expect("initial connect");
+
+            for cycle in 0..3 {
+                server.close_all_streams();
+                let h = wait_for_health(
+                    &adapter,
+                    |h| matches!(h, HealthStatus::Unhealthy(_)),
+                    Duration::from_secs(2),
+                )
+                .await;
+                assert!(
+                    matches!(h, HealthStatus::Unhealthy(_)),
+                    "cycle {}: expected Unhealthy after stream close, got {:?}",
+                    cycle,
+                    h
+                );
+                let h = wait_for_health(
+                    &adapter,
+                    |h| *h == HealthStatus::Healthy,
+                    Duration::from_secs(3),
+                )
+                .await;
+                assert_eq!(
+                    h,
+                    HealthStatus::Healthy,
+                    "cycle {}: expected Healthy after auto-reconnect",
+                    cycle
+                );
+            }
+
+            // No pending requests should have leaked across cycles.
+            assert!(
+                adapter.pending.lock().await.is_empty(),
+                "pending requests leaked across reconnect cycles"
+            );
+
+            // The same supervisor task should still be servicing reconnects;
+            // a fresh listener handle should be tracked from the latest cycle.
+            {
+                let sup = adapter.reconnect_handle.lock().await;
+                assert!(
+                    sup.as_ref().is_some_and(|h| !h.is_finished()),
+                    "supervisor should still be running after multiple cycles"
+                );
+            }
+            assert!(
+                adapter.sse_handle.lock().await.is_some(),
+                "listener handle should be present after final reconnect"
+            );
+
+            assert_eq!(adapter.health(), HealthStatus::Healthy);
+            // Initial connect plus 3 reconnects = at least 4 SSE GETs.
+            assert!(
+                server.state.connections.load(Ordering::SeqCst) >= 4,
+                "expected >=4 SSE connections across 3 reconnect cycles"
+            );
+
+            adapter.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn shutdown_cancels_in_flight_backoff() {
+            let server = start_test_server().await;
+            // Only the first SSE GET succeeds; further attempts return 503,
+            // so the supervisor records a failure and parks in the backoff
+            // sleep before its next reconnect attempt.
+            server.state.healthy_until.store(1, Ordering::SeqCst);
+
+            // Long base backoff so the supervisor is solidly inside
+            // tokio::time::sleep(backoff) when shutdown() is called.
+            let mut adapter = SseAdapter::new(SseConfig::new(&server.url).with_timeout(1));
+            *adapter.crash_tracker.lock().await =
+                CrashTracker::new_test(Duration::from_secs(5), 10, Duration::from_secs(60));
+            adapter.initialize().await.expect("initial connect");
+
+            server.close_all_streams();
+
+            // Wait until the listener has died (Unhealthy) and the supervisor
+            // has had a chance to record the first failure and enter sleep.
+            let h = wait_for_health(
+                &adapter,
+                |h| matches!(h, HealthStatus::Unhealthy(_)),
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(matches!(h, HealthStatus::Unhealthy(_)));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // shutdown() must cancel the multi-second backoff sleep
+            // immediately — well below the configured 5s base backoff.
+            let start = std::time::Instant::now();
+            adapter.shutdown().await.unwrap();
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(200),
+                "shutdown did not cancel in-flight backoff: {:?}",
+                elapsed
+            );
+            assert_eq!(adapter.health(), HealthStatus::Stopped);
+        }
     }
 }

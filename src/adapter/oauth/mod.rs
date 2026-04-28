@@ -20,6 +20,29 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::Instant;
 use tracing::{error, info, warn};
+
+/// Returns the `Instant` at which a proactive refresh should fire when
+/// `issued_at` is unknown (or nonsensical relative to `expires_at`).
+///
+/// The fallback heuristic is "refresh 5 minutes before expiry", clamped to
+/// `now` if we're already inside that window so the returned deadline is
+/// always `>= now`. Uses `checked_sub` so values far in the past don't
+/// underflow `Instant` arithmetic.
+fn fallback_refresh_deadline(now: Instant, expires_at: Instant) -> Instant {
+    let five_min = Duration::from_secs(300);
+    let target = expires_at.checked_sub(five_min).unwrap_or(now);
+    target.max(now)
+}
+
+/// Wall-clock timeout applied to the OAuth refresh `reqwest::Client`.
+///
+/// Bounds recovery time when the configured token endpoint stops responding
+/// (e.g. a half-open TCP connection); without it `do_token_refresh` could pin
+/// the adapter in `Refreshing` indefinitely. Pinning the value as a `const`
+/// gives `refresh_http_client_uses_30s_timeout` a stable hook to assert
+/// against and forces a deliberate review of any future change.
+const REFRESH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Configuration for an OAuth-authenticated MCP endpoint.
 #[derive(Debug, Clone)]
 pub struct OAuthAdapterConfig {
@@ -35,6 +58,12 @@ pub struct OAuthAdapterConfig {
     pub client_secret: Option<String>,
     /// Heartbeat probe interval in seconds (default: 30).
     pub heartbeat_interval_secs: u64,
+    /// Per-probe timeout in seconds (default: 10).
+    pub probe_timeout_secs: u64,
+    /// Number of consecutive probe network failures required before flipping
+    /// `inner_health` to `Unhealthy("upstream unreachable")` (default: 3).
+    /// Hysteresis to avoid flapping on a single transient timeout.
+    pub probe_failure_threshold: u32,
 }
 
 /// Shared inner state for an OAuth adapter, wrapped in `Arc` so it can be
@@ -193,18 +222,30 @@ impl OAuthAdapterInner {
             .extend_pairs(form_parts.iter())
             .finish();
 
-        let resp = self
+        let resp = match self
             .http_client
             .post(&self.config.token_endpoint_url)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(form_body)
             .send()
             .await
-            .map_err(|e| {
-                // Network error during refresh
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // Network/timeout error during refresh — leave Refreshing
+                // for ConnectionFailed so the state machine doesn't hang.
+                error!(
+                    endpoint = %self.config.endpoint_name,
+                    correlation_id = %correlation_id,
+                    error = %e,
+                    "Token refresh network error"
+                );
                 self.metrics.inc_refresh_failure();
-                OAuthError::Http(e)
-            })?;
+                self.transition_to(OAuthState::ConnectionFailed, "token refresh network error")
+                    .await;
+                return Err(OAuthError::Http(e));
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -222,7 +263,28 @@ impl OAuthAdapterInner {
             return Err(OAuthError::RefreshFailed { status, body });
         }
 
-        let token_json: serde_json::Value = resp.json().await?;
+        let token_json: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                // Upstream returned 200 but the body is not parseable JSON.
+                // Treat as a transient connection-quality issue (retry may
+                // recover) and leave Refreshing for ConnectionFailed so the
+                // state machine doesn't hang.
+                error!(
+                    endpoint = %self.config.endpoint_name,
+                    correlation_id = %correlation_id,
+                    error = %e,
+                    "Token refresh JSON parse error"
+                );
+                self.metrics.inc_refresh_failure();
+                self.transition_to(
+                    OAuthState::ConnectionFailed,
+                    "token refresh response not JSON",
+                )
+                .await;
+                return Err(OAuthError::Http(e));
+            }
+        };
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -295,11 +357,19 @@ impl OAuthAdapterInner {
         let mut adapter = Self::build_inner_adapter(&self.config.url, &access_token);
         match adapter.initialize().await {
             Ok(()) => {
+                // Reflect the freshly initialized inner adapter's health
+                // immediately so health() reports Healthy without waiting for
+                // the next heartbeat tick.
+                // Order matters: set the inner adapter BEFORE flipping
+                // inner_health to Healthy so that any reader that observes
+                // `health() == Healthy` is guaranteed to also see
+                // `inner_adapter == Some(_)`.
                 // Bind a forwarder against the new inner's tools-changed
                 // receiver (if any) before publishing it. No synthetic tick
                 // is emitted on swap — real ticks come from inner reconnects.
                 let rx = adapter.subscribe_tools_changed();
                 *self.inner_adapter.write().await = Some(adapter);
+                *self.inner_health.write().await = HealthStatus::Healthy;
                 self.swap_tools_forwarder(rx).await;
                 self.transition_to(
                     OAuthState::Authenticated,
@@ -326,53 +396,94 @@ impl OAuthAdapterInner {
         let has_refresh_token = token_set.refresh_token.is_some();
         *self.tokens.write().await = Some(token_set);
 
-        // 5. Schedule proactive refresh if we have a refresh token and expiry info
-        if !has_refresh_token {
+        // 5. Schedule proactive refresh if we have a refresh token and an
+        //    `expires_at`. We schedule even when `issued_at` is missing —
+        //    tokens persisted before `issued_at` was added will deserialize
+        //    with `issued_at: None` (it's `#[serde(default)]`), but still
+        //    deserve a proactive refresh.
+        let deadline = if !has_refresh_token {
             info!(endpoint = %endpoint, "No refresh token, skipping proactive refresh");
-        } else if let (Some(issued), Some(expires)) = (issued_at_secs, expires_at_secs) {
-            if expires > issued {
-                let now_secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let now_instant = Instant::now();
-                // Convert Unix timestamps to Instants relative to now
-                let issued_instant =
-                    now_instant - Duration::from_secs(now_secs.saturating_sub(issued));
-                let expires_instant =
-                    now_instant + Duration::from_secs(expires.saturating_sub(now_secs));
-                let deadline = refresh_deadline(issued_instant, expires_instant);
+            None
+        } else if let Some(expires) = expires_at_secs {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let now_instant = Instant::now();
+            let expires_instant =
+                now_instant + Duration::from_secs(expires.saturating_sub(now_secs));
+            match issued_at_secs {
+                Some(issued) if expires > issued => {
+                    // Both timestamps known — use the standard heuristic
+                    // (75% of lifetime, capped at 5 min before expiry).
+                    let issued_instant =
+                        now_instant - Duration::from_secs(now_secs.saturating_sub(issued));
+                    Some(refresh_deadline(issued_instant, expires_instant))
+                }
+                _ => {
+                    // No `issued_at` (or nonsensical ordering): fall back to
+                    // refreshing 5 minutes before expiry, clamped to "now"
+                    // if we're already inside that window.
+                    Some(fallback_refresh_deadline(now_instant, expires_instant))
+                }
+            }
+        } else {
+            info!(
+                endpoint = %endpoint,
+                "No expires_at on token, skipping proactive refresh"
+            );
+            None
+        };
 
-                let inner = self.clone();
-                let handle = tokio::spawn(async move {
-                    tokio::time::sleep_until(deadline).await;
-                    info!(endpoint = %inner.config.endpoint_name, "Proactive refresh timer fired");
-                    match inner.do_token_refresh().await {
-                        Ok(new_tokens) => {
-                            // Recursively apply — this will schedule the next refresh
-                            inner.apply_tokens(new_tokens).await;
-                        }
-                        Err(e) => {
-                            warn!(
-                                endpoint = %inner.config.endpoint_name,
-                                error = %e,
-                                "Proactive refresh failed, retrying in 60s"
-                            );
-                            // Retry once after 60 seconds
-                            tokio::time::sleep(Duration::from_secs(60)).await;
-                            if let Ok(new_tokens) = inner.do_token_refresh().await {
+        if let Some(deadline) = deadline {
+            let inner = self.clone();
+            let handle = tokio::spawn(async move {
+                tokio::time::sleep_until(deadline).await;
+                info!(endpoint = %inner.config.endpoint_name, "Proactive refresh timer fired");
+                match inner.do_token_refresh().await {
+                    Ok(new_tokens) => {
+                        // Recursively apply — this will schedule the next refresh
+                        inner.apply_tokens(new_tokens).await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            endpoint = %inner.config.endpoint_name,
+                            error = %e,
+                            "Proactive refresh failed, retrying in 60s"
+                        );
+                        // Retry once after 60 seconds
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        match inner.do_token_refresh().await {
+                            Ok(new_tokens) => {
                                 inner.apply_tokens(new_tokens).await;
-                            } else {
+                            }
+                            Err(retry_err) => {
+                                // `do_token_refresh` already transitioned to
+                                // a terminal state on its own error path; the
+                                // explicit transition here is defensive so a
+                                // future error path that forgets to do so
+                                // still leaves Refreshing for AuthRequired
+                                // (auth-style failure) or ConnectionFailed
+                                // (network/JSON failure).
                                 warn!(
                                     endpoint = %inner.config.endpoint_name,
+                                    error = %retry_err,
                                     "Proactive refresh retry also failed"
                                 );
+                                let target = match &retry_err {
+                                    OAuthError::RefreshFailed { .. }
+                                    | OAuthError::NoRefreshToken { .. } => OAuthState::AuthRequired,
+                                    _ => OAuthState::ConnectionFailed,
+                                };
+                                inner
+                                    .transition_to(target, "proactive refresh retry failed")
+                                    .await;
                             }
                         }
                     }
-                });
-                self.refresh_task_handle.lock().await.replace(handle);
-            }
+                }
+            });
+            self.refresh_task_handle.lock().await.replace(handle);
         }
     }
 
@@ -465,7 +576,10 @@ impl OAuthAdapter {
                 config,
                 inner_adapter: RwLock::new(None),
                 token_manager,
-                http_client: Client::new(),
+                http_client: Client::builder()
+                    .timeout(REFRESH_HTTP_TIMEOUT)
+                    .build()
+                    .expect("static OAuth refresh HTTP client config"),
                 refresh_task_handle: Mutex::new(None),
                 inner_health: RwLock::new(HealthStatus::Starting),
                 heartbeat_task_handle: Mutex::new(None),
@@ -730,6 +844,8 @@ mod tests {
             client_id: "test-client".to_string(),
             client_secret: None,
             heartbeat_interval_secs: 30,
+            probe_timeout_secs: 10,
+            probe_failure_threshold: 3,
         }
     }
 
@@ -1003,6 +1119,512 @@ mod tests {
         let expected = issued + Duration::from_secs(900);
         assert!(deadline >= expected - Duration::from_millis(1));
         assert!(deadline <= expected + Duration::from_millis(1));
+    }
+
+    // --- fallback_refresh_deadline tests (issued_at unknown path) ---
+
+    /// 60 minutes of remaining lifetime: deadline should be 5 minutes before
+    /// expiry (= now + 55 min). Task 2's fallback heuristic is "5 min before
+    /// expiry", not 75% of remaining — assert what the implementation does.
+    #[test]
+    fn fallback_refresh_deadline_uses_5min_before_expiry() {
+        let now = Instant::now();
+        let expires_at = now + Duration::from_secs(3600);
+        let deadline = fallback_refresh_deadline(now, expires_at);
+        let expected = now + Duration::from_secs(3600 - 300);
+        assert!(deadline >= expected - Duration::from_millis(1));
+        assert!(deadline <= expected + Duration::from_millis(1));
+    }
+
+    /// If `expires_at` is in the past or within the 5-minute guard window,
+    /// the deadline must clamp to `now` — never panic, never underflow, and
+    /// the returned deadline must be `>= now`.
+    #[test]
+    fn fallback_refresh_deadline_clamps_to_minimum_when_expiring_soon() {
+        let now = Instant::now();
+
+        // expires_at exactly at now → 5-min subtraction underflows → clamp to now.
+        let deadline = fallback_refresh_deadline(now, now);
+        assert_eq!(
+            deadline, now,
+            "expected clamp to `now` when expires_at == now"
+        );
+
+        // expires_at within the 5-minute window (60s out) → still clamps to now.
+        let near = now + Duration::from_secs(60);
+        let deadline = fallback_refresh_deadline(now, near);
+        assert_eq!(
+            deadline, now,
+            "expected clamp to `now` when expires_at is inside the 5-min guard"
+        );
+
+        // expires_at strictly before now (1s in the past per Instant semantics)
+        // — saturating subtraction inside `checked_sub` must not panic and the
+        // clamp keeps the deadline at `now`.
+        let past = now - Duration::from_secs(1);
+        let deadline = fallback_refresh_deadline(now, past);
+        assert!(
+            deadline >= now,
+            "expected deadline >= now when expires_at is in the past, got delta = {:?}",
+            now.saturating_duration_since(deadline)
+        );
+    }
+
+    /// `expires_at` 100 years out must not panic. Tokio's `Instant` is backed
+    /// by a monotonic clock so addition can theoretically saturate, but the
+    /// helper performs a simple subtraction and `max`, both of which are safe.
+    #[test]
+    fn fallback_refresh_deadline_handles_far_future_without_overflow() {
+        let now = Instant::now();
+        // ~100 years in seconds.
+        let far = now + Duration::from_secs(100 * 365 * 24 * 3600);
+        let deadline = fallback_refresh_deadline(now, far);
+        let expected = far - Duration::from_secs(300);
+        assert_eq!(
+            deadline, expected,
+            "expected deadline to be exactly 5 min before expiry for far-future timestamps"
+        );
+    }
+
+    // --- apply_tokens proactive-refresh & inner_health tests ---
+
+    /// Spawn a minimal in-process MCP server that responds to `initialize`
+    /// with a valid `serverInfo.name` and accepts `notifications/initialized`.
+    /// Returns the URL of the `/mcp` endpoint and a JoinHandle for the server.
+    async fn spawn_minimal_mcp_server() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handle(Json(body): Json<Value>) -> Json<Value> {
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            if method == "initialize" {
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "serverInfo": {"name": "test-server", "version": "0.0.1"},
+                    },
+                }))
+            } else {
+                // Notifications and anything else: empty 200 OK.
+                Json(json!({"jsonrpc": "2.0", "id": id, "result": {}}))
+            }
+        }
+
+        let router = Router::new().route("/mcp", post(handle));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        // Tiny delay to let the server start accepting connections.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}/mcp", addr.port()), handle)
+    }
+
+    /// Regression: a TokenSet with `expires_at` set but `issued_at = None`
+    /// (the shape persisted by older relay versions) must still spawn a
+    /// proactive refresh task.
+    #[tokio::test]
+    async fn apply_tokens_schedules_refresh_without_issued_at() {
+        let mut config = make_config();
+        // Point at an unreachable URL so initialize() fails quickly. The
+        // proactive-refresh scheduling must not depend on init success.
+        config.url = "http://127.0.0.1:19999/mcp".to_string();
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token_set = TokenSet {
+            access_token: "test-access".to_string(),
+            refresh_token: Some("test-refresh".to_string()),
+            expires_at: Some(now_secs + 3600),
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        };
+        adapter.inner.apply_tokens(token_set).await;
+
+        // A refresh task must be scheduled even though issued_at is None.
+        let handle = adapter.inner.refresh_task_handle.lock().await;
+        assert!(
+            handle.is_some(),
+            "expected proactive refresh task to be scheduled when expires_at is set and issued_at is None"
+        );
+        drop(handle);
+
+        // The inner adapter init failed (URL is unreachable), so inner_health
+        // must NOT be `Healthy`: the success-path branch sets it to `Healthy`,
+        // so a regression that flips the branches would leave it `Healthy`
+        // here. Failed init mirrors the inner adapter's own health, which is
+        // `Unhealthy(_)` after a connection failure.
+        let inner_health = adapter.inner.inner_health.read().await.clone();
+        assert!(
+            !matches!(inner_health, HealthStatus::Healthy),
+            "inner_health must not be Healthy after a failed inner adapter init, got {:?}",
+            inner_health
+        );
+    }
+
+    /// On successful re-init, `inner_health` must be set to `Healthy`
+    /// immediately so the management API doesn't show a stale `Starting`
+    /// until the next heartbeat tick.
+    #[tokio::test]
+    async fn apply_tokens_sets_inner_health_healthy_on_success() {
+        let (url, server) = spawn_minimal_mcp_server().await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+
+        let token_set = TokenSet {
+            access_token: "test-access".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        };
+        adapter.inner.apply_tokens(token_set).await;
+
+        let inner_health = adapter.inner.inner_health.read().await.clone();
+        assert_eq!(
+            inner_health,
+            HealthStatus::Healthy,
+            "inner_health should be Healthy immediately after a successful inner adapter initialize"
+        );
+
+        server.abort();
+    }
+
+    // --- do_token_refresh error-path tests ---
+
+    /// Spawn a tiny axum server on `127.0.0.1:0` that serves the configured
+    /// canned response on `POST /token`. Used to exercise the failure paths
+    /// of `do_token_refresh` without a real OAuth provider.
+    async fn spawn_token_server(mode: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::http::StatusCode;
+        use axum::{response::IntoResponse, routing::post, Router};
+
+        async fn bad_request() -> impl IntoResponse {
+            (StatusCode::BAD_REQUEST, "{\"error\":\"invalid_grant\"}")
+        }
+        async fn malformed() -> impl IntoResponse {
+            (StatusCode::OK, "not json")
+        }
+
+        let router = match mode {
+            "400" => Router::new().route("/token", post(bad_request)),
+            "malformed" => Router::new().route("/token", post(malformed)),
+            other => panic!("unknown spawn_token_server mode: {}", other),
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        // Tiny delay to let the server start accepting connections.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}/token", addr.port()), handle)
+    }
+
+    /// Helper: build an adapter pre-loaded with a refresh token so
+    /// `do_token_refresh` reaches the network call.
+    async fn make_adapter_with_refresh_token(config: OAuthAdapterConfig) -> OAuthAdapter {
+        let adapter = make_adapter(config);
+        *adapter.inner.tokens.write().await = Some(TokenSet {
+            access_token: "old-access".to_string(),
+            refresh_token: Some("test-refresh".to_string()),
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        });
+        adapter
+    }
+
+    /// Network error (closed port → ECONNREFUSED) must transition out of
+    /// `Refreshing` into `ConnectionFailed`, not leave the state stuck.
+    #[tokio::test]
+    async fn do_token_refresh_network_error_transitions_to_connection_failed() {
+        let mut config = make_config();
+        // Port 1 is reserved and not bound; this triggers an immediate
+        // connection-refused error rather than waiting for the 30s timeout.
+        config.token_endpoint_url = "http://127.0.0.1:1/token".to_string();
+        let adapter = make_adapter_with_refresh_token(config).await;
+
+        let result = adapter.inner.do_token_refresh().await;
+        assert!(
+            result.is_err(),
+            "expected refresh to fail with network error"
+        );
+
+        let state = adapter.inner.state.read().await.clone();
+        assert_eq!(
+            state,
+            OAuthState::ConnectionFailed,
+            "network error must transition out of Refreshing into ConnectionFailed"
+        );
+        assert!(
+            adapter
+                .inner
+                .metrics
+                .snapshot()
+                .oauth_token_refresh_total_failure
+                >= 1,
+            "refresh failure metric must increment"
+        );
+    }
+
+    /// Non-2xx HTTP response (4xx) must transition into `AuthRequired`.
+    #[tokio::test]
+    async fn do_token_refresh_4xx_transitions_to_auth_required() {
+        let (url, server) = spawn_token_server("400").await;
+        let mut config = make_config();
+        config.token_endpoint_url = url;
+        let adapter = make_adapter_with_refresh_token(config).await;
+
+        let result = adapter.inner.do_token_refresh().await;
+        assert!(
+            matches!(result, Err(OAuthError::RefreshFailed { .. })),
+            "expected RefreshFailed error, got {:?}",
+            result
+        );
+
+        let state = adapter.inner.state.read().await.clone();
+        assert_eq!(
+            state,
+            OAuthState::AuthRequired,
+            "4xx must transition out of Refreshing into AuthRequired"
+        );
+        assert!(
+            adapter
+                .inner
+                .metrics
+                .snapshot()
+                .oauth_token_refresh_total_failure
+                >= 1,
+            "refresh failure metric must increment"
+        );
+
+        server.abort();
+    }
+
+    /// 200 OK with a non-JSON body must transition into `ConnectionFailed`
+    /// (treat as a transient upstream-quality problem so retry can recover).
+    #[tokio::test]
+    async fn do_token_refresh_malformed_json_transitions_to_connection_failed() {
+        let (url, server) = spawn_token_server("malformed").await;
+        let mut config = make_config();
+        config.token_endpoint_url = url;
+        let adapter = make_adapter_with_refresh_token(config).await;
+
+        let result = adapter.inner.do_token_refresh().await;
+        assert!(
+            result.is_err(),
+            "expected refresh to fail with JSON parse error"
+        );
+
+        let state = adapter.inner.state.read().await.clone();
+        assert_eq!(
+            state,
+            OAuthState::ConnectionFailed,
+            "JSON parse failure must transition out of Refreshing into ConnectionFailed"
+        );
+        assert!(
+            adapter
+                .inner
+                .metrics
+                .snapshot()
+                .oauth_token_refresh_total_failure
+                >= 1,
+            "refresh failure metric must increment"
+        );
+
+        server.abort();
+    }
+
+    /// Wait until the shared call counter reaches `target`. Drives the
+    /// runtime by advancing virtual time in tiny steps (which yields and
+    /// gives in-flight HTTP I/O on the spawned proactive task a chance to
+    /// progress against the real reactor). A real-time deadline guards
+    /// against an actual hang.
+    async fn wait_for_calls(counter: &Arc<std::sync::atomic::AtomicUsize>, target: usize) {
+        use std::sync::atomic::Ordering;
+        let real_start = std::time::Instant::now();
+        while counter.load(Ordering::SeqCst) < target {
+            if real_start.elapsed() > std::time::Duration::from_secs(10) {
+                panic!(
+                    "timed out waiting for refresh call {} (got {})",
+                    target,
+                    counter.load(Ordering::SeqCst)
+                );
+            }
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Spawn an axum token endpoint that always responds 500 and bumps a
+    /// shared counter on every request. Used to drive the proactive-refresh
+    /// retry path (1st failure + 2nd failure) in
+    /// `apply_tokens_proactive_refresh_retry_transitions_on_second_failure`.
+    async fn spawn_token_server_always_500(
+        counter: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::extract::State;
+        use axum::http::StatusCode;
+        use axum::{response::IntoResponse, routing::post, Router};
+
+        async fn handler(
+            State(counter): State<Arc<std::sync::atomic::AtomicUsize>>,
+        ) -> impl IntoResponse {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{\"error\":\"server_error\"}",
+            )
+        }
+
+        let router = Router::new()
+            .route("/token", post(handler))
+            .with_state(counter);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        // Tiny delay to let the server start accepting connections.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}/token", addr.port()), handle)
+    }
+
+    /// HIGH #1 (audit): Task 1 added a defensive `transition_to(...)` call
+    /// inside the proactive-refresh retry block that runs after the
+    /// **second** consecutive `do_token_refresh` failure (it was previously
+    /// just a `warn!` log). This regression test forces the proactive task
+    /// to fire, makes the token endpoint fail twice in a row, and asserts
+    /// that the retry block recorded its `"proactive refresh retry failed"`
+    /// transition in the ring buffer.
+    ///
+    /// The negative case (only one failure ⇒ no retry-block transition) is
+    /// covered implicitly: the test pins the request count to exactly 2,
+    /// and the retry-block transition is only reached after the 2nd call
+    /// returns `Err`.
+    #[tokio::test]
+    async fn apply_tokens_proactive_refresh_retry_transitions_on_second_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (url, server) = spawn_token_server_always_500(calls.clone()).await;
+
+        let mut config = make_config();
+        // Point the inner adapter URL at an unreachable port so initialize()
+        // returns ECONNREFUSED quickly without consuming the inner client's
+        // 30 s timeout.
+        config.url = "http://127.0.0.1:19999/mcp".to_string();
+        config.token_endpoint_url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+
+        // Pause time *after* the server is up so the 60 s retry sleep in
+        // the proactive task is virtual (we drive it forward with
+        // `tokio::time::advance`). Setup before this point — TCP listener
+        // bind, axum spawn — runs on real time so I/O works normally.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        tokio::time::pause();
+
+        // expires_at = now_secs ⇒ proactive deadline collapses to
+        // `Instant::now()`, so the spawned task's `sleep_until` returns
+        // immediately on first poll.
+        let token_set = TokenSet {
+            access_token: "old-access".to_string(),
+            refresh_token: Some("test-refresh".to_string()),
+            expires_at: Some(now_secs),
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        };
+        adapter.inner.apply_tokens(token_set).await;
+
+        // Wait for the 1st refresh attempt to reach the fake endpoint.
+        // Real I/O still progresses under paused time; we yield to give
+        // the spawned proactive task a chance to be polled.
+        wait_for_calls(&calls, 1).await;
+
+        // Advance past the proactive task's 60 s retry sleep so the 2nd
+        // attempt fires.
+        tokio::time::advance(Duration::from_secs(61)).await;
+
+        // Wait for the 2nd refresh attempt.
+        wait_for_calls(&calls, 2).await;
+
+        // Yield enough times for the retry block to run its defensive
+        // `transition_to(...)` call after the 2nd Err returns.
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+
+        // Both refresh attempts must have actually hit the fake endpoint —
+        // not just one. This pins the off-by-one the audit flagged.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "expected exactly 2 token endpoint calls (initial + 1 retry)"
+        );
+
+        // The retry block in `apply_tokens_inner` must have recorded its
+        // defensive transition AFTER the 2nd failure.
+        let history = adapter.inner.transition_history.read().await;
+        assert!(
+            history
+                .iter()
+                .any(|r| r.reason == "proactive refresh retry failed"),
+            "expected a transition with reason 'proactive refresh retry failed' \
+             after the 2nd refresh failure; got: {:?}",
+            history
+                .iter()
+                .map(|r| (r.from.clone(), r.to.clone(), r.reason.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        // Final state must be a non-`Refreshing`, non-`Healthy` terminal
+        // state. With 500 responses both `do_token_refresh` and the retry
+        // block target `AuthRequired`.
+        let state = adapter.inner.state.read().await.clone();
+        assert_eq!(
+            state,
+            OAuthState::AuthRequired,
+            "after 2nd RefreshFailed the adapter must land in AuthRequired, \
+             not stay stuck in Refreshing"
+        );
+
+        server.abort();
+    }
+
+    /// MED #6 (audit): Task 1 added a 30 s timeout to the OAuth refresh
+    /// `reqwest::Client` so a stuck token endpoint can no longer pin the
+    /// state machine in `Refreshing` indefinitely. `reqwest::Client` does
+    /// not expose its configured timeout post-build, so we pin the value
+    /// at the `REFRESH_HTTP_TIMEOUT` constant the builder consumes —
+    /// changing the constant forces this assertion to be revisited.
+    #[test]
+    fn refresh_http_client_uses_30s_timeout() {
+        assert_eq!(
+            REFRESH_HTTP_TIMEOUT,
+            Duration::from_secs(30),
+            "OAuth refresh HTTP client timeout must be 30 seconds"
+        );
     }
 
     // --- Tools-changed forwarder (T5) ---
