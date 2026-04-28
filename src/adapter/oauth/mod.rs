@@ -20,6 +20,20 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{error, info, warn};
+
+/// Returns the `Instant` at which a proactive refresh should fire when
+/// `issued_at` is unknown (or nonsensical relative to `expires_at`).
+///
+/// The fallback heuristic is "refresh 5 minutes before expiry", clamped to
+/// `now` if we're already inside that window so the returned deadline is
+/// always `>= now`. Uses `checked_sub` so values far in the past don't
+/// underflow `Instant` arithmetic.
+fn fallback_refresh_deadline(now: Instant, expires_at: Instant) -> Instant {
+    let five_min = Duration::from_secs(300);
+    let target = expires_at.checked_sub(five_min).unwrap_or(now);
+    target.max(now)
+}
+
 /// Configuration for an OAuth-authenticated MCP endpoint.
 #[derive(Debug, Clone)]
 pub struct OAuthAdapterConfig {
@@ -287,6 +301,10 @@ impl OAuthAdapterInner {
         let mut adapter = Self::build_inner_adapter(&self.config.url, &access_token);
         match adapter.initialize().await {
             Ok(()) => {
+                // Reflect the freshly initialized inner adapter's health
+                // immediately so health() reports Healthy without waiting for
+                // the next heartbeat tick.
+                *self.inner_health.write().await = HealthStatus::Healthy;
                 *self.inner_adapter.write().await = Some(adapter);
                 self.transition_to(
                     OAuthState::Authenticated,
@@ -312,53 +330,75 @@ impl OAuthAdapterInner {
         let has_refresh_token = token_set.refresh_token.is_some();
         *self.tokens.write().await = Some(token_set);
 
-        // 5. Schedule proactive refresh if we have a refresh token and expiry info
-        if !has_refresh_token {
+        // 5. Schedule proactive refresh if we have a refresh token and an
+        //    `expires_at`. We schedule even when `issued_at` is missing —
+        //    tokens persisted before `issued_at` was added will deserialize
+        //    with `issued_at: None` (it's `#[serde(default)]`), but still
+        //    deserve a proactive refresh.
+        let deadline = if !has_refresh_token {
             info!(endpoint = %endpoint, "No refresh token, skipping proactive refresh");
-        } else if let (Some(issued), Some(expires)) = (issued_at_secs, expires_at_secs) {
-            if expires > issued {
-                let now_secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                let now_instant = Instant::now();
-                // Convert Unix timestamps to Instants relative to now
-                let issued_instant =
-                    now_instant - Duration::from_secs(now_secs.saturating_sub(issued));
-                let expires_instant =
-                    now_instant + Duration::from_secs(expires.saturating_sub(now_secs));
-                let deadline = refresh_deadline(issued_instant, expires_instant);
+            None
+        } else if let Some(expires) = expires_at_secs {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let now_instant = Instant::now();
+            let expires_instant =
+                now_instant + Duration::from_secs(expires.saturating_sub(now_secs));
+            match issued_at_secs {
+                Some(issued) if expires > issued => {
+                    // Both timestamps known — use the standard heuristic
+                    // (75% of lifetime, capped at 5 min before expiry).
+                    let issued_instant =
+                        now_instant - Duration::from_secs(now_secs.saturating_sub(issued));
+                    Some(refresh_deadline(issued_instant, expires_instant))
+                }
+                _ => {
+                    // No `issued_at` (or nonsensical ordering): fall back to
+                    // refreshing 5 minutes before expiry, clamped to "now"
+                    // if we're already inside that window.
+                    Some(fallback_refresh_deadline(now_instant, expires_instant))
+                }
+            }
+        } else {
+            info!(
+                endpoint = %endpoint,
+                "No expires_at on token, skipping proactive refresh"
+            );
+            None
+        };
 
-                let inner = self.clone();
-                let handle = tokio::spawn(async move {
-                    tokio::time::sleep_until(deadline).await;
-                    info!(endpoint = %inner.config.endpoint_name, "Proactive refresh timer fired");
-                    match inner.do_token_refresh().await {
-                        Ok(new_tokens) => {
-                            // Recursively apply — this will schedule the next refresh
+        if let Some(deadline) = deadline {
+            let inner = self.clone();
+            let handle = tokio::spawn(async move {
+                tokio::time::sleep_until(deadline).await;
+                info!(endpoint = %inner.config.endpoint_name, "Proactive refresh timer fired");
+                match inner.do_token_refresh().await {
+                    Ok(new_tokens) => {
+                        // Recursively apply — this will schedule the next refresh
+                        inner.apply_tokens(new_tokens).await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            endpoint = %inner.config.endpoint_name,
+                            error = %e,
+                            "Proactive refresh failed, retrying in 60s"
+                        );
+                        // Retry once after 60 seconds
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        if let Ok(new_tokens) = inner.do_token_refresh().await {
                             inner.apply_tokens(new_tokens).await;
-                        }
-                        Err(e) => {
+                        } else {
                             warn!(
                                 endpoint = %inner.config.endpoint_name,
-                                error = %e,
-                                "Proactive refresh failed, retrying in 60s"
+                                "Proactive refresh retry also failed"
                             );
-                            // Retry once after 60 seconds
-                            tokio::time::sleep(Duration::from_secs(60)).await;
-                            if let Ok(new_tokens) = inner.do_token_refresh().await {
-                                inner.apply_tokens(new_tokens).await;
-                            } else {
-                                warn!(
-                                    endpoint = %inner.config.endpoint_name,
-                                    "Proactive refresh retry also failed"
-                                );
-                            }
                         }
                     }
-                });
-                self.refresh_task_handle.lock().await.replace(handle);
-            }
+                }
+            });
+            self.refresh_task_handle.lock().await.replace(handle);
         }
     }
 
@@ -950,5 +990,187 @@ mod tests {
         let expected = issued + Duration::from_secs(900);
         assert!(deadline >= expected - Duration::from_millis(1));
         assert!(deadline <= expected + Duration::from_millis(1));
+    }
+
+    // --- fallback_refresh_deadline tests (issued_at unknown path) ---
+
+    /// 60 minutes of remaining lifetime: deadline should be 5 minutes before
+    /// expiry (= now + 55 min). Task 2's fallback heuristic is "5 min before
+    /// expiry", not 75% of remaining — assert what the implementation does.
+    #[test]
+    fn fallback_refresh_deadline_uses_5min_before_expiry() {
+        let now = Instant::now();
+        let expires_at = now + Duration::from_secs(3600);
+        let deadline = fallback_refresh_deadline(now, expires_at);
+        let expected = now + Duration::from_secs(3600 - 300);
+        assert!(deadline >= expected - Duration::from_millis(1));
+        assert!(deadline <= expected + Duration::from_millis(1));
+    }
+
+    /// If `expires_at` is in the past or within the 5-minute guard window,
+    /// the deadline must clamp to `now` — never panic, never underflow, and
+    /// the returned deadline must be `>= now`.
+    #[test]
+    fn fallback_refresh_deadline_clamps_to_minimum_when_expiring_soon() {
+        let now = Instant::now();
+
+        // expires_at exactly at now → 5-min subtraction underflows → clamp to now.
+        let deadline = fallback_refresh_deadline(now, now);
+        assert_eq!(
+            deadline, now,
+            "expected clamp to `now` when expires_at == now"
+        );
+
+        // expires_at within the 5-minute window (60s out) → still clamps to now.
+        let near = now + Duration::from_secs(60);
+        let deadline = fallback_refresh_deadline(now, near);
+        assert_eq!(
+            deadline, now,
+            "expected clamp to `now` when expires_at is inside the 5-min guard"
+        );
+
+        // expires_at strictly before now (1s in the past per Instant semantics)
+        // — saturating subtraction inside `checked_sub` must not panic and the
+        // clamp keeps the deadline at `now`.
+        let past = now - Duration::from_secs(1);
+        let deadline = fallback_refresh_deadline(now, past);
+        assert!(
+            deadline >= now,
+            "expected deadline >= now when expires_at is in the past, got delta = {:?}",
+            now.saturating_duration_since(deadline)
+        );
+    }
+
+    /// `expires_at` 100 years out must not panic. Tokio's `Instant` is backed
+    /// by a monotonic clock so addition can theoretically saturate, but the
+    /// helper performs a simple subtraction and `max`, both of which are safe.
+    #[test]
+    fn fallback_refresh_deadline_handles_far_future_without_overflow() {
+        let now = Instant::now();
+        // ~100 years in seconds.
+        let far = now + Duration::from_secs(100 * 365 * 24 * 3600);
+        let deadline = fallback_refresh_deadline(now, far);
+        let expected = far - Duration::from_secs(300);
+        assert_eq!(
+            deadline, expected,
+            "expected deadline to be exactly 5 min before expiry for far-future timestamps"
+        );
+    }
+
+    // --- apply_tokens proactive-refresh & inner_health tests ---
+
+    /// Spawn a minimal in-process MCP server that responds to `initialize`
+    /// with a valid `serverInfo.name` and accepts `notifications/initialized`.
+    /// Returns the URL of the `/mcp` endpoint and a JoinHandle for the server.
+    async fn spawn_minimal_mcp_server() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handle(Json(body): Json<Value>) -> Json<Value> {
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            if method == "initialize" {
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "serverInfo": {"name": "test-server", "version": "0.0.1"},
+                    },
+                }))
+            } else {
+                // Notifications and anything else: empty 200 OK.
+                Json(json!({"jsonrpc": "2.0", "id": id, "result": {}}))
+            }
+        }
+
+        let router = Router::new().route("/mcp", post(handle));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        // Tiny delay to let the server start accepting connections.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}/mcp", addr.port()), handle)
+    }
+
+    /// Regression: a TokenSet with `expires_at` set but `issued_at = None`
+    /// (the shape persisted by older relay versions) must still spawn a
+    /// proactive refresh task.
+    #[tokio::test]
+    async fn apply_tokens_schedules_refresh_without_issued_at() {
+        let mut config = make_config();
+        // Point at an unreachable URL so initialize() fails quickly. The
+        // proactive-refresh scheduling must not depend on init success.
+        config.url = "http://127.0.0.1:19999/mcp".to_string();
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token_set = TokenSet {
+            access_token: "test-access".to_string(),
+            refresh_token: Some("test-refresh".to_string()),
+            expires_at: Some(now_secs + 3600),
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        };
+        adapter.inner.apply_tokens(token_set).await;
+
+        // A refresh task must be scheduled even though issued_at is None.
+        let handle = adapter.inner.refresh_task_handle.lock().await;
+        assert!(
+            handle.is_some(),
+            "expected proactive refresh task to be scheduled when expires_at is set and issued_at is None"
+        );
+        drop(handle);
+
+        // The inner adapter init failed (URL is unreachable), so inner_health
+        // must NOT be `Healthy`: the success-path branch sets it to `Healthy`,
+        // so a regression that flips the branches would leave it `Healthy`
+        // here. Failed init mirrors the inner adapter's own health, which is
+        // `Unhealthy(_)` after a connection failure.
+        let inner_health = adapter.inner.inner_health.read().await.clone();
+        assert!(
+            !matches!(inner_health, HealthStatus::Healthy),
+            "inner_health must not be Healthy after a failed inner adapter init, got {:?}",
+            inner_health
+        );
+    }
+
+    /// On successful re-init, `inner_health` must be set to `Healthy`
+    /// immediately so the management API doesn't show a stale `Starting`
+    /// until the next heartbeat tick.
+    #[tokio::test]
+    async fn apply_tokens_sets_inner_health_healthy_on_success() {
+        let (url, server) = spawn_minimal_mcp_server().await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+
+        let token_set = TokenSet {
+            access_token: "test-access".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        };
+        adapter.inner.apply_tokens(token_set).await;
+
+        let inner_health = adapter.inner.inner_health.read().await.clone();
+        assert_eq!(
+            inner_health,
+            HealthStatus::Healthy,
+            "inner_health should be Healthy immediately after a successful inner adapter initialize"
+        );
+
+        server.abort();
     }
 }
