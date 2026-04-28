@@ -16,8 +16,8 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, RwLock};
-use tokio::task::JoinHandle;
+use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::Instant;
 use tracing::{error, info, warn};
 /// Configuration for an OAuth-authenticated MCP endpoint.
@@ -64,6 +64,14 @@ pub struct OAuthAdapterInner {
     pub metrics: OAuthMetrics,
     /// Guards concurrent refresh attempts so only one proceeds at a time.
     refresh_mutex: Mutex<()>,
+    /// Outer tools-changed broadcast — the registry subscribes here once and
+    /// keeps that receiver across inner-adapter swaps. Forwarder tasks pump
+    /// ticks from each inner adapter's `subscribe_tools_changed` receiver into
+    /// this sender.
+    outer_tools_changed_tx: broadcast::Sender<()>,
+    /// Abort handle for the current inner→outer tools-changed forwarder task,
+    /// if any. Re-bound on every inner-adapter swap.
+    inner_forwarder_handle: Mutex<Option<AbortHandle>>,
 }
 
 impl OAuthAdapterInner {
@@ -287,7 +295,12 @@ impl OAuthAdapterInner {
         let mut adapter = Self::build_inner_adapter(&self.config.url, &access_token);
         match adapter.initialize().await {
             Ok(()) => {
+                // Bind a forwarder against the new inner's tools-changed
+                // receiver (if any) before publishing it. No synthetic tick
+                // is emitted on swap — real ticks come from inner reconnects.
+                let rx = adapter.subscribe_tools_changed();
                 *self.inner_adapter.write().await = Some(adapter);
+                self.swap_tools_forwarder(rx).await;
                 self.transition_to(
                     OAuthState::Authenticated,
                     "tokens applied, inner adapter ready",
@@ -298,6 +311,7 @@ impl OAuthAdapterInner {
                 // Capture inner adapter's health before clearing it
                 *self.inner_health.write().await = adapter.health();
                 *self.inner_adapter.write().await = None;
+                self.swap_tools_forwarder(None).await;
                 self.transition_to(
                     OAuthState::ConnectionFailed,
                     &format!("inner adapter init failed: {}", e),
@@ -362,6 +376,33 @@ impl OAuthAdapterInner {
         }
     }
 
+    /// Abort any existing inner→outer tools-changed forwarder and, if `rx` is
+    /// `Some`, spawn a fresh forwarder that pumps each inner tick into
+    /// `outer_tools_changed_tx`. `Lagged` is forwarded as a tick (matching the
+    /// registry listener); `Closed` ends the task.
+    async fn swap_tools_forwarder(&self, rx: Option<broadcast::Receiver<()>>) {
+        let mut handle_guard = self.inner_forwarder_handle.lock().await;
+        if let Some(h) = handle_guard.take() {
+            h.abort();
+        }
+        let Some(mut rx) = rx else { return };
+        let outer_tx = self.outer_tools_changed_tx.clone();
+        let join = tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(()) => {
+                        let _ = outer_tx.send(());
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let _ = outer_tx.send(());
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        *handle_guard = Some(join.abort_handle());
+    }
+
     /// Disconnect: abort refresh task, clear tokens, delete from disk, set Disconnected.
     pub async fn disconnect(self: &Arc<Self>) {
         let endpoint = &self.config.endpoint_name;
@@ -373,6 +414,9 @@ impl OAuthAdapterInner {
                 h.abort();
             }
         }
+
+        // Abort inner→outer tools-changed forwarder
+        self.swap_tools_forwarder(None).await;
 
         // Shut down inner adapter
         {
@@ -413,6 +457,7 @@ pub struct OAuthAdapter {
 impl OAuthAdapter {
     /// Create a new OAuthAdapter.
     pub fn new(config: OAuthAdapterConfig, token_manager: Arc<TokenManager>) -> Self {
+        let (outer_tools_changed_tx, _) = broadcast::channel(16);
         Self {
             inner: Arc::new(OAuthAdapterInner {
                 state: RwLock::new(OAuthState::NeedsLogin),
@@ -427,6 +472,8 @@ impl OAuthAdapter {
                 transition_history: RwLock::new(VecDeque::new()),
                 metrics: OAuthMetrics::new(),
                 refresh_mutex: Mutex::new(()),
+                outer_tools_changed_tx,
+                inner_forwarder_handle: Mutex::new(None),
             }),
         }
     }
@@ -633,6 +680,8 @@ impl McpAdapter for OAuthAdapter {
                 h.abort();
             }
         }
+        // Abort inner→outer tools-changed forwarder
+        self.inner.swap_tools_forwarder(None).await;
         let mut guard = self.inner.inner_adapter.write().await;
         if let Some(ref mut adapter) = *guard {
             adapter.shutdown().await?;
@@ -642,6 +691,10 @@ impl McpAdapter for OAuthAdapter {
             .transition_to(OAuthState::Disconnected, "shutdown")
             .await;
         Ok(())
+    }
+
+    fn subscribe_tools_changed(&self) -> Option<broadcast::Receiver<()>> {
+        Some(self.inner.outer_tools_changed_tx.subscribe())
     }
 
     fn health(&self) -> HealthStatus {
@@ -950,5 +1003,163 @@ mod tests {
         let expected = issued + Duration::from_secs(900);
         assert!(deadline >= expected - Duration::from_millis(1));
         assert!(deadline <= expected + Duration::from_millis(1));
+    }
+
+    // --- Tools-changed forwarder (T5) ---
+
+    /// Drain any already-queued ticks so subsequent `recv` reflects new sends.
+    async fn drain(rx: &mut broadcast::Receiver<()>) {
+        loop {
+            match tokio::time::timeout(Duration::from_millis(20), rx.recv()).await {
+                Ok(Ok(())) => continue,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => break,
+            }
+        }
+    }
+
+    /// Wait briefly for an outer tick. Returns whether one arrived.
+    async fn recv_tick(rx: &mut broadcast::Receiver<()>, timeout: Duration) -> bool {
+        matches!(
+            tokio::time::timeout(timeout, rx.recv()).await,
+            Ok(Ok(())) | Ok(Err(broadcast::error::RecvError::Lagged(_)))
+        )
+    }
+
+    #[tokio::test]
+    async fn subscribe_tools_changed_returns_some() {
+        let adapter = make_adapter(make_config());
+        // OAuth always exposes its outer broadcast — registry subscribes once.
+        assert!(adapter.subscribe_tools_changed().is_some());
+    }
+
+    #[tokio::test]
+    async fn forwarder_propagates_inner_tick_to_outer_subscriber() {
+        let adapter = make_adapter(make_config());
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+
+        let (inner_tx, inner_rx) = broadcast::channel::<()>(16);
+        adapter.inner.swap_tools_forwarder(Some(inner_rx)).await;
+
+        inner_tx.send(()).expect("inner send");
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "outer subscriber should receive tick forwarded from inner"
+        );
+    }
+
+    #[tokio::test]
+    async fn inner_swap_aborts_old_forwarder_and_rebinds_new() {
+        let adapter = make_adapter(make_config());
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+
+        // Bind forwarder to inner A.
+        let (inner_tx_a, inner_rx_a) = broadcast::channel::<()>(16);
+        adapter.inner.swap_tools_forwarder(Some(inner_rx_a)).await;
+        // Sanity-check: A propagates.
+        inner_tx_a.send(()).expect("inner A send");
+        assert!(recv_tick(&mut outer_rx, Duration::from_millis(500)).await);
+
+        // Swap to inner B (simulates inner-adapter replacement).
+        let (inner_tx_b, inner_rx_b) = broadcast::channel::<()>(16);
+        adapter.inner.swap_tools_forwarder(Some(inner_rx_b)).await;
+        drain(&mut outer_rx).await;
+
+        // Firing on the OLD inner must NOT propagate (forwarder aborted →
+        // the only subscriber was dropped, so `send` may return SendError;
+        // either way nothing should reach the outer subscriber).
+        let _ = inner_tx_a.send(());
+        assert!(
+            !recv_tick(&mut outer_rx, Duration::from_millis(150)).await,
+            "old inner sender must not propagate after swap"
+        );
+
+        // Firing on the NEW inner DOES propagate (forwarder rebound).
+        inner_tx_b.send(()).expect("inner B send");
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "new inner sender must propagate after swap"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_tokens_rebinds_forwarder_aborting_prior_inner() {
+        // G3 coverage: apply_tokens must drive swap_tools_forwarder so that
+        // a stale forwarder bound to a previous inner is aborted. Here the
+        // upstream URL is unreachable, so apply_tokens hits the
+        // ConnectionFailed branch which calls swap_tools_forwarder(None) —
+        // the prior forwarder must stop propagating ticks regardless.
+        let mut config = make_config();
+        config.url = "http://127.0.0.1:19998/mcp".to_string();
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+
+        // Pre-bind a forwarder to a fake "previous" inner receiver.
+        let (prev_inner_tx, prev_inner_rx) = broadcast::channel::<()>(16);
+        adapter
+            .inner
+            .swap_tools_forwarder(Some(prev_inner_rx))
+            .await;
+        // Sanity: forwarder propagates ticks before apply_tokens runs.
+        prev_inner_tx.send(()).expect("pre-apply send");
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "pre-apply forwarder should propagate"
+        );
+        drain(&mut outer_rx).await;
+
+        // apply_tokens with unreachable URL → ConnectionFailed branch →
+        // swap_tools_forwarder(None) → prior forwarder is aborted.
+        let token_set = TokenSet {
+            access_token: "fake-token".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        };
+        adapter.inner.apply_tokens(token_set).await;
+
+        // Ticks on the previous inner sender must no longer propagate.
+        let _ = prev_inner_tx.send(());
+        assert!(
+            !recv_tick(&mut outer_rx, Duration::from_millis(150)).await,
+            "apply_tokens must rebind the forwarder, aborting the prior one"
+        );
+
+        // The outer broadcast itself remains alive (registry subscription
+        // survives across rebinds): a fresh forwarder bound after apply_tokens
+        // still reaches the same outer subscriber.
+        let (post_inner_tx, post_inner_rx) = broadcast::channel::<()>(16);
+        adapter
+            .inner
+            .swap_tools_forwarder(Some(post_inner_rx))
+            .await;
+        post_inner_tx.send(()).expect("post-apply send");
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "outer broadcast must survive apply_tokens rebind"
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarder_swap_to_none_disables_forwarding() {
+        // Simulates inner adapters that don't expose `subscribe_tools_changed`
+        // (returns `None`): no forwarder is spawned and OAuth still works.
+        let adapter = make_adapter(make_config());
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+
+        let (inner_tx, inner_rx) = broadcast::channel::<()>(16);
+        adapter.inner.swap_tools_forwarder(Some(inner_rx)).await;
+        adapter.inner.swap_tools_forwarder(None).await;
+
+        // After abort, the forwarder's receiver is dropped — `send` may return
+        // SendError (no subscribers). Either way, nothing reaches outer.
+        let _ = inner_tx.send(());
+        assert!(
+            !recv_tick(&mut outer_rx, Duration::from_millis(150)).await,
+            "no tick should reach outer subscriber after forwarder disabled"
+        );
     }
 }
