@@ -2311,15 +2311,32 @@ mod tests {
         }
     }
 
-    /// Mock adapter whose `shutdown` sleeps for a configurable duration. Used
-    /// to verify that `restart_endpoint` does not block on shutdown.
+    /// Mock adapter whose `shutdown` sleeps for a configurable duration and
+    /// optionally flips an `AtomicBool` once shutdown is invoked. Used to
+    /// verify that `restart_endpoint` returns without awaiting shutdown and
+    /// that the background task actually calls `shutdown()` on the old
+    /// adapter (rather than dropping it).
     struct SlowShutdownAdapter {
         shutdown_delay: std::time::Duration,
+        shutdown_called: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
 
     impl SlowShutdownAdapter {
         fn new(shutdown_delay: std::time::Duration) -> Self {
-            Self { shutdown_delay }
+            Self {
+                shutdown_delay,
+                shutdown_called: None,
+            }
+        }
+
+        fn with_shutdown_flag(
+            shutdown_delay: std::time::Duration,
+            flag: Arc<std::sync::atomic::AtomicBool>,
+        ) -> Self {
+            Self {
+                shutdown_delay,
+                shutdown_called: Some(flag),
+            }
         }
     }
 
@@ -2338,6 +2355,9 @@ mod tests {
             HealthStatus::Healthy
         }
         async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            if let Some(flag) = &self.shutdown_called {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             tokio::time::sleep(self.shutdown_delay).await;
             Ok(())
         }
@@ -2776,6 +2796,170 @@ mod tests {
         assert!(
             swapped.is_ok(),
             "registry never reflected new adapter within 5s"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_endpoint_unknown_endpoint_returns_404_and_does_not_spawn() {
+        use std::time::Duration;
+
+        // Register a single healthy adapter under "echo"; the request will
+        // target an entirely different name that is NOT in the registry.
+        let state = test_state(vec![("echo", MockAdapter::healthy_with_tools(vec![]))]).await;
+        let registry_for_check = state.registry.clone();
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/missing-endpoint/restart")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // 4xx (specifically 404) — endpoint_not_found returns NOT_FOUND.
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "endpoint not found");
+
+        // The registry MUST NOT have been mutated:
+        // - "echo" is still its original MockAdapter (Healthy, not Starting).
+        // - No new "missing-endpoint" key was inserted.
+        {
+            let entries = registry_for_check.entries().read().await;
+            assert_eq!(entries.len(), 1, "registry should still have one entry");
+            let echo = entries.get("echo").expect("echo entry preserved");
+            assert!(
+                matches!(echo.adapter.health(), HealthStatus::Healthy),
+                "echo adapter must not have been replaced with StartingAdapter"
+            );
+            assert!(
+                entries.get("missing-endpoint").is_none(),
+                "registry must not contain missing-endpoint"
+            );
+        }
+
+        // Wait briefly to confirm no background spawn mutates the registry
+        // after the response (i.e. no `tokio::spawn` was kicked off).
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        {
+            let entries = registry_for_check.entries().read().await;
+            assert_eq!(entries.len(), 1);
+            let echo = entries.get("echo").unwrap();
+            assert!(matches!(echo.adapter.health(), HealthStatus::Healthy));
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_endpoint_returns_quickly_during_slow_shutdown() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        // Old adapter: 1.5s shutdown delay + a flag that flips when shutdown
+        // is actually invoked (Item C — verifies the background task ran
+        // shutdown rather than dropping the adapter).
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "echo".to_string(),
+                Box::new(SlowShutdownAdapter::with_shutdown_flag(
+                    Duration::from_millis(1500),
+                    shutdown_called.clone(),
+                )),
+                "stdio".to_string(),
+                None,
+                Some("echo".to_string()),
+            )
+            .await;
+        let state = ManagementState {
+            registry: Arc::new(registry),
+            config: Arc::new(RwLock::new(test_config())),
+            start_time: Instant::now(),
+            config_path: None,
+            oauth_flow_manager: None,
+            relay_port: 9400,
+            oauth_adapter_inners: None,
+            token_manager: None,
+            setup_manager: None,
+        };
+        let registry_for_poll = state.registry.clone();
+        let app = management_routes(state);
+
+        // Item B (1): tight upper bound on response time even though the old
+        // adapter's shutdown takes 1.5s.
+        let start = Instant::now();
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/echo/restart")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "restart should return in <100ms, took {:?}",
+            elapsed
+        );
+        let body = body_json(resp).await;
+        assert_eq!(body["ok"], true);
+
+        // Item B (3): immediately after the response, the registry MUST
+        // contain the StartingAdapter placeholder — i.e. the swap happened
+        // synchronously with the request, not asynchronously.
+        {
+            let entries = registry_for_poll.entries().read().await;
+            let entry = entries.get("echo").expect("echo still in registry");
+            assert!(
+                matches!(entry.adapter.health(), HealthStatus::Starting),
+                "registry should hold a StartingAdapter while shutdown runs, got {:?}",
+                entry.adapter.health()
+            );
+        }
+
+        // Item C: poll the AtomicBool until shutdown() is observed running
+        // on the old adapter. The flag flips at the start of shutdown(), so
+        // this should fire well before the 1.5s sleep finishes.
+        let flag_flipped = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if shutdown_called.load(Ordering::SeqCst) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            flag_flipped.is_ok(),
+            "background task never invoked shutdown() on the old adapter"
+        );
+
+        // Item B (4): once the background spawn completes, the registry
+        // should hold the new adapter. With test_config()'s "echo" entry
+        // (command = "echo", no MCP server), create_adapter ends up with a
+        // FailedAdapter whose health is Unhealthy.
+        let final_state = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                {
+                    let entries = registry_for_poll.entries().read().await;
+                    if let Some(entry) = entries.get("echo") {
+                        if matches!(entry.adapter.health(), HealthStatus::Unhealthy(_)) {
+                            return;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        assert!(
+            final_state.is_ok(),
+            "registry never reflected final swapped adapter within 5s"
         );
     }
 
