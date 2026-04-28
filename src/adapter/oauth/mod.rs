@@ -1083,6 +1083,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_tokens_rebinds_forwarder_aborting_prior_inner() {
+        // G3 coverage: apply_tokens must drive swap_tools_forwarder so that
+        // a stale forwarder bound to a previous inner is aborted. Here the
+        // upstream URL is unreachable, so apply_tokens hits the
+        // ConnectionFailed branch which calls swap_tools_forwarder(None) —
+        // the prior forwarder must stop propagating ticks regardless.
+        let mut config = make_config();
+        config.url = "http://127.0.0.1:19998/mcp".to_string();
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+
+        // Pre-bind a forwarder to a fake "previous" inner receiver.
+        let (prev_inner_tx, prev_inner_rx) = broadcast::channel::<()>(16);
+        adapter
+            .inner
+            .swap_tools_forwarder(Some(prev_inner_rx))
+            .await;
+        // Sanity: forwarder propagates ticks before apply_tokens runs.
+        prev_inner_tx.send(()).expect("pre-apply send");
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "pre-apply forwarder should propagate"
+        );
+        drain(&mut outer_rx).await;
+
+        // apply_tokens with unreachable URL → ConnectionFailed branch →
+        // swap_tools_forwarder(None) → prior forwarder is aborted.
+        let token_set = TokenSet {
+            access_token: "fake-token".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        };
+        adapter.inner.apply_tokens(token_set).await;
+
+        // Ticks on the previous inner sender must no longer propagate.
+        let _ = prev_inner_tx.send(());
+        assert!(
+            !recv_tick(&mut outer_rx, Duration::from_millis(150)).await,
+            "apply_tokens must rebind the forwarder, aborting the prior one"
+        );
+
+        // The outer broadcast itself remains alive (registry subscription
+        // survives across rebinds): a fresh forwarder bound after apply_tokens
+        // still reaches the same outer subscriber.
+        let (post_inner_tx, post_inner_rx) = broadcast::channel::<()>(16);
+        adapter
+            .inner
+            .swap_tools_forwarder(Some(post_inner_rx))
+            .await;
+        post_inner_tx.send(()).expect("post-apply send");
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "outer broadcast must survive apply_tokens rebind"
+        );
+    }
+
+    #[tokio::test]
     async fn forwarder_swap_to_none_disables_forwarding() {
         // Simulates inner adapters that don't expose `subscribe_tools_changed`
         // (returns `None`): no forwarder is spawned and OAuth still works.

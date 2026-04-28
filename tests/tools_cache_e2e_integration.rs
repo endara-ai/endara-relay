@@ -192,3 +192,218 @@ async fn test_per_adapter_tools_cache_end_to_end() {
          (before={count_after_lifecycle}, after={final_count})"
     );
 }
+
+/// G4 — `/api/endpoints/:name/refresh` cache-invalidation behaviour.
+///
+/// Strengthens the existing `management_refresh_endpoint` unit test (which
+/// only inspects the response string) by asserting the upstream call counter
+/// behaves as the per-adapter cache invariants require:
+///   1. Two consecutive GETs hit the cache: counter == 1.
+///   2. POST refresh evicts the cache and re-primes it: counter == 2.
+///   3. A subsequent GET stays a cache hit: counter == 2.
+#[tokio::test]
+async fn test_refresh_endpoint_invalidates_per_endpoint_cache() {
+    let count_file = NamedTempFile::new().expect("create count file");
+    let count_path = count_file.path().to_path_buf();
+    let count_path_str = count_path.to_str().unwrap().to_string();
+
+    let fixture_bin = env!("CARGO_BIN_EXE_fixture-swap-notify-server");
+    let config = ConfigBuilder::new()
+        .add_stdio_with_env(
+            "swapper",
+            fixture_bin,
+            &[],
+            &[("FIXTURE_LIST_COUNT_FILE", count_path_str.as_str())],
+        )
+        .build();
+
+    let harness = RelayHarness::start(&config).await;
+    harness
+        .wait_healthy("swapper", Duration::from_secs(15))
+        .await
+        .expect("swapper endpoint did not become healthy");
+
+    let client = reqwest::Client::new();
+    let base = harness.base_url();
+    let tools_url = format!("{}/api/endpoints/swapper/tools", base);
+    let refresh_url = format!("{}/api/endpoints/swapper/refresh", base);
+
+    // 1. First GET primes the cache → upstream count = 1.
+    let _ = fetch_tool_names(&client, &tools_url).await;
+    assert!(
+        poll_until(Duration::from_secs(2), || read_count(&count_path) >= 1).await,
+        "fixture never recorded the first tools/list call"
+    );
+    assert_eq!(
+        read_count(&count_path),
+        1,
+        "first GET should hit upstream exactly once"
+    );
+
+    // 2. Second GET is a cache hit → counter unchanged.
+    let _ = fetch_tool_names(&client, &tools_url).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        read_count(&count_path),
+        1,
+        "second GET should be a per-endpoint cache hit"
+    );
+
+    // 3. POST refresh: invalidates per-endpoint cache and re-primes it
+    //    eagerly via cached_list_tools(). Upstream count must increment by
+    //    exactly one.
+    let resp = client.post(&refresh_url).send().await.unwrap();
+    assert!(resp.status().is_success(), "refresh failed: {resp:?}");
+    assert!(
+        poll_until(Duration::from_secs(2), || read_count(&count_path) >= 2).await,
+        "refresh: expected upstream count to reach 2, got {}",
+        read_count(&count_path)
+    );
+    assert_eq!(
+        read_count(&count_path),
+        2,
+        "refresh should produce exactly one upstream tools/list call"
+    );
+
+    // 4. Subsequent GET stays a cache hit (refresh re-primed the cache).
+    let _ = fetch_tool_names(&client, &tools_url).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        read_count(&count_path),
+        2,
+        "GET after refresh must hit the re-primed cache"
+    );
+}
+
+/// G5 — Per-tool disable/enable invalidates the merged catalog cache.
+///
+/// Verifies the management API contract documented in registry.rs:
+/// `invalidate_catalog_cache` (which also clears every per-endpoint tools
+/// cache, per its docstring) must be called on per-tool disable/enable so
+/// the next `/api/catalog` read reflects the new disabled-tools set.
+#[tokio::test]
+async fn test_per_tool_disable_enable_invalidates_catalog_cache() {
+    let count_file = NamedTempFile::new().expect("create count file");
+    let count_path = count_file.path().to_path_buf();
+    let count_path_str = count_path.to_str().unwrap().to_string();
+
+    let fixture_bin = env!("CARGO_BIN_EXE_fixture-swap-notify-server");
+    let config = ConfigBuilder::new()
+        .add_stdio_with_env(
+            "swapper",
+            fixture_bin,
+            &[],
+            &[("FIXTURE_LIST_COUNT_FILE", count_path_str.as_str())],
+        )
+        .build();
+
+    let harness = RelayHarness::start(&config).await;
+    harness
+        .wait_healthy("swapper", Duration::from_secs(15))
+        .await
+        .expect("swapper endpoint did not become healthy");
+
+    let client = reqwest::Client::new();
+    let base = harness.base_url();
+    let catalog_url = format!("{}/api/catalog", base);
+    let disable_url = format!("{}/api/endpoints/swapper/tools/get_status/disable", base);
+    let enable_url = format!("{}/api/endpoints/swapper/tools/get_status/enable", base);
+
+    // Helper: GET /api/catalog and return tool names.
+    async fn catalog_names(client: &reqwest::Client, url: &str) -> Vec<String> {
+        let resp: Value = client.get(url).send().await.unwrap().json().await.unwrap();
+        resp.as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
+            .collect()
+    }
+
+    // 1. Prime the catalog cache → upstream count = 1.
+    let names = catalog_names(&client, &catalog_url).await;
+    assert!(
+        names.iter().any(|n| n == "get_status"),
+        "expected get_status in initial catalog, got {names:?}"
+    );
+    assert!(
+        poll_until(Duration::from_secs(2), || read_count(&count_path) >= 1).await,
+        "fixture never recorded the first tools/list call"
+    );
+    assert_eq!(
+        read_count(&count_path),
+        1,
+        "first catalog read should hit upstream exactly once"
+    );
+
+    // 2. Second catalog read hits the catalog cache → counter unchanged.
+    let _ = catalog_names(&client, &catalog_url).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        read_count(&count_path),
+        1,
+        "second catalog read should be a cache hit"
+    );
+
+    // 3. POST disable_tool: must invalidate the catalog cache so the next
+    //    GET re-merges the tool list with the new disabled-tools set. Because
+    //    invalidate_catalog_cache also clears every per-endpoint tool cache
+    //    (per its docstring), the next catalog rebuild re-fetches upstream,
+    //    bumping the counter by exactly one.
+    let resp = client.post(&disable_url).send().await.unwrap();
+    assert!(resp.status().is_success(), "disable_tool failed: {resp:?}");
+
+    let names_after_disable = catalog_names(&client, &catalog_url).await;
+    assert!(
+        !names_after_disable.iter().any(|n| n == "get_status"),
+        "catalog cache was not invalidated: get_status still present after disable: {names_after_disable:?}"
+    );
+    assert!(
+        names_after_disable.iter().any(|n| n == "swap_tools"),
+        "non-disabled tool swap_tools must remain in catalog: {names_after_disable:?}"
+    );
+    assert!(
+        poll_until(Duration::from_secs(2), || read_count(&count_path) >= 2).await,
+        "per-tool disable: expected upstream count to reach 2, got {}",
+        read_count(&count_path)
+    );
+    let count_after_disable = read_count(&count_path);
+    assert_eq!(
+        count_after_disable, 2,
+        "disable_tool's catalog invalidation should produce exactly one upstream re-fetch"
+    );
+
+    // 4. Second catalog read after disable is a cache hit: counter unchanged.
+    let _ = catalog_names(&client, &catalog_url).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        read_count(&count_path),
+        count_after_disable,
+        "post-disable catalog read should be a cache hit"
+    );
+
+    // 5. POST enable_tool: must again invalidate the catalog cache, re-merge
+    //    so the re-enabled tool reappears, and produce exactly one extra
+    //    upstream re-fetch.
+    let resp = client.post(&enable_url).send().await.unwrap();
+    assert!(resp.status().is_success(), "enable_tool failed: {resp:?}");
+
+    let names_after_enable = catalog_names(&client, &catalog_url).await;
+    assert!(
+        names_after_enable.iter().any(|n| n == "get_status"),
+        "catalog cache was not invalidated on enable: get_status missing: {names_after_enable:?}"
+    );
+    assert!(
+        poll_until(Duration::from_secs(2), || {
+            read_count(&count_path) > count_after_disable
+        })
+        .await,
+        "per-tool enable: expected upstream count to reach {}, got {}",
+        count_after_disable + 1,
+        read_count(&count_path)
+    );
+    assert_eq!(
+        read_count(&count_path),
+        count_after_disable + 1,
+        "enable_tool's catalog invalidation should produce exactly one upstream re-fetch"
+    );
+}
