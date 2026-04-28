@@ -224,8 +224,7 @@ async fn get_endpoints(State(state): State<ManagementState>) -> Json<Vec<Endpoin
             match entry.adapter.health() {
                 HealthStatus::Healthy => {
                     let count = entry
-                        .adapter
-                        .list_tools()
+                        .cached_list_tools()
                         .await
                         .map(|t| t.len())
                         .unwrap_or(0);
@@ -375,6 +374,11 @@ async fn restart_endpoint(
                 );
             }
         }
+        // Rewire the tools-changed listener against the freshly swapped
+        // adapter, and invalidate any per-endpoint cached tool list so the
+        // next /tools/list reflects the rebuilt adapter.
+        registry.rewire_tools_changed_listener(&task_name).await;
+        registry.invalidate_endpoint_tool_cache(&task_name).await;
         registry.invalidate_catalog_cache().await;
 
         tracing::info!(endpoint = %task_name, "Restart: background task complete");
@@ -392,13 +396,15 @@ async fn refresh_endpoint(
     State(state): State<ManagementState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
+    // Drop the prior cached tools so the next read fetches fresh data,
+    // then repopulate the cache eagerly so callers see the new list.
+    state.registry.invalidate_endpoint_tool_cache(&name).await;
     let entries = state.registry.entries().read().await;
     let Some(entry) = entries.get(&name) else {
         return endpoint_not_found(&name).into_response();
     };
-    let result = entry.adapter.list_tools().await;
+    let result = entry.cached_list_tools().await;
     drop(entries);
-    state.registry.invalidate_catalog_cache().await;
     match result {
         Ok(tools) => Json(ActionResponse {
             ok: true,
@@ -2069,7 +2075,7 @@ async fn get_endpoint_tools(
     let Some(entry) = entries.get(&name) else {
         return endpoint_not_found(&name).into_response();
     };
-    match entry.adapter.list_tools().await {
+    match entry.cached_list_tools().await {
         Ok(tools) => {
             let mut tools_with_status: Vec<ToolInfoWithStatus> = tools
                 .into_iter()

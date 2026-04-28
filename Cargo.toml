@@ -61,6 +61,10 @@ path = "tests/fixtures/http_server.rs"
 name = "fixture-bad-server"
 path = "tests/fixtures/bad_server.rs"
 
+[[bin]]
+name = "fixture-swap-notify-server"
+path = "tests/fixtures/swap_notify_server.rs"
+
 [dev-dependencies]
 futures-util = "0.3"
 reqwest = { version = "0.13", features = ["json", "stream"] }

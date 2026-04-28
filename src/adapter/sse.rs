@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{broadcast, Mutex, Notify, RwLock};
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 
@@ -132,6 +132,9 @@ pub struct SseAdapter {
     reconnect_notify: Arc<Notify>,
     /// Notified by `shutdown()` so the supervisor can exit cleanly.
     shutdown_notify: Arc<Notify>,
+    /// Broadcast emitter for `notifications/tools/list_changed` events. Each
+    /// tick is an opaque cache-invalidation signal consumed by the registry.
+    tools_changed_tx: broadcast::Sender<()>,
 }
 
 impl SseAdapter {
@@ -163,6 +166,8 @@ impl SseAdapter {
             .build()
             .expect("failed to build HTTP client");
 
+        let (tools_changed_tx, _) = broadcast::channel(16);
+
         Self {
             config,
             client,
@@ -177,6 +182,7 @@ impl SseAdapter {
             reconnect_handle: Arc::new(Mutex::new(None)),
             reconnect_notify: Arc::new(Notify::new()),
             shutdown_notify: Arc::new(Notify::new()),
+            tools_changed_tx,
         }
     }
 
@@ -253,6 +259,7 @@ impl SseAdapter {
         let health = self.health.clone();
         let reconnect_notify = self.reconnect_notify.clone();
         let base_url = self.config.url.clone();
+        let tools_changed_tx = self.tools_changed_tx.clone();
 
         // Spawn SSE listener task
         let handle = tokio::spawn(async move {
@@ -312,12 +319,42 @@ impl SseAdapter {
                                         let _ = tx.send(endpoint_url);
                                     }
                                 }
-                                "message" => match serde_json::from_str::<JsonRpcResponse>(&data) {
-                                    Ok(response) => {
-                                        if let Some(id) = response.id {
-                                            let mut map = pending.lock().await;
-                                            if let Some(tx) = map.remove(&id) {
-                                                let _ = tx.send(response);
+                                "message" => match serde_json::from_str::<Value>(&data) {
+                                    Ok(value) => {
+                                        let id_opt = value.get("id").and_then(|v| v.as_u64());
+                                        let method_opt =
+                                            value.get("method").and_then(|v| v.as_str());
+                                        if id_opt.is_none() {
+                                            // No id → JSON-RPC notification (or malformed
+                                            // response). Surface tools-changed ticks; log
+                                            // others.
+                                            match method_opt {
+                                                Some("notifications/tools/list_changed") => {
+                                                    debug!(
+                                                        "received tools/list_changed notification"
+                                                    );
+                                                    let _ = tools_changed_tx.send(());
+                                                }
+                                                Some(method) => {
+                                                    debug!(method = %method, "ignoring SSE notification");
+                                                }
+                                                None => {
+                                                    warn!(data = %data, "SSE message has no id and no method");
+                                                }
+                                            }
+                                        } else {
+                                            match serde_json::from_value::<JsonRpcResponse>(value) {
+                                                Ok(response) => {
+                                                    if let Some(id) = response.id {
+                                                        let mut map = pending.lock().await;
+                                                        if let Some(tx) = map.remove(&id) {
+                                                            let _ = tx.send(response);
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!(error = %e, data = %data, "failed to parse SSE response");
+                                                }
                                             }
                                         }
                                     }
@@ -500,6 +537,11 @@ impl SseAdapter {
         *self.server_type.write().await = Some(sanitized);
         *self.health.write().await = HealthStatus::Healthy;
         self.crash_tracker.lock().await.reset();
+        // Emit a tick after every successful (re)connect + handshake so any
+        // stale post-disconnect tools cache gets invalidated. The registry's
+        // listener loop is idempotent; a no-op invalidation on an empty cache
+        // is harmless. `SendError` (no subscribers) is harmless — drop it.
+        let _ = self.tools_changed_tx.send(());
         Ok(())
     }
 
@@ -622,6 +664,10 @@ impl McpAdapter for SseAdapter {
 
     fn server_type(&self) -> Option<String> {
         self.server_type.try_read().ok().and_then(|g| g.clone())
+    }
+
+    fn subscribe_tools_changed(&self) -> Option<broadcast::Receiver<()>> {
+        Some(self.tools_changed_tx.subscribe())
     }
 
     async fn shutdown(&mut self) -> Result<(), AdapterError> {

@@ -231,7 +231,8 @@ pub async fn apply_diff(
                 }
             }
             drop(entries);
-            reg.invalidate_catalog_cache().await;
+            reg.rewire_tools_changed_listener(&name_clone).await;
+            reg.invalidate_endpoint_tool_cache(&name_clone).await;
             info!(endpoint = %name_clone, "Changed endpoint initialized");
         });
     }
@@ -273,7 +274,8 @@ pub async fn apply_diff(
                 }
             }
             drop(entries);
-            reg.invalidate_catalog_cache().await;
+            reg.rewire_tools_changed_listener(&ep_clone.name).await;
+            reg.invalidate_endpoint_tool_cache(&ep_clone.name).await;
             info!(endpoint = %ep_clone.name, "New endpoint initialized");
         });
     }
@@ -396,7 +398,8 @@ pub async fn apply_diff_graceful(
                 }
             }
             drop(entries);
-            reg.invalidate_catalog_cache().await;
+            reg.rewire_tools_changed_listener(&name_clone).await;
+            reg.invalidate_endpoint_tool_cache(&name_clone).await;
             info!(endpoint = %name_clone, "Changed endpoint initialized");
         });
     }
@@ -462,7 +465,8 @@ pub async fn apply_diff_graceful(
                 }
             }
             drop(entries);
-            reg.invalidate_catalog_cache().await;
+            reg.rewire_tools_changed_listener(&ep_clone.name).await;
+            reg.invalidate_endpoint_tool_cache(&ep_clone.name).await;
             info!(endpoint = %ep_clone.name, "New endpoint initialized");
         });
     }
@@ -562,7 +566,7 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use std::collections::HashMap;
-    use tokio::sync::RwLock;
+    use tokio::sync::{broadcast, RwLock};
 
     /// A mock adapter that tracks whether shutdown was called.
     struct MockAdapter {
@@ -609,12 +613,73 @@ mod tests {
         }
     }
 
+    /// Mock adapter that exposes a tools-changed broadcast receiver. Used to
+    /// verify that registry rewires its listener against the *new* adapter
+    /// after an in-place swap.
+    struct NotifyingMockAdapter {
+        tools: Vec<ToolInfo>,
+        tx: broadcast::Sender<()>,
+    }
+
+    impl NotifyingMockAdapter {
+        fn new(tools: Vec<ToolInfo>, tx: broadcast::Sender<()>) -> Self {
+            Self { tools, tx }
+        }
+    }
+
+    #[async_trait]
+    impl McpAdapter for NotifyingMockAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(self.tools.clone())
+        }
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, AdapterError> {
+            Ok(json!({}))
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        fn subscribe_tools_changed(&self) -> Option<broadcast::Receiver<()>> {
+            Some(self.tx.subscribe())
+        }
+    }
+
     fn make_tool(name: &str) -> ToolInfo {
         ToolInfo {
             name: name.to_string(),
             description: Some(format!("{} tool", name)),
             input_schema: json!({"type": "object"}),
             annotations: None,
+        }
+    }
+
+    fn endpoint_with_bad_command(name: &str) -> EndpointConfig {
+        EndpointConfig {
+            name: name.to_string(),
+            description: None,
+            tool_prefix: None,
+            transport: Transport::Stdio,
+            command: Some("/nonexistent/binary/that/wont/start".to_string()),
+            args: None,
+            url: None,
+            env: None,
+            headers: None,
+            disabled: false,
+            disabled_tools: Vec::new(),
+            oauth_server_url: None,
+            client_id: None,
+            client_secret: None,
+            scopes: None,
+            token_endpoint: None,
         }
     }
 
@@ -900,6 +965,224 @@ mod tests {
         assert!(
             inner_map.contains_key("oauth_ep"),
             "Inner should be registered for oauth_ep"
+        );
+    }
+
+    // ---- G1: apply_diff_graceful direct coverage ------------------------
+
+    #[tokio::test]
+    async fn apply_diff_graceful_no_warnings_added_initializes_in_background() {
+        // Drives apply_diff_graceful's added-endpoint branch with no warnings:
+        // create_adapter fails fast (bad command) so the spawn replaces the
+        // StartingAdapter with a FailedAdapter and runs rewire+invalidate.
+        let registry = Arc::new(AdapterRegistry::new());
+        let (tm, inners) = test_oauth_infra();
+        let new_ep = endpoint_with_bad_command("bad_added");
+        let diff = ConfigDiff {
+            added: vec![new_ep],
+            ..empty_diff()
+        };
+
+        apply_diff_graceful(&diff, &registry, &[], &Default::default(), &tm, &inners).await;
+
+        // Wait for the background spawn to swap StartingAdapter for the
+        // (Failed) adapter produced by create_adapter.
+        let stop = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let entries = registry.entries().read().await;
+            if let Some(entry) = entries.get("bad_added") {
+                if !matches!(entry.adapter.health(), HealthStatus::Starting) {
+                    break;
+                }
+            }
+            drop(entries);
+            if std::time::Instant::now() >= stop {
+                panic!("background init never replaced StartingAdapter");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let entries = registry.entries().read().await;
+        let entry = entries.get("bad_added").expect("bad_added registered");
+        assert!(matches!(entry.adapter.health(), HealthStatus::Unhealthy(_)));
+        // create_adapter failure path => empty cache, so invalidate ran cleanly.
+        assert!(entry.tool_cache.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_diff_graceful_added_warned_endpoint_registers_failed_adapter() {
+        // Warned added endpoints must be registered as FailedAdapter immediately
+        // (no background init, no create_adapter call).
+        let registry = Arc::new(AdapterRegistry::new());
+        let (tm, inners) = test_oauth_infra();
+
+        let mut new_ep = endpoint_with_bad_command("warned_added");
+        new_ep.disabled_tools = vec!["x".to_string()];
+        let diff = ConfigDiff {
+            added: vec![new_ep],
+            ..empty_diff()
+        };
+        let warnings = vec![config::EndpointValidationWarning {
+            endpoint_name: "warned_added".to_string(),
+            message: "bogus command".to_string(),
+        }];
+        let warned: std::collections::HashSet<String> =
+            warnings.iter().map(|w| w.endpoint_name.clone()).collect();
+
+        apply_diff_graceful(&diff, &registry, &warnings, &warned, &tm, &inners).await;
+
+        // No background spawn for warned endpoints — entry is final immediately.
+        let entries = registry.entries().read().await;
+        let entry = entries
+            .get("warned_added")
+            .expect("warned_added registered");
+        match entry.adapter.health() {
+            HealthStatus::Unhealthy(msg) => assert!(msg.contains("bogus command")),
+            other => panic!("expected Unhealthy with warning message, got {:?}", other),
+        }
+        // disabled_tools preserved from the new endpoint config
+        assert!(entry.disabled_tools.contains("x"));
+    }
+
+    #[tokio::test]
+    async fn apply_diff_graceful_changed_warned_endpoint_registers_failed_adapter() {
+        // Warned changed endpoints must shut down old adapter and register a
+        // FailedAdapter immediately (no background init), preserving prior
+        // disabled/disabled_tools state.
+        let registry = Arc::new(AdapterRegistry::new());
+        let (tm, inners) = test_oauth_infra();
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("t")], shutdown.clone())),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+        // Mark prior disabled state to verify it carries through the swap.
+        {
+            let mut entries = registry.entries().write().await;
+            let entry = entries.get_mut("ep").unwrap();
+            entry.disabled_tools.insert("preexisting".to_string());
+        }
+
+        let changed_ep = endpoint_with_bad_command("ep");
+        let diff = ConfigDiff {
+            changed: vec![("ep".to_string(), changed_ep)],
+            ..empty_diff()
+        };
+        let warnings = vec![config::EndpointValidationWarning {
+            endpoint_name: "ep".to_string(),
+            message: "validation failed".to_string(),
+        }];
+        let warned: std::collections::HashSet<String> = ["ep".to_string()].into_iter().collect();
+
+        apply_diff_graceful(&diff, &registry, &warnings, &warned, &tm, &inners).await;
+
+        // Old adapter shut down synchronously.
+        assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
+        let entries = registry.entries().read().await;
+        let entry = entries.get("ep").expect("ep still registered");
+        match entry.adapter.health() {
+            HealthStatus::Unhealthy(msg) => assert!(msg.contains("validation failed")),
+            other => panic!("expected Unhealthy with warning, got {:?}", other),
+        }
+        // Prior disabled_tools must be preserved across the warning swap.
+        assert!(entry.disabled_tools.contains("preexisting"));
+    }
+
+    // ---- G2: registry rewires tools-changed listener after swap --------
+
+    #[tokio::test]
+    async fn registry_swap_rewires_tools_changed_listener() {
+        // Mirrors apply_diff_graceful's spawn block: in-place swap of
+        // entry.adapter, followed by rewire_tools_changed_listener +
+        // invalidate_endpoint_tool_cache. After the swap, ticks on the NEW
+        // adapter's sender must invalidate the per-endpoint cache; ticks on
+        // the OLD adapter's sender must be ignored (its forwarder was aborted
+        // and the only subscriber was dropped).
+        let registry = Arc::new(AdapterRegistry::new());
+        let (tx_old, _) = broadcast::channel::<()>(16);
+        let (tx_new, _) = broadcast::channel::<()>(16);
+
+        registry
+            .register(
+                "ep".into(),
+                Box::new(NotifyingMockAdapter::new(
+                    vec![make_tool("old_tool")],
+                    tx_old.clone(),
+                )),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        // Prime the per-endpoint cache so we can later detect invalidation.
+        let _ = registry.merged_catalog().await;
+        {
+            let entries = registry.entries().read().await;
+            let entry = entries.get("ep").unwrap();
+            assert!(
+                entry.tool_cache.read().await.is_some(),
+                "cache should be primed before swap"
+            );
+        }
+
+        // Simulate apply_diff_graceful's in-place swap + rewire + invalidate.
+        {
+            let mut entries = registry.entries().write().await;
+            let entry = entries.get_mut("ep").unwrap();
+            entry.adapter = Box::new(NotifyingMockAdapter::new(
+                vec![make_tool("new_tool")],
+                tx_new.clone(),
+            ));
+        }
+        registry.rewire_tools_changed_listener("ep").await;
+        registry.invalidate_endpoint_tool_cache("ep").await;
+
+        // Re-prime the cache so the next tick has something to invalidate.
+        let _ = registry.merged_catalog().await;
+        {
+            let entries = registry.entries().read().await;
+            let entry = entries.get("ep").unwrap();
+            assert!(
+                entry.tool_cache.read().await.is_some(),
+                "cache should be re-primed after swap"
+            );
+        }
+
+        // Tick on NEW sender must propagate to the listener and clear cache.
+        tx_new.send(()).expect("new send");
+        let stop = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut cleared = false;
+        while std::time::Instant::now() < stop {
+            let entries = registry.entries().read().await;
+            let entry = entries.get("ep").unwrap();
+            if entry.tool_cache.read().await.is_none() {
+                cleared = true;
+                break;
+            }
+            drop(entries);
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            cleared,
+            "listener was not rewired against the new adapter's sender"
+        );
+
+        // Re-prime once more, then fire on the OLD sender. The OLD listener
+        // was aborted by rewire_tools_changed_listener; the per-endpoint
+        // cache must remain intact.
+        let _ = registry.merged_catalog().await;
+        let _ = tx_old.send(()); // may be Err(_) if no subscribers — that's fine
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let entries = registry.entries().read().await;
+        let entry = entries.get("ep").unwrap();
+        assert!(
+            entry.tool_cache.read().await.is_some(),
+            "old adapter's sender must NOT invalidate the cache after rewire"
         );
     }
 }

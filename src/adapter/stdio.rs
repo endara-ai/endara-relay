@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
@@ -154,6 +154,10 @@ pub struct StdioAdapter {
     crash_tracker: Arc<Mutex<CrashTracker>>,
     /// Sanitized server name from the MCP initialize response.
     server_type: Arc<RwLock<Option<String>>>,
+    /// Broadcast sender used to fan out `notifications/tools/list_changed`
+    /// observations to subscribers (the registry's listener loop). Capacity is
+    /// 16; `SendError` (no subscribers) is intentionally ignored.
+    tools_changed_tx: broadcast::Sender<()>,
     // Background task handles
     _stderr_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     _stdout_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -162,6 +166,7 @@ pub struct StdioAdapter {
 impl StdioAdapter {
     /// Create a new StdioAdapter with the given configuration.
     pub fn new(config: StdioConfig) -> Self {
+        let (tools_changed_tx, _) = broadcast::channel(16);
         Self {
             config,
             child: Arc::new(Mutex::new(None)),
@@ -172,6 +177,7 @@ impl StdioAdapter {
             request_id: AtomicU64::new(1),
             crash_tracker: Arc::new(Mutex::new(CrashTracker::new())),
             server_type: Arc::new(RwLock::new(None)),
+            tools_changed_tx,
             _stderr_handle: Arc::new(Mutex::new(None)),
             _stdout_handle: Arc::new(Mutex::new(None)),
         }
@@ -222,6 +228,8 @@ impl StdioAdapter {
 
         // Set up stdout line reader that dispatches by JSON-RPC response ID
         let pending = self.pending_requests.clone();
+        let tools_changed_tx = self.tools_changed_tx.clone();
+        // TODO: emit tick after post-restart handshake when auto-restart is added
         let stdout_handle = tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
@@ -244,8 +252,16 @@ impl StdioAdapter {
                                 }
                             }
                         } else {
-                            // Server notification (no id) — log and drop
-                            debug!(line = %line, "MCP server notification (no id), dropping");
+                            // Server notification (no id) — surface tools-changed
+                            // ticks; debug-log everything else and drop.
+                            match obj.get("method").and_then(|v| v.as_str()) {
+                                Some("notifications/tools/list_changed") => {
+                                    let _ = tools_changed_tx.send(());
+                                }
+                                _ => {
+                                    debug!(line = %line, "MCP server notification (no id), dropping");
+                                }
+                            }
                         }
                     }
                     Err(e) => {
@@ -441,6 +457,10 @@ impl McpAdapter for StdioAdapter {
 
     fn server_type(&self) -> Option<String> {
         self.server_type.try_read().ok().and_then(|g| g.clone())
+    }
+
+    fn subscribe_tools_changed(&self) -> Option<broadcast::Receiver<()>> {
+        Some(self.tools_changed_tx.subscribe())
     }
 
     async fn stderr_lines(&self) -> Vec<String> {
@@ -907,6 +927,118 @@ for line in sys.stdin:
         // The notification should be silently dropped, not returned as a response
         let result = adapter.send_request("tools/list", None).await.unwrap();
         assert_eq!(result["echo_method"], "tools/list");
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // tools-changed broadcast tests
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn test_subscribe_tools_changed_returns_some() {
+        let adapter = StdioAdapter::new(StdioConfig {
+            command: "python3".to_string(),
+            args: vec!["-c".to_string(), "pass".to_string()],
+            env: HashMap::new(),
+        });
+        assert!(
+            (&adapter as &dyn McpAdapter)
+                .subscribe_tools_changed()
+                .is_some(),
+            "stdio adapter should expose a tools-changed receiver"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stdio_emits_tick_on_list_changed_notification() {
+        // Server that, after each request, prints a tools/list_changed
+        // notification *before* its response. Subscribing before triggering
+        // the request must yield at least one tick on the broadcast channel.
+        let script = r#"
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+        notif = {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
+        sys.stdout.write(json.dumps(notif) + "\n")
+        sys.stdout.flush()
+        resp = {"jsonrpc": "2.0", "result": {"echo_method": req.get("method")}, "id": req.get("id")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
+"#;
+        let mut adapter = StdioAdapter::new(StdioConfig {
+            command: "python3".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: HashMap::new(),
+        });
+        adapter.spawn_process().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut rx = (&adapter as &dyn McpAdapter)
+            .subscribe_tools_changed()
+            .expect("stdio adapter exposes a tools-changed receiver");
+
+        // Trigger the server to emit the notification.
+        let _ = adapter.send_request("tools/list", None).await.unwrap();
+
+        let recv = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await;
+        match recv {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("broadcast recv error: {:?}", e),
+            Err(_) => panic!("did not receive tools-changed tick within 1s"),
+        }
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stdio_unrelated_notification_does_not_emit_tick() {
+        // Server that emits an unrelated notification before its response.
+        // The tools-changed subscriber must NOT receive a tick.
+        let script = r#"
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+        notif = {"jsonrpc": "2.0", "method": "notifications/message", "params": {"level": "info", "data": "hi"}}
+        sys.stdout.write(json.dumps(notif) + "\n")
+        sys.stdout.flush()
+        resp = {"jsonrpc": "2.0", "result": {"echo_method": req.get("method")}, "id": req.get("id")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
+"#;
+        let mut adapter = StdioAdapter::new(StdioConfig {
+            command: "python3".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: HashMap::new(),
+        });
+        adapter.spawn_process().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut rx = (&adapter as &dyn McpAdapter)
+            .subscribe_tools_changed()
+            .expect("stdio adapter exposes a tools-changed receiver");
+
+        let _ = adapter.send_request("tools/list", None).await.unwrap();
+
+        // Give the stdout reader a moment to process the notification line.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        match rx.try_recv() {
+            Err(broadcast::error::TryRecvError::Empty) => {}
+            other => panic!("expected no tick, got {:?}", other),
+        }
 
         adapter.shutdown().await.unwrap();
     }

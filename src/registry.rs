@@ -4,7 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::task::AbortHandle;
 use tracing::{debug, warn};
 
 /// A registered adapter with its metadata.
@@ -16,6 +17,36 @@ pub struct RegisteredAdapter {
     pub last_activity: Option<Instant>,
     pub disabled: bool,
     pub disabled_tools: HashSet<String>,
+    /// Per-adapter cache of the most recent successful `list_tools()` result.
+    /// Purely event-driven (no TTL); cleared by registry invalidation methods
+    /// or when the adapter is swapped/restarted.
+    pub(crate) tool_cache: RwLock<Option<Vec<ToolInfo>>>,
+    /// Coalesces concurrent cache misses so only one `list_tools()` call is
+    /// in-flight per adapter at a time.
+    pub(crate) tool_cache_populate_lock: Mutex<()>,
+    /// Abort handle for the background task that listens to the adapter's
+    /// `subscribe_tools_changed` broadcast and triggers cache invalidation
+    /// on each tick. `None` when the adapter does not expose a receiver.
+    pub(crate) tools_changed_task: Option<AbortHandle>,
+}
+
+impl RegisteredAdapter {
+    /// List tools using the per-adapter cache. On a hit, returns a clone of the
+    /// cached vector without calling the underlying adapter. On a miss, takes
+    /// the populate lock, re-checks the cache (in case another waiter already
+    /// populated it), then calls `adapter.list_tools()` and stores the result.
+    pub async fn cached_list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+        if let Some(cached) = self.tool_cache.read().await.as_ref() {
+            return Ok(cached.clone());
+        }
+        let _populate = self.tool_cache_populate_lock.lock().await;
+        if let Some(cached) = self.tool_cache.read().await.as_ref() {
+            return Ok(cached.clone());
+        }
+        let tools = self.adapter.list_tools().await?;
+        *self.tool_cache.write().await = Some(tools.clone());
+        Ok(tools)
+    }
 }
 
 /// Cached catalog type: `(tool_list, reverse_lookup_map)`.
@@ -59,7 +90,8 @@ impl AdapterRegistry {
         tool_prefix: Option<String>,
     ) {
         debug!(endpoint = %name, ?tool_prefix, "Registering adapter");
-        self.adapters.write().await.insert(
+        let listener_handle = self.spawn_tools_changed_listener(&name, adapter.as_ref());
+        let previous = self.adapters.write().await.insert(
             name,
             RegisteredAdapter {
                 adapter,
@@ -69,26 +101,139 @@ impl AdapterRegistry {
                 last_activity: None,
                 disabled: false,
                 disabled_tools: HashSet::new(),
+                tool_cache: RwLock::new(None),
+                tool_cache_populate_lock: Mutex::new(()),
+                tools_changed_task: listener_handle,
             },
         );
+        if let Some(prev) = previous {
+            if let Some(handle) = prev.tools_changed_task {
+                handle.abort();
+            }
+        }
         self.invalidate_catalog_cache().await;
     }
 
     /// Remove an adapter by endpoint name.
     pub async fn remove(&self, name: &str) -> Option<RegisteredAdapter> {
         let result = self.adapters.write().await.remove(name);
-        if result.is_some() {
+        if let Some(entry) = &result {
+            if let Some(handle) = &entry.tools_changed_task {
+                handle.abort();
+            }
             self.invalidate_catalog_cache().await;
         }
         result
     }
 
+    /// Subscribe to the adapter's tools-changed broadcast (if any) and spawn a
+    /// background task that invalidates the per-endpoint and catalog caches on
+    /// every tick. Returns the spawned task's [`AbortHandle`], or `None` if the
+    /// adapter does not expose a receiver.
+    fn spawn_tools_changed_listener(
+        &self,
+        name: &str,
+        adapter: &dyn McpAdapter,
+    ) -> Option<AbortHandle> {
+        let rx = adapter.subscribe_tools_changed()?;
+        let registry = self.clone();
+        let endpoint = name.to_string();
+        let task = tokio::spawn(async move {
+            Self::tools_changed_listener_loop(registry, endpoint, rx).await;
+        });
+        Some(task.abort_handle())
+    }
+
+    /// Listener loop driven by `subscribe_tools_changed`. Each successful tick
+    /// — as well as a `Lagged` error (treated as a missed-but-coalesced tick)
+    /// — invalidates the per-endpoint tools cache followed by the merged
+    /// catalog cache. A `Closed` receiver terminates the loop.
+    async fn tools_changed_listener_loop(
+        registry: Self,
+        endpoint: String,
+        mut rx: broadcast::Receiver<()>,
+    ) {
+        loop {
+            match rx.recv().await {
+                Ok(()) => {
+                    registry.invalidate_endpoint_tool_cache(&endpoint).await;
+                    registry.invalidate_catalog_cache().await;
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    debug!(
+                        endpoint = %endpoint,
+                        skipped,
+                        "tools-changed listener lagged; treating as tick"
+                    );
+                    registry.invalidate_endpoint_tool_cache(&endpoint).await;
+                    registry.invalidate_catalog_cache().await;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    debug!(endpoint = %endpoint, "tools-changed listener channel closed");
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Abort any existing tools-changed listener for `name` and re-subscribe
+    /// against the adapter currently stored at that endpoint. Call this after
+    /// swapping `entry.adapter` in place (e.g. background init, restart). No-op
+    /// if `name` is not registered.
+    pub async fn rewire_tools_changed_listener(&self, name: &str) {
+        let new_handle = {
+            let entries = self.adapters.read().await;
+            match entries.get(name) {
+                Some(entry) => self.spawn_tools_changed_listener(name, entry.adapter.as_ref()),
+                None => return,
+            }
+        };
+        let mut entries = self.adapters.write().await;
+        if let Some(entry) = entries.get_mut(name) {
+            if let Some(old) = entry.tools_changed_task.take() {
+                old.abort();
+            }
+            entry.tools_changed_task = new_handle;
+        } else if let Some(handle) = new_handle {
+            handle.abort();
+        }
+    }
+
     /// Invalidate the cached catalog so the next read rebuilds it, and bump
     /// the catalog generation counter so downstream caches (e.g. search
-    /// index) can detect the change.
+    /// index) can detect the change. Also clears every per-endpoint tools
+    /// cache so existing callers don't regress when the underlying adapters
+    /// might have changed.
     pub async fn invalidate_catalog_cache(&self) {
+        self.invalidate_all_tool_caches().await;
         *self.catalog_cache.write().await = None;
         self.catalog_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Invalidate the per-endpoint tools cache for a single adapter, clear
+    /// the merged catalog cache, and bump the catalog generation counter.
+    /// Used when an adapter is swapped in place (e.g. background init,
+    /// restart) so the next read fetches fresh tools from the new adapter.
+    pub async fn invalidate_endpoint_tool_cache(&self, name: &str) {
+        {
+            let entries = self.adapters.read().await;
+            if let Some(entry) = entries.get(name) {
+                *entry.tool_cache.write().await = None;
+            }
+        }
+        *self.catalog_cache.write().await = None;
+        self.catalog_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Clear every per-endpoint tools cache without touching the merged
+    /// catalog cache or the generation counter. Used internally by
+    /// [`invalidate_catalog_cache`] and available to callers that want a
+    /// surgical sweep across all adapters.
+    pub async fn invalidate_all_tool_caches(&self) {
+        let entries = self.adapters.read().await;
+        for entry in entries.values() {
+            *entry.tool_cache.write().await = None;
+        }
     }
 
     /// Return the current catalog generation. Starts at 0; incremented on
@@ -189,7 +334,7 @@ impl AdapterRegistry {
                 entry.tool_prefix.clone()
             };
 
-            match entry.adapter.list_tools().await {
+            match entry.cached_list_tools().await {
                 Ok(tools) => {
                     for tool in tools {
                         if entry.disabled_tools.contains(&tool.name) {
@@ -1203,6 +1348,9 @@ mod tests {
                     last_activity: None,
                     disabled: false,
                     disabled_tools: HashSet::new(),
+                    tool_cache: RwLock::new(None),
+                    tool_cache_populate_lock: Mutex::new(()),
+                    tools_changed_task: None,
                 },
             );
         }
@@ -1214,5 +1362,596 @@ mod tests {
         let catalog = registry.merged_catalog().await;
         assert_eq!(catalog.len(), 1);
         assert_eq!(catalog[0].name, "surprise");
+    }
+
+    // --- Per-adapter tools cache (T1) ---
+
+    /// Mock adapter that records the number of `list_tools` invocations.
+    struct CountingAdapter {
+        tools: Vec<ToolInfo>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        delay: Option<std::time::Duration>,
+    }
+
+    impl CountingAdapter {
+        fn new(tools: Vec<ToolInfo>) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Self {
+                    tools,
+                    calls: calls.clone(),
+                    delay: None,
+                },
+                calls,
+            )
+        }
+
+        fn with_delay(mut self, delay: std::time::Duration) -> Self {
+            self.delay = Some(delay);
+            self
+        }
+    }
+
+    #[async_trait]
+    impl McpAdapter for CountingAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(d) = self.delay {
+                tokio::time::sleep(d).await;
+            }
+            Ok(self.tools.clone())
+        }
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, AdapterError> {
+            Ok(json!({}))
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cached_list_tools_hit_does_not_call_adapter() {
+        let registry = AdapterRegistry::new();
+        let (adapter, calls) = CountingAdapter::new(vec![make_tool("a"), make_tool("b")]);
+        registry
+            .register(
+                "ep".into(),
+                Box::new(adapter),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        let entries = registry.entries().read().await;
+        let entry = entries.get("ep").unwrap();
+        let first = entry.cached_list_tools().await.unwrap();
+        let second = entry.cached_list_tools().await.unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "second cached_list_tools call should hit the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cached_list_tools_populates_once_under_concurrency() {
+        let registry = AdapterRegistry::new();
+        let (adapter, calls) = CountingAdapter::new(vec![make_tool("a")]);
+        let adapter = adapter.with_delay(std::time::Duration::from_millis(50));
+        registry
+            .register(
+                "ep".into(),
+                Box::new(adapter),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        let registry = Arc::new(registry);
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let reg = registry.clone();
+            handles.push(tokio::spawn(async move {
+                let entries = reg.entries().read().await;
+                let entry = entries.get("ep").unwrap();
+                entry.cached_list_tools().await.unwrap()
+            }));
+        }
+        for h in handles {
+            let tools = h.await.unwrap();
+            assert_eq!(tools.len(), 1);
+        }
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "concurrent cached_list_tools calls must coalesce into a single populate"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_endpoint_tool_cache_clears_only_target() {
+        let registry = AdapterRegistry::new();
+        let (a1, calls1) = CountingAdapter::new(vec![make_tool("x")]);
+        let (a2, calls2) = CountingAdapter::new(vec![make_tool("y")]);
+        registry
+            .register(
+                "ep1".into(),
+                Box::new(a1),
+                "stdio".into(),
+                None,
+                Some("ep1".into()),
+            )
+            .await;
+        registry
+            .register(
+                "ep2".into(),
+                Box::new(a2),
+                "stdio".into(),
+                None,
+                Some("ep2".into()),
+            )
+            .await;
+
+        // Prime both caches.
+        {
+            let entries = registry.entries().read().await;
+            entries
+                .get("ep1")
+                .unwrap()
+                .cached_list_tools()
+                .await
+                .unwrap();
+            entries
+                .get("ep2")
+                .unwrap()
+                .cached_list_tools()
+                .await
+                .unwrap();
+        }
+        assert_eq!(calls1.load(Ordering::Relaxed), 1);
+        assert_eq!(calls2.load(Ordering::Relaxed), 1);
+
+        // Invalidate only ep1.
+        registry.invalidate_endpoint_tool_cache("ep1").await;
+
+        {
+            let entries = registry.entries().read().await;
+            entries
+                .get("ep1")
+                .unwrap()
+                .cached_list_tools()
+                .await
+                .unwrap();
+            entries
+                .get("ep2")
+                .unwrap()
+                .cached_list_tools()
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            calls1.load(Ordering::Relaxed),
+            2,
+            "ep1 cache should be invalidated and refetched"
+        );
+        assert_eq!(
+            calls2.load(Ordering::Relaxed),
+            1,
+            "ep2 cache should remain intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_all_tool_caches_clears_every_entry() {
+        let registry = AdapterRegistry::new();
+        let (a1, calls1) = CountingAdapter::new(vec![make_tool("x")]);
+        let (a2, calls2) = CountingAdapter::new(vec![make_tool("y")]);
+        registry
+            .register(
+                "ep1".into(),
+                Box::new(a1),
+                "stdio".into(),
+                None,
+                Some("ep1".into()),
+            )
+            .await;
+        registry
+            .register(
+                "ep2".into(),
+                Box::new(a2),
+                "stdio".into(),
+                None,
+                Some("ep2".into()),
+            )
+            .await;
+
+        {
+            let entries = registry.entries().read().await;
+            entries
+                .get("ep1")
+                .unwrap()
+                .cached_list_tools()
+                .await
+                .unwrap();
+            entries
+                .get("ep2")
+                .unwrap()
+                .cached_list_tools()
+                .await
+                .unwrap();
+        }
+        registry.invalidate_all_tool_caches().await;
+        {
+            let entries = registry.entries().read().await;
+            entries
+                .get("ep1")
+                .unwrap()
+                .cached_list_tools()
+                .await
+                .unwrap();
+            entries
+                .get("ep2")
+                .unwrap()
+                .cached_list_tools()
+                .await
+                .unwrap();
+        }
+        assert_eq!(calls1.load(Ordering::Relaxed), 2);
+        assert_eq!(calls2.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_catalog_cache_clears_per_endpoint_caches() {
+        let registry = AdapterRegistry::new();
+        let (adapter, calls) = CountingAdapter::new(vec![make_tool("a")]);
+        registry
+            .register(
+                "ep".into(),
+                Box::new(adapter),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        // First merged_catalog populates the per-endpoint cache.
+        let _ = registry.merged_catalog().await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // A second merged_catalog hits the catalog cache (no list_tools call).
+        let _ = registry.merged_catalog().await;
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // Global invalidation should clear the per-endpoint cache too,
+        // forcing a fresh list_tools on the next rebuild.
+        registry.invalidate_catalog_cache().await;
+        let _ = registry.merged_catalog().await;
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "invalidate_catalog_cache must clear per-endpoint caches"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_endpoint_tool_cache_bumps_generation_and_clears_catalog() {
+        let registry = AdapterRegistry::new();
+        let (adapter, _calls) = CountingAdapter::new(vec![make_tool("a")]);
+        registry
+            .register(
+                "ep".into(),
+                Box::new(adapter),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        let _ = registry.merged_catalog().await;
+        let gen_before = registry.catalog_generation();
+        registry.invalidate_endpoint_tool_cache("ep").await;
+        assert!(registry.catalog_generation() > gen_before);
+        // catalog_cache should be cleared; merged_catalog rebuilds.
+        let catalog = registry.merged_catalog().await;
+        assert_eq!(catalog.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_invalidate_endpoint_tool_cache_unknown_name_is_noop() {
+        let registry = AdapterRegistry::new();
+        let (adapter, _calls) = CountingAdapter::new(vec![make_tool("a")]);
+        registry
+            .register(
+                "ep".into(),
+                Box::new(adapter),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+        // Should not panic and should still bump generation / clear catalog.
+        let gen_before = registry.catalog_generation();
+        registry
+            .invalidate_endpoint_tool_cache("does-not-exist")
+            .await;
+        assert!(registry.catalog_generation() > gen_before);
+    }
+
+    // --- Tools-changed listener (T2) ---
+
+    /// Mock adapter exposing a `broadcast::Sender<()>` so tests can drive
+    /// `subscribe_tools_changed` ticks. Each `list_tools` invocation is
+    /// counted via the shared atomic.
+    struct NotifyingAdapter {
+        tools: Vec<ToolInfo>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        tx: broadcast::Sender<()>,
+    }
+
+    impl NotifyingAdapter {
+        fn new(
+            tools: Vec<ToolInfo>,
+            capacity: usize,
+        ) -> (
+            Self,
+            Arc<std::sync::atomic::AtomicUsize>,
+            broadcast::Sender<()>,
+        ) {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (tx, _) = broadcast::channel(capacity);
+            (
+                Self {
+                    tools,
+                    calls: calls.clone(),
+                    tx: tx.clone(),
+                },
+                calls,
+                tx,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl McpAdapter for NotifyingAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.tools.clone())
+        }
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, AdapterError> {
+            Ok(json!({}))
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        fn subscribe_tools_changed(&self) -> Option<broadcast::Receiver<()>> {
+            Some(self.tx.subscribe())
+        }
+    }
+
+    /// Spin until `cond` returns true or the deadline elapses.
+    async fn await_until<F>(timeout: std::time::Duration, mut cond: F) -> bool
+    where
+        F: FnMut() -> bool,
+    {
+        let deadline = std::time::Instant::now() + timeout;
+        while std::time::Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        cond()
+    }
+
+    #[tokio::test]
+    async fn test_tools_changed_tick_invalidates_cache() {
+        let registry = AdapterRegistry::new();
+        let (adapter, calls, tx) = NotifyingAdapter::new(vec![make_tool("a")], 8);
+        registry
+            .register(
+                "ep".into(),
+                Box::new(adapter),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        // Populate the per-endpoint cache (call #1).
+        {
+            let entries = registry.entries().read().await;
+            entries
+                .get("ep")
+                .unwrap()
+                .cached_list_tools()
+                .await
+                .unwrap();
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+
+        // Send a tick and wait for the listener to invalidate.
+        let gen_before = registry.catalog_generation();
+        tx.send(()).unwrap();
+        let observed = await_until(std::time::Duration::from_secs(1), || {
+            registry.catalog_generation() > gen_before
+        })
+        .await;
+        assert!(observed, "catalog generation should advance after tick");
+
+        // Next cached_list_tools should re-invoke the adapter (call #2).
+        {
+            let entries = registry.entries().read().await;
+            entries
+                .get("ep")
+                .unwrap()
+                .cached_list_tools()
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            2,
+            "cache should have been cleared by the tools-changed tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_remove_aborts_listener_task() {
+        let registry = AdapterRegistry::new();
+        let (adapter, _calls, tx) = NotifyingAdapter::new(vec![make_tool("a")], 8);
+        registry
+            .register(
+                "ep".into(),
+                Box::new(adapter),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        // Sender should observe one receiver (the listener task).
+        assert_eq!(tx.receiver_count(), 1);
+
+        let removed = registry.remove("ep").await;
+        assert!(removed.is_some());
+
+        // After remove + abort, the listener task drops its receiver.
+        let dropped = await_until(std::time::Duration::from_secs(1), || {
+            tx.receiver_count() == 0
+        })
+        .await;
+        assert!(
+            dropped,
+            "listener receiver should be dropped after remove()"
+        );
+
+        // Sending after remove must not panic and must not affect the registry.
+        let gen_before = registry.catalog_generation();
+        // No active receivers → send returns Err, which we deliberately ignore.
+        let _ = tx.send(());
+        // Give any (lingering) tasks a chance to run.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert_eq!(
+            registry.catalog_generation(),
+            gen_before,
+            "no listener should remain to bump the generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_watcher_swap_rewires_listener() {
+        let registry = AdapterRegistry::new();
+        let (a1, _calls1, tx_old) = NotifyingAdapter::new(vec![make_tool("old")], 8);
+        registry
+            .register(
+                "ep".into(),
+                Box::new(a1),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+        assert_eq!(tx_old.receiver_count(), 1);
+
+        // Simulate the watcher swap: replace adapter in place, then rewire.
+        let (a2, _calls2, tx_new) = NotifyingAdapter::new(vec![make_tool("new")], 8);
+        {
+            let mut entries = registry.entries().write().await;
+            entries.get_mut("ep").unwrap().adapter = Box::new(a2);
+        }
+        registry.rewire_tools_changed_listener("ep").await;
+
+        // Old sender's listener must be torn down; new sender must have one.
+        let old_dropped = await_until(std::time::Duration::from_secs(1), || {
+            tx_old.receiver_count() == 0
+        })
+        .await;
+        assert!(old_dropped, "old listener should be aborted on swap");
+        assert_eq!(tx_new.receiver_count(), 1);
+
+        // Tick on the OLD sender must NOT bump the registry.
+        let gen_before = registry.catalog_generation();
+        let _ = tx_old.send(());
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert_eq!(
+            registry.catalog_generation(),
+            gen_before,
+            "old sender ticks must be ignored after swap"
+        );
+
+        // Tick on the NEW sender must bump the registry.
+        tx_new.send(()).unwrap();
+        let observed = await_until(std::time::Duration::from_secs(1), || {
+            registry.catalog_generation() > gen_before
+        })
+        .await;
+        assert!(observed, "new sender ticks must drive invalidation");
+    }
+
+    #[tokio::test]
+    async fn test_tools_changed_lagged_invalidates() {
+        let registry = AdapterRegistry::new();
+        // Capacity = 1: any burst beyond a single buffered message forces
+        // `Lagged` on the next `recv()` after the listener drains.
+        let (adapter, _calls, tx) = NotifyingAdapter::new(vec![make_tool("a")], 1);
+        registry
+            .register(
+                "ep".into(),
+                Box::new(adapter),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        // Drive one Ok tick first so the listener is back at `recv()` with
+        // an empty buffer. Catalog generation bumps twice per tick (per-endpoint
+        // cache + catalog cache).
+        tx.send(()).unwrap();
+        let _ = await_until(std::time::Duration::from_secs(1), || {
+            registry.catalog_generation() >= 3
+        })
+        .await;
+        let gen_after_first = registry.catalog_generation();
+
+        // Now send a burst that overruns capacity. The listener will observe
+        // exactly one `Lagged` on its next `recv()`, which must still trigger
+        // an invalidation per the spec.
+        for _ in 0..5 {
+            let _ = tx.send(());
+        }
+
+        let observed = await_until(std::time::Duration::from_secs(1), || {
+            registry.catalog_generation() > gen_after_first
+        })
+        .await;
+        assert!(
+            observed,
+            "Lagged ticks must still trigger cache invalidation"
+        );
     }
 }
