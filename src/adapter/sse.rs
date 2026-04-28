@@ -1027,6 +1027,31 @@ mod tests {
             // Health remains Unhealthy — confirm by sampling again after a delay.
             tokio::time::sleep(Duration::from_millis(300)).await;
             assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+
+            // Supervisor task must have terminated after hitting the cap.
+            {
+                let guard = adapter.reconnect_handle.lock().await;
+                let handle = guard
+                    .as_ref()
+                    .expect("supervisor handle should still be tracked post-cap");
+                assert!(
+                    handle.is_finished(),
+                    "supervisor should exit after failure cap"
+                );
+            }
+
+            // Subsequent stream-death notifications must NOT restart the
+            // supervisor or trigger further GET /sse attempts.
+            let connections_before = server.state.connections.load(Ordering::SeqCst);
+            adapter.reconnect_notify.notify_waiters();
+            adapter.reconnect_notify.notify_one();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert_eq!(
+                server.state.connections.load(Ordering::SeqCst),
+                connections_before,
+                "supervisor must not restart after cap"
+            );
+
             adapter.shutdown().await.unwrap();
         }
 
@@ -1092,6 +1117,155 @@ mod tests {
             );
             assert!(adapter.reconnect_handle.lock().await.is_none());
             assert!(adapter.sse_handle.lock().await.is_none());
+            assert_eq!(adapter.health(), HealthStatus::Stopped);
+        }
+
+        #[tokio::test]
+        async fn crash_tracker_reset_on_successful_reconnect() {
+            let server = start_test_server().await;
+            let mut adapter = build_adapter(&server.url, 5).await;
+            adapter.initialize().await.expect("initial connect");
+            assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+            // Drive a single failure cycle: close the stream, wait for the
+            // supervisor to flag Unhealthy, then wait for a successful
+            // auto-reconnect back to Healthy.
+            server.close_all_streams();
+            let h = wait_for_health(
+                &adapter,
+                |h| matches!(h, HealthStatus::Unhealthy(_)),
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(matches!(h, HealthStatus::Unhealthy(_)));
+            let h = wait_for_health(
+                &adapter,
+                |h| *h == HealthStatus::Healthy,
+                Duration::from_secs(3),
+            )
+            .await;
+            assert_eq!(h, HealthStatus::Healthy);
+
+            // After the successful reconnect, the crash tracker must be
+            // reset so the next failure cycle starts with a full attempt
+            // budget rather than 1 attempt left.
+            {
+                let tracker = adapter.crash_tracker.lock().await;
+                assert_eq!(
+                    tracker.consecutive_failures, 0,
+                    "tracker must reset consecutive_failures on success"
+                );
+                assert!(
+                    tracker.timestamps.is_empty(),
+                    "tracker must clear failure timestamps on success"
+                );
+            }
+
+            adapter.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn supervisor_handles_multiple_reconnect_cycles() {
+            let server = start_test_server().await;
+            let mut adapter = build_adapter(&server.url, 5).await;
+            adapter.initialize().await.expect("initial connect");
+
+            for cycle in 0..3 {
+                server.close_all_streams();
+                let h = wait_for_health(
+                    &adapter,
+                    |h| matches!(h, HealthStatus::Unhealthy(_)),
+                    Duration::from_secs(2),
+                )
+                .await;
+                assert!(
+                    matches!(h, HealthStatus::Unhealthy(_)),
+                    "cycle {}: expected Unhealthy after stream close, got {:?}",
+                    cycle,
+                    h
+                );
+                let h = wait_for_health(
+                    &adapter,
+                    |h| *h == HealthStatus::Healthy,
+                    Duration::from_secs(3),
+                )
+                .await;
+                assert_eq!(
+                    h,
+                    HealthStatus::Healthy,
+                    "cycle {}: expected Healthy after auto-reconnect",
+                    cycle
+                );
+            }
+
+            // No pending requests should have leaked across cycles.
+            assert!(
+                adapter.pending.lock().await.is_empty(),
+                "pending requests leaked across reconnect cycles"
+            );
+
+            // The same supervisor task should still be servicing reconnects;
+            // a fresh listener handle should be tracked from the latest cycle.
+            {
+                let sup = adapter.reconnect_handle.lock().await;
+                assert!(
+                    sup.as_ref().is_some_and(|h| !h.is_finished()),
+                    "supervisor should still be running after multiple cycles"
+                );
+            }
+            assert!(
+                adapter.sse_handle.lock().await.is_some(),
+                "listener handle should be present after final reconnect"
+            );
+
+            assert_eq!(adapter.health(), HealthStatus::Healthy);
+            // Initial connect plus 3 reconnects = at least 4 SSE GETs.
+            assert!(
+                server.state.connections.load(Ordering::SeqCst) >= 4,
+                "expected >=4 SSE connections across 3 reconnect cycles"
+            );
+
+            adapter.shutdown().await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn shutdown_cancels_in_flight_backoff() {
+            let server = start_test_server().await;
+            // Only the first SSE GET succeeds; further attempts return 503,
+            // so the supervisor records a failure and parks in the backoff
+            // sleep before its next reconnect attempt.
+            server.state.healthy_until.store(1, Ordering::SeqCst);
+
+            // Long base backoff so the supervisor is solidly inside
+            // tokio::time::sleep(backoff) when shutdown() is called.
+            let mut adapter = SseAdapter::new(SseConfig::new(&server.url).with_timeout(1));
+            *adapter.crash_tracker.lock().await =
+                CrashTracker::new_test(Duration::from_secs(5), 10, Duration::from_secs(60));
+            adapter.initialize().await.expect("initial connect");
+
+            server.close_all_streams();
+
+            // Wait until the listener has died (Unhealthy) and the supervisor
+            // has had a chance to record the first failure and enter sleep.
+            let h = wait_for_health(
+                &adapter,
+                |h| matches!(h, HealthStatus::Unhealthy(_)),
+                Duration::from_secs(2),
+            )
+            .await;
+            assert!(matches!(h, HealthStatus::Unhealthy(_)));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+
+            // shutdown() must cancel the multi-second backoff sleep
+            // immediately — well below the configured 5s base backoff.
+            let start = std::time::Instant::now();
+            adapter.shutdown().await.unwrap();
+            let elapsed = start.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(200),
+                "shutdown did not cancel in-flight backoff: {:?}",
+                elapsed
+            );
             assert_eq!(adapter.health(), HealthStatus::Stopped);
         }
     }
