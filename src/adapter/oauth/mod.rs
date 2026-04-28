@@ -185,18 +185,30 @@ impl OAuthAdapterInner {
             .extend_pairs(form_parts.iter())
             .finish();
 
-        let resp = self
+        let resp = match self
             .http_client
             .post(&self.config.token_endpoint_url)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(form_body)
             .send()
             .await
-            .map_err(|e| {
-                // Network error during refresh
+        {
+            Ok(r) => r,
+            Err(e) => {
+                // Network/timeout error during refresh — leave Refreshing
+                // for ConnectionFailed so the state machine doesn't hang.
+                error!(
+                    endpoint = %self.config.endpoint_name,
+                    correlation_id = %correlation_id,
+                    error = %e,
+                    "Token refresh network error"
+                );
                 self.metrics.inc_refresh_failure();
-                OAuthError::Http(e)
-            })?;
+                self.transition_to(OAuthState::ConnectionFailed, "token refresh network error")
+                    .await;
+                return Err(OAuthError::Http(e));
+            }
+        };
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -214,7 +226,28 @@ impl OAuthAdapterInner {
             return Err(OAuthError::RefreshFailed { status, body });
         }
 
-        let token_json: serde_json::Value = resp.json().await?;
+        let token_json: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                // Upstream returned 200 but the body is not parseable JSON.
+                // Treat as a transient connection-quality issue (retry may
+                // recover) and leave Refreshing for ConnectionFailed so the
+                // state machine doesn't hang.
+                error!(
+                    endpoint = %self.config.endpoint_name,
+                    correlation_id = %correlation_id,
+                    error = %e,
+                    "Token refresh JSON parse error"
+                );
+                self.metrics.inc_refresh_failure();
+                self.transition_to(
+                    OAuthState::ConnectionFailed,
+                    "token refresh response not JSON",
+                )
+                .await;
+                return Err(OAuthError::Http(e));
+            }
+        };
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -290,8 +323,12 @@ impl OAuthAdapterInner {
                 // Reflect the freshly initialized inner adapter's health
                 // immediately so health() reports Healthy without waiting for
                 // the next heartbeat tick.
-                *self.inner_health.write().await = HealthStatus::Healthy;
+                // Order matters: set the inner adapter BEFORE flipping
+                // inner_health to Healthy so that any reader that observes
+                // `health() == Healthy` is guaranteed to also see
+                // `inner_adapter == Some(_)`.
                 *self.inner_adapter.write().await = Some(adapter);
+                *self.inner_health.write().await = HealthStatus::Healthy;
                 self.transition_to(
                     OAuthState::Authenticated,
                     "tokens applied, inner adapter ready",
@@ -375,13 +412,32 @@ impl OAuthAdapterInner {
                         );
                         // Retry once after 60 seconds
                         tokio::time::sleep(Duration::from_secs(60)).await;
-                        if let Ok(new_tokens) = inner.do_token_refresh().await {
-                            inner.apply_tokens(new_tokens).await;
-                        } else {
-                            warn!(
-                                endpoint = %inner.config.endpoint_name,
-                                "Proactive refresh retry also failed"
-                            );
+                        match inner.do_token_refresh().await {
+                            Ok(new_tokens) => {
+                                inner.apply_tokens(new_tokens).await;
+                            }
+                            Err(retry_err) => {
+                                // `do_token_refresh` already transitioned to
+                                // a terminal state on its own error path; the
+                                // explicit transition here is defensive so a
+                                // future error path that forgets to do so
+                                // still leaves Refreshing for AuthRequired
+                                // (auth-style failure) or ConnectionFailed
+                                // (network/JSON failure).
+                                warn!(
+                                    endpoint = %inner.config.endpoint_name,
+                                    error = %retry_err,
+                                    "Proactive refresh retry also failed"
+                                );
+                                let target = match &retry_err {
+                                    OAuthError::RefreshFailed { .. }
+                                    | OAuthError::NoRefreshToken { .. } => OAuthState::AuthRequired,
+                                    _ => OAuthState::ConnectionFailed,
+                                };
+                                inner
+                                    .transition_to(target, "proactive refresh retry failed")
+                                    .await;
+                            }
                         }
                     }
                 }
@@ -448,7 +504,10 @@ impl OAuthAdapter {
                 config,
                 inner_adapter: RwLock::new(None),
                 token_manager,
-                http_client: Client::new(),
+                http_client: Client::builder()
+                    .timeout(Duration::from_secs(30))
+                    .build()
+                    .expect("static OAuth refresh HTTP client config"),
                 refresh_task_handle: Mutex::new(None),
                 inner_health: RwLock::new(HealthStatus::Starting),
                 heartbeat_task_handle: Mutex::new(None),
@@ -1079,6 +1138,154 @@ mod tests {
             inner_health,
             HealthStatus::Healthy,
             "inner_health should be Healthy immediately after a successful inner adapter initialize"
+        );
+
+        server.abort();
+    }
+
+    // --- do_token_refresh error-path tests ---
+
+    /// Spawn a tiny axum server on `127.0.0.1:0` that serves the configured
+    /// canned response on `POST /token`. Used to exercise the failure paths
+    /// of `do_token_refresh` without a real OAuth provider.
+    async fn spawn_token_server(mode: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::http::StatusCode;
+        use axum::{response::IntoResponse, routing::post, Router};
+
+        async fn bad_request() -> impl IntoResponse {
+            (StatusCode::BAD_REQUEST, "{\"error\":\"invalid_grant\"}")
+        }
+        async fn malformed() -> impl IntoResponse {
+            (StatusCode::OK, "not json")
+        }
+
+        let router = match mode {
+            "400" => Router::new().route("/token", post(bad_request)),
+            "malformed" => Router::new().route("/token", post(malformed)),
+            other => panic!("unknown spawn_token_server mode: {}", other),
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        // Tiny delay to let the server start accepting connections.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}/token", addr.port()), handle)
+    }
+
+    /// Helper: build an adapter pre-loaded with a refresh token so
+    /// `do_token_refresh` reaches the network call.
+    async fn make_adapter_with_refresh_token(config: OAuthAdapterConfig) -> OAuthAdapter {
+        let adapter = make_adapter(config);
+        *adapter.inner.tokens.write().await = Some(TokenSet {
+            access_token: "old-access".to_string(),
+            refresh_token: Some("test-refresh".to_string()),
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        });
+        adapter
+    }
+
+    /// Network error (closed port → ECONNREFUSED) must transition out of
+    /// `Refreshing` into `ConnectionFailed`, not leave the state stuck.
+    #[tokio::test]
+    async fn do_token_refresh_network_error_transitions_to_connection_failed() {
+        let mut config = make_config();
+        // Port 1 is reserved and not bound; this triggers an immediate
+        // connection-refused error rather than waiting for the 30s timeout.
+        config.token_endpoint_url = "http://127.0.0.1:1/token".to_string();
+        let adapter = make_adapter_with_refresh_token(config).await;
+
+        let result = adapter.inner.do_token_refresh().await;
+        assert!(
+            result.is_err(),
+            "expected refresh to fail with network error"
+        );
+
+        let state = adapter.inner.state.read().await.clone();
+        assert_eq!(
+            state,
+            OAuthState::ConnectionFailed,
+            "network error must transition out of Refreshing into ConnectionFailed"
+        );
+        assert!(
+            adapter
+                .inner
+                .metrics
+                .snapshot()
+                .oauth_token_refresh_total_failure
+                >= 1,
+            "refresh failure metric must increment"
+        );
+    }
+
+    /// Non-2xx HTTP response (4xx) must transition into `AuthRequired`.
+    #[tokio::test]
+    async fn do_token_refresh_4xx_transitions_to_auth_required() {
+        let (url, server) = spawn_token_server("400").await;
+        let mut config = make_config();
+        config.token_endpoint_url = url;
+        let adapter = make_adapter_with_refresh_token(config).await;
+
+        let result = adapter.inner.do_token_refresh().await;
+        assert!(
+            matches!(result, Err(OAuthError::RefreshFailed { .. })),
+            "expected RefreshFailed error, got {:?}",
+            result
+        );
+
+        let state = adapter.inner.state.read().await.clone();
+        assert_eq!(
+            state,
+            OAuthState::AuthRequired,
+            "4xx must transition out of Refreshing into AuthRequired"
+        );
+        assert!(
+            adapter
+                .inner
+                .metrics
+                .snapshot()
+                .oauth_token_refresh_total_failure
+                >= 1,
+            "refresh failure metric must increment"
+        );
+
+        server.abort();
+    }
+
+    /// 200 OK with a non-JSON body must transition into `ConnectionFailed`
+    /// (treat as a transient upstream-quality problem so retry can recover).
+    #[tokio::test]
+    async fn do_token_refresh_malformed_json_transitions_to_connection_failed() {
+        let (url, server) = spawn_token_server("malformed").await;
+        let mut config = make_config();
+        config.token_endpoint_url = url;
+        let adapter = make_adapter_with_refresh_token(config).await;
+
+        let result = adapter.inner.do_token_refresh().await;
+        assert!(
+            result.is_err(),
+            "expected refresh to fail with JSON parse error"
+        );
+
+        let state = adapter.inner.state.read().await.clone();
+        assert_eq!(
+            state,
+            OAuthState::ConnectionFailed,
+            "JSON parse failure must transition out of Refreshing into ConnectionFailed"
+        );
+        assert!(
+            adapter
+                .inner
+                .metrics
+                .snapshot()
+                .oauth_token_refresh_total_failure
+                >= 1,
+            "refresh failure metric must increment"
         );
 
         server.abort();
