@@ -440,10 +440,30 @@ impl OAuthAdapterInner {
             let handle = tokio::spawn(async move {
                 tokio::time::sleep_until(deadline).await;
                 info!(endpoint = %inner.config.endpoint_name, "Proactive refresh timer fired");
+                // Detach our own handle from the slot before re-entering
+                // `apply_tokens`. Step 2 of `apply_tokens_inner`
+                // (`refresh_task_handle.take()` followed by `h.abort()`)
+                // would otherwise abort the future we are currently
+                // executing — the rc.4 self-cancellation bug that pinned
+                // OAuth endpoints in `Refreshing` indefinitely.
+                {
+                    let _ = inner.refresh_task_handle.lock().await.take();
+                }
                 match inner.do_token_refresh().await {
                     Ok(new_tokens) => {
                         // Recursively apply — this will schedule the next refresh
                         inner.apply_tokens(new_tokens).await;
+                        // Defensive: if the recursive apply_tokens ever
+                        // returns while still in `Refreshing`, surface a
+                        // loud warn-log so a future regression is not
+                        // silent the way the rc.4 self-abort was.
+                        let state = inner.state.read().await.clone();
+                        if matches!(state, OAuthState::Refreshing) {
+                            warn!(
+                                endpoint = %inner.config.endpoint_name,
+                                "Proactive refresh recursive apply_tokens returned with state still Refreshing — possible regression"
+                            );
+                        }
                     }
                     Err(e) => {
                         warn!(
@@ -453,9 +473,24 @@ impl OAuthAdapterInner {
                         );
                         // Retry once after 60 seconds
                         tokio::time::sleep(Duration::from_secs(60)).await;
+                        // Detach again before the retry: an external
+                        // caller may have stored a fresh handle in the
+                        // slot during the 60 s sleep, and the recursive
+                        // `apply_tokens` in the retry-success arm would
+                        // hit the same self-abort foot-gun.
+                        {
+                            let _ = inner.refresh_task_handle.lock().await.take();
+                        }
                         match inner.do_token_refresh().await {
                             Ok(new_tokens) => {
                                 inner.apply_tokens(new_tokens).await;
+                                let state = inner.state.read().await.clone();
+                                if matches!(state, OAuthState::Refreshing) {
+                                    warn!(
+                                        endpoint = %inner.config.endpoint_name,
+                                        "Proactive refresh retry recursive apply_tokens returned with state still Refreshing — possible regression"
+                                    );
+                                }
                             }
                             Err(retry_err) => {
                                 // `do_token_refresh` already transitioned to
@@ -1504,6 +1539,137 @@ mod tests {
         // Tiny delay to let the server start accepting connections.
         tokio::time::sleep(Duration::from_millis(20)).await;
         (format!("http://127.0.0.1:{}/token", addr.port()), handle)
+    }
+
+    /// Spawn an axum token endpoint that always responds 200 OK with a valid
+    /// refresh response (`expires_in` long enough that the next proactive
+    /// deadline is far in the future, so the test sees exactly one
+    /// proactive-refresh cycle).
+    async fn spawn_token_server_success() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handler() -> Json<Value> {
+            Json(json!({
+                "access_token": "new-access-token",
+                "token_type": "Bearer",
+                "expires_in": 3600u64,
+                "refresh_token": "new-refresh-token",
+            }))
+        }
+
+        let router = Router::new().route("/token", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}/token", addr.port()), handle)
+    }
+
+    /// rc.5 regression: the proactive-refresh task must NOT abort itself when
+    /// it recursively re-enters `apply_tokens` after a successful
+    /// `do_token_refresh`. In rc.4 the spawned task stored its own
+    /// `AbortHandle` in `refresh_task_handle`; step 2 of `apply_tokens_inner`
+    /// (`handle.take().abort()`) then killed the running task before it could
+    /// rebuild the inner adapter and transition to `Authenticated`, leaving
+    /// the state pinned in `Refreshing` forever.
+    ///
+    /// This test arranges for the proactive deadline to fire immediately,
+    /// lets the task run on real time (no `tokio::time::pause()`), and
+    /// asserts the state reaches `Authenticated` within a short wall-clock
+    /// budget. Without the fix the state would remain `Refreshing` past the
+    /// timeout and the assertion would fail.
+    #[tokio::test]
+    async fn proactive_refresh_does_not_self_abort() {
+        let (mcp_url, mcp_server) = spawn_minimal_mcp_server().await;
+        let (token_url, token_server) = spawn_token_server_success().await;
+
+        let mut config = make_config();
+        config.url = mcp_url;
+        config.token_endpoint_url = token_url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+
+        // expires_at = now ⇒ proactive deadline collapses to `Instant::now()`,
+        // so the spawned task fires on its very first poll.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let token_set = TokenSet {
+            access_token: "old-access".to_string(),
+            refresh_token: Some("old-refresh".to_string()),
+            expires_at: Some(now_secs),
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        };
+        adapter.inner.apply_tokens(token_set).await;
+
+        // Poll for the *new* access token to be installed in memory. The
+        // first `apply_tokens` above already transitions to `Authenticated`
+        // (inner-adapter init against the minimal MCP server succeeds), so
+        // the state alone is not a useful signal here. The recursive
+        // `apply_tokens` invoked from inside the proactive-refresh task is
+        // what installs the new token (step 4 of `apply_tokens_inner`):
+        //   - With the fix, the task detaches its own handle before that
+        //     recursive call, finishes all five steps, and the in-memory
+        //     token flips to "new-access-token".
+        //   - Without the fix, step 2 of the recursive call aborts the
+        //     running task before step 4, so the in-memory token stays
+        //     "old-access" forever and this poll times out.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let access = {
+                let tokens = adapter.inner.tokens.read().await;
+                tokens
+                    .as_ref()
+                    .map(|t| t.access_token.clone())
+                    .unwrap_or_default()
+            };
+            if access == "new-access-token" {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let state = adapter.inner.state.read().await.clone();
+                let history = adapter.inner.transition_history.read().await;
+                panic!(
+                    "proactive refresh task self-aborted: access_token still {:?}, state {:?} after 5s; transitions: {:?}",
+                    access,
+                    state,
+                    history
+                        .iter()
+                        .map(|r| (r.from.clone(), r.to.clone(), r.reason.clone()))
+                        .collect::<Vec<_>>()
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        // Final state must be `Authenticated` — the recursive
+        // `apply_tokens` ran step 3 (rebuild inner adapter) and the
+        // accompanying `transition_to(Authenticated, ...)`.
+        let state = adapter.inner.state.read().await.clone();
+        assert_eq!(
+            state,
+            OAuthState::Authenticated,
+            "after a successful proactive refresh the state must be Authenticated"
+        );
+
+        // A fresh proactive refresh task must be scheduled for the new
+        // token (its `expires_in` is 3600 s, so its deadline is far in the
+        // future and the test does not race a second refresh).
+        let handle = adapter.inner.refresh_task_handle.lock().await;
+        assert!(
+            handle.is_some(),
+            "expected a fresh proactive refresh task to be scheduled for the new token"
+        );
+        drop(handle);
+
+        token_server.abort();
+        mcp_server.abort();
     }
 
     /// HIGH #1 (audit): Task 1 added a defensive `transition_to(...)` call
