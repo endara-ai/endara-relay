@@ -31,20 +31,57 @@ pub struct RegisteredAdapter {
 }
 
 impl RegisteredAdapter {
-    /// List tools using the per-adapter cache. On a hit, returns a clone of the
-    /// cached vector without calling the underlying adapter. On a miss, takes
-    /// the populate lock, re-checks the cache (in case another waiter already
-    /// populated it), then calls `adapter.list_tools()` and stores the result.
+    /// List tools using the per-adapter cache. On a healthy hit, returns a
+    /// clone of the cached vector without calling the underlying adapter.
+    /// On any other case (cache miss, or adapter not yet `Healthy`), takes
+    /// the populate lock and re-checks state under it so a thundering herd
+    /// of concurrent callers cannot drive the underlying `list_tools` (and,
+    /// for OAuth adapters, its refresh) more than once per coalesced group.
+    ///
+    /// When the adapter is **not** `HealthStatus::Healthy` (for example, an
+    /// OAuth adapter pinned in `Refreshing` reports `Starting`) the cache is
+    /// bypassed and the call is delegated straight to the adapter. This
+    /// prevents a stale cached vector — captured back when the adapter was
+    /// healthy — from masking a stuck endpoint and from short-circuiting the
+    /// reactive 401-driven refresh path inside the adapter's `list_tools`.
+    /// The cache is **only** populated from the bypass branch when the
+    /// adapter has fully recovered to `Healthy` by the time the call
+    /// completes; if it is still unhealthy the result is returned verbatim
+    /// without writing the cache, preserving the invariant that an
+    /// unhealthy adapter never poisons the cache.
     pub async fn cached_list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
-        if let Some(cached) = self.tool_cache.read().await.as_ref() {
-            return Ok(cached.clone());
+        // Fast path: healthy adapter with a populated cache returns
+        // without taking the populate lock or calling the adapter.
+        if matches!(self.adapter.health(), HealthStatus::Healthy) {
+            if let Some(cached) = self.tool_cache.read().await.as_ref() {
+                return Ok(cached.clone());
+            }
         }
+        // Slow path: serialize concurrent callers behind the populate lock
+        // so a herd against a recovering or unhealthy adapter cannot drive
+        // the underlying `list_tools` independently per caller.
         let _populate = self.tool_cache_populate_lock.lock().await;
-        if let Some(cached) = self.tool_cache.read().await.as_ref() {
-            return Ok(cached.clone());
+        // Re-check under the lock: a prior holder may have driven recovery
+        // and populated the cache while we were parked.
+        if matches!(self.adapter.health(), HealthStatus::Healthy) {
+            if let Some(cached) = self.tool_cache.read().await.as_ref() {
+                return Ok(cached.clone());
+            }
+            let tools = self.adapter.list_tools().await?;
+            *self.tool_cache.write().await = Some(tools.clone());
+            return Ok(tools);
         }
+        // Still not `Healthy` under the lock: delegate straight to the
+        // adapter (its own `list_tools` may drive a reactive refresh) and
+        // only populate the cache if the adapter has fully recovered to
+        // `Healthy` by the time the call completes — this lets a single
+        // coalesced caller's recovered result short-circuit the rest of
+        // the herd while preserving the invariant that a still-unhealthy
+        // adapter never poisons the cache.
         let tools = self.adapter.list_tools().await?;
-        *self.tool_cache.write().await = Some(tools.clone());
+        if matches!(self.adapter.health(), HealthStatus::Healthy) {
+            *self.tool_cache.write().await = Some(tools.clone());
+        }
         Ok(tools)
     }
 }
@@ -1952,6 +1989,202 @@ mod tests {
         assert!(
             observed,
             "Lagged ticks must still trigger cache invalidation"
+        );
+    }
+
+    /// rc.5 regression: when the adapter is not `Healthy` (for example an
+    /// OAuth adapter pinned in `Refreshing` reports `Starting`),
+    /// `cached_list_tools` must bypass the per-adapter cache and delegate
+    /// straight to the adapter. Without the bypass, a previously cached
+    /// "good" tool list — captured back when the adapter was Healthy —
+    /// continues to be served indefinitely while the adapter is stuck,
+    /// pinning the merged catalog and short-circuiting the reactive
+    /// 401-driven refresh path inside the adapter's own `list_tools`.
+    #[tokio::test]
+    async fn cached_list_tools_bypasses_cache_when_not_healthy() {
+        let registry = AdapterRegistry::new();
+
+        // 1. Register a Healthy adapter and prime the cache with its tools.
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("cached_tool")])),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+        {
+            let entries = registry.entries().read().await;
+            let entry = entries.get("ep").unwrap();
+            let primed = entry.cached_list_tools().await.unwrap();
+            assert_eq!(primed.len(), 1);
+            assert_eq!(primed[0].name, "cached_tool");
+        }
+
+        // 2. Swap the adapter for a not-Healthy one (still has tools).
+        // Crucially we do NOT call `invalidate_endpoint_tool_cache` —
+        // that path is the existing escape hatch; this test exercises the
+        // bypass behaviour while the stale cache is still resident.
+        {
+            let mut entries = registry.entries().write().await;
+            let entry = entries.get_mut("ep").unwrap();
+            entry.adapter = Box::new(MockAdapter::unhealthy_with_tools(vec![make_tool(
+                "live_tool",
+            )]));
+        }
+
+        // 3. With the fix, `cached_list_tools` sees a non-Healthy adapter
+        // and delegates to `adapter.list_tools()`, returning the live
+        // `live_tool`. Without the fix, the stale cache is served and the
+        // returned list contains `cached_tool`.
+        let entries = registry.entries().read().await;
+        let entry = entries.get("ep").unwrap();
+        let live = entry.cached_list_tools().await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(
+            live[0].name, "live_tool",
+            "expected cached_list_tools to bypass the stale cache for a non-Healthy adapter and return live tools"
+        );
+
+        // 4. The bypass must NOT poison the cache by overwriting it with
+        // tools fetched while the adapter was unhealthy. Confirm the cache
+        // still contains the previously-primed entry. (If a future change
+        // populates the cache from the bypass branch, the asserted name
+        // would flip and force a deliberate review here.)
+        let cached_after = entry.tool_cache.read().await.clone();
+        let cached_after = cached_after.expect("cache must remain populated after bypass");
+        assert_eq!(cached_after.len(), 1);
+        assert_eq!(
+            cached_after[0].name, "cached_tool",
+            "bypass must not write through to the cache"
+        );
+    }
+
+    /// Mock adapter that starts `Unhealthy` and flips to `Healthy` during
+    /// its first `list_tools` invocation. Used by
+    /// `cached_list_tools_coalesces_under_unhealthy_recovery` to model an
+    /// OAuth adapter that recovers via a reactive refresh inside
+    /// `list_tools` while a herd of concurrent callers is parked on the
+    /// per-adapter populate lock.
+    struct FlipAdapter {
+        tools: Vec<ToolInfo>,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        healthy: Arc<std::sync::atomic::AtomicBool>,
+        delay: std::time::Duration,
+    }
+
+    impl FlipAdapter {
+        fn new(
+            tools: Vec<ToolInfo>,
+            delay: std::time::Duration,
+        ) -> (
+            Self,
+            Arc<std::sync::atomic::AtomicUsize>,
+            Arc<std::sync::atomic::AtomicBool>,
+        ) {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let healthy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let adapter = Self {
+                tools,
+                calls: calls.clone(),
+                healthy: healthy.clone(),
+                delay,
+            };
+            (adapter, calls, healthy)
+        }
+    }
+
+    #[async_trait]
+    impl McpAdapter for FlipAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            // Hold the populate lock long enough for a concurrent caller
+            // to enqueue behind us, then flip to `Healthy` so the second
+            // caller observes recovery on its re-check.
+            tokio::time::sleep(self.delay).await;
+            self.healthy.store(true, Ordering::Relaxed);
+            Ok(self.tools.clone())
+        }
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, AdapterError> {
+            Ok(json!({}))
+        }
+        fn health(&self) -> HealthStatus {
+            if self.healthy.load(Ordering::Relaxed) {
+                HealthStatus::Healthy
+            } else {
+                HealthStatus::Unhealthy("recovering".into())
+            }
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    /// rc.5 regression: when two callers concurrently enter
+    /// `cached_list_tools` on a not-`Healthy` adapter, the second caller
+    /// must serialize behind the per-adapter populate lock and observe
+    /// the cache populated by the first caller's recovered call — not
+    /// trigger an independent `list_tools` invocation. Without coalescing
+    /// (the lost herd protection from the original T-Fix-2), a herd of N
+    /// callers would each drive their own `list_tools` and, for OAuth
+    /// adapters, a per-caller refresh attempt past the in-flight dedup
+    /// guard (observed in CI as `test_oauth_thundering_herd_single_refresh`
+    /// reporting 25 refresh POSTs against a `<= 10` bound).
+    #[tokio::test]
+    async fn cached_list_tools_coalesces_under_unhealthy_recovery() {
+        let registry = AdapterRegistry::new();
+        let (adapter, calls, _healthy) = FlipAdapter::new(
+            vec![make_tool("recovered_tool")],
+            std::time::Duration::from_millis(50),
+        );
+        registry
+            .register(
+                "ep".into(),
+                Box::new(adapter),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        let registry = Arc::new(registry);
+        let r1 = registry.clone();
+        let r2 = registry.clone();
+
+        // Spawn caller 1, then a tiny stagger so it wins the race to
+        // acquire the populate lock before caller 2 enters.
+        let h1 = tokio::spawn(async move {
+            let entries = r1.entries().read().await;
+            let entry = entries.get("ep").unwrap();
+            entry.cached_list_tools().await
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let h2 = tokio::spawn(async move {
+            let entries = r2.entries().read().await;
+            let entry = entries.get("ep").unwrap();
+            entry.cached_list_tools().await
+        });
+
+        let result1 = h1.await.unwrap().expect("caller 1 list_tools");
+        let result2 = h2.await.unwrap().expect("caller 2 list_tools");
+
+        assert_eq!(result1.len(), 1);
+        assert_eq!(result1[0].name, "recovered_tool");
+        assert_eq!(result2.len(), 1);
+        assert_eq!(result2[0].name, "recovered_tool");
+        assert_eq!(
+            calls.load(Ordering::Relaxed),
+            1,
+            "expected exactly one underlying list_tools call; the second \
+             caller must observe the populated cache after the populate lock"
         );
     }
 }
