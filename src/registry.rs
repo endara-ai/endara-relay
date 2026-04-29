@@ -35,7 +35,21 @@ impl RegisteredAdapter {
     /// cached vector without calling the underlying adapter. On a miss, takes
     /// the populate lock, re-checks the cache (in case another waiter already
     /// populated it), then calls `adapter.list_tools()` and stores the result.
+    ///
+    /// When the adapter is **not** `HealthStatus::Healthy` (for example, an
+    /// OAuth adapter pinned in `Refreshing` reports `Starting`) the cache is
+    /// bypassed and the call is delegated straight to the adapter. This
+    /// prevents a stale cached vector — captured back when the adapter was
+    /// healthy — from masking a stuck endpoint and from short-circuiting the
+    /// reactive 401-driven refresh path inside the adapter's `list_tools`.
+    /// The cache is intentionally **not** populated from the bypass call,
+    /// so the next healthy hit either re-uses the prior cache (if still
+    /// valid) or re-populates it on a clean miss after a tools-changed
+    /// invalidation.
     pub async fn cached_list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+        if !matches!(self.adapter.health(), HealthStatus::Healthy) {
+            return self.adapter.list_tools().await;
+        }
         if let Some(cached) = self.tool_cache.read().await.as_ref() {
             return Ok(cached.clone());
         }
@@ -1952,6 +1966,75 @@ mod tests {
         assert!(
             observed,
             "Lagged ticks must still trigger cache invalidation"
+        );
+    }
+
+    /// rc.5 regression: when the adapter is not `Healthy` (for example an
+    /// OAuth adapter pinned in `Refreshing` reports `Starting`),
+    /// `cached_list_tools` must bypass the per-adapter cache and delegate
+    /// straight to the adapter. Without the bypass, a previously cached
+    /// "good" tool list — captured back when the adapter was Healthy —
+    /// continues to be served indefinitely while the adapter is stuck,
+    /// pinning the merged catalog and short-circuiting the reactive
+    /// 401-driven refresh path inside the adapter's own `list_tools`.
+    #[tokio::test]
+    async fn cached_list_tools_bypasses_cache_when_not_healthy() {
+        let registry = AdapterRegistry::new();
+
+        // 1. Register a Healthy adapter and prime the cache with its tools.
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("cached_tool")])),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+        {
+            let entries = registry.entries().read().await;
+            let entry = entries.get("ep").unwrap();
+            let primed = entry.cached_list_tools().await.unwrap();
+            assert_eq!(primed.len(), 1);
+            assert_eq!(primed[0].name, "cached_tool");
+        }
+
+        // 2. Swap the adapter for a not-Healthy one (still has tools).
+        // Crucially we do NOT call `invalidate_endpoint_tool_cache` —
+        // that path is the existing escape hatch; this test exercises the
+        // bypass behaviour while the stale cache is still resident.
+        {
+            let mut entries = registry.entries().write().await;
+            let entry = entries.get_mut("ep").unwrap();
+            entry.adapter = Box::new(MockAdapter::unhealthy_with_tools(vec![make_tool(
+                "live_tool",
+            )]));
+        }
+
+        // 3. With the fix, `cached_list_tools` sees a non-Healthy adapter
+        // and delegates to `adapter.list_tools()`, returning the live
+        // `live_tool`. Without the fix, the stale cache is served and the
+        // returned list contains `cached_tool`.
+        let entries = registry.entries().read().await;
+        let entry = entries.get("ep").unwrap();
+        let live = entry.cached_list_tools().await.unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(
+            live[0].name, "live_tool",
+            "expected cached_list_tools to bypass the stale cache for a non-Healthy adapter and return live tools"
+        );
+
+        // 4. The bypass must NOT poison the cache by overwriting it with
+        // tools fetched while the adapter was unhealthy. Confirm the cache
+        // still contains the previously-primed entry. (If a future change
+        // populates the cache from the bypass branch, the asserted name
+        // would flip and force a deliberate review here.)
+        let cached_after = entry.tool_cache.read().await.clone();
+        let cached_after = cached_after.expect("cache must remain populated after bypass");
+        assert_eq!(cached_after.len(), 1);
+        assert_eq!(
+            cached_after[0].name, "cached_tool",
+            "bypass must not write through to the cache"
         );
     }
 }
