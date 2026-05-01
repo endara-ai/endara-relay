@@ -57,10 +57,10 @@ No cloud. No accounts. Everything runs on your machine.
 ### 1. Install
 
 ```bash
-# Homebrew (macOS / Linux)
+# Homebrew — recommended (macOS / Linux)
 brew install endara-ai/tap/endara-relay
 
-# Cargo
+# Or, with cargo:
 cargo install endara-relay
 
 # Or download a pre-built binary from GitHub Releases:
