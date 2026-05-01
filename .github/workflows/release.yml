@@ -89,11 +89,22 @@ jobs:
             --password "$APPLE_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait
+      - name: Create tar.gz archive for Homebrew
+        if: matrix.target != 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive="endara-relay-v${version}-${{ matrix.target }}.tar.gz"
+          staging="$(mktemp -d)"
+          cp "endara-relay-${{ matrix.target }}" "${staging}/endara-relay"
+          tar -C "${staging}" -czf "${archive}" endara-relay
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: endara-relay-${{ matrix.target }}
-          path: endara-relay-${{ matrix.target }}*
+          path: |
+            endara-relay-${{ matrix.target }}*
+            endara-relay-v*-${{ matrix.target }}.tar.gz
 
   release:
     needs: build
