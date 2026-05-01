@@ -35,7 +35,7 @@ pub type OAuthAdapterInners = Arc<RwLock<HashMap<String, Arc<OAuthAdapterInner>>
 use watcher::ConfigWatcher;
 
 #[derive(Parser)]
-#[command(name = "endara-relay", about = "Endara Relay agent")]
+#[command(name = "endara-relay", version, about = "Endara Relay agent")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
