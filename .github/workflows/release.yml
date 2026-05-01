@@ -2,12 +2,19 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Existing release version to (re)publish to the Homebrew tap (e.g. v0.1.1). Skips build; reuses assets already attached to that GitHub Release.'
+        required: true
+        type: string
 
 permissions:
   contents: write
 
 jobs:
   build:
+    if: github.event_name == 'push'
     strategy:
       matrix:
         include:
@@ -89,14 +96,26 @@ jobs:
             --password "$APPLE_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait
+      - name: Create tar.gz archive for Homebrew
+        if: matrix.target != 'x86_64-pc-windows-msvc'
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          archive="endara-relay-v${version}-${{ matrix.target }}.tar.gz"
+          staging="$(mktemp -d)"
+          cp "endara-relay-${{ matrix.target }}" "${staging}/endara-relay"
+          tar -C "${staging}" -czf "${archive}" endara-relay
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: endara-relay-${{ matrix.target }}
-          path: endara-relay-${{ matrix.target }}*
+          path: |
+            endara-relay-${{ matrix.target }}*
+            endara-relay-v*-${{ matrix.target }}.tar.gz
 
   release:
     needs: build
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -109,4 +128,100 @@ jobs:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, 'rc') }}
           files: artifacts/*
+
+  update-homebrew-tap:
+    needs: release
+    # Only run on stable tag pushes (skip -rc.* prereleases) or manual workflow_dispatch.
+    if: |
+      always() &&
+      (
+        (github.event_name == 'push' && needs.release.result == 'success' && !contains(github.ref_name, '-rc.')) ||
+        github.event_name == 'workflow_dispatch'
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${INPUT_VERSION}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          if [[ -z "$tag" ]]; then
+            echo "Could not resolve a version/tag." >&2
+            exit 1
+          fi
+          version="${tag#v}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+      - name: Download tar.gz archives from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.version.outputs.tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p archives
+          for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+            asset="endara-relay-v${VERSION}-${target}.tar.gz"
+            echo "Downloading ${asset} from release ${TAG}..."
+            gh release download "${TAG}" \
+              --repo "${{ github.repository }}" \
+              --pattern "${asset}" \
+              --dir archives
+          done
+      - name: Compute SHA256 sums
+        id: sha
+        run: |
+          v="${{ steps.version.outputs.version }}"
+          sha_arm64_darwin=$(shasum -a 256 "archives/endara-relay-v${v}-aarch64-apple-darwin.tar.gz" | awk '{print $1}')
+          sha_x64_darwin=$(shasum -a 256 "archives/endara-relay-v${v}-x86_64-apple-darwin.tar.gz" | awk '{print $1}')
+          sha_arm64_linux=$(shasum -a 256 "archives/endara-relay-v${v}-aarch64-unknown-linux-gnu.tar.gz" | awk '{print $1}')
+          sha_x64_linux=$(shasum -a 256 "archives/endara-relay-v${v}-x86_64-unknown-linux-gnu.tar.gz" | awk '{print $1}')
+          {
+            echo "arm64_darwin=${sha_arm64_darwin}"
+            echo "x64_darwin=${sha_x64_darwin}"
+            echo "arm64_linux=${sha_arm64_linux}"
+            echo "x64_linux=${sha_x64_linux}"
+          } >> "$GITHUB_OUTPUT"
+      - name: Checkout endara-relay (for update-formula.py)
+        uses: actions/checkout@v4
+        with:
+          path: relay
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: endara-ai/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Update formula
+        run: |
+          mkdir -p homebrew-tap/Formula
+          python3 relay/scripts/update-formula.py \
+            --version "${{ steps.version.outputs.version }}" \
+            --sha256-arm64-darwin "${{ steps.sha.outputs.arm64_darwin }}" \
+            --sha256-x64-darwin "${{ steps.sha.outputs.x64_darwin }}" \
+            --sha256-arm64-linux "${{ steps.sha.outputs.arm64_linux }}" \
+            --sha256-x64-linux "${{ steps.sha.outputs.x64_linux }}" \
+            --formula-path homebrew-tap/Formula/endara-relay.rb
+      - name: Commit and push to homebrew-tap
+        working-directory: homebrew-tap
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git config user.name "endara-bot"
+          git config user.email "endara-bot@users.noreply.github.com"
+          git add Formula/endara-relay.rb
+          if git diff --cached --quiet; then
+            echo "No formula changes to commit."
+            exit 0
+          fi
+          git commit -m "chore: bump endara-relay to ${VERSION}"
+          git push origin HEAD:main
 
