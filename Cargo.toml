@@ -1,6 +1,6 @@
 [package]
 name = "endara-relay"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Local MCP tool aggregator — aggregate multiple MCP servers behind a single endpoint"
 license = "Apache-2.0"
