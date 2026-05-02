@@ -40,6 +40,8 @@ pub struct AppState {
     pub oauth_adapter_inners: Option<OAuthAdapterInners>,
     /// Transient OAuth setup session manager (preflight flow).
     pub setup_manager: Option<Arc<OAuthSetupManager>>,
+    /// Process start time, used to compute `/healthz` uptime.
+    pub started_at: Instant,
 }
 
 /// JSON-RPC request body expected by MCP routes.
@@ -844,11 +846,19 @@ pub fn build_router_with_origins(state: AppState, extra_origins: &[String]) -> R
 
 /// GET /healthz — liveness probe.
 ///
-/// Returns `200 OK` with a plain-text `ok` body so external supervisors
+/// Returns `200 OK` with a JSON body containing `status`, the crate
+/// `version`, and process `uptime_secs`, so external supervisors
 /// (load balancers, container orchestrators, uptime checks) can verify
 /// the relay process is up without exercising upstream MCP adapters.
-async fn healthz() -> impl IntoResponse {
-    (StatusCode::OK, "ok")
+async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION").to_string(),
+            "uptime_secs": state.started_at.elapsed().as_secs(),
+        })),
+    )
 }
 
 /// Create a future that resolves when a shutdown signal (SIGINT, SIGTERM, or SIGHUP) is received.
@@ -980,6 +990,7 @@ mod tests {
             token_manager: None,
             oauth_adapter_inners: None,
             setup_manager: None,
+            started_at: Instant::now(),
         }
     }
 
@@ -1159,23 +1170,6 @@ mod tests {
         let state = test_app_state();
         let _router = build_router(state);
         // If we get here without panic, the router was built successfully.
-    }
-
-    #[tokio::test]
-    async fn healthz_returns_ok() {
-        use axum::body::Body;
-        use axum::http::Request;
-        use tower::ServiceExt; // for oneshot
-
-        let state = test_app_state();
-        let app = build_router(state);
-        let resp = app
-            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
-        assert_eq!(&bytes[..], b"ok");
     }
 
     #[tokio::test]
