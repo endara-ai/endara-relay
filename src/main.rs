@@ -390,6 +390,7 @@ async fn main() {
                 token_manager: Some(token_manager.clone()),
                 oauth_adapter_inners: Some(oauth_adapter_inners.clone()),
                 setup_manager: Some(setup_manager.clone()),
+                started_at: std::time::Instant::now(),
             };
             let mgmt_state = management::ManagementState {
                 registry: registry.clone(),

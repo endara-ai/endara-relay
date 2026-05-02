@@ -11,7 +11,7 @@ use super::OAuthAdapterInner;
 use std::sync::Weak;
 use std::time::Duration;
 use tokio::time::MissedTickBehavior;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 /// Error type for heartbeat probes.
 #[derive(Debug)]
@@ -141,7 +141,7 @@ async fn apply_probe_action(
         ProbeAction::MarkHealthy => {
             *adapter.inner_health.write().await = HealthStatus::Healthy;
             adapter.metrics.inc_heartbeat_healthy();
-            debug!(
+            trace!(
                 endpoint = %endpoint,
                 oauth_state = ?oauth_state,
                 result = "healthy",

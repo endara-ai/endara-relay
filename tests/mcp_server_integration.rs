@@ -47,6 +47,7 @@ async fn setup_server() -> (SocketAddr, AdapterRegistry, tokio::task::JoinHandle
         token_manager: None,
         oauth_adapter_inners: None,
         setup_manager: None,
+        started_at: std::time::Instant::now(),
     };
     let router = build_router(state);
     // Bind to port 0 to get a random available port

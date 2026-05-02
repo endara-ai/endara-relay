@@ -52,6 +52,7 @@ async fn setup_js_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         token_manager: None,
         oauth_adapter_inners: None,
         setup_manager: None,
+        started_at: std::time::Instant::now(),
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();

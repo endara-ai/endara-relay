@@ -40,6 +40,8 @@ pub struct AppState {
     pub oauth_adapter_inners: Option<OAuthAdapterInners>,
     /// Transient OAuth setup session manager (preflight flow).
     pub setup_manager: Option<Arc<OAuthSetupManager>>,
+    /// Process start time, used to compute `/healthz` uptime.
+    pub started_at: Instant,
 }
 
 /// JSON-RPC request body expected by MCP routes.
@@ -831,6 +833,7 @@ pub fn build_router_with_origins(state: AppState, extra_origins: &[String]) -> R
         .allow_headers([axum::http::header::CONTENT_TYPE]);
 
     Router::new()
+        .route("/healthz", get(healthz))
         .route("/mcp", post(mcp_unified).delete(mcp_delete))
         .route("/mcp/initialize", post(mcp_initialize_logged))
         .route("/mcp/tools/list", post(mcp_tools_list_logged))
@@ -839,6 +842,23 @@ pub fn build_router_with_origins(state: AppState, extra_origins: &[String]) -> R
         .route("/oauth/callback", get(oauth_callback))
         .layer(cors)
         .with_state(state)
+}
+
+/// GET /healthz — liveness probe.
+///
+/// Returns `200 OK` with a JSON body containing `status`, the crate
+/// `version`, and process `uptime_secs`, so external supervisors
+/// (load balancers, container orchestrators, uptime checks) can verify
+/// the relay process is up without exercising upstream MCP adapters.
+async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION").to_string(),
+            "uptime_secs": state.started_at.elapsed().as_secs(),
+        })),
+    )
 }
 
 /// Create a future that resolves when a shutdown signal (SIGINT, SIGTERM, or SIGHUP) is received.
@@ -970,6 +990,7 @@ mod tests {
             token_manager: None,
             oauth_adapter_inners: None,
             setup_manager: None,
+            started_at: Instant::now(),
         }
     }
 
