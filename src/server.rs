@@ -831,6 +831,7 @@ pub fn build_router_with_origins(state: AppState, extra_origins: &[String]) -> R
         .allow_headers([axum::http::header::CONTENT_TYPE]);
 
     Router::new()
+        .route("/healthz", get(healthz))
         .route("/mcp", post(mcp_unified).delete(mcp_delete))
         .route("/mcp/initialize", post(mcp_initialize_logged))
         .route("/mcp/tools/list", post(mcp_tools_list_logged))
@@ -839,6 +840,15 @@ pub fn build_router_with_origins(state: AppState, extra_origins: &[String]) -> R
         .route("/oauth/callback", get(oauth_callback))
         .layer(cors)
         .with_state(state)
+}
+
+/// GET /healthz — liveness probe.
+///
+/// Returns `200 OK` with a plain-text `ok` body so external supervisors
+/// (load balancers, container orchestrators, uptime checks) can verify
+/// the relay process is up without exercising upstream MCP adapters.
+async fn healthz() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
 }
 
 /// Create a future that resolves when a shutdown signal (SIGINT, SIGTERM, or SIGHUP) is received.
@@ -1149,6 +1159,23 @@ mod tests {
         let state = test_app_state();
         let _router = build_router(state);
         // If we get here without panic, the router was built successfully.
+    }
+
+    #[tokio::test]
+    async fn healthz_returns_ok() {
+        use axum::body::Body;
+        use axum::http::Request;
+        use tower::ServiceExt; // for oneshot
+
+        let state = test_app_state();
+        let app = build_router(state);
+        let resp = app
+            .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&bytes[..], b"ok");
     }
 
     #[tokio::test]
