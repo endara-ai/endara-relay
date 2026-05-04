@@ -1445,6 +1445,14 @@ struct OAuthSetupRequest {
     scopes: Option<Vec<String>>,
     #[serde(default)]
     tool_prefix: Option<String>,
+    /// If provided, skip DCR and use these client credentials directly.
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    client_secret: Option<String>,
+    /// If provided, use this URL as the discovery base instead of `url`.
+    #[serde(default)]
+    oauth_server_url: Option<String>,
 }
 
 /// Response for POST /api/oauth/setup
@@ -1528,8 +1536,18 @@ async fn oauth_setup(
     let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", state.relay_port);
 
     // ── Step 1: Discover OAuth server ──────────────────────────────────
+    // If the caller supplied an explicit `oauth_server_url`, use that as the
+    // discovery base instead of the resource URL — this lets users point at an
+    // authorization server that doesn't expose RFC 9728 protected-resource
+    // metadata on the resource URL itself.
+    let discovery_base = body
+        .oauth_server_url
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(body.url.as_str());
     let http = reqwest::Client::new();
-    let disc = match discovery::discover_oauth_server(&http, &body.url).await {
+    let disc = match discovery::discover_oauth_server(&http, discovery_base).await {
         Ok(d) => d,
         Err(e) => {
             // Clean up session on failure
@@ -1559,8 +1577,42 @@ async fn oauth_setup(
         })
         .await;
 
-    // ── Step 2: Resolve client credentials (DCR) ───────────────────────
-    let dcr_result = if let Some(ref reg_endpoint) = registration_endpoint {
+    // ── Step 2: Resolve client credentials ─────────────────────────────
+    // If the caller already supplied a client_id, skip DCR entirely and use
+    // the provided credentials. This mirrors the DCR success path: persist
+    // via the token manager and proceed straight to authorize URL building.
+    let manual_client_id = body
+        .client_id
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let manual_client_secret = body
+        .client_secret
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    let used_dcr = manual_client_id.is_none();
+
+    let dcr_result: Result<(String, Option<String>), String> = if let Some(client_id) =
+        manual_client_id
+    {
+        // Persist manual credentials so future re-auth can find them
+        if let Some(ref tm) = state.token_manager {
+            let creds = DcrCredentials {
+                client_id: client_id.clone(),
+                client_secret: manual_client_secret.clone(),
+                client_secret_expires_at: 0,
+                registered_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            };
+            if let Err(e) = tm.save_dcr(&body.name, &creds).await {
+                warn!(endpoint = %body.name, error = %e, "Failed to persist manual credentials");
+            }
+        }
+        Ok((client_id, manual_client_secret))
+    } else if let Some(ref reg_endpoint) = registration_endpoint {
         match dcr::register_client(&http, reg_endpoint, &redirect_uri, &body.name).await {
             Ok(resp) => {
                 // Persist DCR credentials for future re-auth
@@ -1629,7 +1681,7 @@ async fn oauth_setup(
 
             let discovery_info = OAuthDiscoveryInfo {
                 auth_server: auth_server_url,
-                dcr_used: true,
+                dcr_used: used_dcr,
                 scopes_available: discovered_scopes,
             };
 
