@@ -1,11 +1,28 @@
 # Endara Relay
 
-**A local MCP tool aggregator — aggregate multiple MCP servers behind a single endpoint.**
+**One endpoint for all your MCP servers.** [endara.ai](https://endara.ai)
+
+Aggregate local and cloud MCP servers behind a single endpoint.
+Add servers, manage OAuth, connect any AI client — all from one place.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
-[![Crates.io](https://img.shields.io/crates/v/endara-relay.svg)](https://crates.io/crates/endara-relay)
 [![CI](https://img.shields.io/github/actions/workflow/status/endara-ai/endara-relay/ci.yml?branch=main&label=CI)](https://github.com/endara-ai/endara-relay/actions)
 [![GitHub Release](https://img.shields.io/github/v/release/endara-ai/endara-relay)](https://github.com/endara-ai/endara-relay/releases)
+
+<!-- TODO(website): unblock once endara.ai/images/desktop-hero.png exists -->
+<!-- ![Endara Desktop — endpoint dashboard](https://endara.ai/images/desktop-hero.png) -->
+
+> Works with Claude Desktop, ChatGPT, Cursor, Windsurf, VS Code, Zed, Continue, and any MCP-compatible client.
+
+---
+
+## Why?
+
+- **One endpoint, not N** — point every AI client at `localhost:9400` instead of pasting the same MCP server config into each app.
+- **OAuth managed for you** — Relay handles token storage and refresh for servers that need it, so your clients don't have to.
+- **Hot-reload config** — edit your TOML, save, and Relay picks up the change without a restart.
+- **Automatic restart on crash** — flaky STDIO servers come back on their own with exponential backoff.
+- **Fully local** — no cloud, no accounts, no telemetry. Everything runs on your machine.
 
 ---
 
@@ -293,6 +310,12 @@ On every push and PR, the CI workflow runs:
 
 ---
 
+## Desktop App
+
+Prefer a UI to running a binary from a terminal? [Endara Desktop](https://github.com/endara-ai/endara-desktop) bundles Relay as a sidecar and adds an endpoint dashboard, log viewer, and one-click OAuth flows. It installs from the same Homebrew tap (`brew install --cask endara-ai/tap/endara-desktop`) and is built on top of this repo. More at [endara.ai](https://endara.ai).
+
+---
+
 ## Contributing
 
 Contributions are welcome! Here's how to get started:
@@ -307,12 +330,20 @@ Please open an issue first for large changes or new features so we can discuss t
 
 ---
 
+## Links
+
+- Website: [endara.ai](https://endara.ai)
+- Desktop app: [endara-ai/endara-desktop](https://github.com/endara-ai/endara-desktop)
+- Releases: [github.com/endara-ai/endara-relay/releases](https://github.com/endara-ai/endara-relay/releases)
+
+---
+
 ## License
 
 Licensed under the [Apache License, Version 2.0](LICENSE).
 
 ```
-Copyright 2025 Endara AI
+Copyright 2025–2026 Endara AI
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
