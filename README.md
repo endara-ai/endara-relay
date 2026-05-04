@@ -312,7 +312,7 @@ On every push and PR, the CI workflow runs:
 
 ## Desktop App
 
-Prefer a UI to running a binary from a terminal? [Endara Desktop](https://github.com/endara-ai/endara-desktop) bundles Relay as a sidecar and adds an endpoint dashboard, log viewer, and one-click OAuth flows. It installs from the same Homebrew tap (`brew install --cask endara-ai/tap/endara-desktop`) and is built on top of this repo. More at [endara.ai](https://endara.ai).
+Prefer a UI to running a binary from a terminal? [Endara Desktop](https://github.com/endara-ai/endara-desktop) bundles Relay as a sidecar and adds an endpoint dashboard, log viewer, and one-click OAuth flows. It installs from the same Homebrew tap (`brew install --cask endara-ai/tap/endara`) and is built on top of this repo. More at [endara.ai](https://endara.ai).
 
 ---
 
