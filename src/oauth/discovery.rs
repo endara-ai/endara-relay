@@ -511,7 +511,7 @@ mod tests {
 
     #[test]
     fn test_has_path_with_path() {
-        assert!(has_path("https://mcp.linear.app/sse"));
+        assert!(has_path("https://mcp.linear.app/mcp"));
         assert!(has_path("https://api.githubcopilot.com/mcp/"));
         assert!(has_path("https://github.com/login/oauth"));
     }
@@ -519,7 +519,7 @@ mod tests {
     #[test]
     fn test_build_well_known_url_root() {
         let url =
-            build_well_known_url_root("https://mcp.linear.app/sse", "oauth-protected-resource")
+            build_well_known_url_root("https://mcp.linear.app/mcp", "oauth-protected-resource")
                 .unwrap();
         assert_eq!(
             url,

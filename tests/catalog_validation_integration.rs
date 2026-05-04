@@ -172,7 +172,7 @@ async fn validate_oauth_discovery(
 #[ignore] // Run with: cargo test -- --ignored
 async fn test_linear_discovery_live() {
     let client = Client::new();
-    validate_oauth_discovery(&client, "https://mcp.linear.app/sse", true)
+    validate_oauth_discovery(&client, "https://mcp.linear.app/mcp", true)
         .await
         .unwrap();
 }
