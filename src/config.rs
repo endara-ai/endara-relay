@@ -67,6 +67,10 @@ pub struct EndpointConfig {
     pub oauth_server_url: Option<String>,
     #[serde(default)]
     pub client_id: Option<String>,
+    /// **Legacy** — read on adapter init only for backwards compatibility with
+    /// existing `config.toml` files. New callers should write client credentials
+    /// via `POST /api/endpoints/{name}/credentials`, which persists them through
+    /// the `TokenManager` (DCR file) instead of TOML.
     #[serde(default)]
     pub client_secret: Option<String>,
     #[serde(default)]
@@ -194,6 +198,22 @@ pub fn default_config() -> Config {
     }
 }
 
+/// Write `contents` to `path` and tighten permissions to 0o600 on Unix.
+///
+/// This is the preferred helper for any callsite that writes `config.toml`, so
+/// that secrets that legacy callers may still place in TOML are at least
+/// protected at rest. The mode change is best-effort: if it fails it is
+/// surfaced as the underlying io error.
+pub fn write_config_file(path: &Path, contents: &str) -> std::io::Result<()> {
+    std::fs::write(path, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
 /// Write a default config file to the given path, creating parent directories as needed.
 pub fn create_default_config_file(path: &Path) -> Result<Config, ConfigError> {
     let resolved = expand_tilde(path);
@@ -204,7 +224,7 @@ pub fn create_default_config_file(path: &Path) -> Result<Config, ConfigError> {
     let toml_str = toml::to_string_pretty(&config).map_err(|e| {
         ConfigError::ValidationError(format!("Failed to serialize default config: {}", e))
     })?;
-    std::fs::write(&resolved, &toml_str)?;
+    write_config_file(&resolved, &toml_str)?;
     Ok(config)
 }
 

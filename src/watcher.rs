@@ -477,6 +477,48 @@ pub async fn apply_diff_graceful(
     }
 }
 
+/// Resolve the OAuth client credentials for `ep`, preferring the DCR file
+/// (managed by `TokenManager`) over the legacy `EndpointConfig` fields.
+///
+/// Wave 3a routes new credentials through `TokenManager::save_dcr`; the legacy
+/// `client_id`/`client_secret` TOML fields remain readable for backwards
+/// compatibility. When a TOML `client_secret` is the only source we emit a
+/// one-time WARN so operators notice they should re-provision via the new
+/// `POST /api/endpoints/{name}/credentials` route.
+pub(crate) async fn resolve_oauth_client_creds(
+    ep: &EndpointConfig,
+    token_manager: &TokenManager,
+) -> (String, Option<String>) {
+    match token_manager.load_dcr(&ep.name).await {
+        Ok(Some(creds)) => (creds.client_id, creds.client_secret),
+        Ok(None) => {
+            if ep.client_secret.is_some() {
+                warn!(
+                    endpoint = %ep.name,
+                    "Using legacy `client_secret` from config.toml; \
+                     re-provision via POST /api/endpoints/{{name}}/credentials \
+                     to remove the secret from TOML"
+                );
+            }
+            (
+                ep.client_id.clone().unwrap_or_default(),
+                ep.client_secret.clone(),
+            )
+        }
+        Err(e) => {
+            warn!(
+                endpoint = %ep.name,
+                error = %e,
+                "Failed to read DCR credentials; falling back to config.toml"
+            );
+            (
+                ep.client_id.clone().unwrap_or_default(),
+                ep.client_secret.clone(),
+            )
+        }
+    }
+}
+
 /// Create an adapter from an endpoint configuration.
 ///
 /// Always returns an adapter. If initialization fails, returns a [`FailedAdapter`]
@@ -529,6 +571,8 @@ pub(crate) async fn create_adapter(
             }
         }
         Transport::Oauth => {
+            let (client_id, client_secret) =
+                resolve_oauth_client_creds(ep, token_manager.as_ref()).await;
             let oauth_config = OAuthAdapterConfig {
                 endpoint_name: ep.name.clone(),
                 url: ep.url.clone().unwrap_or_default(),
@@ -538,8 +582,8 @@ pub(crate) async fn create_adapter(
                         ep.oauth_server_url.as_deref().unwrap_or_default()
                     )
                 }),
-                client_id: ep.client_id.clone().unwrap_or_default(),
-                client_secret: ep.client_secret.clone(),
+                client_id,
+                client_secret,
                 heartbeat_interval_secs: 30,
                 probe_timeout_secs: 10,
                 probe_failure_threshold: 3,
@@ -1184,5 +1228,79 @@ mod tests {
             entry.tool_cache.read().await.is_some(),
             "old adapter's sender must NOT invalidate the cache after rewire"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_oauth_client_creds tests (Wave 3a)
+    // -----------------------------------------------------------------------
+
+    fn oauth_endpoint(
+        name: &str,
+        client_id: Option<&str>,
+        client_secret: Option<&str>,
+    ) -> EndpointConfig {
+        EndpointConfig {
+            name: name.to_string(),
+            description: None,
+            tool_prefix: None,
+            transport: Transport::Oauth,
+            command: None,
+            args: None,
+            url: Some("https://mcp.example.com".to_string()),
+            env: None,
+            headers: None,
+            disabled: false,
+            disabled_tools: Vec::new(),
+            oauth_server_url: Some("https://auth.example.com".to_string()),
+            client_id: client_id.map(|s| s.to_string()),
+            client_secret: client_secret.map(|s| s.to_string()),
+            scopes: None,
+            token_endpoint: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn adapter_init_prefers_dcr_file_over_config_secret() {
+        use crate::token_manager::DcrCredentials;
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = TokenManager::new(tmp.path().to_path_buf());
+        tm.save_dcr(
+            "ep",
+            &DcrCredentials {
+                client_id: "dcr-client".to_string(),
+                client_secret: Some("dcr-secret".to_string()),
+                client_secret_expires_at: 0,
+                registered_at: 1_700_000_000,
+            },
+        )
+        .await
+        .unwrap();
+
+        let ep = oauth_endpoint("ep", Some("toml-client"), Some("toml-secret"));
+        let (id, secret) = resolve_oauth_client_creds(&ep, &tm).await;
+        assert_eq!(id, "dcr-client");
+        assert_eq!(secret.as_deref(), Some("dcr-secret"));
+    }
+
+    #[tokio::test]
+    async fn adapter_init_falls_back_to_legacy_toml_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = TokenManager::new(tmp.path().to_path_buf());
+
+        let ep = oauth_endpoint("ep", Some("toml-client"), Some("toml-secret"));
+        let (id, secret) = resolve_oauth_client_creds(&ep, &tm).await;
+        assert_eq!(id, "toml-client");
+        assert_eq!(secret.as_deref(), Some("toml-secret"));
+    }
+
+    #[tokio::test]
+    async fn adapter_init_no_dcr_no_secret_returns_config_client_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = TokenManager::new(tmp.path().to_path_buf());
+
+        let ep = oauth_endpoint("ep", Some("toml-client"), None);
+        let (id, secret) = resolve_oauth_client_creds(&ep, &tm).await;
+        assert_eq!(id, "toml-client");
+        assert!(secret.is_none());
     }
 }
