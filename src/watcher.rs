@@ -1303,4 +1303,50 @@ mod tests {
         assert_eq!(id, "toml-client");
         assert!(secret.is_none());
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn adapter_init_warns_when_falling_back_to_toml_secret() {
+        use std::io;
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct BufWriter(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for BufWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for BufWriter {
+            type Writer = BufWriter;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let buf = BufWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = TokenManager::new(tmp.path().to_path_buf());
+        let ep = oauth_endpoint("warned-ep", Some("toml-client"), Some("toml-secret"));
+        let (id, secret) = resolve_oauth_client_creds(&ep, &tm).await;
+        assert_eq!(id, "toml-client");
+        assert_eq!(secret.as_deref(), Some("toml-secret"));
+
+        let captured = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("legacy `client_secret`") && captured.contains("warned-ep"),
+            "expected WARN log mentioning legacy client_secret and the endpoint name; got: {captured}"
+        );
+    }
 }
