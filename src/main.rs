@@ -287,6 +287,8 @@ async fn main() {
                 // OAuth endpoints initialize inline (always fast)
                 if ep.transport == config::Transport::Oauth {
                     let base = ep.oauth_server_url.as_deref().unwrap_or_default();
+                    let (client_id, client_secret) =
+                        watcher::resolve_oauth_client_creds(ep, token_manager.as_ref()).await;
                     let oauth_config = OAuthAdapterConfig {
                         endpoint_name: ep.name.clone(),
                         url: ep.url.clone().unwrap_or_default(),
@@ -294,8 +296,8 @@ async fn main() {
                             .token_endpoint
                             .clone()
                             .unwrap_or_else(|| format!("{}/token", base)),
-                        client_id: ep.client_id.clone().unwrap_or_default(),
-                        client_secret: ep.client_secret.clone(),
+                        client_id,
+                        client_secret,
                         heartbeat_interval_secs: 30,
                         probe_timeout_secs: 10,
                         probe_failure_threshold: 3,

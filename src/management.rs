@@ -641,7 +641,7 @@ async fn delete_endpoint(
         }
     };
 
-    if let Err(e) = std::fs::write(&resolved, &new_contents) {
+    if let Err(e) = crate::config::write_config_file(&resolved, &new_contents) {
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "failed to write config file",
@@ -683,7 +683,7 @@ async fn persist_disabled_state(state: &ManagementState) {
     // Write back to file
     let resolved = crate::config::expand_tilde(config_path);
     if let Ok(toml_str) = toml::to_string_pretty(&*config) {
-        if let Err(e) = std::fs::write(&resolved, &toml_str) {
+        if let Err(e) = crate::config::write_config_file(&resolved, &toml_str) {
             warn!(error = %e, "Failed to persist disabled state");
         }
     }
@@ -832,6 +832,36 @@ struct OAuthCredentialsRequest {
     client_id: String,
     #[serde(default)]
     client_secret: Option<String>,
+}
+
+/// Request body for POST /api/endpoints/:name/credentials.
+///
+/// All fields are optional in the JSON shape so callers can omit secrets they
+/// don't want to update. `client_id` is required at runtime — if missing, the
+/// handler responds with 400.
+#[derive(Deserialize)]
+struct EndpointCredentialsRequest {
+    #[serde(default)]
+    client_id: Option<String>,
+    #[serde(default)]
+    client_secret: Option<String>,
+    /// Currently informational — `DcrCredentials` does not yet persist this
+    /// field, so it's accepted for forward compatibility but ignored.
+    #[serde(default)]
+    #[allow(dead_code)]
+    oauth_server_url: Option<String>,
+}
+
+/// Response body for GET /api/endpoints/:name/credentials.
+#[derive(Serialize)]
+struct EndpointCredentialsResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_id: Option<String>,
+    client_secret_set: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oauth_server_url: Option<String>,
+    /// Where the credentials surfaced from: "dcr" or "config" or "none".
+    source: &'static str,
 }
 
 /// Response for GET /api/endpoints/:name/oauth/status (simple)
@@ -1152,6 +1182,131 @@ async fn oauth_credentials(
     }
 
     Json(serde_json::json!({ "status": "saved" })).into_response()
+}
+
+/// POST /api/endpoints/:name/credentials
+///
+/// Persist caller-supplied OAuth client credentials via `TokenManager` (the
+/// DCR file). Never writes them to `config.toml`. Used by Wave 3a so that
+/// `client_secret` is no longer treated as a static config value.
+async fn set_endpoint_credentials(
+    State(state): State<ManagementState>,
+    Path(name): Path<String>,
+    Json(body): Json<EndpointCredentialsRequest>,
+) -> impl IntoResponse {
+    // Verify endpoint exists.
+    {
+        let config = state.config.read().await;
+        let exists = config.endpoints.iter().any(|e| e.name == name);
+        if !exists {
+            return endpoint_not_found(&name).into_response();
+        }
+    }
+
+    let client_id = match body.client_id.as_deref().map(str::trim) {
+        Some(id) if !id.is_empty() => id.to_string(),
+        _ => {
+            return error_response(StatusCode::BAD_REQUEST, "client_id must not be empty", None)
+                .into_response();
+        }
+    };
+
+    let Some(ref tm) = state.token_manager else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Token manager not available",
+            None,
+        )
+        .into_response();
+    };
+
+    let client_secret_set = body
+        .client_secret
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+
+    let creds = DcrCredentials {
+        client_id,
+        client_secret: body.client_secret.filter(|s| !s.is_empty()),
+        client_secret_expires_at: 0,
+        registered_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    };
+
+    if let Err(e) = tm.save_dcr(&name, &creds).await {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to save credentials",
+            Some(&e.to_string()),
+        )
+        .into_response();
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "client_secret_set": client_secret_set,
+    }))
+    .into_response()
+}
+
+/// GET /api/endpoints/:name/credentials
+///
+/// Returns the resolved credential view for an endpoint, preferring the DCR
+/// file and falling back to `EndpointConfig` (legacy TOML). Never returns the
+/// secret value itself — only `client_secret_set: bool`.
+async fn get_endpoint_credentials(
+    State(state): State<ManagementState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    // Verify endpoint exists and capture legacy fields.
+    let (cfg_client_id, cfg_secret, cfg_oauth_server_url) = {
+        let config = state.config.read().await;
+        let Some(ep) = config.endpoints.iter().find(|e| e.name == name) else {
+            return endpoint_not_found(&name).into_response();
+        };
+        (
+            ep.client_id.clone(),
+            ep.client_secret.clone(),
+            ep.oauth_server_url.clone(),
+        )
+    };
+
+    if let Some(ref tm) = state.token_manager {
+        match tm.load_dcr(&name).await {
+            Ok(Some(creds)) => {
+                return Json(EndpointCredentialsResponse {
+                    client_id: Some(creds.client_id),
+                    client_secret_set: creds.client_secret.is_some(),
+                    oauth_server_url: cfg_oauth_server_url,
+                    source: "dcr",
+                })
+                .into_response();
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(endpoint = %name, error = %e, "Failed to read DCR credentials; falling back to config");
+            }
+        }
+    }
+
+    let source = if cfg_client_id.is_some() || cfg_secret.is_some() {
+        "config"
+    } else {
+        "none"
+    };
+    Json(EndpointCredentialsResponse {
+        client_id: cfg_client_id,
+        client_secret_set: cfg_secret
+            .as_deref()
+            .map(|s| !s.is_empty())
+            .unwrap_or(false),
+        oauth_server_url: cfg_oauth_server_url,
+        source,
+    })
+    .into_response()
 }
 
 /// Simple URL encoding helper (percent-encode special chars).
@@ -2012,7 +2167,7 @@ async fn oauth_setup_commit(
         }
     };
 
-    if let Err(e) = std::fs::write(&resolved, &new_contents) {
+    if let Err(e) = crate::config::write_config_file(&resolved, &new_contents) {
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "failed to write config file",
@@ -2091,6 +2246,10 @@ pub fn management_routes(state: ManagementState) -> Router {
         .route(
             "/api/endpoints/{name}/tools/{tool_name}/enable",
             post(enable_tool),
+        )
+        .route(
+            "/api/endpoints/{name}/credentials",
+            get(get_endpoint_credentials).post(set_endpoint_credentials),
         )
         .route("/api/endpoints/{name}/oauth/start", post(oauth_start))
         .route(
@@ -4195,5 +4354,201 @@ command = "echo"
         let expires_in: u64 = 3600;
         let expires_at = now_secs + expires_in;
         assert_eq!(expires_at, 1_700_003_600);
+    }
+
+    // -----------------------------------------------------------------------
+    // /api/endpoints/{name}/credentials route tests (Wave 3a)
+    // -----------------------------------------------------------------------
+
+    /// Build a `ManagementState` with a `TokenManager` rooted in `tmp_dir` and
+    /// a single endpoint named `name` in the config (and no OAuth adapter
+    /// registered — the credentials routes do not require one).
+    async fn test_state_with_token_manager(
+        name: &str,
+        tmp_dir: &std::path::Path,
+        config_secret: Option<&str>,
+        config_oauth_server_url: Option<&str>,
+    ) -> (ManagementState, Arc<TokenManager>) {
+        let token_manager = Arc::new(TokenManager::new(tmp_dir.to_path_buf()));
+        let cfg = Config {
+            relay: RelayConfig {
+                machine_name: "test-machine".to_string(),
+                local_js_execution: None,
+                token_dir: None,
+            },
+            endpoints: vec![EndpointConfig {
+                name: name.to_string(),
+                description: None,
+                tool_prefix: None,
+                transport: Transport::Oauth,
+                command: None,
+                args: None,
+                url: Some("https://mcp.example.com".to_string()),
+                env: None,
+                headers: None,
+                disabled: false,
+                disabled_tools: Vec::new(),
+                oauth_server_url: config_oauth_server_url.map(|s| s.to_string()),
+                client_id: Some("legacy-client-id".to_string()),
+                client_secret: config_secret.map(|s| s.to_string()),
+                scopes: None,
+                token_endpoint: None,
+            }],
+        };
+        let state = ManagementState {
+            registry: Arc::new(AdapterRegistry::new()),
+            config: Arc::new(RwLock::new(cfg)),
+            start_time: Instant::now(),
+            config_path: None,
+            oauth_flow_manager: None,
+            relay_port: 9400,
+            oauth_adapter_inners: None,
+            token_manager: Some(token_manager.clone()),
+            setup_manager: None,
+        };
+        (state, token_manager)
+    }
+
+    #[tokio::test]
+    async fn credentials_endpoint_persists_via_token_manager() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, tm) = test_state_with_token_manager("ep1", tmp.path(), None, None).await;
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/credentials")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "client_id": "new-client",
+                            "client_secret": "new-secret",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["client_secret_set"], true);
+
+        let loaded = tm.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(loaded.client_id, "new-client");
+        assert_eq!(loaded.client_secret.as_deref(), Some("new-secret"));
+    }
+
+    #[tokio::test]
+    async fn credentials_endpoint_rejects_missing_client_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _tm) = test_state_with_token_manager("ep1", tmp.path(), None, None).await;
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/credentials")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "client_secret": "x" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn credentials_endpoint_unknown_endpoint_returns_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _tm) = test_state_with_token_manager("ep1", tmp.path(), None, None).await;
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/nope/credentials")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "client_id": "x" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn get_credentials_prefers_dcr_over_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, tm) = test_state_with_token_manager(
+            "ep1",
+            tmp.path(),
+            Some("legacy-secret"),
+            Some("https://auth.example.com"),
+        )
+        .await;
+        // Seed DCR with a different client_id and a secret.
+        tm.save_dcr(
+            "ep1",
+            &DcrCredentials {
+                client_id: "dcr-client".to_string(),
+                client_secret: Some("dcr-secret".to_string()),
+                client_secret_expires_at: 0,
+                registered_at: 1_700_000_000,
+            },
+        )
+        .await
+        .unwrap();
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::get("/api/endpoints/ep1/credentials")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["client_id"], "dcr-client");
+        assert_eq!(body["client_secret_set"], true);
+        assert_eq!(body["source"], "dcr");
+        assert_eq!(body["oauth_server_url"], "https://auth.example.com");
+        // Secret value must NOT be returned.
+        assert!(body.get("client_secret").is_none());
+    }
+
+    #[tokio::test]
+    async fn get_credentials_falls_back_to_config_when_no_dcr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _tm) =
+            test_state_with_token_manager("ep1", tmp.path(), Some("legacy-secret"), None).await;
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::get("/api/endpoints/ep1/credentials")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["client_id"], "legacy-client-id");
+        assert_eq!(body["client_secret_set"], true);
+        assert_eq!(body["source"], "config");
+        assert!(body.get("client_secret").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_toml_written_with_0600_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("config.toml");
+        crate::config::write_config_file(&path, "# placeholder").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "Expected 0600, got {:o}", mode & 0o777);
     }
 }
