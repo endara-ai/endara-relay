@@ -130,30 +130,32 @@ fn meta_tool_definitions() -> Vec<Value> {
             "name": "execute_tools",
             "description": concat!(
                 "Execute a JavaScript snippet that can call tools. ",
-                "Tools are available as `tools[\"tool_name\"]({...})`. ",
+                "Invoke a tool with `call(\"tool_name\", { ...args })`; the equivalent `tools[\"tool_name\"]({...})` indexer form is also supported. ",
                 "Multi-server tool names use `prefix__name` format (double underscore); single-server mode has no prefix. ",
                 "Each tool call returns an MCP result with `content` (array of `{type, text}`) and/or `structuredContent`. ",
                 "Prefer `structuredContent` when present — it is the server's structured output. ",
                 "`content[0].text` is provider-defined and is NOT guaranteed to be JSON: it may be prose, a partial summary, empty, or truncated. ",
                 "Only call `JSON.parse` on it after a guard such as `typeof t === \"string\" && /^\\s*[\\[{]/.test(t)`. ",
+                "Calling an unknown tool name throws an error that lists the closest matching tools. ",
+                "Pass `{ retry: 3 }` as the third argument (e.g. `await call(\"name\", args, { retry: 3 })`) to retry transient errors on tools whose annotations declare `readOnlyHint` or `idempotentHint`. ",
                 "Use `return` to send data back.\n\n",
                 "Examples:\n",
                 "```js\n",
                 "// Safe pattern: prefer structuredContent, only JSON.parse after a guard\n",
-                "const r = await tools[\"todoist__get-tasks\"]({ limit: 5 });\n",
+                "const r = await call(\"todoist__get-tasks\", { limit: 5 });\n",
                 "if (r.structuredContent) return r.structuredContent;\n",
                 "const t = r.content && r.content[0] && r.content[0].text;\n",
                 "return typeof t === \"string\" && /^\\s*[\\[{]/.test(t) ? JSON.parse(t) : t;\n",
                 "```\n",
                 "```js\n",
                 "// Chain two tool calls\n",
-                "const projects = await tools[\"todoist__get-projects\"]({});\n",
-                "const tasks = await tools[\"todoist__get-tasks\"]({ project_id: \"123\" });\n",
+                "const projects = await call(\"todoist__get-projects\", {});\n",
+                "const tasks = await call(\"todoist__get-tasks\", { project_id: \"123\" });\n",
                 "return { projects, tasks };\n",
                 "```\n",
                 "```js\n",
                 "// Single-server mode (no prefix)\n",
-                "const result = await tools[\"read_file\"]({ path: \"src/main.rs\" });\n",
+                "const result = await call(\"read_file\", { path: \"src/main.rs\" });\n",
                 "return result;\n",
                 "```",
             ),
@@ -1123,8 +1125,12 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            exec_desc.contains("tools[\""),
-            "execute_tools description should document calling convention with tools[\""
+            exec_desc.contains("call(\"tool_name\""),
+            "execute_tools description should document the call() helper as the primary calling convention"
+        );
+        assert!(
+            exec_desc.contains("tools[\"tool_name\"]"),
+            "execute_tools description should still mention the tools[\"...\"] indexer form"
         );
         assert!(
             exec_desc.contains("prefix__name") || exec_desc.contains("double underscore"),
@@ -1162,6 +1168,23 @@ mod tests {
             exec_desc
                 .contains(r#"typeof t === "string" && /^\s*[\[{]/.test(t) ? JSON.parse(t) : t"#),
             "execute_tools description should include the typeof + regex guard before JSON.parse"
+        );
+        assert!(
+            exec_desc.contains("closest matching tools") || exec_desc.contains("closest tools"),
+            "execute_tools description should advertise fuzzy unknown-tool suggestions"
+        );
+        // At least one code example should call() a tool with await.
+        assert!(
+            exec_desc.contains("await call("),
+            "execute_tools description should include at least one `await call(...)` example"
+        );
+        assert!(
+            exec_desc.contains("retry: 3"),
+            "execute_tools description should document the opt-in `{{ retry: 3 }}` option"
+        );
+        assert!(
+            exec_desc.contains("readOnlyHint") && exec_desc.contains("idempotentHint"),
+            "execute_tools description should mention readOnlyHint / idempotentHint as the gating annotations for retry"
         );
     }
 

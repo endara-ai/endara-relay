@@ -13,8 +13,45 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
-use crate::adapter::ToolInfo;
+use crate::adapter::{AdapterError, ToolInfo};
 use crate::registry::AdapterRegistry;
+
+// ---------------------------------------------------------------------------
+// Retry tuning (Wave 3)
+// ---------------------------------------------------------------------------
+
+/// Max number of retries beyond the first attempt (so total attempts at most
+/// `1 + MAX_RETRIES`). The caller's `retry` value is clamped to this.
+const MAX_RETRIES: usize = 3;
+
+/// Base retry backoff schedule in ms — the self-documenting reference for
+/// the production loop. Each per-attempt sleep is this base multiplied by a
+/// ±25% jitter factor (see [`jittered_backoff_ms`]). Tests override the
+/// effective schedule to zero via [`RETRY_BACKOFFS_MS`] to keep the suite
+/// fast; `0 * jitter == 0`, so the call site formula is unchanged.
+const RETRY_BACKOFF_SCHEDULE_MS: [u64; MAX_RETRIES] = [200, 400, 800];
+
+/// Effective backoff schedule consulted by the retry loop. In production
+/// builds this mirrors [`RETRY_BACKOFF_SCHEDULE_MS`]; in `cfg(test)` builds
+/// it is zero so existing tests don't pay real backoff cost.
+#[cfg(not(test))]
+const RETRY_BACKOFFS_MS: [u64; MAX_RETRIES] = RETRY_BACKOFF_SCHEDULE_MS;
+#[cfg(test)]
+const RETRY_BACKOFFS_MS: [u64; MAX_RETRIES] = [0, 0, 0];
+
+/// Substrings (lower-cased) that mark an `AdapterError` as transient and
+/// therefore retryable. Matched against `AdapterError`'s `Display` text.
+const RETRY_TRANSIENT_SUBSTRINGS: &[&str] =
+    &["503", "502", "504", "timeout", "connection", "reset"];
+
+/// Apply ±25% jitter to a backoff value: returns `(base as f64 * f) as u64`
+/// where `f` is uniformly drawn from `[0.75, 1.25]`. A zero `base` always
+/// returns zero, which preserves the test-suite zero-backoff override.
+fn jittered_backoff_ms(base: u64, rng: &mut impl rand::Rng) -> u64 {
+    use rand::RngExt;
+    let factor: f64 = rng.random_range(0.75..=1.25);
+    (base as f64 * factor) as u64
+}
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -38,6 +75,17 @@ pub enum JsSandboxError {
 struct SandboxState {
     registry: Arc<AdapterRegistry>,
     handle: tokio::runtime::Handle,
+    /// Wall-clock deadline for the running script (`now + sandbox_timeout`,
+    /// captured when `execute_in_sandbox` enters). The retry loop checks this
+    /// before each jittered sleep so it can abort early — surfacing the last
+    /// transient error — instead of being killed mid-sleep by the outer
+    /// `tokio::time::timeout`.
+    deadline: std::time::Instant,
+    /// When `true`, the retry loop applies the production
+    /// [`RETRY_BACKOFF_SCHEDULE_MS`] schedule even in `cfg(test)` builds.
+    /// Defaults to `false`, which preserves the existing zero-backoff override
+    /// that keeps the test suite fast.
+    use_real_backoff: bool,
 }
 
 thread_local! {
@@ -52,18 +100,36 @@ thread_local! {
 pub struct JsSandbox {
     registry: Arc<AdapterRegistry>,
     timeout: Duration,
+    /// Test-only override that opts a single sandbox into the real backoff
+    /// schedule. Production callers leave this at `false` because production
+    /// builds always apply the real schedule regardless.
+    use_real_backoff: bool,
 }
 
 impl JsSandbox {
     /// Create a new sandbox backed by the given registry.
     pub fn new(registry: Arc<AdapterRegistry>, timeout: Duration) -> Self {
-        Self { registry, timeout }
+        Self {
+            registry,
+            timeout,
+            use_real_backoff: false,
+        }
+    }
+
+    /// Test-only: opt this sandbox into the real backoff schedule. Without
+    /// this, `cfg(test)` builds short-circuit retry sleeps to zero so the
+    /// suite stays fast. Used by the deadline-budget test.
+    #[cfg(test)]
+    pub(crate) fn with_real_backoff(mut self) -> Self {
+        self.use_real_backoff = true;
+        self
     }
 
     /// Execute a JavaScript script in the sandbox.
     pub async fn execute(&self, script: &str) -> Result<Value, JsSandboxError> {
         let registry = self.registry.clone();
         let timeout = self.timeout;
+        let use_real_backoff = self.use_real_backoff;
         let script = script.to_string();
         let handle = tokio::runtime::Handle::current();
         let catalog = self.registry.merged_catalog().await;
@@ -71,7 +137,14 @@ impl JsSandbox {
         let result = tokio::time::timeout(
             timeout,
             tokio::task::spawn_blocking(move || {
-                execute_in_sandbox(&script, &catalog, &registry, &handle)
+                execute_in_sandbox(
+                    &script,
+                    &catalog,
+                    &registry,
+                    &handle,
+                    timeout,
+                    use_real_backoff,
+                )
             }),
         )
         .await;
@@ -93,11 +166,16 @@ fn execute_in_sandbox(
     catalog: &[ToolInfo],
     registry: &Arc<AdapterRegistry>,
     handle: &tokio::runtime::Handle,
+    sandbox_timeout: Duration,
+    use_real_backoff: bool,
 ) -> Result<Value, JsSandboxError> {
+    let deadline = std::time::Instant::now() + sandbox_timeout;
     SANDBOX_STATE.with(|cell| {
         *cell.borrow_mut() = Some(SandboxState {
             registry: registry.clone(),
             handle: handle.clone(),
+            deadline,
+            use_real_backoff,
         });
     });
     let result = run_js(script, catalog);
@@ -118,6 +196,7 @@ fn run_js(script: &str, catalog: &[ToolInfo]) -> Result<Value, JsSandboxError> {
         .set_loop_iteration_limit(1_000_000);
 
     register_call_tool(&mut context)?;
+    register_call_tool_with_retry(&mut context)?;
     register_tools_object(&mut context, catalog)?;
     register_json_parse_wrapper(&mut context)?;
 
@@ -173,6 +252,21 @@ fn register_call_tool(context: &mut Context) -> Result<(), JsSandboxError> {
     Ok(())
 }
 
+fn register_call_tool_with_retry(context: &mut Context) -> Result<(), JsSandboxError> {
+    let f = NativeFunction::from_fn_ptr(call_tool_with_retry_native);
+    let js_func = f.to_js_function(context.realm());
+    context
+        .register_global_property(
+            boa_engine::js_string!("__call_tool_with_retry"),
+            js_func,
+            Attribute::READONLY | Attribute::NON_ENUMERABLE,
+        )
+        .map_err(|e| {
+            JsSandboxError::Internal(format!("failed to register __call_tool_with_retry: {}", e))
+        })?;
+    Ok(())
+}
+
 fn call_tool_native(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let tool_name = args
         .first()
@@ -195,6 +289,22 @@ fn call_tool_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
         let state = borrow
             .as_ref()
             .ok_or_else(|| JsNativeError::error().with_message("sandbox state not initialised"))?;
+        // Pre-flight existence check so unknown tool names yield a fuzzy
+        // suggestion error instead of the bare adapter "no tool found" text.
+        let catalog = state.handle.block_on(state.registry.merged_catalog());
+        let tool = match catalog.iter().find(|t| t.name == tool_name) {
+            Some(t) => t,
+            None => {
+                let msg = format_unknown_tool_error(&tool_name, &catalog);
+                return Err(JsError::from(JsNativeError::error().with_message(msg)));
+            }
+        };
+        // Pre-flight strict-schema check so unknown arg keys fail fast with a
+        // helpful list of valid parameters instead of being silently dropped
+        // by the upstream MCP server.
+        if let Some(msg) = validate_tool_args(tool, &arguments) {
+            return Err(JsError::from(JsNativeError::error().with_message(msg)));
+        }
         let res = state
             .handle
             .block_on(state.registry.route_tool_call(&tool_name, arguments))
@@ -211,20 +321,398 @@ fn call_tool_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
 }
 
 // ---------------------------------------------------------------------------
-// Build the `tools` global object via JS eval
+// Native function: __call_tool_with_retry(name, args_json, retry)
+//   -> result_json_string
+//
+// Same pre-flight checks as `__call_tool` (existence, strict-schema), plus a
+// retry-eligibility gate that requires the tool's annotations to declare it
+// `readOnlyHint: true` or `idempotentHint: true` (and never `destructiveHint:
+// true`). Loops up to `min(retry, MAX_RETRIES)` additional attempts on
+// transient `AdapterError`s with backoff `RETRY_BACKOFFS_MS`.
+//
+// Application errors (`isError: true` envelopes) are returned as `Ok(value)`
+// from `route_tool_call` — they are NOT retried; the JS `call()` helper turns
+// them into a thrown `Error` on first occurrence.
+// ---------------------------------------------------------------------------
+
+fn call_tool_with_retry_native(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let tool_name = args
+        .first()
+        .ok_or_else(|| {
+            JsNativeError::typ().with_message("__call_tool_with_retry: missing tool name")
+        })?
+        .to_string(context)?
+        .to_std_string_escaped();
+
+    let args_json_str = args
+        .get(1)
+        .ok_or_else(|| {
+            JsNativeError::typ().with_message("__call_tool_with_retry: missing arguments")
+        })?
+        .to_string(context)?
+        .to_std_string_escaped();
+
+    let retry_requested = args
+        .get(2)
+        .and_then(|v| v.as_number())
+        .map(|n| {
+            if n.is_finite() && n > 0.0 {
+                n as usize
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0);
+
+    let arguments: Value = serde_json::from_str(&args_json_str).map_err(|e| {
+        JsNativeError::typ()
+            .with_message(format!("__call_tool_with_retry: invalid JSON args: {}", e))
+    })?;
+
+    let result = SANDBOX_STATE.with(|cell| {
+        let borrow = cell.borrow();
+        let state = borrow
+            .as_ref()
+            .ok_or_else(|| JsNativeError::error().with_message("sandbox state not initialised"))?;
+        // Pre-flight existence + schema checks share the same shape as the
+        // plain `__call_tool` path; the eligibility gate is the only addition.
+        let catalog = state.handle.block_on(state.registry.merged_catalog());
+        let tool = match catalog.iter().find(|t| t.name == tool_name) {
+            Some(t) => t,
+            None => {
+                let msg = format_unknown_tool_error(&tool_name, &catalog);
+                return Err(JsError::from(JsNativeError::error().with_message(msg)));
+            }
+        };
+        if let Some(msg) = validate_tool_args(tool, &arguments) {
+            return Err(JsError::from(JsNativeError::error().with_message(msg)));
+        }
+        if !is_retry_eligible(tool.annotations.as_ref()) {
+            return Err(JsError::from(JsNativeError::error().with_message(format!(
+                "call('{}'): retry not allowed (tool not declared read-only or idempotent)",
+                tool_name
+            ))));
+        }
+        let max_retries = retry_requested.min(MAX_RETRIES);
+        let registry = state.registry.clone();
+        let deadline = state.deadline;
+        let use_real_backoff = state.use_real_backoff;
+        let res = state
+            .handle
+            .block_on(call_tool_with_retry_loop(
+                &registry,
+                &tool_name,
+                arguments,
+                max_retries,
+                deadline,
+                use_real_backoff,
+            ))
+            .map_err(|e| {
+                JsNativeError::error()
+                    .with_message(format!("tool call '{}' failed: {}", tool_name, e))
+            })?;
+        Ok::<Value, JsError>(res)
+    })?;
+
+    let result_str = serde_json::to_string(&result)
+        .map_err(|e| JsNativeError::error().with_message(format!("serialisation error: {}", e)))?;
+    Ok(JsValue::from(boa_engine::js_string!(result_str.as_str())))
+}
+
+/// Retry loop driving up to `1 + max_retries` attempts on transient errors.
+/// Backoff is applied **between** attempts (no delay before the first try)
+/// and is jittered by ±25% via [`jittered_backoff_ms`].
+///
+/// Aborts early when the next jittered sleep would push the wall clock past
+/// `deadline`. The last-seen transient error is wrapped in an
+/// `AdapterError::ProtocolError` whose message names the tool, the number of
+/// attempts actually made, and embeds the underlying error's `Display` text.
+/// This prevents the retry loop from being killed mid-sleep by the sandbox's
+/// outer timeout while preserving the underlying cause for the caller.
+///
+/// `use_real_backoff` selects between [`RETRY_BACKOFF_SCHEDULE_MS`] and the
+/// effective (possibly zero, in `cfg(test)`) [`RETRY_BACKOFFS_MS`] schedule.
+/// Production callers pass `false` because `RETRY_BACKOFFS_MS` already mirrors
+/// the real schedule outside `cfg(test)`. Tests pass `true` to opt back into
+/// real sleeps.
+async fn call_tool_with_retry_loop(
+    registry: &AdapterRegistry,
+    tool_name: &str,
+    arguments: Value,
+    max_retries: usize,
+    deadline: std::time::Instant,
+    use_real_backoff: bool,
+) -> Result<Value, AdapterError> {
+    let schedule: &[u64; MAX_RETRIES] = if use_real_backoff {
+        &RETRY_BACKOFF_SCHEDULE_MS
+    } else {
+        &RETRY_BACKOFFS_MS
+    };
+    let mut attempt: usize = 0;
+    let mut rng = rand::rng();
+    loop {
+        let res = registry.route_tool_call(tool_name, arguments.clone()).await;
+        match res {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if attempt < max_retries && is_transient_error(&e) {
+                    let base_ms = schedule
+                        .get(attempt)
+                        .copied()
+                        .unwrap_or(*schedule.last().unwrap_or(&0));
+                    let backoff_ms = jittered_backoff_ms(base_ms, &mut rng);
+                    // Deadline gate: if the next sleep would exceed the
+                    // sandbox's wall-clock budget, wrap the last-seen
+                    // transient error so the caller can distinguish a
+                    // budget-exhausted retry from a single first-attempt
+                    // failure. `attempt + 1` is the number of attempts made
+                    // so far (the current failed call included).
+                    if std::time::Instant::now() + Duration::from_millis(backoff_ms) >= deadline {
+                        let attempts_made = attempt + 1;
+                        return Err(AdapterError::ProtocolError(format!(
+                            "call('{}'): retry deadline exceeded after {} attempts (last error: {})",
+                            tool_name, attempts_made, e
+                        )));
+                    }
+                    if backoff_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    }
+                    attempt += 1;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// Decide whether a tool may be retried based on its MCP annotations.
+///
+/// Allowed iff annotations exist AND (`readOnlyHint: true` OR
+/// `idempotentHint: true`); `destructiveHint: true` overrides and disqualifies
+/// even an idempotent-marked tool. Tools without annotations are conservatively
+/// rejected.
+fn is_retry_eligible(annotations: Option<&Value>) -> bool {
+    let Some(obj) = annotations.and_then(|a| a.as_object()) else {
+        return false;
+    };
+    if obj.get("destructiveHint").and_then(|v| v.as_bool()) == Some(true) {
+        return false;
+    }
+    let read_only = obj.get("readOnlyHint").and_then(|v| v.as_bool()) == Some(true);
+    let idempotent = obj.get("idempotentHint").and_then(|v| v.as_bool()) == Some(true);
+    read_only || idempotent
+}
+
+/// Treat an `AdapterError` as transient if its `Display` text contains any of
+/// the known retryable substrings (case-insensitive).
+fn is_transient_error(err: &AdapterError) -> bool {
+    let lower = err.to_string().to_lowercase();
+    RETRY_TRANSIENT_SUBSTRINGS.iter().any(|s| lower.contains(s))
+}
+
+/// Build the message for a "tool not found" error, including up to three
+/// fuzzy-matched suggestions when the catalog has nearby names.
+fn format_unknown_tool_error(name: &str, catalog: &[ToolInfo]) -> String {
+    let suggestions = suggest_tool_names(name, catalog);
+    if suggestions.is_empty() {
+        format!(
+            "no tool named '{}'. Use list_tools or search_tools to discover available tools.",
+            name
+        )
+    } else {
+        let quoted: Vec<String> = suggestions.iter().map(|s| format!("'{}'", s)).collect();
+        format!(
+            "no tool named '{}'. Did you mean: {}? Use list_tools or search_tools to discover other tools.",
+            name,
+            quoted.join(", ")
+        )
+    }
+}
+
+/// Return up to three catalog tool names that are closest to `name` by
+/// Optimal String Alignment distance (case-insensitive). Distances are
+/// computed against both the full prefixed name and the suffix after `__`,
+/// taking the smaller, so e.g. typo `ehco` suggests `ep__echo`.
+fn suggest_tool_names(name: &str, catalog: &[ToolInfo]) -> Vec<String> {
+    if catalog.is_empty() {
+        return Vec::new();
+    }
+    let name_lower = name.to_lowercase();
+    let len = name.chars().count();
+    // Threshold scales gently with name length; clamped so very short names
+    // still allow at least one edit and very long names don't drown in noise.
+    let threshold = (len / 3).clamp(1, 4);
+    let mut scored: Vec<(usize, &str)> = catalog
+        .iter()
+        .map(|t| {
+            let full_lower = t.name.to_lowercase();
+            let suffix_lower = t
+                .name
+                .split_once("__")
+                .map(|(_, n)| n.to_lowercase())
+                .unwrap_or_else(|| full_lower.clone());
+            let d = strsim::osa_distance(&name_lower, &full_lower)
+                .min(strsim::osa_distance(&name_lower, &suffix_lower));
+            (d, t.name.as_str())
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    scored
+        .into_iter()
+        .filter(|(d, _)| *d <= threshold)
+        .take(3)
+        .map(|(_, n)| n.to_string())
+        .collect()
+}
+
+/// Reject calls that pass keys not declared by the tool's `input_schema`.
+///
+/// Strict only when the schema is shaped like a closed object: `type` is
+/// `"object"` (or absent), `properties` is a defined object, and
+/// `additionalProperties` is **not** `true` (missing/false/schema → strict,
+/// per JSON Schema convention). Tools without `properties` accept arbitrary
+/// args and bypass the check. Returns the formatted error message when args
+/// should be rejected; `None` means pass-through.
+fn validate_tool_args(tool: &ToolInfo, args: &Value) -> Option<String> {
+    let schema = &tool.input_schema;
+    if let Some(t) = schema.get("type") {
+        if t.as_str() != Some("object") {
+            return None;
+        }
+    }
+    let properties = schema.get("properties").and_then(|p| p.as_object())?;
+    if schema.get("additionalProperties").and_then(|v| v.as_bool()) == Some(true) {
+        return None;
+    }
+    let args_obj = args.as_object()?;
+    let mut unknown: Vec<&str> = args_obj
+        .keys()
+        .filter(|k| !properties.contains_key(k.as_str()))
+        .map(|s| s.as_str())
+        .collect();
+    if unknown.is_empty() {
+        return None;
+    }
+    unknown.sort_unstable();
+
+    let unknown_list = unknown
+        .iter()
+        .map(|k| format!("'{}'", k))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut valid_params: Vec<(&str, Option<&str>)> = properties
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.get("description").and_then(|d| d.as_str())))
+        .collect();
+    valid_params.sort_by(|a, b| a.0.cmp(b.0));
+    let valid_list = if valid_params.is_empty() {
+        "(none)".to_string()
+    } else {
+        valid_params
+            .iter()
+            .map(|(k, d)| match d {
+                Some(desc) => format!("'{}' ({})", k, desc),
+                None => format!("'{}'", k),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    Some(format!(
+        "tool '{}' rejected unknown parameter(s) {}. Valid parameters: {}.",
+        tool.name, unknown_list, valid_list
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Build the `tools` global object and `call` helper via JS eval.
+//
+// `tools` is a Proxy over a plain object containing one function per known
+// catalog tool. Unknown property accesses still return a function (so
+// `typeof tools["x"]` is `"function"` and `"x" in tools` is truthy), but
+// invoking that function throws a fuzzy "no tool named …" error from the
+// native side. Invoking `tools[name](args)` returns the *raw* MCP envelope
+// (`{ content, structuredContent, isError, ... }`) — the indexer is the
+// escape hatch for callers that need full envelope access.
+//
+// `call(name, args, opts)` is the recommended helper. It unwraps the
+// envelope: on `isError` it throws an `Error` whose message includes the
+// tool name and `content[0].text`; with `opts.raw === true` it returns the
+// parsed envelope unchanged; otherwise it returns `structuredContent` when
+// present, parses `content[0].text` when it begins with `[` or `{`, returns
+// the text as-is when it doesn't look JSON-shaped, and falls back to the
+// raw envelope when neither field is set.
+//
+// `opts.retry` (number) opts the call into transient-error retry. Routing
+// switches to `__call_tool_with_retry`, which gates eligibility on the tool's
+// `annotations` (`readOnlyHint` / `idempotentHint`, never `destructiveHint`)
+// and retries on transient `AdapterError`s with capped exponential backoff.
 // ---------------------------------------------------------------------------
 
 fn register_tools_object(
     context: &mut Context,
     catalog: &[ToolInfo],
 ) -> Result<(), JsSandboxError> {
-    let mut js_src = String::from("var tools = {};\n");
+    let mut js_src = String::from("var __real_tools = {};\n");
     for tool in catalog {
         let name = &tool.name;
         js_src.push_str(&format!(
-            "tools[\"{name}\"] = function(args) {{ return JSON.parse(__call_tool(\"{name}\", JSON.stringify(args || {{}}))); }};\n"
+            "__real_tools[\"{name}\"] = function(args) {{ return JSON.parse(__call_tool(\"{name}\", JSON.stringify(args || {{}}))); }};\n"
         ));
     }
+    js_src.push_str(
+        r#"
+function __unknown_tool_stub(name) {
+  return function(args) {
+    return JSON.parse(__call_tool(name, JSON.stringify(args || {})));
+  };
+}
+var tools = new Proxy(__real_tools, {
+  get: function(target, prop, receiver) {
+    if (Object.prototype.hasOwnProperty.call(target, prop)) {
+      return target[prop];
+    }
+    if (typeof prop === 'symbol' || prop in target) {
+      return Reflect.get(target, prop, receiver);
+    }
+    return __unknown_tool_stub(prop);
+  },
+  has: function(target, prop) {
+    if (typeof prop === 'string') return true;
+    return prop in target;
+  }
+});
+function call(name, args, opts) {
+  var retry = (opts && typeof opts.retry === "number" && opts.retry > 0) ? opts.retry : 0;
+  var r;
+  if (retry > 0) {
+    r = JSON.parse(__call_tool_with_retry(name, JSON.stringify(args || {}), retry));
+  } else {
+    r = JSON.parse(__call_tool(name, JSON.stringify(args || {})));
+  }
+  if (r && r.isError) {
+    var msg = "";
+    if (r.content && r.content[0] && typeof r.content[0].text === "string") {
+      msg = r.content[0].text;
+    }
+    throw new Error("call('" + name + "') failed: " + msg);
+  }
+  if (opts && opts.raw) return r;
+  if (r && r.structuredContent !== undefined) return r.structuredContent;
+  if (r && r.content && r.content[0] && typeof r.content[0].text === "string") {
+    var t = r.content[0].text;
+    return /^\s*[\[{]/.test(t) ? JSON.parse(t) : t;
+  }
+  return r;
+}
+"#,
+    );
     context
         .eval(Source::from_bytes(js_src.as_bytes()))
         .map_err(|e| JsSandboxError::Internal(format!("failed to create tools object: {}", e)))?;
@@ -1309,6 +1797,411 @@ mod tests {
         assert_eq!(result["args"]["msg"], "sync");
     }
 
+    // --- call() helper + fuzzy tool-not-found tests ---
+
+    #[tokio::test]
+    async fn test_js_sandbox_call_helper_known_tool() {
+        let reg = make_registry().await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("echo", { text: "hi" });"#)
+            .await
+            .unwrap();
+        assert_eq!(result["called"], "echo");
+        assert_eq!(result["args"]["text"], "hi");
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_call_helper_omitted_args_defaults_to_object() {
+        let reg = make_registry().await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox.execute(r#"return call("echo");"#).await.unwrap();
+        assert_eq!(result["called"], "echo");
+        assert!(result["args"].is_object(), "args should default to {{}}");
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_call_unknown_tool_suggests_close_match() {
+        // "ehco" is one transposition away from "echo" — must be suggested.
+        let reg = make_registry().await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox.execute(r#"return call("ehco", {});"#).await;
+        assert!(result.is_err(), "expected unknown tool to throw");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("no tool named 'ehco'"),
+            "error should name the missing tool: {}",
+            err
+        );
+        assert!(
+            err.contains("Did you mean") && err.contains("'echo'"),
+            "error should suggest 'echo': {}",
+            err
+        );
+        assert!(
+            err.contains("list_tools") && err.contains("search_tools"),
+            "error should point at list_tools / search_tools: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_tools_indexer_unknown_throws_on_invocation() {
+        // typeof + `in` must remain truthy (throw-on-invocation, not on access),
+        // and invoking the unknown stub must surface the same fuzzy error.
+        let reg = make_registry().await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let probe = sandbox
+            .execute(r#"return { tof: typeof tools["ehco"], inOp: ("ehco" in tools) };"#)
+            .await
+            .unwrap();
+        assert_eq!(probe["tof"], "function");
+        assert_eq!(probe["inOp"], true);
+
+        let result = sandbox.execute(r#"return tools["ehco"]({});"#).await;
+        assert!(result.is_err(), "invoking unknown tool stub must throw");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("no tool named 'ehco'") && err.contains("'echo'"),
+            "indexer-form unknown tool must produce the same fuzzy error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_call_unknown_tool_no_close_match_omits_did_you_mean() {
+        let reg = make_registry().await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("zzzzzzzzzzzzzz", {});"#)
+            .await;
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("no tool named 'zzzzzzzzzzzzzz'"),
+            "error should name the missing tool: {}",
+            err
+        );
+        assert!(
+            !err.contains("Did you mean"),
+            "no nearby names — should not include Did you mean: {}",
+            err
+        );
+        assert!(
+            err.contains("list_tools") && err.contains("search_tools"),
+            "error should still point at list_tools / search_tools: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_tools_known_indexer_still_works() {
+        // Sanity: the Proxy must not change behavior for real catalog tools.
+        let reg = make_registry().await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return tools["echo"]({ msg: "via-indexer" });"#)
+            .await
+            .unwrap();
+        assert_eq!(result["called"], "echo");
+        assert_eq!(result["args"]["msg"], "via-indexer");
+    }
+
+    // --- call() envelope-unwrapping tests ---
+    //
+    // These use a dedicated adapter that returns a per-tool fixed envelope
+    // so we can drive each branch of the unwrap logic deterministically.
+
+    struct EnvelopeAdapter {
+        tools: Vec<ToolInfo>,
+        responses: std::collections::HashMap<String, Value>,
+    }
+
+    #[async_trait]
+    impl McpAdapter for EnvelopeAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(self.tools.clone())
+        }
+        async fn call_tool(&self, name: &str, _arguments: Value) -> Result<Value, AdapterError> {
+            Ok(self.responses.get(name).cloned().unwrap_or(Value::Null))
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    async fn make_envelope_registry(responses: Vec<(&str, Value)>) -> Arc<AdapterRegistry> {
+        let registry = AdapterRegistry::new();
+        let tools: Vec<ToolInfo> = responses
+            .iter()
+            .map(|(n, _)| make_tool(n, "envelope tool"))
+            .collect();
+        let map: std::collections::HashMap<String, Value> = responses
+            .into_iter()
+            .map(|(n, v)| (n.to_string(), v))
+            .collect();
+        registry
+            .register(
+                "env".into(),
+                Box::new(EnvelopeAdapter {
+                    tools,
+                    responses: map,
+                }),
+                "stdio".into(),
+                None,
+                None,
+            )
+            .await;
+        Arc::new(registry)
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_call_returns_structured_content() {
+        let reg =
+            make_envelope_registry(vec![("sc", json!({ "structuredContent": { "foo": 1 } }))])
+                .await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox.execute(r#"return call("sc", {});"#).await.unwrap();
+        assert_eq!(result, json!({ "foo": 1 }));
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_call_parses_json_text_content() {
+        let reg = make_envelope_registry(vec![(
+            "tj",
+            json!({ "content": [{ "type": "text", "text": "{\"x\":42}" }] }),
+        )])
+        .await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox.execute(r#"return call("tj", {});"#).await.unwrap();
+        assert_eq!(result, json!({ "x": 42 }));
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_call_returns_text_when_not_json_shaped() {
+        let reg = make_envelope_registry(vec![(
+            "tt",
+            json!({ "content": [{ "type": "text", "text": "hello" }] }),
+        )])
+        .await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox.execute(r#"return call("tt", {});"#).await.unwrap();
+        assert_eq!(result, json!("hello"));
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_call_throws_on_is_error_envelope() {
+        let reg = make_envelope_registry(vec![(
+            "boom",
+            json!({
+                "isError": true,
+                "content": [{ "type": "text", "text": "upstream broke" }]
+            }),
+        )])
+        .await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox.execute(r#"return call("boom", {});"#).await;
+        assert!(result.is_err(), "expected isError envelope to throw");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("boom"),
+            "error should mention the tool name: {}",
+            err
+        );
+        assert!(
+            err.contains("upstream broke"),
+            "error should include content[0].text: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_call_raw_opt_returns_envelope() {
+        let reg = make_envelope_registry(vec![(
+            "raw",
+            json!({
+                "structuredContent": { "foo": 1 },
+                "content": [{ "type": "text", "text": "{\"foo\":1}" }]
+            }),
+        )])
+        .await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("raw", {}, { raw: true });"#)
+            .await
+            .unwrap();
+        assert_eq!(result["structuredContent"], json!({ "foo": 1 }));
+        assert_eq!(result["content"][0]["text"], "{\"foo\":1}");
+    }
+
+    // --- unknown-parameter rejection tests ---
+    //
+    // These exercise the strict-schema check in `__call_tool` that rejects
+    // arg keys not declared by the tool's `input_schema.properties` before
+    // routing to the upstream adapter. The mock adapter echoes its input,
+    // so a successful pass-through round-trips the args back to the test.
+
+    async fn registry_with_single_tool(tool: ToolInfo) -> Arc<AdapterRegistry> {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::new(vec![tool])),
+                "stdio".into(),
+                None,
+                None,
+            )
+            .await;
+        Arc::new(registry)
+    }
+
+    fn echo_strict_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string", "description": "Text to echo back" },
+                "count": { "type": "number", "description": "Repeat count" }
+            },
+            "required": ["text"]
+        })
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_strict_schema_rejects_unknown_param() {
+        let tool = make_tool_with_schema("echo", "Echo tool", echo_strict_schema());
+        let reg = registry_with_single_tool(tool).await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("echo", { text: "hi", zzz: 1, aaa: 2 });"#)
+            .await;
+        assert!(result.is_err(), "unknown params should reject");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("'echo'"), "error names tool: {}", err);
+        // Unknown keys are listed alphabetically.
+        let aaa_idx = err.find("'aaa'").expect("unknown 'aaa' listed");
+        let zzz_idx = err.find("'zzz'").expect("unknown 'zzz' listed");
+        assert!(aaa_idx < zzz_idx, "unknown keys must be sorted: {}", err);
+        // Valid params + their descriptions surface.
+        assert!(
+            err.contains("'text'") && err.contains("Text to echo back"),
+            "valid param 'text' with description: {}",
+            err
+        );
+        assert!(
+            err.contains("'count'") && err.contains("Repeat count"),
+            "valid param 'count' with description: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_additional_properties_true_is_permissive() {
+        let mut schema = echo_strict_schema();
+        schema["additionalProperties"] = json!(true);
+        let tool = make_tool_with_schema("echo", "Echo tool", schema);
+        let reg = registry_with_single_tool(tool).await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("echo", { text: "hi", extra: "ok" });"#)
+            .await
+            .expect("additionalProperties:true should not reject");
+        assert_eq!(result["called"], "echo");
+        assert_eq!(result["args"]["extra"], "ok");
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_additional_properties_false_rejects() {
+        let mut schema = echo_strict_schema();
+        schema["additionalProperties"] = json!(false);
+        let tool = make_tool_with_schema("echo", "Echo tool", schema);
+        let reg = registry_with_single_tool(tool).await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("echo", { text: "hi", extra: "nope" });"#)
+            .await;
+        assert!(result.is_err(), "additionalProperties:false should reject");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("'extra'"), "error lists unknown key: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_schema_without_properties_allows_arbitrary_args() {
+        // `make_tool` defaults to `{"type": "object"}` with no `properties`
+        // field — the validator must treat this as "accepts arbitrary args".
+        let reg = make_registry().await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("echo", { anything: 1, goes: true });"#)
+            .await
+            .expect("no properties → no rejection");
+        assert_eq!(result["args"]["anything"], 1);
+        assert_eq!(result["args"]["goes"], true);
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_unknown_param_rejected_via_tools_indexer() {
+        // Parity with `call(...)`: invoking `tools["name"](args)` shares the
+        // same `__call_tool` path, so strict rejection must trigger here too.
+        let tool = make_tool_with_schema("echo", "Echo tool", echo_strict_schema());
+        let reg = registry_with_single_tool(tool).await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return tools["echo"]({ text: "hi", bogus: 1 });"#)
+            .await;
+        assert!(result.is_err(), "indexer path must also reject");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("'bogus'"), "error lists unknown key: {}", err);
+        assert!(err.contains("'echo'"), "error names tool: {}", err);
+    }
+
+    // --- suggest_tool_names unit tests ---
+
+    #[test]
+    fn test_suggest_tool_names_prefers_close_match() {
+        let catalog = vec![
+            make_tool("echo", "Echo tool"),
+            make_tool("add", "Add numbers"),
+            make_tool("greet", "Greeting tool"),
+        ];
+        let suggestions = suggest_tool_names("ehco", &catalog);
+        assert!(
+            suggestions.first().map(|s| s.as_str()) == Some("echo"),
+            "expected 'echo' first, got {:?}",
+            suggestions
+        );
+    }
+
+    #[test]
+    fn test_suggest_tool_names_matches_suffix_after_prefix() {
+        let catalog = vec![
+            make_tool("ep__echo", "Echo tool"),
+            make_tool("ep__add", "Add numbers"),
+        ];
+        let suggestions = suggest_tool_names("ehco", &catalog);
+        assert!(
+            suggestions.iter().any(|s| s == "ep__echo"),
+            "should match suffix after '__': {:?}",
+            suggestions
+        );
+    }
+
+    #[test]
+    fn test_suggest_tool_names_returns_empty_for_total_mismatch() {
+        let catalog = vec![make_tool("echo", "x"), make_tool("add", "y")];
+        let suggestions = suggest_tool_names("zzzzzzzzzzzzzz", &catalog);
+        assert!(
+            suggestions.is_empty(),
+            "very dissimilar query should yield no suggestions: {:?}",
+            suggestions
+        );
+    }
+
     #[tokio::test]
     async fn test_js_sandbox_timeout() {
         let reg = make_registry().await;
@@ -1681,5 +2574,401 @@ mod tests {
 
         // Stable read after mutations stop.
         assert_eq!(registry.catalog_generation(), g5);
+    }
+
+    // ----------------------------------------------------------------------
+    // Wave 3 — opt-in retry for read-only / idempotent tools
+    // ----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Mock adapter that fails its first `failures_remaining` `call_tool`
+    /// invocations with a configurable transient error, then succeeds.
+    struct FlakyAdapter {
+        tools: Vec<ToolInfo>,
+        failures_remaining: AtomicUsize,
+        call_count: Arc<AtomicUsize>,
+        // When true, the failure is `HttpError { status: 503, .. }`; when
+        // false, it's `AuthenticationRequired` (a non-transient error).
+        transient: bool,
+    }
+
+    #[async_trait]
+    impl McpAdapter for FlakyAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(self.tools.clone())
+        }
+        async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            if self.failures_remaining.load(Ordering::SeqCst) > 0 {
+                self.failures_remaining.fetch_sub(1, Ordering::SeqCst);
+                return Err(if self.transient {
+                    AdapterError::HttpError {
+                        status: 503,
+                        body: "service unavailable".into(),
+                    }
+                } else {
+                    AdapterError::AuthenticationRequired {
+                        endpoint: "ep".into(),
+                        message: "token expired".into(),
+                    }
+                });
+            }
+            Ok(json!({ "called": name, "args": arguments }))
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    fn tool_with_annotations(name: &str, annotations: Value) -> ToolInfo {
+        ToolInfo {
+            name: name.to_string(),
+            description: Some(format!("{} tool", name)),
+            input_schema: json!({"type": "object"}),
+            annotations: Some(annotations),
+        }
+    }
+
+    /// Build a registry with a single flaky adapter exposing one tool whose
+    /// annotations the caller controls, plus a shared call-counter handle.
+    async fn make_flaky_registry(
+        tool: ToolInfo,
+        failures: usize,
+        transient: bool,
+    ) -> (Arc<AdapterRegistry>, Arc<AtomicUsize>) {
+        let registry = AdapterRegistry::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+        registry
+            .register(
+                "ep".into(),
+                Box::new(FlakyAdapter {
+                    tools: vec![tool],
+                    failures_remaining: AtomicUsize::new(failures),
+                    call_count: Arc::clone(&counter),
+                    transient,
+                }),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+        (Arc::new(registry), counter)
+    }
+
+    // --- jittered_backoff_ms -----------------------------------------------
+
+    #[test]
+    fn jittered_backoff_ms_within_bounds() {
+        // For every base in the production schedule, 200 samples of
+        // `jittered_backoff_ms` must land in `[floor(base*0.75), ceil(base*1.25)]`.
+        // `0` is also covered explicitly to guard the zero-backoff override.
+        let mut rng = rand::rng();
+        let mut bases: Vec<u64> = RETRY_BACKOFF_SCHEDULE_MS.to_vec();
+        bases.push(0);
+        bases.push(50);
+        for base in bases {
+            let lo = (base as f64 * 0.75).floor() as u64;
+            let hi = (base as f64 * 1.25).ceil() as u64;
+            for _ in 0..200 {
+                let j = jittered_backoff_ms(base, &mut rng);
+                assert!(
+                    j >= lo && j <= hi,
+                    "jitter out of bounds: base={}, j={}, expected [{},{}]",
+                    base,
+                    j,
+                    lo,
+                    hi
+                );
+            }
+        }
+        // Zero base must be exactly zero — preserves the test-suite override.
+        for _ in 0..50 {
+            assert_eq!(jittered_backoff_ms(0, &mut rng), 0);
+        }
+    }
+
+    // --- is_transient_error -------------------------------------------------
+
+    #[test]
+    fn is_transient_error_matches_known_substrings() {
+        assert!(is_transient_error(&AdapterError::HttpError {
+            status: 503,
+            body: "x".into(),
+        }));
+        assert!(is_transient_error(&AdapterError::HttpError {
+            status: 502,
+            body: "x".into(),
+        }));
+        assert!(is_transient_error(&AdapterError::HttpError {
+            status: 504,
+            body: "x".into(),
+        }));
+        assert!(is_transient_error(&AdapterError::ProtocolError(
+            "upstream request timeout exceeded".into()
+        )));
+        assert!(is_transient_error(&AdapterError::ConnectionFailed(
+            "stream closed".into()
+        )));
+        assert!(is_transient_error(&AdapterError::ProtocolError(
+            "connection reset by peer".into()
+        )));
+    }
+
+    #[test]
+    fn is_transient_error_rejects_unrelated_errors() {
+        assert!(!is_transient_error(&AdapterError::NotInitialized));
+        assert!(!is_transient_error(&AdapterError::ProtocolError(
+            "schema mismatch".into()
+        )));
+        assert!(!is_transient_error(&AdapterError::JsonRpcError {
+            code: -32000,
+            message: "bad arg".into(),
+            data: None,
+        }));
+    }
+
+    // --- is_retry_eligible --------------------------------------------------
+
+    #[test]
+    fn is_retry_eligible_read_only_hint_allows() {
+        let ann = json!({ "readOnlyHint": true });
+        assert!(is_retry_eligible(Some(&ann)));
+    }
+
+    #[test]
+    fn is_retry_eligible_idempotent_hint_allows() {
+        let ann = json!({ "idempotentHint": true });
+        assert!(is_retry_eligible(Some(&ann)));
+    }
+
+    #[test]
+    fn is_retry_eligible_destructive_hint_overrides_idempotent() {
+        let ann = json!({ "idempotentHint": true, "destructiveHint": true });
+        assert!(!is_retry_eligible(Some(&ann)));
+    }
+
+    #[test]
+    fn is_retry_eligible_no_annotations_rejects() {
+        assert!(!is_retry_eligible(None));
+        assert!(!is_retry_eligible(Some(&json!({}))));
+        assert!(!is_retry_eligible(Some(&json!({ "title": "Echo" }))));
+    }
+
+    // --- end-to-end through the JS `call(..., { retry })` helper ------------
+
+    #[tokio::test]
+    async fn call_with_retry_recovers_from_transient_error() {
+        // Read-only tool, 2 transient failures then success → 3 total calls,
+        // and the JS layer sees a successful result.
+        let tool = tool_with_annotations("echo", json!({ "readOnlyHint": true }));
+        let (reg, counter) = make_flaky_registry(tool, 2, true).await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("echo", { text: "hi" }, { retry: 3 });"#)
+            .await
+            .unwrap();
+        assert_eq!(result["called"], "echo");
+        assert_eq!(result["args"]["text"], "hi");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            3,
+            "expected 1 initial + 2 retried call_tool invocations"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_with_retry_blocks_non_eligible_tool() {
+        // Tool has no annotations → eligibility gate must fail before any
+        // adapter call_tool invocation happens, with a clear error message.
+        let tool = make_tool("echo", "plain echo");
+        let (reg, counter) = make_flaky_registry(tool, 0, true).await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("echo", {}, { retry: 3 });"#)
+            .await;
+        assert!(result.is_err(), "expected eligibility gate to reject");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("retry not allowed"),
+            "error should explain retry was rejected, got: {}",
+            err
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "no adapter call_tool calls should be made when retry is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_with_retry_does_not_retry_non_transient_error() {
+        // Read-only tool, but the failure is non-transient (auth) → loop
+        // returns immediately after the first failure.
+        let tool = tool_with_annotations("echo", json!({ "readOnlyHint": true }));
+        let (reg, counter) = make_flaky_registry(tool, 5, false).await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("echo", {}, { retry: 3 });"#)
+            .await;
+        assert!(result.is_err(), "non-transient error must propagate");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "non-transient errors must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_with_retry_clamps_to_max_retries() {
+        // Always-failing transient tool with retry: 999 must be clamped to
+        // MAX_RETRIES (3) → 4 total calls and the final transient error.
+        let tool = tool_with_annotations("echo", json!({ "idempotentHint": true }));
+        let (reg, counter) = make_flaky_registry(tool, usize::MAX, true).await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("echo", {}, { retry: 999 });"#)
+            .await;
+        assert!(result.is_err(), "exhausted retries must surface the error");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1 + MAX_RETRIES,
+            "should attempt 1 + MAX_RETRIES total calls"
+        );
+    }
+
+    /// Adapter returning a fixed `isError: true` envelope as `Ok(value)` and
+    /// counting `call_tool` invocations. Used to verify that application-level
+    /// errors are surfaced on the first attempt without retry.
+    struct IsErrorEnvelopeAdapter {
+        tools: Vec<ToolInfo>,
+        call_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl McpAdapter for IsErrorEnvelopeAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(self.tools.clone())
+        }
+        async fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, AdapterError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({
+                "isError": true,
+                "content": [{ "type": "text", "text": "upstream broke" }]
+            }))
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn call_with_retry_does_not_retry_is_error_envelope() {
+        // `isError: true` envelopes come back from `route_tool_call` as
+        // `Ok(value)` — the retry loop only retries `Err`. The JS `call()`
+        // helper turns the envelope into a thrown `Error` on first occurrence,
+        // and the adapter must be invoked exactly once.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let tool = tool_with_annotations("boom", json!({ "readOnlyHint": true }));
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "ep".into(),
+                Box::new(IsErrorEnvelopeAdapter {
+                    tools: vec![tool],
+                    call_count: Arc::clone(&counter),
+                }),
+                "stdio".into(),
+                None,
+                None,
+            )
+            .await;
+        let reg = Arc::new(registry);
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("boom", {}, { retry: 3 });"#)
+            .await;
+        assert!(result.is_err(), "isError envelope must throw in JS");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("upstream broke"),
+            "error should include content text: {}",
+            err
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "isError envelopes must not be retried, got {} calls",
+            counter.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn call_with_retry_aborts_when_backoff_exceeds_budget() {
+        // Real backoff schedule starts at 200ms; with a 50ms sandbox timeout,
+        // the very first jittered sleep (>=150ms) is guaranteed to exceed the
+        // remaining wall-clock budget. The retry loop must surface the
+        // last-seen transient error rather than sleep into the outer timeout.
+        let tool = tool_with_annotations("flaky", json!({ "readOnlyHint": true }));
+        let (reg, counter) = make_flaky_registry(tool, usize::MAX, true).await;
+        let sandbox = JsSandbox::new(reg, Duration::from_millis(50)).with_real_backoff();
+        let started = std::time::Instant::now();
+        let result = sandbox
+            .execute(r#"return call("flaky", {}, { retry: 3 });"#)
+            .await;
+        let elapsed = started.elapsed();
+        // Exactly one adapter call: first attempt fails transiently, the
+        // deadline gate fires before any retry sleep, and no further calls
+        // are issued.
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "deadline gate must abort before any retry attempt"
+        );
+        assert!(result.is_err(), "exhausted retry must surface as JS error");
+        let err = format!("{}", result.unwrap_err());
+        // Wrapped message must explicitly flag the deadline-exhaustion path,
+        // name the tool, and embed the underlying transient error so callers
+        // can distinguish a budget-exhausted retry from a single first-attempt
+        // failure.
+        assert!(
+            err.contains("retry deadline exceeded"),
+            "error should flag deadline exhaustion, got: {}",
+            err
+        );
+        assert!(
+            err.contains("call('flaky')"),
+            "error should name the tool, got: {}",
+            err
+        );
+        assert!(
+            err.contains("503") || err.to_lowercase().contains("service"),
+            "error should embed the underlying transient cause, got: {}",
+            err
+        );
+        assert!(
+            !err.to_lowercase().contains("script execution timed out"),
+            "deadline gate must beat the sandbox timeout, got: {}",
+            err
+        );
+        // Sanity check: must return well before the first real backoff
+        // (>=150ms) would have completed — well within sandbox_timeout + 100ms.
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "retry loop should abort before first real sleep, took {:?}",
+            elapsed
+        );
     }
 }
