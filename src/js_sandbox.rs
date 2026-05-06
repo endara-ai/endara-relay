@@ -195,6 +195,13 @@ fn call_tool_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
         let state = borrow
             .as_ref()
             .ok_or_else(|| JsNativeError::error().with_message("sandbox state not initialised"))?;
+        // Pre-flight existence check so unknown tool names yield a fuzzy
+        // suggestion error instead of the bare adapter "no tool found" text.
+        let catalog = state.handle.block_on(state.registry.merged_catalog());
+        if !catalog.iter().any(|t| t.name == tool_name) {
+            let msg = format_unknown_tool_error(&tool_name, &catalog);
+            return Err(JsError::from(JsNativeError::error().with_message(msg)));
+        }
         let res = state
             .handle
             .block_on(state.registry.route_tool_call(&tool_name, arguments))
@@ -210,21 +217,113 @@ fn call_tool_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
     Ok(JsValue::from(boa_engine::js_string!(result_str.as_str())))
 }
 
+/// Build the message for a "tool not found" error, including up to three
+/// fuzzy-matched suggestions when the catalog has nearby names.
+fn format_unknown_tool_error(name: &str, catalog: &[ToolInfo]) -> String {
+    let suggestions = suggest_tool_names(name, catalog);
+    if suggestions.is_empty() {
+        format!(
+            "no tool named '{}'. Use list_tools or search_tools to discover available tools.",
+            name
+        )
+    } else {
+        let quoted: Vec<String> = suggestions.iter().map(|s| format!("'{}'", s)).collect();
+        format!(
+            "no tool named '{}'. Did you mean: {}? Use list_tools or search_tools to discover other tools.",
+            name,
+            quoted.join(", ")
+        )
+    }
+}
+
+/// Return up to three catalog tool names that are closest to `name` by
+/// Optimal String Alignment distance (case-insensitive). Distances are
+/// computed against both the full prefixed name and the suffix after `__`,
+/// taking the smaller, so e.g. typo `ehco` suggests `ep__echo`.
+fn suggest_tool_names(name: &str, catalog: &[ToolInfo]) -> Vec<String> {
+    if catalog.is_empty() {
+        return Vec::new();
+    }
+    let name_lower = name.to_lowercase();
+    let len = name.chars().count();
+    // Threshold scales gently with name length; clamped so very short names
+    // still allow at least one edit and very long names don't drown in noise.
+    let threshold = (len / 3).clamp(1, 4);
+    let mut scored: Vec<(usize, &str)> = catalog
+        .iter()
+        .map(|t| {
+            let full_lower = t.name.to_lowercase();
+            let suffix_lower = t
+                .name
+                .split_once("__")
+                .map(|(_, n)| n.to_lowercase())
+                .unwrap_or_else(|| full_lower.clone());
+            let d = strsim::osa_distance(&name_lower, &full_lower)
+                .min(strsim::osa_distance(&name_lower, &suffix_lower));
+            (d, t.name.as_str())
+        })
+        .collect();
+    scored.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    scored
+        .into_iter()
+        .filter(|(d, _)| *d <= threshold)
+        .take(3)
+        .map(|(_, n)| n.to_string())
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
-// Build the `tools` global object via JS eval
+// Build the `tools` global object and `call` helper via JS eval.
+//
+// `tools` is a Proxy over a plain object containing one function per known
+// catalog tool. Unknown property accesses still return a function (so
+// `typeof tools["x"]` is `"function"` and `"x" in tools` is truthy), but
+// invoking that function throws a fuzzy "no tool named …" error from the
+// native side.
+//
+// `call(name, args)` is a thin global helper equivalent to
+// `tools[name](args)` that pairs naturally with the suggestion error and is
+// the recommended way to invoke a tool when the name is dynamic.
 // ---------------------------------------------------------------------------
 
 fn register_tools_object(
     context: &mut Context,
     catalog: &[ToolInfo],
 ) -> Result<(), JsSandboxError> {
-    let mut js_src = String::from("var tools = {};\n");
+    let mut js_src = String::from("var __real_tools = {};\n");
     for tool in catalog {
         let name = &tool.name;
         js_src.push_str(&format!(
-            "tools[\"{name}\"] = function(args) {{ return JSON.parse(__call_tool(\"{name}\", JSON.stringify(args || {{}}))); }};\n"
+            "__real_tools[\"{name}\"] = function(args) {{ return JSON.parse(__call_tool(\"{name}\", JSON.stringify(args || {{}}))); }};\n"
         ));
     }
+    js_src.push_str(
+        r#"
+function __unknown_tool_stub(name) {
+  return function(args) {
+    return JSON.parse(__call_tool(name, JSON.stringify(args || {})));
+  };
+}
+var tools = new Proxy(__real_tools, {
+  get: function(target, prop, receiver) {
+    if (Object.prototype.hasOwnProperty.call(target, prop)) {
+      return target[prop];
+    }
+    if (typeof prop === 'symbol' || prop in target) {
+      return Reflect.get(target, prop, receiver);
+    }
+    return __unknown_tool_stub(prop);
+  },
+  has: function(target, prop) {
+    if (typeof prop === 'string') return true;
+    return prop in target;
+  }
+});
+function call(name, args) {
+  return JSON.parse(__call_tool(name, JSON.stringify(args || {})));
+}
+"#,
+    );
     context
         .eval(Source::from_bytes(js_src.as_bytes()))
         .map_err(|e| JsSandboxError::Internal(format!("failed to create tools object: {}", e)))?;
@@ -1307,6 +1406,158 @@ mod tests {
             .unwrap();
         assert_eq!(result["called"], "echo");
         assert_eq!(result["args"]["msg"], "sync");
+    }
+
+    // --- call() helper + fuzzy tool-not-found tests ---
+
+    #[tokio::test]
+    async fn test_js_sandbox_call_helper_known_tool() {
+        let reg = make_registry().await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("echo", { text: "hi" });"#)
+            .await
+            .unwrap();
+        assert_eq!(result["called"], "echo");
+        assert_eq!(result["args"]["text"], "hi");
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_call_helper_omitted_args_defaults_to_object() {
+        let reg = make_registry().await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox.execute(r#"return call("echo");"#).await.unwrap();
+        assert_eq!(result["called"], "echo");
+        assert!(result["args"].is_object(), "args should default to {{}}");
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_call_unknown_tool_suggests_close_match() {
+        // "ehco" is one transposition away from "echo" — must be suggested.
+        let reg = make_registry().await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox.execute(r#"return call("ehco", {});"#).await;
+        assert!(result.is_err(), "expected unknown tool to throw");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("no tool named 'ehco'"),
+            "error should name the missing tool: {}",
+            err
+        );
+        assert!(
+            err.contains("Did you mean") && err.contains("'echo'"),
+            "error should suggest 'echo': {}",
+            err
+        );
+        assert!(
+            err.contains("list_tools") && err.contains("search_tools"),
+            "error should point at list_tools / search_tools: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_tools_indexer_unknown_throws_on_invocation() {
+        // typeof + `in` must remain truthy (throw-on-invocation, not on access),
+        // and invoking the unknown stub must surface the same fuzzy error.
+        let reg = make_registry().await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let probe = sandbox
+            .execute(r#"return { tof: typeof tools["ehco"], inOp: ("ehco" in tools) };"#)
+            .await
+            .unwrap();
+        assert_eq!(probe["tof"], "function");
+        assert_eq!(probe["inOp"], true);
+
+        let result = sandbox.execute(r#"return tools["ehco"]({});"#).await;
+        assert!(result.is_err(), "invoking unknown tool stub must throw");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("no tool named 'ehco'") && err.contains("'echo'"),
+            "indexer-form unknown tool must produce the same fuzzy error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_call_unknown_tool_no_close_match_omits_did_you_mean() {
+        let reg = make_registry().await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("zzzzzzzzzzzzzz", {});"#)
+            .await;
+        assert!(result.is_err());
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("no tool named 'zzzzzzzzzzzzzz'"),
+            "error should name the missing tool: {}",
+            err
+        );
+        assert!(
+            !err.contains("Did you mean"),
+            "no nearby names — should not include Did you mean: {}",
+            err
+        );
+        assert!(
+            err.contains("list_tools") && err.contains("search_tools"),
+            "error should still point at list_tools / search_tools: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_tools_known_indexer_still_works() {
+        // Sanity: the Proxy must not change behavior for real catalog tools.
+        let reg = make_registry().await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return tools["echo"]({ msg: "via-indexer" });"#)
+            .await
+            .unwrap();
+        assert_eq!(result["called"], "echo");
+        assert_eq!(result["args"]["msg"], "via-indexer");
+    }
+
+    // --- suggest_tool_names unit tests ---
+
+    #[test]
+    fn test_suggest_tool_names_prefers_close_match() {
+        let catalog = vec![
+            make_tool("echo", "Echo tool"),
+            make_tool("add", "Add numbers"),
+            make_tool("greet", "Greeting tool"),
+        ];
+        let suggestions = suggest_tool_names("ehco", &catalog);
+        assert!(
+            suggestions.first().map(|s| s.as_str()) == Some("echo"),
+            "expected 'echo' first, got {:?}",
+            suggestions
+        );
+    }
+
+    #[test]
+    fn test_suggest_tool_names_matches_suffix_after_prefix() {
+        let catalog = vec![
+            make_tool("ep__echo", "Echo tool"),
+            make_tool("ep__add", "Add numbers"),
+        ];
+        let suggestions = suggest_tool_names("ehco", &catalog);
+        assert!(
+            suggestions.iter().any(|s| s == "ep__echo"),
+            "should match suffix after '__': {:?}",
+            suggestions
+        );
+    }
+
+    #[test]
+    fn test_suggest_tool_names_returns_empty_for_total_mismatch() {
+        let catalog = vec![make_tool("echo", "x"), make_tool("add", "y")];
+        let suggestions = suggest_tool_names("zzzzzzzzzzzzzz", &catalog);
+        assert!(
+            suggestions.is_empty(),
+            "very dissimilar query should yield no suggestions: {:?}",
+            suggestions
+        );
     }
 
     #[tokio::test]
