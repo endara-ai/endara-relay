@@ -198,8 +198,17 @@ fn call_tool_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
         // Pre-flight existence check so unknown tool names yield a fuzzy
         // suggestion error instead of the bare adapter "no tool found" text.
         let catalog = state.handle.block_on(state.registry.merged_catalog());
-        if !catalog.iter().any(|t| t.name == tool_name) {
-            let msg = format_unknown_tool_error(&tool_name, &catalog);
+        let tool = match catalog.iter().find(|t| t.name == tool_name) {
+            Some(t) => t,
+            None => {
+                let msg = format_unknown_tool_error(&tool_name, &catalog);
+                return Err(JsError::from(JsNativeError::error().with_message(msg)));
+            }
+        };
+        // Pre-flight strict-schema check so unknown arg keys fail fast with a
+        // helpful list of valid parameters instead of being silently dropped
+        // by the upstream MCP server.
+        if let Some(msg) = validate_tool_args(tool, &arguments) {
             return Err(JsError::from(JsNativeError::error().with_message(msg)));
         }
         let res = state
@@ -270,6 +279,66 @@ fn suggest_tool_names(name: &str, catalog: &[ToolInfo]) -> Vec<String> {
         .take(3)
         .map(|(_, n)| n.to_string())
         .collect()
+}
+
+/// Reject calls that pass keys not declared by the tool's `input_schema`.
+///
+/// Strict only when the schema is shaped like a closed object: `type` is
+/// `"object"` (or absent), `properties` is a defined object, and
+/// `additionalProperties` is **not** `true` (missing/false/schema → strict,
+/// per JSON Schema convention). Tools without `properties` accept arbitrary
+/// args and bypass the check. Returns the formatted error message when args
+/// should be rejected; `None` means pass-through.
+fn validate_tool_args(tool: &ToolInfo, args: &Value) -> Option<String> {
+    let schema = &tool.input_schema;
+    if let Some(t) = schema.get("type") {
+        if t.as_str() != Some("object") {
+            return None;
+        }
+    }
+    let properties = schema.get("properties").and_then(|p| p.as_object())?;
+    if schema.get("additionalProperties").and_then(|v| v.as_bool()) == Some(true) {
+        return None;
+    }
+    let args_obj = args.as_object()?;
+    let mut unknown: Vec<&str> = args_obj
+        .keys()
+        .filter(|k| !properties.contains_key(k.as_str()))
+        .map(|s| s.as_str())
+        .collect();
+    if unknown.is_empty() {
+        return None;
+    }
+    unknown.sort_unstable();
+
+    let unknown_list = unknown
+        .iter()
+        .map(|k| format!("'{}'", k))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let mut valid_params: Vec<(&str, Option<&str>)> = properties
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.get("description").and_then(|d| d.as_str())))
+        .collect();
+    valid_params.sort_by(|a, b| a.0.cmp(b.0));
+    let valid_list = if valid_params.is_empty() {
+        "(none)".to_string()
+    } else {
+        valid_params
+            .iter()
+            .map(|(k, d)| match d {
+                Some(desc) => format!("'{}' ({})", k, desc),
+                None => format!("'{}'", k),
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    Some(format!(
+        "tool '{}' rejected unknown parameter(s) {}. Valid parameters: {}.",
+        tool.name, unknown_list, valid_list
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1669,6 +1738,126 @@ mod tests {
             .unwrap();
         assert_eq!(result["structuredContent"], json!({ "foo": 1 }));
         assert_eq!(result["content"][0]["text"], "{\"foo\":1}");
+    }
+
+    // --- unknown-parameter rejection tests ---
+    //
+    // These exercise the strict-schema check in `__call_tool` that rejects
+    // arg keys not declared by the tool's `input_schema.properties` before
+    // routing to the upstream adapter. The mock adapter echoes its input,
+    // so a successful pass-through round-trips the args back to the test.
+
+    async fn registry_with_single_tool(tool: ToolInfo) -> Arc<AdapterRegistry> {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::new(vec![tool])),
+                "stdio".into(),
+                None,
+                None,
+            )
+            .await;
+        Arc::new(registry)
+    }
+
+    fn echo_strict_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "text": { "type": "string", "description": "Text to echo back" },
+                "count": { "type": "number", "description": "Repeat count" }
+            },
+            "required": ["text"]
+        })
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_strict_schema_rejects_unknown_param() {
+        let tool = make_tool_with_schema("echo", "Echo tool", echo_strict_schema());
+        let reg = registry_with_single_tool(tool).await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("echo", { text: "hi", zzz: 1, aaa: 2 });"#)
+            .await;
+        assert!(result.is_err(), "unknown params should reject");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("'echo'"), "error names tool: {}", err);
+        // Unknown keys are listed alphabetically.
+        let aaa_idx = err.find("'aaa'").expect("unknown 'aaa' listed");
+        let zzz_idx = err.find("'zzz'").expect("unknown 'zzz' listed");
+        assert!(aaa_idx < zzz_idx, "unknown keys must be sorted: {}", err);
+        // Valid params + their descriptions surface.
+        assert!(
+            err.contains("'text'") && err.contains("Text to echo back"),
+            "valid param 'text' with description: {}",
+            err
+        );
+        assert!(
+            err.contains("'count'") && err.contains("Repeat count"),
+            "valid param 'count' with description: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_additional_properties_true_is_permissive() {
+        let mut schema = echo_strict_schema();
+        schema["additionalProperties"] = json!(true);
+        let tool = make_tool_with_schema("echo", "Echo tool", schema);
+        let reg = registry_with_single_tool(tool).await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("echo", { text: "hi", extra: "ok" });"#)
+            .await
+            .expect("additionalProperties:true should not reject");
+        assert_eq!(result["called"], "echo");
+        assert_eq!(result["args"]["extra"], "ok");
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_additional_properties_false_rejects() {
+        let mut schema = echo_strict_schema();
+        schema["additionalProperties"] = json!(false);
+        let tool = make_tool_with_schema("echo", "Echo tool", schema);
+        let reg = registry_with_single_tool(tool).await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("echo", { text: "hi", extra: "nope" });"#)
+            .await;
+        assert!(result.is_err(), "additionalProperties:false should reject");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("'extra'"), "error lists unknown key: {}", err);
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_schema_without_properties_allows_arbitrary_args() {
+        // `make_tool` defaults to `{"type": "object"}` with no `properties`
+        // field — the validator must treat this as "accepts arbitrary args".
+        let reg = make_registry().await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("echo", { anything: 1, goes: true });"#)
+            .await
+            .expect("no properties → no rejection");
+        assert_eq!(result["args"]["anything"], 1);
+        assert_eq!(result["args"]["goes"], true);
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_unknown_param_rejected_via_tools_indexer() {
+        // Parity with `call(...)`: invoking `tools["name"](args)` shares the
+        // same `__call_tool` path, so strict rejection must trigger here too.
+        let tool = make_tool_with_schema("echo", "Echo tool", echo_strict_schema());
+        let reg = registry_with_single_tool(tool).await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return tools["echo"]({ text: "hi", bogus: 1 });"#)
+            .await;
+        assert!(result.is_err(), "indexer path must also reject");
+        let err = format!("{}", result.unwrap_err());
+        assert!(err.contains("'bogus'"), "error lists unknown key: {}", err);
+        assert!(err.contains("'echo'"), "error names tool: {}", err);
     }
 
     // --- suggest_tool_names unit tests ---
