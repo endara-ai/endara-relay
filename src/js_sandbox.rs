@@ -2712,4 +2712,76 @@ mod tests {
             "should attempt 1 + MAX_RETRIES total calls"
         );
     }
+
+    /// Adapter returning a fixed `isError: true` envelope as `Ok(value)` and
+    /// counting `call_tool` invocations. Used to verify that application-level
+    /// errors are surfaced on the first attempt without retry.
+    struct IsErrorEnvelopeAdapter {
+        tools: Vec<ToolInfo>,
+        call_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl McpAdapter for IsErrorEnvelopeAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(self.tools.clone())
+        }
+        async fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, AdapterError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            Ok(json!({
+                "isError": true,
+                "content": [{ "type": "text", "text": "upstream broke" }]
+            }))
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn call_with_retry_does_not_retry_is_error_envelope() {
+        // `isError: true` envelopes come back from `route_tool_call` as
+        // `Ok(value)` — the retry loop only retries `Err`. The JS `call()`
+        // helper turns the envelope into a thrown `Error` on first occurrence,
+        // and the adapter must be invoked exactly once.
+        let counter = Arc::new(AtomicUsize::new(0));
+        let tool = tool_with_annotations("boom", json!({ "readOnlyHint": true }));
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "ep".into(),
+                Box::new(IsErrorEnvelopeAdapter {
+                    tools: vec![tool],
+                    call_count: Arc::clone(&counter),
+                }),
+                "stdio".into(),
+                None,
+                None,
+            )
+            .await;
+        let reg = Arc::new(registry);
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("boom", {}, { retry: 3 });"#)
+            .await;
+        assert!(result.is_err(), "isError envelope must throw in JS");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("upstream broke"),
+            "error should include content text: {}",
+            err
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "isError envelopes must not be retried, got {} calls",
+            counter.load(Ordering::SeqCst)
+        );
+    }
 }
