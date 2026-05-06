@@ -406,7 +406,8 @@ async fn main() {
                 setup_manager: Some(setup_manager.clone()),
             };
             let router = build_router(state).merge(management::management_routes(mgmt_state));
-            let addr: SocketAddr = ([0, 0, 0, 0], port).into();
+            // Bind to loopback only; the relay is a local-only service.
+            let addr: SocketAddr = ([127, 0, 0, 1], port).into();
 
             match start_server(router, addr).await {
                 Ok((bound_addr, handle)) => {
