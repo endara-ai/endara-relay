@@ -24,10 +24,18 @@ use crate::registry::AdapterRegistry;
 /// `1 + MAX_RETRIES`). The caller's `retry` value is clamped to this.
 const MAX_RETRIES: usize = 3;
 
-/// Backoff between consecutive retry attempts (no delay before the first try).
-/// Tests override to zero to keep the suite fast.
+/// Base retry backoff schedule in ms — the self-documenting reference for
+/// the production loop. Each per-attempt sleep is this base multiplied by a
+/// ±25% jitter factor (see [`jittered_backoff_ms`]). Tests override the
+/// effective schedule to zero via [`RETRY_BACKOFFS_MS`] to keep the suite
+/// fast; `0 * jitter == 0`, so the call site formula is unchanged.
+const RETRY_BACKOFF_SCHEDULE_MS: [u64; MAX_RETRIES] = [200, 400, 800];
+
+/// Effective backoff schedule consulted by the retry loop. In production
+/// builds this mirrors [`RETRY_BACKOFF_SCHEDULE_MS`]; in `cfg(test)` builds
+/// it is zero so existing tests don't pay real backoff cost.
 #[cfg(not(test))]
-const RETRY_BACKOFFS_MS: [u64; MAX_RETRIES] = [200, 400, 800];
+const RETRY_BACKOFFS_MS: [u64; MAX_RETRIES] = RETRY_BACKOFF_SCHEDULE_MS;
 #[cfg(test)]
 const RETRY_BACKOFFS_MS: [u64; MAX_RETRIES] = [0, 0, 0];
 
@@ -35,6 +43,15 @@ const RETRY_BACKOFFS_MS: [u64; MAX_RETRIES] = [0, 0, 0];
 /// therefore retryable. Matched against `AdapterError`'s `Display` text.
 const RETRY_TRANSIENT_SUBSTRINGS: &[&str] =
     &["503", "502", "504", "timeout", "connection", "reset"];
+
+/// Apply ±25% jitter to a backoff value: returns `(base as f64 * f) as u64`
+/// where `f` is uniformly drawn from `[0.75, 1.25]`. A zero `base` always
+/// returns zero, which preserves the test-suite zero-backoff override.
+fn jittered_backoff_ms(base: u64, rng: &mut impl rand::Rng) -> u64 {
+    use rand::RngExt;
+    let factor: f64 = rng.random_range(0.75..=1.25);
+    (base as f64 * factor) as u64
+}
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -362,7 +379,8 @@ fn call_tool_with_retry_native(
 }
 
 /// Retry loop driving up to `1 + max_retries` attempts on transient errors.
-/// Backoff is applied **between** attempts (no delay before the first try).
+/// Backoff is applied **between** attempts (no delay before the first try)
+/// and is jittered by ±25% via [`jittered_backoff_ms`].
 async fn call_tool_with_retry_loop(
     registry: &AdapterRegistry,
     tool_name: &str,
@@ -370,16 +388,18 @@ async fn call_tool_with_retry_loop(
     max_retries: usize,
 ) -> Result<Value, AdapterError> {
     let mut attempt: usize = 0;
+    let mut rng = rand::rng();
     loop {
         let res = registry.route_tool_call(tool_name, arguments.clone()).await;
         match res {
             Ok(v) => return Ok(v),
             Err(e) => {
                 if attempt < max_retries && is_transient_error(&e) {
-                    let backoff_ms = RETRY_BACKOFFS_MS
+                    let base_ms = RETRY_BACKOFFS_MS
                         .get(attempt)
                         .copied()
                         .unwrap_or(*RETRY_BACKOFFS_MS.last().unwrap_or(&0));
+                    let backoff_ms = jittered_backoff_ms(base_ms, &mut rng);
                     if backoff_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     }
@@ -2562,6 +2582,38 @@ mod tests {
             )
             .await;
         (Arc::new(registry), counter)
+    }
+
+    // --- jittered_backoff_ms -----------------------------------------------
+
+    #[test]
+    fn jittered_backoff_ms_within_bounds() {
+        // For every base in the production schedule, 200 samples of
+        // `jittered_backoff_ms` must land in `[floor(base*0.75), ceil(base*1.25)]`.
+        // `0` is also covered explicitly to guard the zero-backoff override.
+        let mut rng = rand::rng();
+        let mut bases: Vec<u64> = RETRY_BACKOFF_SCHEDULE_MS.to_vec();
+        bases.push(0);
+        bases.push(50);
+        for base in bases {
+            let lo = (base as f64 * 0.75).floor() as u64;
+            let hi = (base as f64 * 1.25).ceil() as u64;
+            for _ in 0..200 {
+                let j = jittered_backoff_ms(base, &mut rng);
+                assert!(
+                    j >= lo && j <= hi,
+                    "jitter out of bounds: base={}, j={}, expected [{},{}]",
+                    base,
+                    j,
+                    lo,
+                    hi
+                );
+            }
+        }
+        // Zero base must be exactly zero — preserves the test-suite override.
+        for _ in 0..50 {
+            assert_eq!(jittered_backoff_ms(0, &mut rng), 0);
+        }
     }
 
     // --- is_transient_error -------------------------------------------------
