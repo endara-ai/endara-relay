@@ -137,6 +137,7 @@ fn meta_tool_definitions() -> Vec<Value> {
                 "`content[0].text` is provider-defined and is NOT guaranteed to be JSON: it may be prose, a partial summary, empty, or truncated. ",
                 "Only call `JSON.parse` on it after a guard such as `typeof t === \"string\" && /^\\s*[\\[{]/.test(t)`. ",
                 "Calling an unknown tool name throws an error that lists the closest matching tools. ",
+                "Pass `{ retry: 3 }` as the third argument (e.g. `await call(\"name\", args, { retry: 3 })`) to retry transient errors on tools whose annotations declare `readOnlyHint` or `idempotentHint`. ",
                 "Use `return` to send data back.\n\n",
                 "Examples:\n",
                 "```js\n",
@@ -1176,6 +1177,14 @@ mod tests {
         assert!(
             exec_desc.contains("await call("),
             "execute_tools description should include at least one `await call(...)` example"
+        );
+        assert!(
+            exec_desc.contains("retry: 3"),
+            "execute_tools description should document the opt-in `{{ retry: 3 }}` option"
+        );
+        assert!(
+            exec_desc.contains("readOnlyHint") && exec_desc.contains("idempotentHint"),
+            "execute_tools description should mention readOnlyHint / idempotentHint as the gating annotations for retry"
         );
     }
 

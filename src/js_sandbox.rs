@@ -13,8 +13,28 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
-use crate::adapter::ToolInfo;
+use crate::adapter::{AdapterError, ToolInfo};
 use crate::registry::AdapterRegistry;
+
+// ---------------------------------------------------------------------------
+// Retry tuning (Wave 3)
+// ---------------------------------------------------------------------------
+
+/// Max number of retries beyond the first attempt (so total attempts at most
+/// `1 + MAX_RETRIES`). The caller's `retry` value is clamped to this.
+const MAX_RETRIES: usize = 3;
+
+/// Backoff between consecutive retry attempts (no delay before the first try).
+/// Tests override to zero to keep the suite fast.
+#[cfg(not(test))]
+const RETRY_BACKOFFS_MS: [u64; MAX_RETRIES] = [200, 400, 800];
+#[cfg(test)]
+const RETRY_BACKOFFS_MS: [u64; MAX_RETRIES] = [0, 0, 0];
+
+/// Substrings (lower-cased) that mark an `AdapterError` as transient and
+/// therefore retryable. Matched against `AdapterError`'s `Display` text.
+const RETRY_TRANSIENT_SUBSTRINGS: &[&str] =
+    &["503", "502", "504", "timeout", "connection", "reset"];
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -118,6 +138,7 @@ fn run_js(script: &str, catalog: &[ToolInfo]) -> Result<Value, JsSandboxError> {
         .set_loop_iteration_limit(1_000_000);
 
     register_call_tool(&mut context)?;
+    register_call_tool_with_retry(&mut context)?;
     register_tools_object(&mut context, catalog)?;
     register_json_parse_wrapper(&mut context)?;
 
@@ -173,6 +194,21 @@ fn register_call_tool(context: &mut Context) -> Result<(), JsSandboxError> {
     Ok(())
 }
 
+fn register_call_tool_with_retry(context: &mut Context) -> Result<(), JsSandboxError> {
+    let f = NativeFunction::from_fn_ptr(call_tool_with_retry_native);
+    let js_func = f.to_js_function(context.realm());
+    context
+        .register_global_property(
+            boa_engine::js_string!("__call_tool_with_retry"),
+            js_func,
+            Attribute::READONLY | Attribute::NON_ENUMERABLE,
+        )
+        .map_err(|e| {
+            JsSandboxError::Internal(format!("failed to register __call_tool_with_retry: {}", e))
+        })?;
+    Ok(())
+}
+
 fn call_tool_native(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
     let tool_name = args
         .first()
@@ -224,6 +260,161 @@ fn call_tool_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
     let result_str = serde_json::to_string(&result)
         .map_err(|e| JsNativeError::error().with_message(format!("serialisation error: {}", e)))?;
     Ok(JsValue::from(boa_engine::js_string!(result_str.as_str())))
+}
+
+// ---------------------------------------------------------------------------
+// Native function: __call_tool_with_retry(name, args_json, retry)
+//   -> result_json_string
+//
+// Same pre-flight checks as `__call_tool` (existence, strict-schema), plus a
+// retry-eligibility gate that requires the tool's annotations to declare it
+// `readOnlyHint: true` or `idempotentHint: true` (and never `destructiveHint:
+// true`). Loops up to `min(retry, MAX_RETRIES)` additional attempts on
+// transient `AdapterError`s with backoff `RETRY_BACKOFFS_MS`.
+//
+// Application errors (`isError: true` envelopes) are returned as `Ok(value)`
+// from `route_tool_call` — they are NOT retried; the JS `call()` helper turns
+// them into a thrown `Error` on first occurrence.
+// ---------------------------------------------------------------------------
+
+fn call_tool_with_retry_native(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let tool_name = args
+        .first()
+        .ok_or_else(|| {
+            JsNativeError::typ().with_message("__call_tool_with_retry: missing tool name")
+        })?
+        .to_string(context)?
+        .to_std_string_escaped();
+
+    let args_json_str = args
+        .get(1)
+        .ok_or_else(|| {
+            JsNativeError::typ().with_message("__call_tool_with_retry: missing arguments")
+        })?
+        .to_string(context)?
+        .to_std_string_escaped();
+
+    let retry_requested = args
+        .get(2)
+        .and_then(|v| v.as_number())
+        .map(|n| {
+            if n.is_finite() && n > 0.0 {
+                n as usize
+            } else {
+                0
+            }
+        })
+        .unwrap_or(0);
+
+    let arguments: Value = serde_json::from_str(&args_json_str).map_err(|e| {
+        JsNativeError::typ()
+            .with_message(format!("__call_tool_with_retry: invalid JSON args: {}", e))
+    })?;
+
+    let result = SANDBOX_STATE.with(|cell| {
+        let borrow = cell.borrow();
+        let state = borrow
+            .as_ref()
+            .ok_or_else(|| JsNativeError::error().with_message("sandbox state not initialised"))?;
+        // Pre-flight existence + schema checks share the same shape as the
+        // plain `__call_tool` path; the eligibility gate is the only addition.
+        let catalog = state.handle.block_on(state.registry.merged_catalog());
+        let tool = match catalog.iter().find(|t| t.name == tool_name) {
+            Some(t) => t,
+            None => {
+                let msg = format_unknown_tool_error(&tool_name, &catalog);
+                return Err(JsError::from(JsNativeError::error().with_message(msg)));
+            }
+        };
+        if let Some(msg) = validate_tool_args(tool, &arguments) {
+            return Err(JsError::from(JsNativeError::error().with_message(msg)));
+        }
+        if !is_retry_eligible(tool.annotations.as_ref()) {
+            return Err(JsError::from(JsNativeError::error().with_message(format!(
+                "call('{}'): retry not allowed (tool not declared read-only or idempotent)",
+                tool_name
+            ))));
+        }
+        let max_retries = retry_requested.min(MAX_RETRIES);
+        let registry = state.registry.clone();
+        let res = state
+            .handle
+            .block_on(call_tool_with_retry_loop(
+                &registry,
+                &tool_name,
+                arguments,
+                max_retries,
+            ))
+            .map_err(|e| {
+                JsNativeError::error()
+                    .with_message(format!("tool call '{}' failed: {}", tool_name, e))
+            })?;
+        Ok::<Value, JsError>(res)
+    })?;
+
+    let result_str = serde_json::to_string(&result)
+        .map_err(|e| JsNativeError::error().with_message(format!("serialisation error: {}", e)))?;
+    Ok(JsValue::from(boa_engine::js_string!(result_str.as_str())))
+}
+
+/// Retry loop driving up to `1 + max_retries` attempts on transient errors.
+/// Backoff is applied **between** attempts (no delay before the first try).
+async fn call_tool_with_retry_loop(
+    registry: &AdapterRegistry,
+    tool_name: &str,
+    arguments: Value,
+    max_retries: usize,
+) -> Result<Value, AdapterError> {
+    let mut attempt: usize = 0;
+    loop {
+        let res = registry.route_tool_call(tool_name, arguments.clone()).await;
+        match res {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                if attempt < max_retries && is_transient_error(&e) {
+                    let backoff_ms = RETRY_BACKOFFS_MS
+                        .get(attempt)
+                        .copied()
+                        .unwrap_or(*RETRY_BACKOFFS_MS.last().unwrap_or(&0));
+                    if backoff_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                    }
+                    attempt += 1;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
+/// Decide whether a tool may be retried based on its MCP annotations.
+///
+/// Allowed iff annotations exist AND (`readOnlyHint: true` OR
+/// `idempotentHint: true`); `destructiveHint: true` overrides and disqualifies
+/// even an idempotent-marked tool. Tools without annotations are conservatively
+/// rejected.
+fn is_retry_eligible(annotations: Option<&Value>) -> bool {
+    let Some(obj) = annotations.and_then(|a| a.as_object()) else {
+        return false;
+    };
+    if obj.get("destructiveHint").and_then(|v| v.as_bool()) == Some(true) {
+        return false;
+    }
+    let read_only = obj.get("readOnlyHint").and_then(|v| v.as_bool()) == Some(true);
+    let idempotent = obj.get("idempotentHint").and_then(|v| v.as_bool()) == Some(true);
+    read_only || idempotent
+}
+
+/// Treat an `AdapterError` as transient if its `Display` text contains any of
+/// the known retryable substrings (case-insensitive).
+fn is_transient_error(err: &AdapterError) -> bool {
+    let lower = err.to_string().to_lowercase();
+    RETRY_TRANSIENT_SUBSTRINGS.iter().any(|s| lower.contains(s))
 }
 
 /// Build the message for a "tool not found" error, including up to three
@@ -359,6 +550,11 @@ fn validate_tool_args(tool: &ToolInfo, args: &Value) -> Option<String> {
 // present, parses `content[0].text` when it begins with `[` or `{`, returns
 // the text as-is when it doesn't look JSON-shaped, and falls back to the
 // raw envelope when neither field is set.
+//
+// `opts.retry` (number) opts the call into transient-error retry. Routing
+// switches to `__call_tool_with_retry`, which gates eligibility on the tool's
+// `annotations` (`readOnlyHint` / `idempotentHint`, never `destructiveHint`)
+// and retries on transient `AdapterError`s with capped exponential backoff.
 // ---------------------------------------------------------------------------
 
 fn register_tools_object(
@@ -395,7 +591,13 @@ var tools = new Proxy(__real_tools, {
   }
 });
 function call(name, args, opts) {
-  var r = JSON.parse(__call_tool(name, JSON.stringify(args || {})));
+  var retry = (opts && typeof opts.retry === "number" && opts.retry > 0) ? opts.retry : 0;
+  var r;
+  if (retry > 0) {
+    r = JSON.parse(__call_tool_with_retry(name, JSON.stringify(args || {}), retry));
+  } else {
+    r = JSON.parse(__call_tool(name, JSON.stringify(args || {})));
+  }
   if (r && r.isError) {
     var msg = "";
     if (r.content && r.content[0] && typeof r.content[0].text === "string") {
@@ -2274,5 +2476,240 @@ mod tests {
 
         // Stable read after mutations stop.
         assert_eq!(registry.catalog_generation(), g5);
+    }
+
+    // ----------------------------------------------------------------------
+    // Wave 3 — opt-in retry for read-only / idempotent tools
+    // ----------------------------------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Mock adapter that fails its first `failures_remaining` `call_tool`
+    /// invocations with a configurable transient error, then succeeds.
+    struct FlakyAdapter {
+        tools: Vec<ToolInfo>,
+        failures_remaining: AtomicUsize,
+        call_count: Arc<AtomicUsize>,
+        // When true, the failure is `HttpError { status: 503, .. }`; when
+        // false, it's `AuthenticationRequired` (a non-transient error).
+        transient: bool,
+    }
+
+    #[async_trait]
+    impl McpAdapter for FlakyAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(self.tools.clone())
+        }
+        async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
+            self.call_count.fetch_add(1, Ordering::SeqCst);
+            if self.failures_remaining.load(Ordering::SeqCst) > 0 {
+                self.failures_remaining.fetch_sub(1, Ordering::SeqCst);
+                return Err(if self.transient {
+                    AdapterError::HttpError {
+                        status: 503,
+                        body: "service unavailable".into(),
+                    }
+                } else {
+                    AdapterError::AuthenticationRequired {
+                        endpoint: "ep".into(),
+                        message: "token expired".into(),
+                    }
+                });
+            }
+            Ok(json!({ "called": name, "args": arguments }))
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    fn tool_with_annotations(name: &str, annotations: Value) -> ToolInfo {
+        ToolInfo {
+            name: name.to_string(),
+            description: Some(format!("{} tool", name)),
+            input_schema: json!({"type": "object"}),
+            annotations: Some(annotations),
+        }
+    }
+
+    /// Build a registry with a single flaky adapter exposing one tool whose
+    /// annotations the caller controls, plus a shared call-counter handle.
+    async fn make_flaky_registry(
+        tool: ToolInfo,
+        failures: usize,
+        transient: bool,
+    ) -> (Arc<AdapterRegistry>, Arc<AtomicUsize>) {
+        let registry = AdapterRegistry::new();
+        let counter = Arc::new(AtomicUsize::new(0));
+        registry
+            .register(
+                "ep".into(),
+                Box::new(FlakyAdapter {
+                    tools: vec![tool],
+                    failures_remaining: AtomicUsize::new(failures),
+                    call_count: Arc::clone(&counter),
+                    transient,
+                }),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+        (Arc::new(registry), counter)
+    }
+
+    // --- is_transient_error -------------------------------------------------
+
+    #[test]
+    fn is_transient_error_matches_known_substrings() {
+        assert!(is_transient_error(&AdapterError::HttpError {
+            status: 503,
+            body: "x".into(),
+        }));
+        assert!(is_transient_error(&AdapterError::HttpError {
+            status: 502,
+            body: "x".into(),
+        }));
+        assert!(is_transient_error(&AdapterError::HttpError {
+            status: 504,
+            body: "x".into(),
+        }));
+        assert!(is_transient_error(&AdapterError::ProtocolError(
+            "upstream request timeout exceeded".into()
+        )));
+        assert!(is_transient_error(&AdapterError::ConnectionFailed(
+            "stream closed".into()
+        )));
+        assert!(is_transient_error(&AdapterError::ProtocolError(
+            "connection reset by peer".into()
+        )));
+    }
+
+    #[test]
+    fn is_transient_error_rejects_unrelated_errors() {
+        assert!(!is_transient_error(&AdapterError::NotInitialized));
+        assert!(!is_transient_error(&AdapterError::ProtocolError(
+            "schema mismatch".into()
+        )));
+        assert!(!is_transient_error(&AdapterError::JsonRpcError {
+            code: -32000,
+            message: "bad arg".into(),
+            data: None,
+        }));
+    }
+
+    // --- is_retry_eligible --------------------------------------------------
+
+    #[test]
+    fn is_retry_eligible_read_only_hint_allows() {
+        let ann = json!({ "readOnlyHint": true });
+        assert!(is_retry_eligible(Some(&ann)));
+    }
+
+    #[test]
+    fn is_retry_eligible_idempotent_hint_allows() {
+        let ann = json!({ "idempotentHint": true });
+        assert!(is_retry_eligible(Some(&ann)));
+    }
+
+    #[test]
+    fn is_retry_eligible_destructive_hint_overrides_idempotent() {
+        let ann = json!({ "idempotentHint": true, "destructiveHint": true });
+        assert!(!is_retry_eligible(Some(&ann)));
+    }
+
+    #[test]
+    fn is_retry_eligible_no_annotations_rejects() {
+        assert!(!is_retry_eligible(None));
+        assert!(!is_retry_eligible(Some(&json!({}))));
+        assert!(!is_retry_eligible(Some(&json!({ "title": "Echo" }))));
+    }
+
+    // --- end-to-end through the JS `call(..., { retry })` helper ------------
+
+    #[tokio::test]
+    async fn call_with_retry_recovers_from_transient_error() {
+        // Read-only tool, 2 transient failures then success → 3 total calls,
+        // and the JS layer sees a successful result.
+        let tool = tool_with_annotations("echo", json!({ "readOnlyHint": true }));
+        let (reg, counter) = make_flaky_registry(tool, 2, true).await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("echo", { text: "hi" }, { retry: 3 });"#)
+            .await
+            .unwrap();
+        assert_eq!(result["called"], "echo");
+        assert_eq!(result["args"]["text"], "hi");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            3,
+            "expected 1 initial + 2 retried call_tool invocations"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_with_retry_blocks_non_eligible_tool() {
+        // Tool has no annotations → eligibility gate must fail before any
+        // adapter call_tool invocation happens, with a clear error message.
+        let tool = make_tool("echo", "plain echo");
+        let (reg, counter) = make_flaky_registry(tool, 0, true).await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("echo", {}, { retry: 3 });"#)
+            .await;
+        assert!(result.is_err(), "expected eligibility gate to reject");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("retry not allowed"),
+            "error should explain retry was rejected, got: {}",
+            err
+        );
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "no adapter call_tool calls should be made when retry is rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_with_retry_does_not_retry_non_transient_error() {
+        // Read-only tool, but the failure is non-transient (auth) → loop
+        // returns immediately after the first failure.
+        let tool = tool_with_annotations("echo", json!({ "readOnlyHint": true }));
+        let (reg, counter) = make_flaky_registry(tool, 5, false).await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("echo", {}, { retry: 3 });"#)
+            .await;
+        assert!(result.is_err(), "non-transient error must propagate");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "non-transient errors must not be retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_with_retry_clamps_to_max_retries() {
+        // Always-failing transient tool with retry: 999 must be clamped to
+        // MAX_RETRIES (3) → 4 total calls and the final transient error.
+        let tool = tool_with_annotations("echo", json!({ "idempotentHint": true }));
+        let (reg, counter) = make_flaky_registry(tool, usize::MAX, true).await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("echo", {}, { retry: 999 });"#)
+            .await;
+        assert!(result.is_err(), "exhausted retries must surface the error");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1 + MAX_RETRIES,
+            "should attempt 1 + MAX_RETRIES total calls"
+        );
     }
 }
