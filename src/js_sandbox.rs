@@ -427,11 +427,12 @@ fn call_tool_with_retry_native(
 /// Backoff is applied **between** attempts (no delay before the first try)
 /// and is jittered by ±25% via [`jittered_backoff_ms`].
 ///
-/// Aborts early — surfacing the most recent transient error — when the next
-/// jittered sleep would push the wall clock past `deadline`. This prevents
-/// the retry loop from being killed mid-sleep by the sandbox's outer timeout
-/// and ensures the caller sees the underlying tool error, not a generic
-/// "script timed out".
+/// Aborts early when the next jittered sleep would push the wall clock past
+/// `deadline`. The last-seen transient error is wrapped in an
+/// `AdapterError::ProtocolError` whose message names the tool, the number of
+/// attempts actually made, and embeds the underlying error's `Display` text.
+/// This prevents the retry loop from being killed mid-sleep by the sandbox's
+/// outer timeout while preserving the underlying cause for the caller.
 ///
 /// `use_real_backoff` selects between [`RETRY_BACKOFF_SCHEDULE_MS`] and the
 /// effective (possibly zero, in `cfg(test)`) [`RETRY_BACKOFFS_MS`] schedule.
@@ -465,10 +466,17 @@ async fn call_tool_with_retry_loop(
                         .unwrap_or(*schedule.last().unwrap_or(&0));
                     let backoff_ms = jittered_backoff_ms(base_ms, &mut rng);
                     // Deadline gate: if the next sleep would exceed the
-                    // sandbox's wall-clock budget, surface the last-seen
-                    // transient error instead of sleeping into the timeout.
+                    // sandbox's wall-clock budget, wrap the last-seen
+                    // transient error so the caller can distinguish a
+                    // budget-exhausted retry from a single first-attempt
+                    // failure. `attempt + 1` is the number of attempts made
+                    // so far (the current failed call included).
                     if std::time::Instant::now() + Duration::from_millis(backoff_ms) >= deadline {
-                        return Err(e);
+                        let attempts_made = attempt + 1;
+                        return Err(AdapterError::ProtocolError(format!(
+                            "call('{}'): retry deadline exceeded after {} attempts (last error: {})",
+                            tool_name, attempts_made, e
+                        )));
                     }
                     if backoff_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
@@ -2931,11 +2939,23 @@ mod tests {
         );
         assert!(result.is_err(), "exhausted retry must surface as JS error");
         let err = format!("{}", result.unwrap_err());
-        // Message must reflect the underlying transient error, not a generic
-        // sandbox timeout.
+        // Wrapped message must explicitly flag the deadline-exhaustion path,
+        // name the tool, and embed the underlying transient error so callers
+        // can distinguish a budget-exhausted retry from a single first-attempt
+        // failure.
+        assert!(
+            err.contains("retry deadline exceeded"),
+            "error should flag deadline exhaustion, got: {}",
+            err
+        );
+        assert!(
+            err.contains("call('flaky')"),
+            "error should name the tool, got: {}",
+            err
+        );
         assert!(
             err.contains("503") || err.to_lowercase().contains("service"),
-            "error should surface the last transient error, got: {}",
+            "error should embed the underlying transient cause, got: {}",
             err
         );
         assert!(
@@ -2944,7 +2964,7 @@ mod tests {
             err
         );
         // Sanity check: must return well before the first real backoff
-        // (>=150ms) would have completed.
+        // (>=150ms) would have completed — well within sandbox_timeout + 100ms.
         assert!(
             elapsed < Duration::from_millis(150),
             "retry loop should abort before first real sleep, took {:?}",
