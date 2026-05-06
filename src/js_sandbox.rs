@@ -279,11 +279,17 @@ fn suggest_tool_names(name: &str, catalog: &[ToolInfo]) -> Vec<String> {
 // catalog tool. Unknown property accesses still return a function (so
 // `typeof tools["x"]` is `"function"` and `"x" in tools` is truthy), but
 // invoking that function throws a fuzzy "no tool named …" error from the
-// native side.
+// native side. Invoking `tools[name](args)` returns the *raw* MCP envelope
+// (`{ content, structuredContent, isError, ... }`) — the indexer is the
+// escape hatch for callers that need full envelope access.
 //
-// `call(name, args)` is a thin global helper equivalent to
-// `tools[name](args)` that pairs naturally with the suggestion error and is
-// the recommended way to invoke a tool when the name is dynamic.
+// `call(name, args, opts)` is the recommended helper. It unwraps the
+// envelope: on `isError` it throws an `Error` whose message includes the
+// tool name and `content[0].text`; with `opts.raw === true` it returns the
+// parsed envelope unchanged; otherwise it returns `structuredContent` when
+// present, parses `content[0].text` when it begins with `[` or `{`, returns
+// the text as-is when it doesn't look JSON-shaped, and falls back to the
+// raw envelope when neither field is set.
 // ---------------------------------------------------------------------------
 
 fn register_tools_object(
@@ -319,8 +325,22 @@ var tools = new Proxy(__real_tools, {
     return prop in target;
   }
 });
-function call(name, args) {
-  return JSON.parse(__call_tool(name, JSON.stringify(args || {})));
+function call(name, args, opts) {
+  var r = JSON.parse(__call_tool(name, JSON.stringify(args || {})));
+  if (r && r.isError) {
+    var msg = "";
+    if (r.content && r.content[0] && typeof r.content[0].text === "string") {
+      msg = r.content[0].text;
+    }
+    throw new Error("call('" + name + "') failed: " + msg);
+  }
+  if (opts && opts.raw) return r;
+  if (r && r.structuredContent !== undefined) return r.structuredContent;
+  if (r && r.content && r.content[0] && typeof r.content[0].text === "string") {
+    var t = r.content[0].text;
+    return /^\s*[\[{]/.test(t) ? JSON.parse(t) : t;
+  }
+  return r;
 }
 "#,
     );
@@ -1516,6 +1536,139 @@ mod tests {
             .unwrap();
         assert_eq!(result["called"], "echo");
         assert_eq!(result["args"]["msg"], "via-indexer");
+    }
+
+    // --- call() envelope-unwrapping tests ---
+    //
+    // These use a dedicated adapter that returns a per-tool fixed envelope
+    // so we can drive each branch of the unwrap logic deterministically.
+
+    struct EnvelopeAdapter {
+        tools: Vec<ToolInfo>,
+        responses: std::collections::HashMap<String, Value>,
+    }
+
+    #[async_trait]
+    impl McpAdapter for EnvelopeAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(self.tools.clone())
+        }
+        async fn call_tool(&self, name: &str, _arguments: Value) -> Result<Value, AdapterError> {
+            Ok(self.responses.get(name).cloned().unwrap_or(Value::Null))
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    async fn make_envelope_registry(responses: Vec<(&str, Value)>) -> Arc<AdapterRegistry> {
+        let registry = AdapterRegistry::new();
+        let tools: Vec<ToolInfo> = responses
+            .iter()
+            .map(|(n, _)| make_tool(n, "envelope tool"))
+            .collect();
+        let map: std::collections::HashMap<String, Value> = responses
+            .into_iter()
+            .map(|(n, v)| (n.to_string(), v))
+            .collect();
+        registry
+            .register(
+                "env".into(),
+                Box::new(EnvelopeAdapter {
+                    tools,
+                    responses: map,
+                }),
+                "stdio".into(),
+                None,
+                None,
+            )
+            .await;
+        Arc::new(registry)
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_call_returns_structured_content() {
+        let reg =
+            make_envelope_registry(vec![("sc", json!({ "structuredContent": { "foo": 1 } }))])
+                .await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox.execute(r#"return call("sc", {});"#).await.unwrap();
+        assert_eq!(result, json!({ "foo": 1 }));
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_call_parses_json_text_content() {
+        let reg = make_envelope_registry(vec![(
+            "tj",
+            json!({ "content": [{ "type": "text", "text": "{\"x\":42}" }] }),
+        )])
+        .await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox.execute(r#"return call("tj", {});"#).await.unwrap();
+        assert_eq!(result, json!({ "x": 42 }));
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_call_returns_text_when_not_json_shaped() {
+        let reg = make_envelope_registry(vec![(
+            "tt",
+            json!({ "content": [{ "type": "text", "text": "hello" }] }),
+        )])
+        .await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox.execute(r#"return call("tt", {});"#).await.unwrap();
+        assert_eq!(result, json!("hello"));
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_call_throws_on_is_error_envelope() {
+        let reg = make_envelope_registry(vec![(
+            "boom",
+            json!({
+                "isError": true,
+                "content": [{ "type": "text", "text": "upstream broke" }]
+            }),
+        )])
+        .await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox.execute(r#"return call("boom", {});"#).await;
+        assert!(result.is_err(), "expected isError envelope to throw");
+        let err = format!("{}", result.unwrap_err());
+        assert!(
+            err.contains("boom"),
+            "error should mention the tool name: {}",
+            err
+        );
+        assert!(
+            err.contains("upstream broke"),
+            "error should include content[0].text: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_js_sandbox_call_raw_opt_returns_envelope() {
+        let reg = make_envelope_registry(vec![(
+            "raw",
+            json!({
+                "structuredContent": { "foo": 1 },
+                "content": [{ "type": "text", "text": "{\"foo\":1}" }]
+            }),
+        )])
+        .await;
+        let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
+        let result = sandbox
+            .execute(r#"return call("raw", {}, { raw: true });"#)
+            .await
+            .unwrap();
+        assert_eq!(result["structuredContent"], json!({ "foo": 1 }));
+        assert_eq!(result["content"][0]["text"], "{\"foo\":1}");
     }
 
     // --- suggest_tool_names unit tests ---
