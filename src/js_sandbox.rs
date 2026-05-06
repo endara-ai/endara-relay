@@ -75,6 +75,17 @@ pub enum JsSandboxError {
 struct SandboxState {
     registry: Arc<AdapterRegistry>,
     handle: tokio::runtime::Handle,
+    /// Wall-clock deadline for the running script (`now + sandbox_timeout`,
+    /// captured when `execute_in_sandbox` enters). The retry loop checks this
+    /// before each jittered sleep so it can abort early — surfacing the last
+    /// transient error — instead of being killed mid-sleep by the outer
+    /// `tokio::time::timeout`.
+    deadline: std::time::Instant,
+    /// When `true`, the retry loop applies the production
+    /// [`RETRY_BACKOFF_SCHEDULE_MS`] schedule even in `cfg(test)` builds.
+    /// Defaults to `false`, which preserves the existing zero-backoff override
+    /// that keeps the test suite fast.
+    use_real_backoff: bool,
 }
 
 thread_local! {
@@ -89,18 +100,36 @@ thread_local! {
 pub struct JsSandbox {
     registry: Arc<AdapterRegistry>,
     timeout: Duration,
+    /// Test-only override that opts a single sandbox into the real backoff
+    /// schedule. Production callers leave this at `false` because production
+    /// builds always apply the real schedule regardless.
+    use_real_backoff: bool,
 }
 
 impl JsSandbox {
     /// Create a new sandbox backed by the given registry.
     pub fn new(registry: Arc<AdapterRegistry>, timeout: Duration) -> Self {
-        Self { registry, timeout }
+        Self {
+            registry,
+            timeout,
+            use_real_backoff: false,
+        }
+    }
+
+    /// Test-only: opt this sandbox into the real backoff schedule. Without
+    /// this, `cfg(test)` builds short-circuit retry sleeps to zero so the
+    /// suite stays fast. Used by the deadline-budget test.
+    #[cfg(test)]
+    pub(crate) fn with_real_backoff(mut self) -> Self {
+        self.use_real_backoff = true;
+        self
     }
 
     /// Execute a JavaScript script in the sandbox.
     pub async fn execute(&self, script: &str) -> Result<Value, JsSandboxError> {
         let registry = self.registry.clone();
         let timeout = self.timeout;
+        let use_real_backoff = self.use_real_backoff;
         let script = script.to_string();
         let handle = tokio::runtime::Handle::current();
         let catalog = self.registry.merged_catalog().await;
@@ -108,7 +137,14 @@ impl JsSandbox {
         let result = tokio::time::timeout(
             timeout,
             tokio::task::spawn_blocking(move || {
-                execute_in_sandbox(&script, &catalog, &registry, &handle)
+                execute_in_sandbox(
+                    &script,
+                    &catalog,
+                    &registry,
+                    &handle,
+                    timeout,
+                    use_real_backoff,
+                )
             }),
         )
         .await;
@@ -130,11 +166,16 @@ fn execute_in_sandbox(
     catalog: &[ToolInfo],
     registry: &Arc<AdapterRegistry>,
     handle: &tokio::runtime::Handle,
+    sandbox_timeout: Duration,
+    use_real_backoff: bool,
 ) -> Result<Value, JsSandboxError> {
+    let deadline = std::time::Instant::now() + sandbox_timeout;
     SANDBOX_STATE.with(|cell| {
         *cell.borrow_mut() = Some(SandboxState {
             registry: registry.clone(),
             handle: handle.clone(),
+            deadline,
+            use_real_backoff,
         });
     });
     let result = run_js(script, catalog);
@@ -358,6 +399,8 @@ fn call_tool_with_retry_native(
         }
         let max_retries = retry_requested.min(MAX_RETRIES);
         let registry = state.registry.clone();
+        let deadline = state.deadline;
+        let use_real_backoff = state.use_real_backoff;
         let res = state
             .handle
             .block_on(call_tool_with_retry_loop(
@@ -365,6 +408,8 @@ fn call_tool_with_retry_native(
                 &tool_name,
                 arguments,
                 max_retries,
+                deadline,
+                use_real_backoff,
             ))
             .map_err(|e| {
                 JsNativeError::error()
@@ -381,12 +426,31 @@ fn call_tool_with_retry_native(
 /// Retry loop driving up to `1 + max_retries` attempts on transient errors.
 /// Backoff is applied **between** attempts (no delay before the first try)
 /// and is jittered by ±25% via [`jittered_backoff_ms`].
+///
+/// Aborts early — surfacing the most recent transient error — when the next
+/// jittered sleep would push the wall clock past `deadline`. This prevents
+/// the retry loop from being killed mid-sleep by the sandbox's outer timeout
+/// and ensures the caller sees the underlying tool error, not a generic
+/// "script timed out".
+///
+/// `use_real_backoff` selects between [`RETRY_BACKOFF_SCHEDULE_MS`] and the
+/// effective (possibly zero, in `cfg(test)`) [`RETRY_BACKOFFS_MS`] schedule.
+/// Production callers pass `false` because `RETRY_BACKOFFS_MS` already mirrors
+/// the real schedule outside `cfg(test)`. Tests pass `true` to opt back into
+/// real sleeps.
 async fn call_tool_with_retry_loop(
     registry: &AdapterRegistry,
     tool_name: &str,
     arguments: Value,
     max_retries: usize,
+    deadline: std::time::Instant,
+    use_real_backoff: bool,
 ) -> Result<Value, AdapterError> {
+    let schedule: &[u64; MAX_RETRIES] = if use_real_backoff {
+        &RETRY_BACKOFF_SCHEDULE_MS
+    } else {
+        &RETRY_BACKOFFS_MS
+    };
     let mut attempt: usize = 0;
     let mut rng = rand::rng();
     loop {
@@ -395,11 +459,17 @@ async fn call_tool_with_retry_loop(
             Ok(v) => return Ok(v),
             Err(e) => {
                 if attempt < max_retries && is_transient_error(&e) {
-                    let base_ms = RETRY_BACKOFFS_MS
+                    let base_ms = schedule
                         .get(attempt)
                         .copied()
-                        .unwrap_or(*RETRY_BACKOFFS_MS.last().unwrap_or(&0));
+                        .unwrap_or(*schedule.last().unwrap_or(&0));
                     let backoff_ms = jittered_backoff_ms(base_ms, &mut rng);
+                    // Deadline gate: if the next sleep would exceed the
+                    // sandbox's wall-clock budget, surface the last-seen
+                    // transient error instead of sleeping into the timeout.
+                    if std::time::Instant::now() + Duration::from_millis(backoff_ms) >= deadline {
+                        return Err(e);
+                    }
                     if backoff_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                     }
@@ -2834,6 +2904,51 @@ mod tests {
             1,
             "isError envelopes must not be retried, got {} calls",
             counter.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn call_with_retry_aborts_when_backoff_exceeds_budget() {
+        // Real backoff schedule starts at 200ms; with a 50ms sandbox timeout,
+        // the very first jittered sleep (>=150ms) is guaranteed to exceed the
+        // remaining wall-clock budget. The retry loop must surface the
+        // last-seen transient error rather than sleep into the outer timeout.
+        let tool = tool_with_annotations("flaky", json!({ "readOnlyHint": true }));
+        let (reg, counter) = make_flaky_registry(tool, usize::MAX, true).await;
+        let sandbox = JsSandbox::new(reg, Duration::from_millis(50)).with_real_backoff();
+        let started = std::time::Instant::now();
+        let result = sandbox
+            .execute(r#"return call("flaky", {}, { retry: 3 });"#)
+            .await;
+        let elapsed = started.elapsed();
+        // Exactly one adapter call: first attempt fails transiently, the
+        // deadline gate fires before any retry sleep, and no further calls
+        // are issued.
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "deadline gate must abort before any retry attempt"
+        );
+        assert!(result.is_err(), "exhausted retry must surface as JS error");
+        let err = format!("{}", result.unwrap_err());
+        // Message must reflect the underlying transient error, not a generic
+        // sandbox timeout.
+        assert!(
+            err.contains("503") || err.to_lowercase().contains("service"),
+            "error should surface the last transient error, got: {}",
+            err
+        );
+        assert!(
+            !err.to_lowercase().contains("script execution timed out"),
+            "deadline gate must beat the sandbox timeout, got: {}",
+            err
+        );
+        // Sanity check: must return well before the first real backoff
+        // (>=150ms) would have completed.
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "retry loop should abort before first real sleep, took {:?}",
+            elapsed
         );
     }
 }
