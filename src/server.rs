@@ -130,33 +130,34 @@ fn meta_tool_definitions() -> Vec<Value> {
             "name": "execute_tools",
             "description": concat!(
                 "Execute a JavaScript snippet that can call tools. ",
-                "Invoke a tool with `call(\"tool_name\", { ...args })`; the equivalent `tools[\"tool_name\"]({...})` indexer form is also supported. ",
+                "Invoke a tool with `await call(\"tool_name\", { ...args })` — `call()` returns the unwrapped result directly, no manual envelope reading required. ",
+                "Behind the scenes it returns `structuredContent` when the tool provides it, parses `content[0].text` when it begins with `[` or `{`, returns the text as-is otherwise, and throws an `Error` on `isError` envelopes (the message includes the tool name and `content[0].text`). ",
                 "Multi-server tool names use `prefix__name` format (double underscore); single-server mode has no prefix. ",
-                "Each tool call returns an MCP result with `content` (array of `{type, text}`) and/or `structuredContent`. ",
-                "Prefer `structuredContent` when present — it is the server's structured output. ",
-                "`content[0].text` is provider-defined and is NOT guaranteed to be JSON: it may be prose, a partial summary, empty, or truncated. ",
-                "Only call `JSON.parse` on it after a guard such as `typeof t === \"string\" && /^\\s*[\\[{]/.test(t)`. ",
+                "Use `tools[\"tool_name\"](args)` only when you need the raw MCP envelope (`{ content, structuredContent, isError }`) — for example to inspect `isError` without throwing or to read the literal `content[0].text`. ",
                 "Calling an unknown tool name throws an error that lists the closest matching tools. ",
                 "Pass `{ retry: 3 }` as the third argument (e.g. `await call(\"name\", args, { retry: 3 })`) to retry transient errors on tools whose annotations declare `readOnlyHint` or `idempotentHint`. ",
                 "Use `return` to send data back.\n\n",
                 "Examples:\n",
                 "```js\n",
-                "// Safe pattern: prefer structuredContent, only JSON.parse after a guard\n",
-                "const r = await call(\"todoist__get-tasks\", { limit: 5 });\n",
-                "if (r.structuredContent) return r.structuredContent;\n",
-                "const t = r.content && r.content[0] && r.content[0].text;\n",
-                "return typeof t === \"string\" && /^\\s*[\\[{]/.test(t) ? JSON.parse(t) : t;\n",
+                "// call() returns the unwrapped result — no need to read content[0].text yourself.\n",
+                "const tasks = await call(\"todoist__get-tasks\", { limit: 5 });\n",
+                "return tasks;\n",
                 "```\n",
                 "```js\n",
-                "// Chain two tool calls\n",
+                "// Chain two tool calls and combine their results.\n",
                 "const projects = await call(\"todoist__get-projects\", {});\n",
-                "const tasks = await call(\"todoist__get-tasks\", { project_id: \"123\" });\n",
+                "const tasks = await call(\"todoist__get-tasks\", { project_id: projects[0].id });\n",
                 "return { projects, tasks };\n",
                 "```\n",
                 "```js\n",
-                "// Single-server mode (no prefix)\n",
-                "const result = await call(\"read_file\", { path: \"src/main.rs\" });\n",
-                "return result;\n",
+                "// Opt into retry for read-only / idempotent tools.\n",
+                "const issues = await call(\"github__list-issues\", { repo: \"endara-ai/relay\" }, { retry: 3 });\n",
+                "return issues;\n",
+                "```\n",
+                "```js\n",
+                "// Use the tools[...] indexer when you need the raw MCP envelope.\n",
+                "const r = await tools[\"todoist__get-tasks\"]({ limit: 5 });\n",
+                "return r.structuredContent;\n",
                 "```",
             ),
             "inputSchema": {
@@ -1149,25 +1150,20 @@ mod tests {
             "execute_tools description should include at least one code example with await"
         );
         assert!(
-            exec_desc.contains("NOT guaranteed to be JSON"),
-            "execute_tools description should warn that content[0].text is not guaranteed to be JSON"
+            exec_desc.contains("unwrapped"),
+            "execute_tools description should explain that call() returns the unwrapped result directly"
         );
         assert!(
-            exec_desc.contains("Prefer `structuredContent`"),
-            "execute_tools description should prefer structuredContent over content[0].text"
+            exec_desc.contains("isError"),
+            "execute_tools description should explain that call() throws on isError envelopes"
         );
         assert!(
-            exec_desc.contains(r#"/^\s*[\[{]/"#),
-            "execute_tools description should show a regex guard before JSON.parse"
+            exec_desc.contains("raw MCP envelope"),
+            "execute_tools description should explain when to use the tools[...] indexer (raw MCP envelope)"
         );
         assert!(
-            exec_desc.contains("if (r.structuredContent) return r.structuredContent"),
-            "execute_tools description should include the safe-guard example preferring structuredContent"
-        );
-        assert!(
-            exec_desc
-                .contains(r#"typeof t === "string" && /^\s*[\[{]/.test(t) ? JSON.parse(t) : t"#),
-            "execute_tools description should include the typeof + regex guard before JSON.parse"
+            exec_desc.contains("r.structuredContent"),
+            "execute_tools description should include a tools[...] indexer example accessing r.structuredContent"
         );
         assert!(
             exec_desc.contains("closest matching tools") || exec_desc.contains("closest tools"),
