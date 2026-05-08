@@ -110,11 +110,13 @@ async fn test_multi_endpoint_merged_catalog() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let tools = body["result"]["tools"].as_array().expect("tools array");
 
-    // echo-ep has 1 tool, multi-ep has 12 tools, + 3 meta-tools = 16 total
+    // echo-ep has 1 tool, multi-ep has 12 tools, + 2 meta-tools = 15 total.
+    // execute_tools is gated on local_js_execution and is hidden when off
+    // (the default for this fixture).
     assert_eq!(
         tools.len(),
-        16,
-        "expected 16 tools (1+12+3), got {}",
+        15,
+        "expected 15 tools (1+12+2), got {}",
         tools.len()
     );
 
@@ -133,10 +135,11 @@ async fn test_multi_endpoint_merged_catalog() {
         tool_names.contains(&"multi_ep__uppercase"),
         "missing multi_ep uppercase"
     );
-    // Verify meta-tools
+    // Verify meta-tools (execute_tools is gated on local_js_execution
+    // and is intentionally hidden from the catalog when JS mode is off).
     assert!(tool_names.contains(&"list_tools"));
     assert!(tool_names.contains(&"search_tools"));
-    assert!(tool_names.contains(&"execute_tools"));
+    assert!(!tool_names.contains(&"execute_tools"));
 }
 
 #[tokio::test]
@@ -247,11 +250,12 @@ async fn test_multi_endpoint_overlapping_tool_names() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let tools = body["result"]["tools"].as_array().expect("tools array");
 
-    // Each endpoint has 12 tools, 3 endpoints = 36 + 3 meta-tools = 39
+    // Each endpoint has 12 tools, 3 endpoints = 36 + 2 meta-tools = 38.
+    // execute_tools is gated on local_js_execution and is hidden when off.
     assert_eq!(
         tools.len(),
-        39,
-        "expected 39 tools (12*3+3), got {}",
+        38,
+        "expected 38 tools (12*3+2), got {}",
         tools.len()
     );
 

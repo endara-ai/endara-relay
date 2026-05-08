@@ -77,7 +77,10 @@ async fn test_js_mode_on_tools_list_only_meta_tools() {
     }
 }
 
-/// 4.1b — With js_execution_mode=false, tools/list includes standard tools AND meta-tools.
+/// 4.1b — With js_execution_mode=false, tools/list includes standard tools and
+/// the always-on meta-tools (list_tools, search_tools), but `execute_tools`
+/// is intentionally hidden — it is gated on `local_js_execution` so we do not
+/// advertise a tool the invocation handler will reject.
 #[tokio::test]
 async fn test_js_mode_off_tools_list_includes_standard_and_meta() {
     if require_node().is_none() {
@@ -88,13 +91,14 @@ async fn test_js_mode_off_tools_list_includes_standard_and_meta() {
     let tools = client.list_tools().await.expect("list_tools failed");
     let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
 
-    // Should include standard tools like "echo" plus the 3 meta-tools
+    // Should include standard tools like "echo"
     assert!(
         tool_names.contains(&"echo"),
         "Expected 'echo' in tool list when JS mode OFF, got: {:?}",
         tool_names
     );
-    for meta in META_TOOL_NAMES {
+    // list_tools and search_tools must still be advertised
+    for meta in &["list_tools", "search_tools"] {
         assert!(
             tool_names.contains(meta),
             "Expected '{}' in tool list when JS mode OFF, got: {:?}",
@@ -102,10 +106,16 @@ async fn test_js_mode_off_tools_list_includes_standard_and_meta() {
             tool_names
         );
     }
-    // More than 3 tools (standard + meta)
+    // execute_tools must NOT be advertised when JS mode is off
     assert!(
-        tool_names.len() > 3,
-        "Expected more than 3 tools when JS mode OFF, got: {:?}",
+        !tool_names.contains(&"execute_tools"),
+        "execute_tools must be hidden from the catalog when JS mode is OFF, got: {:?}",
+        tool_names
+    );
+    // More than 2 tools (standard + 2 meta)
+    assert!(
+        tool_names.len() > 2,
+        "Expected more than 2 tools when JS mode OFF, got: {:?}",
         tool_names
     );
 }
