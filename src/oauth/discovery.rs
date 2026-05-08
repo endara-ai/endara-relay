@@ -2,6 +2,8 @@ use reqwest::Client;
 use std::time::Duration;
 use url::Url;
 
+use crate::oauth::url_guard::{self, UrlGuardError};
+
 /// Protected Resource Metadata per RFC 9728.
 /// Returned by `{resource_url}/.well-known/oauth-protected-resource`.
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -82,6 +84,9 @@ pub enum DiscoveryError {
 
     #[error("Discovery timed out after {0}s")]
     Timeout(u64),
+
+    #[error("Discovery URL rejected by SSRF guard: {0}")]
+    UrlGuard(#[from] UrlGuardError),
 }
 
 /// Build a well-known URL per RFC 5785 §3 and RFC 8414 §3.1.
@@ -136,20 +141,27 @@ fn has_path(base_url: &str) -> bool {
 /// 3. Fetches `{origin}/.well-known/oauth-authorization-server{path}`
 ///    - Falls back to `{origin}/.well-known/oauth-authorization-server` if 404 and path is non-empty
 /// 4. Validates S256 PKCE support
+///
+/// Both the resource URL and the authorization server URL (which may be on a
+/// different origin and is server-supplied) are validated through
+/// [`url_guard`] before any HTTP request is sent, and each request uses a
+/// per-host pinned client to defeat DNS rebinding.
 pub async fn discover_oauth_server(
-    http_client: &Client,
     resource_url: &str,
+    allow_insecure: bool,
 ) -> Result<DiscoveryResult, DiscoveryError> {
-    // Step 1: Fetch protected resource metadata (with root fallback)
+    // Step 1: Fetch protected resource metadata (with root fallback) using a
+    // client pinned to the resource host.
     let well_known_url = build_well_known_url(resource_url, "oauth-protected-resource")?;
+    let resource_client = url_guard::validated_client(&well_known_url, allow_insecure).await?;
 
     let resource_meta: ProtectedResourceMetadata =
-        match fetch_well_known(http_client, &well_known_url).await {
+        match fetch_well_known(&resource_client, &well_known_url).await {
             Ok(resp) => resp.json().await?,
             Err(DiscoveryError::MetadataNotFound { .. }) if has_path(resource_url) => {
-                // Fallback: try root well-known URL without path
+                // Fallback: try root well-known URL without path (same host, reuse client)
                 let root_url = build_well_known_url_root(resource_url, "oauth-protected-resource")?;
-                fetch_well_known(http_client, &root_url)
+                fetch_well_known(&resource_client, &root_url)
                     .await
                     .map_err(|_| DiscoveryError::MetadataNotFound {
                         url: well_known_url.clone(),
@@ -166,14 +178,16 @@ pub async fn discover_oauth_server(
         .ok_or(DiscoveryError::NoAuthorizationServer)?
         .clone();
 
-    // Step 2: Fetch authorization server metadata (with root fallback)
+    // Step 2: Fetch authorization server metadata using a client pinned to
+    // the (potentially different and server-supplied) auth-server host.
     let as_well_known = build_well_known_url(&auth_server_url, "oauth-authorization-server")
         .map_err(|_| DiscoveryError::AuthServerMetadataNotFound {
             url: auth_server_url.clone(),
         })?;
+    let as_client = url_guard::validated_client(&as_well_known, allow_insecure).await?;
 
     let as_meta: AuthorizationServerMetadata =
-        match fetch_well_known(http_client, &as_well_known).await {
+        match fetch_well_known(&as_client, &as_well_known).await {
             Ok(resp) => resp.json().await?,
             Err(DiscoveryError::MetadataNotFound { .. }) if has_path(&auth_server_url) => {
                 let root_url =
@@ -181,7 +195,7 @@ pub async fn discover_oauth_server(
                         .map_err(|_| DiscoveryError::AuthServerMetadataNotFound {
                             url: auth_server_url.clone(),
                         })?;
-                fetch_well_known(http_client, &root_url)
+                fetch_well_known(&as_client, &root_url)
                     .await
                     .map_err(|_| DiscoveryError::AuthServerMetadataNotFound {
                         url: as_well_known.clone(),

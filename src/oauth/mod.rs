@@ -1,5 +1,6 @@
 pub mod dcr;
 pub mod discovery;
+pub mod url_guard;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use sha2::{Digest, Sha256};

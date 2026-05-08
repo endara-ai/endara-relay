@@ -1,5 +1,6 @@
-use reqwest::Client;
 use std::time::Duration;
+
+use crate::oauth::url_guard::{self, UrlGuardError};
 
 /// Dynamic Client Registration request per RFC 7591.
 #[derive(Debug, serde::Serialize)]
@@ -40,18 +41,28 @@ pub enum DcrError {
 
     #[error("DCR HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+
+    #[error("DCR URL rejected by SSRF guard: {0}")]
+    UrlGuard(#[from] UrlGuardError),
 }
 
 /// Register a client dynamically with an OAuth authorization server.
 ///
 /// Sends a POST to the `registration_endpoint` with client metadata.
 /// Registers as a public client (`token_endpoint_auth_method: "none"`).
+///
+/// `registration_endpoint` is server-supplied (RFC 8414 metadata) and is
+/// validated through [`url_guard`] before any HTTP request is sent. The
+/// per-call client is pinned to the resolved address set to defeat
+/// DNS rebinding.
 pub async fn register_client(
-    http_client: &Client,
     registration_endpoint: &str,
     redirect_uri: &str,
     endpoint_name: &str,
+    allow_insecure: bool,
 ) -> Result<ClientRegistrationResponse, DcrError> {
+    let http_client = url_guard::validated_client(registration_endpoint, allow_insecure).await?;
+
     let request = ClientRegistrationRequest {
         client_name: format!("Endara Relay — {}", endpoint_name),
         redirect_uris: vec![redirect_uri.to_string()],

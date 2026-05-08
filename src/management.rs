@@ -945,6 +945,7 @@ async fn oauth_start(
     let scopes = ep.scopes.clone();
     let config_token_endpoint = ep.token_endpoint.clone();
     let endpoint_url = ep.url.clone().unwrap_or_default();
+    let allow_insecure_oauth = config.relay.allow_insecure_oauth.unwrap_or(false);
     drop(config);
 
     let Some(ref flow_mgr) = state.oauth_flow_manager else {
@@ -979,9 +980,8 @@ async fn oauth_start(
             None::<String>,
         )
     } else {
-        // Try RFC 9728 discovery
-        let http = reqwest::Client::new();
-        match discovery::discover_oauth_server(&http, &endpoint_url).await {
+        // Try RFC 9728 discovery (URL guard + per-host pinned client live inside)
+        match discovery::discover_oauth_server(&endpoint_url, allow_insecure_oauth).await {
             Ok(disc) => (
                 disc.authorization_endpoint,
                 disc.token_endpoint,
@@ -1026,9 +1026,10 @@ async fn oauth_start(
         if let Some(creds) = persisted {
             (creds.client_id, creds.client_secret, true)
         } else if let Some(ref reg_endpoint) = registration_endpoint {
-            // Attempt dynamic client registration
-            let http = reqwest::Client::new();
-            match dcr::register_client(&http, reg_endpoint, &redirect_uri, &name).await {
+            // Attempt dynamic client registration (URL guard + pinned client inside)
+            match dcr::register_client(reg_endpoint, &redirect_uri, &name, allow_insecure_oauth)
+                .await
+            {
                 Ok(resp) => {
                     // Persist the new credentials
                     if let Some(ref tm) = state.token_manager {
@@ -1661,8 +1662,9 @@ async fn oauth_setup(
         .into_response();
     };
 
-    // Check for duplicate name in existing config
-    {
+    // Check for duplicate name in existing config and snapshot the
+    // SSRF opt-out flag for this request.
+    let allow_insecure_oauth = {
         let config = state.config.read().await;
         if config.endpoints.iter().any(|e| e.name == body.name) {
             return error_response(
@@ -1675,7 +1677,8 @@ async fn oauth_setup(
             )
             .into_response();
         }
-    }
+        config.relay.allow_insecure_oauth.unwrap_or(false)
+    };
 
     let scopes_str = body.scopes.as_ref().map(|s| s.join(" "));
     let session_id = setup_mgr
@@ -1700,8 +1703,7 @@ async fn oauth_setup(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .unwrap_or(body.url.as_str());
-    let http = reqwest::Client::new();
-    let disc = match discovery::discover_oauth_server(&http, discovery_base).await {
+    let disc = match discovery::discover_oauth_server(discovery_base, allow_insecure_oauth).await {
         Ok(d) => d,
         Err(e) => {
             // Clean up session on failure
@@ -1767,7 +1769,14 @@ async fn oauth_setup(
         }
         Ok((client_id, manual_client_secret))
     } else if let Some(ref reg_endpoint) = registration_endpoint {
-        match dcr::register_client(&http, reg_endpoint, &redirect_uri, &body.name).await {
+        match dcr::register_client(
+            reg_endpoint,
+            &redirect_uri,
+            &body.name,
+            allow_insecure_oauth,
+        )
+        .await
+        {
             Ok(resp) => {
                 // Persist DCR credentials for future re-auth
                 if let Some(ref tm) = state.token_manager {
@@ -2587,6 +2596,7 @@ mod tests {
                 machine_name: "test-machine".to_string(),
                 local_js_execution: None,
                 token_dir: None,
+                allow_insecure_oauth: None,
             },
             endpoints: vec![EndpointConfig {
                 name: "echo".to_string(),
@@ -4376,6 +4386,7 @@ command = "echo"
                 machine_name: "test-machine".to_string(),
                 local_js_execution: None,
                 token_dir: None,
+                allow_insecure_oauth: None,
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
