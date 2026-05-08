@@ -147,6 +147,15 @@ jobs:
         github.event_name == 'workflow_dispatch'
       )
     runs-on: ubuntu-latest
+    # CI-013 hardening: narrow GITHUB_TOKEN to read-only for this job so a
+    # successful injection (e.g. CI-002 or a compromised third-party action)
+    # cannot use the workflow-default `contents: write` to push tampered
+    # commits back to this repo. Writes to the consumer-facing
+    # `endara-ai/homebrew-tap` are gated separately on `HOMEBREW_TAP_TOKEN`,
+    # which is only ever attached to the dedicated `Checkout homebrew-tap`
+    # step below — no other step in this job references it.
+    permissions:
+      contents: read
     steps:
       - name: Resolve version
         id: version
@@ -191,10 +200,29 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
-          sha_arm64_darwin=$(shasum -a 256 "archives/endara-relay-v${VERSION}-aarch64-apple-darwin.tar.gz" | awk '{print $1}')
-          sha_x64_darwin=$(shasum -a 256 "archives/endara-relay-v${VERSION}-x86_64-apple-darwin.tar.gz" | awk '{print $1}')
-          sha_arm64_linux=$(shasum -a 256 "archives/endara-relay-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz" | awk '{print $1}')
-          sha_x64_linux=$(shasum -a 256 "archives/endara-relay-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz" | awk '{print $1}')
+          set -euo pipefail
+          compute() {
+            local file="$1"
+            if [[ ! -s "$file" ]]; then
+              echo "Asset $file is missing or empty; refusing to publish a tap commit." >&2
+              exit 1
+            fi
+            local sum
+            sum=$(shasum -a 256 "$file" | awk '{print $1}')
+            # Sanity-check the digest before it is interpolated into the cask.
+            # A non-hex value here would mean either the upstream tool
+            # changed format or someone managed to substitute a script-like
+            # string into the workflow context.
+            if [[ ! "$sum" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "Computed SHA-256 for $file is not 64-char hex: '$sum'" >&2
+              exit 1
+            fi
+            printf '%s' "$sum"
+          }
+          sha_arm64_darwin=$(compute "archives/endara-relay-v${VERSION}-aarch64-apple-darwin.tar.gz")
+          sha_x64_darwin=$(compute "archives/endara-relay-v${VERSION}-x86_64-apple-darwin.tar.gz")
+          sha_arm64_linux=$(compute "archives/endara-relay-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz")
+          sha_x64_linux=$(compute "archives/endara-relay-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz")
           {
             echo "arm64_darwin=${sha_arm64_darwin}"
             echo "x64_darwin=${sha_x64_darwin}"
@@ -205,6 +233,12 @@ jobs:
         uses: actions/checkout@v4
         with:
           path: relay
+          # CI-013: don't let actions/checkout persist GITHUB_TOKEN as a git
+          # credential here. The next step performs a *separate* checkout with
+          # `HOMEBREW_TAP_TOKEN` and inherits any persisted credentials in the
+          # global git config; keeping per-step token scoping keeps the tap
+          # PAT isolated to the homebrew-tap working tree only.
+          persist-credentials: false
       - name: Checkout homebrew-tap
         uses: actions/checkout@v4
         with:
