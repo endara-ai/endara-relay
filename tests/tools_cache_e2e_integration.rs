@@ -9,9 +9,10 @@
 
 mod common;
 
+use common::api_client::ApiClient;
 use common::config::ConfigBuilder;
 use common::harness::RelayHarness;
-use serde_json::{json, Value};
+use serde_json::json;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
@@ -37,8 +38,8 @@ async fn poll_until<F: FnMut() -> bool>(deadline: Duration, mut predicate: F) ->
 }
 
 /// GET `/api/endpoints/<name>/tools` and return the tool name set.
-async fn fetch_tool_names(client: &reqwest::Client, url: &str) -> Vec<String> {
-    let resp: Value = client.get(url).send().await.unwrap().json().await.unwrap();
+async fn fetch_tool_names(api: &ApiClient, path: &str) -> Vec<String> {
+    let resp = api.get(path).await;
     resp.as_array()
         .unwrap()
         .iter()
@@ -69,13 +70,12 @@ async fn test_per_adapter_tools_cache_end_to_end() {
         .await
         .expect("swapper endpoint did not become healthy");
 
-    let client = reqwest::Client::new();
-    let base = harness.base_url();
-    let tools_url = format!("{}/api/endpoints/swapper/tools", base);
-    let catalog_url = format!("{}/api/catalog", base);
+    let api = harness.api();
+    let tools_url = "/api/endpoints/swapper/tools";
+    let catalog_url = "/api/catalog";
 
     // Step 1: First read populates per-endpoint cache → upstream count = 1.
-    let names = fetch_tool_names(&client, &tools_url).await;
+    let names = fetch_tool_names(api, tools_url).await;
     assert!(
         names.iter().any(|n| n == "swap_tools") && names.iter().any(|n| n == "get_status"),
         "expected initial tools, got {names:?}"
@@ -95,7 +95,7 @@ async fn test_per_adapter_tools_cache_end_to_end() {
     );
 
     // Step 2: Second read hits the per-endpoint cache → no upstream traffic.
-    let _ = fetch_tool_names(&client, &tools_url).await;
+    let _ = fetch_tool_names(api, tools_url).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         read_count(&count_path),
@@ -104,14 +104,7 @@ async fn test_per_adapter_tools_cache_end_to_end() {
     );
 
     // Step 3: Catalog reuses the per-endpoint cache → still no upstream.
-    let _: Value = client
-        .get(&catalog_url)
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
+    let _ = api.get(catalog_url).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         read_count(&count_path),
@@ -120,24 +113,18 @@ async fn test_per_adapter_tools_cache_end_to_end() {
     );
 
     // Step 4: Disable → enable invalidates the cache; the next GET re-fetches.
-    let resp = client
-        .post(format!("{}/api/endpoints/swapper/disable", base))
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success(), "disable failed: {resp:?}");
-    let resp = client
-        .post(format!("{}/api/endpoints/swapper/enable", base))
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success(), "enable failed: {resp:?}");
+    let (status, _) = api
+        .post_empty_status("/api/endpoints/swapper/disable")
+        .await;
+    assert!(status.is_success(), "disable failed: {status}");
+    let (status, _) = api.post_empty_status("/api/endpoints/swapper/enable").await;
+    assert!(status.is_success(), "enable failed: {status}");
     harness
         .wait_healthy("swapper", Duration::from_secs(15))
         .await
         .expect("swapper did not become healthy after re-enable");
 
-    let _ = fetch_tool_names(&client, &tools_url).await;
+    let _ = fetch_tool_names(api, tools_url).await;
     assert!(
         poll_until(Duration::from_secs(2), || read_count(&count_path) >= 2).await,
         "lifecycle invalidation: expected upstream count to reach 2, got {}",
@@ -152,7 +139,7 @@ async fn test_per_adapter_tools_cache_end_to_end() {
     // Step 5: Trigger upstream swap via tools/call → fixture emits
     // notifications/tools/list_changed → registry invalidates the cache →
     // next GET returns the swapped list and bumps the upstream counter by 1.
-    let mut mcp = common::mcp_client::McpClient::new(base.clone());
+    let mut mcp = common::mcp_client::McpClient::new(harness.base_url());
     mcp.initialize().await.expect("initialize handshake failed");
     let call_resp = mcp
         .call_tool("swap_tools", json!({}))
@@ -170,7 +157,7 @@ async fn test_per_adapter_tools_cache_end_to_end() {
     let mut saw_new_tool = false;
     let stop = Instant::now() + Duration::from_secs(2);
     while Instant::now() < stop {
-        let names = fetch_tool_names(&client, &tools_url).await;
+        let names = fetch_tool_names(api, tools_url).await;
         if names.iter().any(|n| n == "extra_tool_after_swap") {
             saw_new_tool = true;
             last_names = names;
@@ -223,13 +210,12 @@ async fn test_refresh_endpoint_invalidates_per_endpoint_cache() {
         .await
         .expect("swapper endpoint did not become healthy");
 
-    let client = reqwest::Client::new();
-    let base = harness.base_url();
-    let tools_url = format!("{}/api/endpoints/swapper/tools", base);
-    let refresh_url = format!("{}/api/endpoints/swapper/refresh", base);
+    let api = harness.api();
+    let tools_url = "/api/endpoints/swapper/tools";
+    let refresh_url = "/api/endpoints/swapper/refresh";
 
     // 1. First GET primes the cache → upstream count = 1.
-    let _ = fetch_tool_names(&client, &tools_url).await;
+    let _ = fetch_tool_names(api, tools_url).await;
     assert!(
         poll_until(Duration::from_secs(2), || read_count(&count_path) >= 1).await,
         "fixture never recorded the first tools/list call"
@@ -241,7 +227,7 @@ async fn test_refresh_endpoint_invalidates_per_endpoint_cache() {
     );
 
     // 2. Second GET is a cache hit → counter unchanged.
-    let _ = fetch_tool_names(&client, &tools_url).await;
+    let _ = fetch_tool_names(api, tools_url).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         read_count(&count_path),
@@ -252,8 +238,8 @@ async fn test_refresh_endpoint_invalidates_per_endpoint_cache() {
     // 3. POST refresh: invalidates per-endpoint cache and re-primes it
     //    eagerly via cached_list_tools(). Upstream count must increment by
     //    exactly one.
-    let resp = client.post(&refresh_url).send().await.unwrap();
-    assert!(resp.status().is_success(), "refresh failed: {resp:?}");
+    let (status, _) = api.post_empty_status(refresh_url).await;
+    assert!(status.is_success(), "refresh failed: {status}");
     assert!(
         poll_until(Duration::from_secs(2), || read_count(&count_path) >= 2).await,
         "refresh: expected upstream count to reach 2, got {}",
@@ -266,7 +252,7 @@ async fn test_refresh_endpoint_invalidates_per_endpoint_cache() {
     );
 
     // 4. Subsequent GET stays a cache hit (refresh re-primed the cache).
-    let _ = fetch_tool_names(&client, &tools_url).await;
+    let _ = fetch_tool_names(api, tools_url).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         read_count(&count_path),
@@ -303,15 +289,14 @@ async fn test_per_tool_disable_enable_invalidates_catalog_cache() {
         .await
         .expect("swapper endpoint did not become healthy");
 
-    let client = reqwest::Client::new();
-    let base = harness.base_url();
-    let catalog_url = format!("{}/api/catalog", base);
-    let disable_url = format!("{}/api/endpoints/swapper/tools/get_status/disable", base);
-    let enable_url = format!("{}/api/endpoints/swapper/tools/get_status/enable", base);
+    let api = harness.api();
+    let catalog_url = "/api/catalog";
+    let disable_url = "/api/endpoints/swapper/tools/get_status/disable";
+    let enable_url = "/api/endpoints/swapper/tools/get_status/enable";
 
     // Helper: GET /api/catalog and return tool names.
-    async fn catalog_names(client: &reqwest::Client, url: &str) -> Vec<String> {
-        let resp: Value = client.get(url).send().await.unwrap().json().await.unwrap();
+    async fn catalog_names(api: &ApiClient, path: &str) -> Vec<String> {
+        let resp = api.get(path).await;
         resp.as_array()
             .unwrap()
             .iter()
@@ -320,7 +305,7 @@ async fn test_per_tool_disable_enable_invalidates_catalog_cache() {
     }
 
     // 1. Prime the catalog cache → upstream count = 1.
-    let names = catalog_names(&client, &catalog_url).await;
+    let names = catalog_names(api, catalog_url).await;
     assert!(
         names.iter().any(|n| n == "get_status"),
         "expected get_status in initial catalog, got {names:?}"
@@ -336,7 +321,7 @@ async fn test_per_tool_disable_enable_invalidates_catalog_cache() {
     );
 
     // 2. Second catalog read hits the catalog cache → counter unchanged.
-    let _ = catalog_names(&client, &catalog_url).await;
+    let _ = catalog_names(api, catalog_url).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         read_count(&count_path),
@@ -349,10 +334,10 @@ async fn test_per_tool_disable_enable_invalidates_catalog_cache() {
     //    invalidate_catalog_cache also clears every per-endpoint tool cache
     //    (per its docstring), the next catalog rebuild re-fetches upstream,
     //    bumping the counter by exactly one.
-    let resp = client.post(&disable_url).send().await.unwrap();
-    assert!(resp.status().is_success(), "disable_tool failed: {resp:?}");
+    let (status, _) = api.post_empty_status(disable_url).await;
+    assert!(status.is_success(), "disable_tool failed: {status}");
 
-    let names_after_disable = catalog_names(&client, &catalog_url).await;
+    let names_after_disable = catalog_names(api, catalog_url).await;
     assert!(
         !names_after_disable.iter().any(|n| n == "get_status"),
         "catalog cache was not invalidated: get_status still present after disable: {names_after_disable:?}"
@@ -373,7 +358,7 @@ async fn test_per_tool_disable_enable_invalidates_catalog_cache() {
     );
 
     // 4. Second catalog read after disable is a cache hit: counter unchanged.
-    let _ = catalog_names(&client, &catalog_url).await;
+    let _ = catalog_names(api, catalog_url).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert_eq!(
         read_count(&count_path),
@@ -384,10 +369,10 @@ async fn test_per_tool_disable_enable_invalidates_catalog_cache() {
     // 5. POST enable_tool: must again invalidate the catalog cache, re-merge
     //    so the re-enabled tool reappears, and produce exactly one extra
     //    upstream re-fetch.
-    let resp = client.post(&enable_url).send().await.unwrap();
-    assert!(resp.status().is_success(), "enable_tool failed: {resp:?}");
+    let (status, _) = api.post_empty_status(enable_url).await;
+    assert!(status.is_success(), "enable_tool failed: {status}");
 
-    let names_after_enable = catalog_names(&client, &catalog_url).await;
+    let names_after_enable = catalog_names(api, catalog_url).await;
     assert!(
         names_after_enable.iter().any(|n| n == "get_status"),
         "catalog cache was not invalidated on enable: get_status missing: {names_after_enable:?}"

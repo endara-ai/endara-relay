@@ -7,6 +7,7 @@ mod common;
 
 use axum::extract::State;
 use axum::response::IntoResponse;
+use common::api_client::ApiClient;
 use common::config::ConfigBuilder;
 use common::harness::{wait_for_lifecycle_state, RelayHarness};
 use common::mcp_client::McpClient;
@@ -470,13 +471,12 @@ async fn start_mock_mcp_without_server_name() -> (SocketAddr, Arc<MockMcpState>)
 // ---------------------------------------------------------------------------
 
 async fn poll_oauth_status(
-    base_url: &str,
+    api: &ApiClient,
     endpoint_name: &str,
     expected_status: &str,
     timeout: Duration,
 ) -> Value {
-    let client = reqwest::Client::new();
-    let url = format!("{}/api/endpoints/{}/oauth/status", base_url, endpoint_name);
+    let path = format!("/api/endpoints/{}/oauth/status", endpoint_name);
     let deadline = tokio::time::Instant::now() + timeout;
     let mut last_body: Option<Value> = None;
 
@@ -487,16 +487,14 @@ async fn poll_oauth_status(
                 expected_status, endpoint_name, last_body
             );
         }
-        if let Ok(resp) = client.get(&url).send().await {
-            let status_code = resp.status();
-            if let Ok(body) = resp.json::<Value>().await {
-                if body["status"].as_str() == Some(expected_status) {
-                    return body;
-                }
-                last_body = Some(body);
-            } else {
-                eprintln!("poll_oauth_status: non-JSON response, HTTP {}", status_code);
+        let (status_code, body) = api.get_status_json(&path).await;
+        if !body.is_null() {
+            if body["status"].as_str() == Some(expected_status) {
+                return body;
             }
+            last_body = Some(body);
+        } else {
+            eprintln!("poll_oauth_status: non-JSON response, HTTP {}", status_code);
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -504,22 +502,10 @@ async fn poll_oauth_status(
 
 /// Simulate the OAuth callback by following the authorize URL and hitting the
 /// relay's /oauth/callback with the code and state.
-async fn simulate_oauth_login(relay_base_url: &str, endpoint_name: &str) -> Value {
-    let client = reqwest::Client::new();
-
-    // Step 1: Call /oauth/start to get the authorize URL
-    let start_url = format!(
-        "{}/api/endpoints/{}/oauth/start",
-        relay_base_url, endpoint_name
-    );
-    let start_resp: Value = client
-        .post(&start_url)
-        .send()
-        .await
-        .expect("oauth/start failed")
-        .json()
-        .await
-        .expect("parse oauth/start response");
+async fn simulate_oauth_login(api: &ApiClient, endpoint_name: &str) -> Value {
+    // Step 1: Call /oauth/start (UDS) to get the authorize URL
+    let start_path = format!("/api/endpoints/{}/oauth/start", endpoint_name);
+    let start_resp = api.post_empty(&start_path).await;
 
     let authorize_url = start_resp["authorize_url"]
         .as_str()
@@ -580,20 +566,24 @@ async fn test_oauth_fresh_login_flow() {
         .build();
 
     let harness = RelayHarness::start(&config).await;
-    let base = harness.base_url();
 
     // Verify initial state is needs_login
-    let status =
-        poll_oauth_status(&base, "test-oauth", "needs_login", Duration::from_secs(10)).await;
+    let status = poll_oauth_status(
+        harness.api(),
+        "test-oauth",
+        "needs_login",
+        Duration::from_secs(10),
+    )
+    .await;
     assert_eq!(status["status"].as_str(), Some("needs_login"));
 
     // Simulate the OAuth login flow
-    let login_result = simulate_oauth_login(&base, "test-oauth").await;
+    let login_result = simulate_oauth_login(harness.api(), "test-oauth").await;
     assert_eq!(login_result["status"].as_u64(), Some(200));
 
     // Wait for authenticated state
     let status = poll_oauth_status(
-        &base,
+        harness.api(),
         "test-oauth",
         "authenticated",
         Duration::from_secs(15),
@@ -636,10 +626,16 @@ async fn test_oauth_token_refresh_on_401() {
     let base = harness.base_url();
 
     // Login first
-    poll_oauth_status(&base, "test-oauth", "needs_login", Duration::from_secs(10)).await;
-    simulate_oauth_login(&base, "test-oauth").await;
     poll_oauth_status(
-        &base,
+        harness.api(),
+        "test-oauth",
+        "needs_login",
+        Duration::from_secs(10),
+    )
+    .await;
+    simulate_oauth_login(harness.api(), "test-oauth").await;
+    poll_oauth_status(
+        harness.api(),
         "test-oauth",
         "authenticated",
         Duration::from_secs(15),
@@ -686,13 +682,18 @@ async fn test_oauth_refresh_failure_transitions_to_auth_required() {
         .build();
 
     let harness = RelayHarness::start(&config).await;
-    let base = harness.base_url();
 
     // Login
-    poll_oauth_status(&base, "test-oauth", "needs_login", Duration::from_secs(10)).await;
-    simulate_oauth_login(&base, "test-oauth").await;
     poll_oauth_status(
-        &base,
+        harness.api(),
+        "test-oauth",
+        "needs_login",
+        Duration::from_secs(10),
+    )
+    .await;
+    simulate_oauth_login(harness.api(), "test-oauth").await;
+    poll_oauth_status(
+        harness.api(),
         "test-oauth",
         "authenticated",
         Duration::from_secs(15),
@@ -703,16 +704,15 @@ async fn test_oauth_refresh_failure_transitions_to_auth_required() {
     *oauth_state.fail_refresh.write().await = true;
     *mcp_state.valid_token.write().await = "will-never-match".to_string();
 
-    // Trigger a manual refresh via management API
-    let client = reqwest::Client::new();
-    let _resp = client
-        .post(format!("{}/api/endpoints/test-oauth/oauth/refresh", base))
-        .send()
+    // Trigger a manual refresh via management API (UDS)
+    let _ = harness
+        .api()
+        .post_empty_status("/api/endpoints/test-oauth/oauth/refresh")
         .await;
 
     // Wait for auth_required state (refresh failed with invalid_grant)
     let status = poll_oauth_status(
-        &base,
+        harness.api(),
         "test-oauth",
         "auth_required",
         Duration::from_secs(15),
@@ -735,31 +735,39 @@ async fn test_oauth_disconnect_and_reconnect() {
         .build();
 
     let harness = RelayHarness::start(&config).await;
-    let base = harness.base_url();
 
     // Login
-    poll_oauth_status(&base, "test-oauth", "needs_login", Duration::from_secs(10)).await;
-    simulate_oauth_login(&base, "test-oauth").await;
     poll_oauth_status(
-        &base,
+        harness.api(),
+        "test-oauth",
+        "needs_login",
+        Duration::from_secs(10),
+    )
+    .await;
+    simulate_oauth_login(harness.api(), "test-oauth").await;
+    poll_oauth_status(
+        harness.api(),
         "test-oauth",
         "authenticated",
         Duration::from_secs(15),
     )
     .await;
 
-    // Disconnect via management API (revoke)
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{}/api/endpoints/test-oauth/oauth/revoke", base))
-        .send()
-        .await
-        .expect("revoke request failed");
-    assert!(resp.status().is_success(), "revoke should succeed");
+    // Disconnect via management API (revoke, UDS)
+    let (status, _) = harness
+        .api()
+        .post_empty_status("/api/endpoints/test-oauth/oauth/revoke")
+        .await;
+    assert!(status.is_success(), "revoke should succeed");
 
     // Verify disconnected state
-    let status =
-        poll_oauth_status(&base, "test-oauth", "disconnected", Duration::from_secs(10)).await;
+    let status = poll_oauth_status(
+        harness.api(),
+        "test-oauth",
+        "disconnected",
+        Duration::from_secs(10),
+    )
+    .await;
     assert_eq!(status["status"].as_str(), Some("disconnected"));
 
     // Verify tokens are gone from disk
@@ -788,10 +796,16 @@ async fn test_oauth_thundering_herd_single_refresh() {
     let base = harness.base_url();
 
     // Login
-    poll_oauth_status(&base, "test-oauth", "needs_login", Duration::from_secs(10)).await;
-    simulate_oauth_login(&base, "test-oauth").await;
     poll_oauth_status(
-        &base,
+        harness.api(),
+        "test-oauth",
+        "needs_login",
+        Duration::from_secs(10),
+    )
+    .await;
+    simulate_oauth_login(harness.api(), "test-oauth").await;
+    poll_oauth_status(
+        harness.api(),
         "test-oauth",
         "authenticated",
         Duration::from_secs(15),
@@ -858,10 +872,16 @@ async fn test_oauth_bearer_token_in_authorization_header() {
     let base = harness.base_url();
 
     // Login
-    poll_oauth_status(&base, "test-oauth", "needs_login", Duration::from_secs(10)).await;
-    simulate_oauth_login(&base, "test-oauth").await;
     poll_oauth_status(
-        &base,
+        harness.api(),
+        "test-oauth",
+        "needs_login",
+        Duration::from_secs(10),
+    )
+    .await;
+    simulate_oauth_login(harness.api(), "test-oauth").await;
+    poll_oauth_status(
+        harness.api(),
         "test-oauth",
         "authenticated",
         Duration::from_secs(15),
@@ -914,20 +934,21 @@ async fn test_oauth_discovery_metadata_fetch() {
         .build();
 
     let harness = RelayHarness::start(&config).await;
-    let base = harness.base_url();
 
     // Wait for startup
-    poll_oauth_status(&base, "test-oauth", "needs_login", Duration::from_secs(10)).await;
+    poll_oauth_status(
+        harness.api(),
+        "test-oauth",
+        "needs_login",
+        Duration::from_secs(10),
+    )
+    .await;
 
-    // Trigger oauth/start which resolves endpoints
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{}/api/endpoints/test-oauth/oauth/start", base))
-        .send()
-        .await
-        .expect("oauth/start request failed");
-
-    let start_body: Value = resp.json().await.expect("parse start response");
+    // Trigger oauth/start which resolves endpoints (UDS)
+    let start_body = harness
+        .api()
+        .post_empty("/api/endpoints/test-oauth/oauth/start")
+        .await;
     // Should get an authorize_url — confirming the relay resolved the endpoints
     assert!(
         start_body["authorize_url"].is_string(),
@@ -957,13 +978,18 @@ async fn test_oauth_token_endpoint_post() {
         .build();
 
     let harness = RelayHarness::start(&config).await;
-    let base = harness.base_url();
 
     // Login (triggers token exchange)
-    poll_oauth_status(&base, "test-oauth", "needs_login", Duration::from_secs(10)).await;
-    simulate_oauth_login(&base, "test-oauth").await;
     poll_oauth_status(
-        &base,
+        harness.api(),
+        "test-oauth",
+        "needs_login",
+        Duration::from_secs(10),
+    )
+    .await;
+    simulate_oauth_login(harness.api(), "test-oauth").await;
+    poll_oauth_status(
+        harness.api(),
         "test-oauth",
         "authenticated",
         Duration::from_secs(15),
@@ -1003,20 +1029,20 @@ async fn test_oauth_pkce_challenge() {
         .build();
 
     let harness = RelayHarness::start(&config).await;
-    let base = harness.base_url();
 
-    poll_oauth_status(&base, "test-oauth", "needs_login", Duration::from_secs(10)).await;
+    poll_oauth_status(
+        harness.api(),
+        "test-oauth",
+        "needs_login",
+        Duration::from_secs(10),
+    )
+    .await;
 
-    // Call /oauth/start to get the authorize_url
-    let client = reqwest::Client::new();
-    let resp: Value = client
-        .post(format!("{}/api/endpoints/test-oauth/oauth/start", base))
-        .send()
-        .await
-        .expect("oauth/start failed")
-        .json()
-        .await
-        .expect("parse response");
+    // Call /oauth/start to get the authorize_url (UDS)
+    let resp = harness
+        .api()
+        .post_empty("/api/endpoints/test-oauth/oauth/start")
+        .await;
 
     let authorize_url = resp["authorize_url"].as_str().expect("no authorize_url");
     let parsed = url::Url::parse(authorize_url).expect("invalid URL");
@@ -1066,19 +1092,20 @@ async fn test_oauth_client_registration() {
         .build();
 
     let harness = RelayHarness::start(&config).await;
-    let base = harness.base_url();
 
-    poll_oauth_status(&base, "test-oauth", "needs_login", Duration::from_secs(10)).await;
+    poll_oauth_status(
+        harness.api(),
+        "test-oauth",
+        "needs_login",
+        Duration::from_secs(10),
+    )
+    .await;
 
-    // Trigger /oauth/start which should attempt discovery → DCR
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{}/api/endpoints/test-oauth/oauth/start", base))
-        .send()
-        .await
-        .expect("oauth/start failed");
-
-    let body: Value = resp.json().await.expect("parse response");
+    // Trigger /oauth/start which should attempt discovery → DCR (UDS)
+    let body = harness
+        .api()
+        .post_empty("/api/endpoints/test-oauth/oauth/start")
+        .await;
 
     // If DCR succeeded, we should get an authorize_url
     // If DCR returned 400, we'd get dcr_unsupported error
@@ -1145,28 +1172,27 @@ async fn test_oauth_server_info_name_enforcement() {
         .build();
 
     let harness = RelayHarness::start(&config).await;
-    let base = harness.base_url();
 
     // 3. Verify initial state is needs_login
-    poll_oauth_status(&base, "test-oauth", "needs_login", Duration::from_secs(10)).await;
+    poll_oauth_status(
+        harness.api(),
+        "test-oauth",
+        "needs_login",
+        Duration::from_secs(10),
+    )
+    .await;
 
     // 4. Simulate the OAuth login flow
     // The callback may fail with an incomplete message if the relay closes
     // the connection while processing the inner adapter initialization.
     // That's OK — the important thing is that the token exchange succeeds
     // (OAuth layer works) and then the adapter transitions to Failed state.
-    let client = reqwest::Client::new();
 
-    // Step 4a: Call /oauth/start to get the authorize URL
-    let start_url = format!("{}/api/endpoints/test-oauth/oauth/start", base);
-    let start_resp: Value = client
-        .post(&start_url)
-        .send()
-        .await
-        .expect("oauth/start failed")
-        .json()
-        .await
-        .expect("parse oauth/start response");
+    // Step 4a: Call /oauth/start to get the authorize URL (UDS)
+    let start_resp = harness
+        .api()
+        .post_empty("/api/endpoints/test-oauth/oauth/start")
+        .await;
 
     let authorize_url = start_resp["authorize_url"]
         .as_str()
@@ -1222,26 +1248,15 @@ async fn test_oauth_server_info_name_enforcement() {
     // during apply_tokens (which may have caused the callback to fail)
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // Check if the relay is still responding
-    let health_client = reqwest::Client::new();
-    let health_resp = health_client
-        .get(format!("{}/api/status", base))
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await;
-    match health_resp {
-        Ok(r) => eprintln!("Relay still responding: HTTP {}", r.status()),
-        Err(e) => eprintln!("Relay not responding: {}", e),
-    }
+    // Check if the relay is still responding (UDS)
+    let (health_status, _) = harness.api().get_status_json("/api/status").await;
+    eprintln!("Relay still responding: HTTP {}", health_status);
 
     // Check if the OAuth state transitioned past needs_login (token exchange happened)
-    let oauth_status_url = format!("{}/api/endpoints/test-oauth/oauth/status", base);
-    let oauth_resp = health_client
-        .get(&oauth_status_url)
-        .send()
-        .await
-        .expect("oauth status request failed");
-    let oauth_status: Value = oauth_resp.json().await.expect("parse oauth status");
+    let oauth_status = harness
+        .api()
+        .get("/api/endpoints/test-oauth/oauth/status")
+        .await;
     eprintln!("OAuth status after callback: {:?}", oauth_status);
 
     // The OAuth state should NOT be needs_login anymore if token exchange succeeded
@@ -1280,14 +1295,8 @@ async fn test_oauth_server_info_name_enforcement() {
         error["detail"]
     );
 
-    // Assertion #4: Catalog returns zero tools
-    let client = reqwest::Client::new();
-    let catalog_resp = client
-        .get(format!("{}/api/catalog", base))
-        .send()
-        .await
-        .expect("catalog request failed");
-    let catalog: Value = catalog_resp.json().await.unwrap();
+    // Assertion #4: Catalog returns zero tools (UDS)
+    let catalog = harness.api().get("/api/catalog").await;
     let tools = catalog.as_array().unwrap();
     assert!(
         tools.is_empty(),

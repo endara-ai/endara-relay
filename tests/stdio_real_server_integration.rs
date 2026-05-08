@@ -120,18 +120,8 @@ async fn test_stdio_npx_crash_recovery() {
         .await
         .expect("everything endpoint did not become healthy");
 
-    // Verify endpoint is healthy
-    let http = reqwest::Client::new();
-    let endpoints_url = format!("{}/api/endpoints", harness.base_url());
-    let resp: serde_json::Value = http
-        .get(&endpoints_url)
-        .send()
-        .await
-        .expect("endpoints request failed")
-        .json()
-        .await
-        .expect("endpoints parse failed");
-
+    // Verify endpoint is healthy (UDS)
+    let resp = harness.api().get("/api/endpoints").await;
     let endpoints = resp.as_array().expect("endpoints should be array");
     let everything_ep = endpoints
         .iter()

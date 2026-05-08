@@ -7,7 +7,6 @@ mod common;
 
 use common::config::ConfigBuilder;
 use common::harness::{wait_for_lifecycle_state, RelayHarness};
-use serde_json::Value;
 use std::time::Duration;
 
 fn bad_server_bin() -> String {
@@ -105,16 +104,9 @@ async fn test_failed_adapter_contributes_zero_tools() {
         .await
         .expect("endpoint did not enter Failed state");
 
-    // Check the catalog API
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(format!("{}/api/catalog", harness.base_url()))
-        .send()
-        .await
-        .expect("request failed");
-
-    assert!(resp.status().is_success());
-    let body: Value = resp.json().await.unwrap();
+    // Check the catalog API (UDS)
+    let (status, body) = harness.api().get_status_json("/api/catalog").await;
+    assert!(status.is_success());
     let tools = body.as_array().unwrap();
 
     // Failed adapter should contribute zero tools
