@@ -12,7 +12,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::RwLock;
-use tower_http::cors::CorsLayer;
 
 use tracing::warn;
 
@@ -2273,7 +2272,9 @@ pub fn management_routes(state: ManagementState) -> Router {
         .route("/api/config", get(get_config))
         .route("/api/config/reload", post(reload_config))
         .route("/api/test-connection", post(test_connection))
-        .layer(CorsLayer::permissive())
+        // No CORS layer: this router is served exclusively over a Unix-domain
+        // socket / Windows named pipe (see `management_listener`), which is not
+        // reachable from a browser and has no cross-origin attack surface.
         .with_state(state)
 }
 
