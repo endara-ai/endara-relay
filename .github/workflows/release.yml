@@ -36,10 +36,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # Pin third-party actions on the signing/release path to immutable
+      # commit SHAs (CI-003 in the consolidated security audit). The build job
+      # imports an Apple signing keychain and produces notarized artifacts;
+      # any compromise of a moving tag (e.g. `@stable`, `@v2`) on a third-party
+      # action would let the attacker exfiltrate the signing identity or swap
+      # the artifact before notarization.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}
-      - uses: swatinem/rust-cache@v2
+      - uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: build-${{ matrix.target }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -123,7 +129,9 @@ jobs:
           path: artifacts
           merge-multiple: true
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        # Pinned to the v2.6.2 commit SHA (CI-003). The release job is the
+        # one that actually publishes notarized artifacts to consumers.
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, 'rc') }}
