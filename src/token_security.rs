@@ -109,6 +109,75 @@ fn ensure_token_dir_secure_unix(path: &Path) -> Result<PathBuf, TokenSecurityErr
         })
 }
 
+/// Best-effort detection of common consumer cloud-sync providers in a path.
+///
+/// OAuth refresh tokens stored in a synced directory are silently uploaded
+/// to a third-party server, copied to every other device on the account, and
+/// retained in the provider's version history. This is almost never what a
+/// user intends. We log a one-shot warning at startup so users notice it
+/// without blocking the relay from running (the user may have intentionally
+/// chosen this path, or be using a non-syncing subdirectory of a synced root).
+///
+/// Returns `Some(provider_name)` if a known provider segment is found, else
+/// `None`. The match is case-insensitive against path components only — we
+/// don't grep arbitrary substrings to avoid false positives like
+/// "/home/dropbox-user/...".
+pub fn detect_cloud_sync_provider(path: &Path) -> Option<&'static str> {
+    // Case-insensitive component match. Each entry is (lowercase needle,
+    // pretty name). Order matters only for stability of the returned name.
+    const PROVIDERS: &[(&str, &str)] = &[
+        ("dropbox", "Dropbox"),
+        ("onedrive", "OneDrive"),
+        ("google drive", "Google Drive"),
+        ("googledrive", "Google Drive"),
+        ("googledrivefs", "Google Drive"),
+        ("drivefs", "Google Drive"),
+        ("icloud", "iCloud Drive"),
+        ("mobile documents", "iCloud Drive"),
+        ("com~apple~clouddocs", "iCloud Drive"),
+        // macOS umbrella root for File Provider-based sync (Dropbox,
+        // OneDrive-Personal, GoogleDrive-AccountName, Box, etc.). The
+        // sub-folder names carry account suffixes that won't match the
+        // provider needles above on their own, so detect the root itself.
+        ("cloudstorage", "macOS CloudStorage"),
+        ("box sync", "Box"),
+        ("boxdrive", "Box"),
+        ("sync.com", "Sync.com"),
+        ("pcloud", "pCloud"),
+        ("mega", "MEGA"),
+    ];
+
+    // Lowercase each component once. Then iterate providers in the order
+    // listed — earlier entries are more specific and win over later
+    // catch-all entries like "cloudstorage".
+    let lowered: Vec<String> = path
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_lowercase())
+        .collect();
+    for (needle, pretty) in PROVIDERS {
+        if lowered.iter().any(|c| c == *needle) {
+            return Some(pretty);
+        }
+    }
+    None
+}
+
+/// Emit a one-shot warning if `path` looks like it lives inside a known
+/// consumer cloud-sync provider (Dropbox, iCloud, OneDrive, Google Drive,
+/// etc.). Non-fatal — the relay will still start.
+pub fn warn_if_cloud_synced(path: &Path) {
+    if let Some(provider) = detect_cloud_sync_provider(path) {
+        tracing::warn!(
+            path = %path.display(),
+            provider = provider,
+            "Token directory appears to live inside {provider}. \
+             OAuth refresh tokens stored here will be uploaded to {provider} \
+             and synced to every other device on the same account. \
+             Move token_dir outside the synced folder unless this is intentional."
+        );
+    }
+}
+
 #[cfg(not(unix))]
 fn ensure_token_dir_secure_fallback(path: &Path) -> Result<PathBuf, TokenSecurityError> {
     use std::fs;
@@ -237,5 +306,74 @@ mod tests {
             // All threads should succeed (no panics, no errors)
             h.join().unwrap().unwrap();
         }
+    }
+
+    #[test]
+    fn detect_cloud_sync_dropbox() {
+        let p = PathBuf::from("/Users/alice/Dropbox/relay/tokens");
+        assert_eq!(detect_cloud_sync_provider(&p), Some("Dropbox"));
+    }
+
+    #[test]
+    fn detect_cloud_sync_dropbox_case_insensitive() {
+        let p = PathBuf::from("/home/alice/dropbox/relay/tokens");
+        assert_eq!(detect_cloud_sync_provider(&p), Some("Dropbox"));
+    }
+
+    #[test]
+    fn detect_cloud_sync_icloud_macos() {
+        let p =
+            PathBuf::from("/Users/alice/Library/Mobile Documents/com~apple~CloudDocs/relay/tokens");
+        assert_eq!(detect_cloud_sync_provider(&p), Some("iCloud Drive"));
+    }
+
+    #[test]
+    fn detect_cloud_sync_onedrive() {
+        let p = PathBuf::from("/Users/alice/OneDrive/relay/tokens");
+        assert_eq!(detect_cloud_sync_provider(&p), Some("OneDrive"));
+    }
+
+    #[test]
+    fn detect_cloud_sync_google_drive_with_space() {
+        let p = PathBuf::from("/Users/alice/Google Drive/relay/tokens");
+        assert_eq!(detect_cloud_sync_provider(&p), Some("Google Drive"));
+    }
+
+    #[test]
+    fn detect_cloud_sync_google_drivefs() {
+        let p = PathBuf::from("/Users/alice/Library/CloudStorage/GoogleDrive/relay/tokens");
+        assert_eq!(detect_cloud_sync_provider(&p), Some("Google Drive"));
+    }
+
+    #[test]
+    fn detect_cloud_sync_cloudstorage_umbrella_with_suffixed_provider() {
+        // macOS File Provider-based sync uses suffixed folder names like
+        // "OneDrive-Personal" or "GoogleDrive-alice@example.com". The
+        // CloudStorage umbrella catches them even when the sub-folder name
+        // doesn't match a known provider needle exactly.
+        let p = PathBuf::from("/Users/alice/Library/CloudStorage/OneDrive-Personal/relay/tokens");
+        assert_eq!(detect_cloud_sync_provider(&p), Some("macOS CloudStorage"));
+    }
+
+    #[test]
+    fn detect_cloud_sync_no_false_positive_substring() {
+        // "dropbox-user" is a substring of "dropbox" but not a path component.
+        let p = PathBuf::from("/home/dropbox-user/relay/tokens");
+        assert_eq!(detect_cloud_sync_provider(&p), None);
+    }
+
+    #[test]
+    fn detect_cloud_sync_returns_none_for_normal_paths() {
+        let p = PathBuf::from("/Users/alice/.local/share/endara-relay/tokens");
+        assert_eq!(detect_cloud_sync_provider(&p), None);
+    }
+
+    #[test]
+    fn warn_if_cloud_synced_does_not_panic() {
+        // Smoke test — both paths must complete without panicking.
+        warn_if_cloud_synced(&PathBuf::from("/Users/alice/Dropbox/relay/tokens"));
+        warn_if_cloud_synced(&PathBuf::from(
+            "/Users/alice/.local/share/endara-relay/tokens",
+        ));
     }
 }

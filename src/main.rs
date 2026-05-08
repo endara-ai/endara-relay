@@ -244,6 +244,10 @@ async fn main() {
                         token_dir_path // Fall back to unsecured path
                     }
                 };
+            // Warn (but do not block) if token_dir lives inside a known
+            // consumer cloud-sync provider — refresh tokens stored there
+            // get uploaded off-device.
+            endara_relay::token_security::warn_if_cloud_synced(&token_dir);
             let token_manager = Arc::new(TokenManager::new(token_dir));
             let oauth_flow_manager = Arc::new(OAuthFlowManager::new());
             let oauth_adapter_inners: OAuthAdapterInners = Arc::new(RwLock::new(HashMap::new()));
