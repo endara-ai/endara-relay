@@ -502,6 +502,58 @@ struct OAuthCallbackParams {
     error: Option<String>,
 }
 
+/// Escape a string for safe interpolation into an HTML text node or quoted attribute.
+///
+/// The OAuth callback handler interpolates upstream-influenced strings (error
+/// codes, error descriptions, token-endpoint response bodies, and the locally
+/// configured endpoint name) into the response HTML. Without escaping, a
+/// malicious upstream `error_description` such as `<script>fetch('/api/...')` would
+/// execute on the relay's own `http://127.0.0.1:<port>` origin — same origin as
+/// the management API. Pair this with the `default-src 'none'` CSP added by
+/// [`oauth_html_response`] to also block any future regression that might inline
+/// a `<script>` tag.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Build a `text/html` response for the OAuth callback with a strict
+/// `Content-Security-Policy: default-src 'none'` header. The CSP makes any
+/// regression that re-introduces unescaped interpolation un-exploitable as
+/// inline `<script>`/`<img onerror>`/etc., because the user agent will refuse
+/// to fetch or execute any subresource.
+fn oauth_html_response(body: String) -> Response {
+    (
+        [
+            (axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; style-src 'unsafe-inline'",
+            ),
+            (
+                axum::http::header::HeaderName::from_static("x-content-type-options"),
+                "nosniff",
+            ),
+            (
+                axum::http::header::HeaderName::from_static("referrer-policy"),
+                "no-referrer",
+            ),
+        ],
+        Html(body),
+    )
+        .into_response()
+}
+
 /// GET /oauth/callback
 ///
 /// The OAuth authorization server redirects the user's browser here after login.
@@ -509,20 +561,20 @@ struct OAuthCallbackParams {
 async fn oauth_callback(
     State(state): State<AppState>,
     Query(params): Query<OAuthCallbackParams>,
-) -> Html<String> {
+) -> Response {
     // Handle OAuth error
     if let Some(ref err) = params.error {
         warn!(error = %err, "OAuth callback received error");
-        return Html(format!(
+        return oauth_html_response(format!(
             "<html><body><h1>OAuth Error</h1><p>{}</p><p>You can close this window.</p></body></html>",
-            err
+            html_escape(err)
         ));
     }
 
     let code = match params.code {
         Some(c) => c,
         None => {
-            return Html(
+            return oauth_html_response(
                 "<html><body><h1>OAuth Error</h1><p>Missing authorization code.</p><p>You can close this window.</p></body></html>"
                     .to_string(),
             );
@@ -531,7 +583,7 @@ async fn oauth_callback(
     let state_param = match params.state {
         Some(s) => s,
         None => {
-            return Html(
+            return oauth_html_response(
                 "<html><body><h1>OAuth Error</h1><p>Missing state parameter.</p><p>You can close this window.</p></body></html>"
                     .to_string(),
             );
@@ -539,7 +591,7 @@ async fn oauth_callback(
     };
 
     let Some(ref flow_mgr) = state.oauth_flow_manager else {
-        return Html(
+        return oauth_html_response(
             "<html><body><h1>OAuth Error</h1><p>OAuth not configured.</p></body></html>"
                 .to_string(),
         );
@@ -549,7 +601,7 @@ async fn oauth_callback(
         Some(f) => f,
         None => {
             warn!(state = %state_param, "Invalid or expired OAuth state");
-            return Html(
+            return oauth_html_response(
                 "<html><body><h1>OAuth Error</h1><p>Invalid or expired login session. Please try again.</p><p>You can close this window.</p></body></html>"
                     .to_string(),
             );
@@ -583,9 +635,9 @@ async fn oauth_callback(
         Ok(resp) => resp,
         Err(e) => {
             error!(error = %e, "Failed to exchange authorization code");
-            return Html(format!(
+            return oauth_html_response(format!(
                 "<html><body><h1>OAuth Error</h1><p>Failed to exchange code: {}</p><p>You can close this window.</p></body></html>",
-                e
+                html_escape(&e.to_string())
             ));
         }
     };
@@ -594,9 +646,10 @@ async fn oauth_callback(
         let status = token_response.status();
         let body = token_response.text().await.unwrap_or_default();
         error!(%status, body = %body, "Token endpoint returned error");
-        return Html(format!(
+        return oauth_html_response(format!(
             "<html><body><h1>OAuth Error</h1><p>Token endpoint returned {}: {}</p><p>You can close this window.</p></body></html>",
-            status, body
+            html_escape(status.as_str()),
+            html_escape(&body)
         ));
     }
 
@@ -604,9 +657,9 @@ async fn oauth_callback(
         Ok(v) => v,
         Err(e) => {
             error!(error = %e, "Failed to parse token response");
-            return Html(format!(
+            return oauth_html_response(format!(
                 "<html><body><h1>OAuth Error</h1><p>Invalid token response: {}</p><p>You can close this window.</p></body></html>",
-                e
+                html_escape(&e.to_string())
             ));
         }
     };
@@ -616,7 +669,7 @@ async fn oauth_callback(
         .unwrap_or_default()
         .to_string();
     if access_token.is_empty() {
-        return Html(
+        return oauth_html_response(
             "<html><body><h1>OAuth Error</h1><p>No access_token in response.</p><p>You can close this window.</p></body></html>"
                 .to_string(),
         );
@@ -646,7 +699,7 @@ async fn oauth_callback(
             if let Some(ref setup_mgr) = state.setup_manager {
                 if setup_mgr.mark_authorized(&session_id, token_set).await {
                     info!(session_id = %session_id_str, "Setup session authorized via callback");
-                    return Html(
+                    return oauth_html_response(
                         "<html><body><h1>Authorization Successful</h1>\
                          <p>You can close this window and return to the app to complete setup.</p>\
                          </body></html>"
@@ -656,7 +709,7 @@ async fn oauth_callback(
             }
         }
         warn!(flow_name = %flow.endpoint_name, "Setup session not found for callback");
-        return Html(
+        return oauth_html_response(
             "<html><body><h1>OAuth Error</h1>\
              <p>Setup session not found or expired. Please start over.</p>\
              <p>You can close this window.</p></body></html>"
@@ -680,9 +733,9 @@ async fn oauth_callback(
         }
     }
 
-    Html(format!(
+    oauth_html_response(format!(
         "<html><body><h1>Login Successful</h1><p>Endpoint <strong>{}</strong> is now authenticated.</p><p>You can close this window.</p></body></html>",
-        flow.endpoint_name
+        html_escape(&flow.endpoint_name)
     ))
 }
 
@@ -2065,5 +2118,55 @@ mod tests {
         assert!(names.contains(&"execute_tools"));
         assert!(names.contains(&"list_tools"));
         assert!(names.contains(&"search_tools"));
+    }
+
+    #[test]
+    fn test_html_escape_replaces_metacharacters() {
+        let raw = r#"<script>alert("xss")</script> & 'quote'"#;
+        let escaped = html_escape(raw);
+        assert_eq!(
+            escaped,
+            "&lt;script&gt;alert(&quot;xss&quot;)&lt;/script&gt; &amp; &#x27;quote&#x27;"
+        );
+        // No raw metacharacter should survive.
+        assert!(!escaped.contains('<'));
+        assert!(!escaped.contains('>'));
+        assert!(!escaped.contains('"'));
+        assert!(!escaped.contains('\''));
+    }
+
+    #[test]
+    fn test_html_escape_passes_through_safe_text() {
+        assert_eq!(html_escape(""), "");
+        assert_eq!(
+            html_escape("plain endpoint name 123"),
+            "plain endpoint name 123"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oauth_callback_escapes_error_param_and_sets_csp() {
+        use axum::body::to_bytes;
+        let state = test_app_state();
+        let params = OAuthCallbackParams {
+            code: None,
+            state: None,
+            error: Some(
+                "<script>fetch('/api/test-connection',{method:'POST'})</script>".to_string(),
+            ),
+        };
+        let resp = oauth_callback(State(state), Query(params)).await;
+        let csp = resp
+            .headers()
+            .get("content-security-policy")
+            .expect("CSP header present")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(csp.contains("default-src 'none'"), "csp = {csp}");
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("&lt;script&gt;"), "body = {body_str}");
+        assert!(!body_str.contains("<script>"));
     }
 }
