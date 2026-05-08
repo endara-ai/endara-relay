@@ -220,7 +220,11 @@ async fn run_unix_accept_loop(
                 .serve_connection(io, service)
                 .await
             {
-                tracing::debug!(error = %e, "Management API connection ended with error");
+                if is_benign_connection_close(&*e) {
+                    tracing::trace!(error = %e, "Management API connection closed");
+                } else {
+                    tracing::debug!(error = %e, "Management API connection ended with error");
+                }
             }
         });
     }
@@ -279,10 +283,50 @@ async fn run_windows_accept_loop(pipe_name: String, router: Router) -> io::Resul
                 .serve_connection(io, service)
                 .await
             {
-                tracing::debug!(error = %e, "Management API connection ended with error");
+                if is_benign_connection_close(&*e) {
+                    tracing::trace!(error = %e, "Management API connection closed");
+                } else {
+                    tracing::debug!(error = %e, "Management API connection ended with error");
+                }
             }
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Connection-close error classification
+// ---------------------------------------------------------------------------
+
+/// Classify an error returned by `serve_connection` as a benign per-connection
+/// close (the client opened a fresh connection, did one round-trip, and
+/// dropped its sender) versus a genuinely unexpected failure.
+///
+/// The desktop's API proxy opens a new UDS / Named-Pipe HTTP/1 connection per
+/// `/api/*` request, so hyper consistently surfaces a half-close error once
+/// per request. Logging those at `debug!` produces a constant stream of noise;
+/// route them to `trace!` instead and keep `debug!` for genuine errors.
+fn is_benign_connection_close(err: &(dyn std::error::Error + 'static)) -> bool {
+    let msg = err.to_string();
+    if msg.contains("error shutting down connection")
+        || msg.contains("connection closed before message completed")
+        || msg.contains("IncompleteMessage")
+    {
+        return true;
+    }
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(e) = cur {
+        if let Some(io) = e.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind::*;
+            if matches!(
+                io.kind(),
+                BrokenPipe | UnexpectedEof | ConnectionAborted | ConnectionReset
+            ) {
+                return true;
+            }
+        }
+        cur = e.source();
+    }
+    false
 }
 
 #[cfg(test)]
@@ -306,5 +350,51 @@ mod tests {
         assert!(path.exists());
         cleanup_stale_unix_socket(&path).await.unwrap();
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn benign_close_matches_broken_pipe_io_error() {
+        let err = std::io::Error::from(std::io::ErrorKind::BrokenPipe);
+        assert!(is_benign_connection_close(&err));
+    }
+
+    #[test]
+    fn benign_close_matches_unexpected_eof_io_error() {
+        let err = std::io::Error::from(std::io::ErrorKind::UnexpectedEof);
+        assert!(is_benign_connection_close(&err));
+    }
+
+    #[test]
+    fn benign_close_matches_known_message_substring() {
+        #[derive(Debug)]
+        struct FakeErr;
+        impl std::fmt::Display for FakeErr {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("error shutting down connection")
+            }
+        }
+        impl std::error::Error for FakeErr {}
+        let err = FakeErr;
+        assert!(is_benign_connection_close(&err));
+    }
+
+    #[test]
+    fn benign_close_rejects_unexpected_io_error() {
+        let err = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(!is_benign_connection_close(&err));
+    }
+
+    #[test]
+    fn benign_close_rejects_unrelated_error() {
+        #[derive(Debug)]
+        struct OtherErr;
+        impl std::fmt::Display for OtherErr {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("something went wrong")
+            }
+        }
+        impl std::error::Error for OtherErr {}
+        let err = OtherErr;
+        assert!(!is_benign_connection_close(&err));
     }
 }
