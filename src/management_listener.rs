@@ -45,6 +45,7 @@ pub fn resolve_api_socket_path(#[allow(unused_variables)] data_dir: &Path) -> Pa
                 return runtime.join("endara-relay").join("api.sock");
             }
         }
+        return data_dir.join("api.sock");
     }
 
     #[cfg(target_os = "macos")]
@@ -62,10 +63,13 @@ pub fn resolve_api_socket_path(#[allow(unused_variables)] data_dir: &Path) -> Pa
         return PathBuf::from(format!(r"\\.\pipe\endara-relay-{session_id}"));
     }
 
-    // Final fallback — reached on Linux when XDG_RUNTIME_DIR is unset, and on
-    // any platform not covered by the cfg branches above. macOS / Windows
-    // branches above always early-return, so they never fall through here.
-    data_dir.join("api.sock")
+    // Final fallback for any other target (e.g. non-macOS unix variants not
+    // covered above). The platform-specific branches above all early-return,
+    // so this is only compiled where it can actually be reached.
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        data_dir.join("api.sock")
+    }
 }
 
 #[cfg(unix)]
