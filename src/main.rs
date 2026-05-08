@@ -1,6 +1,7 @@
 mod config;
 mod js_sandbox;
 mod management;
+mod management_listener;
 mod oauth;
 mod token_manager;
 mod watcher;
@@ -405,9 +406,36 @@ async fn main() {
                 token_manager: Some(token_manager.clone()),
                 setup_manager: Some(setup_manager.clone()),
             };
-            let router = build_router(state).merge(management::management_routes(mgmt_state));
+            // Build the MCP (TCP) and management (UDS / Named Pipe) routers
+            // separately. The management API carries credential-bearing routes
+            // (`/api/*`) and is served exclusively over a local IPC transport
+            // to eliminate the DNS-rebinding / CSRF attack surface — see
+            // `management_listener` and the security audit (Cluster 1).
+            let router = build_router(state);
+            let mgmt_router = management::management_routes(mgmt_state);
+
             // Bind to loopback only; the relay is a local-only service.
             let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+
+            // Start the management listener on its IPC path. We do this before
+            // starting the TCP listener so that callers observing the TCP port
+            // already see a fully-initialized control plane.
+            let api_socket_path = management_listener::resolve_api_socket_path(&data_dir_path);
+            let _mgmt_handle = match management_listener::serve_management_api(
+                mgmt_router,
+                api_socket_path.clone(),
+            )
+            .await
+            {
+                Ok((path, h)) => {
+                    info!(path = %path.display(), "Management API listener ready");
+                    h
+                }
+                Err(e) => {
+                    error!(error = %e, path = %api_socket_path.display(), "Failed to start management API listener");
+                    std::process::exit(1);
+                }
+            };
 
             match start_server(router, addr).await {
                 Ok((bound_addr, handle)) => {

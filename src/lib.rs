@@ -3,6 +3,7 @@ pub mod config;
 pub mod js_sandbox;
 pub mod jsonrpc;
 pub mod management;
+pub mod management_listener;
 pub mod oauth;
 pub mod prefix;
 pub mod registry;

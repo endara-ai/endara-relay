@@ -167,18 +167,9 @@ async fn test_multi_server_hot_reload_remove() {
         .build();
     std::fs::write(&harness.config_path, &new_config).expect("failed to write new config");
 
-    // Trigger config reload via management API
-    let http = reqwest::Client::new();
-    let reload_resp = http
-        .post(format!("{}/api/config/reload", harness.base_url()))
-        .send()
-        .await
-        .expect("reload request failed");
-    assert!(
-        reload_resp.status().is_success(),
-        "reload returned: {}",
-        reload_resp.status()
-    );
+    // Trigger config reload via management API (UDS)
+    let (status, _) = harness.api().post_empty_status("/api/config/reload").await;
+    assert!(status.is_success(), "reload returned: {}", status);
 
     // Wait for the reload to take effect
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -248,14 +239,9 @@ async fn test_multi_server_hot_reload_add() {
     let new_config = everything_plus_filesystem_config(&fs_root);
     std::fs::write(&harness.config_path, &new_config).expect("failed to write new config");
 
-    // Trigger config reload
-    let http = reqwest::Client::new();
-    let reload_resp = http
-        .post(format!("{}/api/config/reload", harness.base_url()))
-        .send()
-        .await
-        .expect("reload request failed");
-    assert!(reload_resp.status().is_success());
+    // Trigger config reload (UDS)
+    let (status, _) = harness.api().post_empty_status("/api/config/reload").await;
+    assert!(status.is_success());
 
     // Wait for the new endpoint to become healthy
     harness
