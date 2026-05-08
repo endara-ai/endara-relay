@@ -38,36 +38,15 @@ No cloud. No accounts. Everything runs on your machine.
 ┌──────────────────────────────────────────────────────┐
 │ Endara Relay (single Rust process)                   │
 │                                                      │
-│  ┌─────────────────┐  ┌─────────────────────────┐   │
-│  │ Config Watcher   │  │ Local HTTP Server :9400  │   │
-│  │ (notify crate)   │  │                         │   │
-│  │ TOML hot-reload  │  │  /mcp   → MCP protocol  │   │
-│  └────────┬─────────┘  │  /api   → Management    │   │
-│           │            └────────┬────────────────┘   │
-│           ▼                     │                    │
-│  ┌─────────────────────────┐    │                    │
-│  │ Adapter Registry        │◀───┘                    │
-│  │                         │                         │
-│  │  ┌──────┐ ┌──────┐ ┌──────┐                      │
-│  │  │STDIO │ │ SSE  │ │ HTTP │   Adapters            │
-│  │  └──┬───┘ └──┬───┘ └──┬───┘                      │
-│  └─────┼────────┼────────┼───────────────────────┘   │
-│        ▼        ▼        ▼                           │
-│     [MCP-A]  [MCP-B]  [MCP-C]                        │
-│                                                      │
-│  ┌─────────────────────────┐                         │
-│  │ JS Sandbox (boa_engine) │                         │
-│  │ execute_tools runtime   │                         │
-│  └─────────────────────────┘                         │
+│  ┌────────────────────┐  ┌──────────────────────────┐│
+│  │ TCP loopback :9400 │  │ Unix socket / Named pipe ││
+│  │  /mcp  /healthz    │  │  /api/*  (per-user, 0600)││
+│  │  /oauth/callback   │  │                          ││
+│  └────────────────────┘  └──────────────────────────┘│
 └──────────────────────────────────────────────────────┘
-         ▲
-         │ localhost:9400
-┌────────┴──────────────┐
-│ Claude Desktop /      │
-│ Cursor / any MCP      │
-│ client                │
-└───────────────────────┘
 ```
+
+The TCP loopback listener serves MCP traffic, the health probe, and the OAuth callback. The management API (`/api/*`) is bound exclusively to a per-user OS-local Unix-domain socket (Linux/macOS) or Named Pipe (Windows) with 0600 permissions; it is not reachable over TCP. See [Management API](#management-api) for the full endpoint list and the platform-specific socket paths.
 
 ## Quick Start
 
@@ -228,7 +207,13 @@ The JS sandbox is powered by [boa_engine](https://crates.io/crates/boa_engine) a
 
 ## Management API
 
-Relay exposes a REST API on `:9400/api` for monitoring and management:
+Relay exposes a management REST API for monitoring and control. The API is reachable only through an OS-local Unix-domain socket (Linux/macOS) or Named Pipe (Windows) created per-user with 0600 permissions; it is not bound to TCP.
+
+| Platform | Path |
+|----------|------|
+| Linux    | `$XDG_RUNTIME_DIR/endara-relay/api.sock` (fallback: `<data-dir>/api.sock`) |
+| macOS    | `$TMPDIR/endara-relay-<uid>/api.sock` |
+| Windows  | `\\.\pipe\endara-relay-<session-id>` |
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
@@ -241,17 +226,10 @@ Relay exposes a REST API on `:9400/api` for monitoring and management:
 | `GET` | `/api/config` | View current config (env values redacted) |
 | `POST` | `/api/config/reload` | Trigger a config reload |
 
-**Example:**
+**Example (Linux/macOS):**
 
 ```bash
-# Check relay status
-curl http://localhost:9400/api/status
-
-# List all endpoints
-curl http://localhost:9400/api/endpoints
-
-# Restart a misbehaving endpoint
-curl -X POST http://localhost:9400/api/endpoints/github/restart
+curl --unix-socket "$XDG_RUNTIME_DIR/endara-relay/api.sock" http://localhost/api/status
 ```
 
 ---
@@ -313,6 +291,12 @@ On every push and PR, the CI workflow runs:
 ## Desktop App
 
 Prefer a UI to running a binary from a terminal? [Endara Desktop](https://github.com/endara-ai/endara-desktop) bundles Relay as a sidecar and adds an endpoint dashboard, log viewer, and one-click OAuth flows. It installs from the same Homebrew tap (`brew install --cask endara-ai/tap/endara`) and is built on top of this repo. More at [endara.ai](https://endara.ai).
+
+---
+
+## Security
+
+The relay's threat model — including its trust boundaries, the management API's UDS/Named-Pipe isolation, and the OAuth callback's localhost-only CSRF protections — is documented in [`THREAT_MODEL.md`](THREAT_MODEL.md). Report security issues by opening a private security advisory on GitHub.
 
 ---
 
