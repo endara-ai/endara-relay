@@ -1,8 +1,7 @@
 # Endara Relay — Threat Model
 
 This document describes the trust boundaries, in-scope threats, and intentional
-non-goals for the Endara Relay process. It complements the consolidated security
-audit and the R1 + R2 hardening work landed in May 2026.
+non-goals for the Endara Relay process.
 
 ## Trust model
 
@@ -48,7 +47,7 @@ audit and the R1 + R2 hardening work landed in May 2026.
 - Side-channel and supply-chain attacks against the Rust toolchain or its
   standard library.
 
-## Protections (as of R1 + R2)
+## Protections
 
 ### Network surface
 
