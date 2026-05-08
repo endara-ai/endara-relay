@@ -150,10 +150,16 @@ jobs:
     steps:
       - name: Resolve version
         id: version
+        # Defense in depth (CI-002): every value that originates from
+        # attacker-influenceable context (`inputs.version`, `github.ref_name`,
+        # `github.event_name`) is exported into the shell via `env:` and read
+        # as a quoted variable, never interpolated directly into the script
+        # body where a value such as `v$(curl evil)` would execute.
         env:
           INPUT_VERSION: ${{ inputs.version }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
             tag="${INPUT_VERSION}"
           else
             tag="${GITHUB_REF_NAME}"
@@ -182,12 +188,13 @@ jobs:
           done
       - name: Compute SHA256 sums
         id: sha
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
-          v="${{ steps.version.outputs.version }}"
-          sha_arm64_darwin=$(shasum -a 256 "archives/endara-relay-v${v}-aarch64-apple-darwin.tar.gz" | awk '{print $1}')
-          sha_x64_darwin=$(shasum -a 256 "archives/endara-relay-v${v}-x86_64-apple-darwin.tar.gz" | awk '{print $1}')
-          sha_arm64_linux=$(shasum -a 256 "archives/endara-relay-v${v}-aarch64-unknown-linux-gnu.tar.gz" | awk '{print $1}')
-          sha_x64_linux=$(shasum -a 256 "archives/endara-relay-v${v}-x86_64-unknown-linux-gnu.tar.gz" | awk '{print $1}')
+          sha_arm64_darwin=$(shasum -a 256 "archives/endara-relay-v${VERSION}-aarch64-apple-darwin.tar.gz" | awk '{print $1}')
+          sha_x64_darwin=$(shasum -a 256 "archives/endara-relay-v${VERSION}-x86_64-apple-darwin.tar.gz" | awk '{print $1}')
+          sha_arm64_linux=$(shasum -a 256 "archives/endara-relay-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz" | awk '{print $1}')
+          sha_x64_linux=$(shasum -a 256 "archives/endara-relay-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz" | awk '{print $1}')
           {
             echo "arm64_darwin=${sha_arm64_darwin}"
             echo "x64_darwin=${sha_x64_darwin}"
@@ -209,14 +216,25 @@ jobs:
         with:
           python-version: '3.12'
       - name: Update formula
+        # Move every steps.*.outputs.* value into env (CI-002). The version
+        # output transitively comes from `inputs.version` / `github.ref_name`,
+        # which a tag-pusher or workflow-dispatch caller controls; the SHA
+        # outputs are computed from local files and are inert hex, but are
+        # exported uniformly for consistency.
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SHA_ARM64_DARWIN: ${{ steps.sha.outputs.arm64_darwin }}
+          SHA_X64_DARWIN: ${{ steps.sha.outputs.x64_darwin }}
+          SHA_ARM64_LINUX: ${{ steps.sha.outputs.arm64_linux }}
+          SHA_X64_LINUX: ${{ steps.sha.outputs.x64_linux }}
         run: |
           mkdir -p homebrew-tap/Formula
           python3 relay/scripts/update-formula.py \
-            --version "${{ steps.version.outputs.version }}" \
-            --sha256-arm64-darwin "${{ steps.sha.outputs.arm64_darwin }}" \
-            --sha256-x64-darwin "${{ steps.sha.outputs.x64_darwin }}" \
-            --sha256-arm64-linux "${{ steps.sha.outputs.arm64_linux }}" \
-            --sha256-x64-linux "${{ steps.sha.outputs.x64_linux }}" \
+            --version "$VERSION" \
+            --sha256-arm64-darwin "$SHA_ARM64_DARWIN" \
+            --sha256-x64-darwin "$SHA_X64_DARWIN" \
+            --sha256-arm64-linux "$SHA_ARM64_LINUX" \
+            --sha256-x64-linux "$SHA_X64_LINUX" \
             --formula-path homebrew-tap/Formula/endara-relay.rb
       - name: Commit and push to homebrew-tap
         working-directory: homebrew-tap
