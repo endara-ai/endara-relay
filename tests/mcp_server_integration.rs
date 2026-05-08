@@ -106,17 +106,16 @@ async fn test_mcp_tools_list_prefixed() {
     assert!(resp.status().is_success());
     let body: serde_json::Value = resp.json().await.unwrap();
     let tools = body["result"]["tools"].as_array().expect("tools array");
-    // 1 catalog tool (unprefixed in single-server mode) + 3 meta-tools = 4 total
-    assert_eq!(tools.len(), 4);
-    // With single active endpoint, tool names are not prefixed
-    assert_eq!(tools[0]["name"], "echo");
-    assert!(tools[0]["description"].as_str().is_some());
-    assert!(tools[0]["inputSchema"].is_object());
-    // Meta-tools should be present
+    // 1 catalog tool (unprefixed in single-server mode) + 2 meta-tools = 3 total.
+    // execute_tools is gated on local_js_execution and is hidden from the
+    // catalog when JS mode is off (this fixture sets js_execution_mode=false).
+    assert_eq!(tools.len(), 3);
+    // Meta-tools should be present (sans execute_tools)
     let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(tool_names.contains(&"echo"));
     assert!(tool_names.contains(&"list_tools"));
     assert!(tool_names.contains(&"search_tools"));
-    assert!(tool_names.contains(&"execute_tools"));
+    assert!(!tool_names.contains(&"execute_tools"));
 }
 
 #[tokio::test]

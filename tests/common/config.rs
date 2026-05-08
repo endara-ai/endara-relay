@@ -144,6 +144,10 @@ impl ConfigBuilder {
         let mut out = String::new();
         out.push_str("[relay]\n");
         out.push_str("machine_name = \"integration-test\"\n");
+        // Integration tests run mock OAuth servers on http://127.0.0.1; opt
+        // out of the SSRF / DNS-rebinding guard so discovery + DCR can reach
+        // them without requiring TLS or a public address.
+        out.push_str("allow_insecure_oauth = true\n");
         if self.js_execution_mode {
             out.push_str("local_js_execution = true\n");
         }

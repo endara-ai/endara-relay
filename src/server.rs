@@ -100,9 +100,15 @@ async fn mcp_initialize(Json(body): Json<JsonRpcBody>) -> Json<Value> {
     )
 }
 
-/// Build the 3 meta-tool definitions as JSON values.
-fn meta_tool_definitions() -> Vec<Value> {
-    vec![
+/// Build the meta-tool definitions as JSON values.
+///
+/// `list_tools` and `search_tools` are always advertised. `execute_tools` is
+/// only included when `js_mode` is on — this matches the invocation-side
+/// gate in `mcp_tools_call`, which rejects `execute_tools` calls when
+/// `local_js_execution` is disabled.
+#[allow(unused_mut)]
+fn meta_tool_definitions(js_mode: bool) -> Vec<Value> {
+    let mut tools = vec![
         json!({
             "name": "list_tools",
             "description": "List available tools with pagination. Returns `{ tools, total, limit, offset }`. Each tool has `name`, `description`, and `input_schema`. The `name` is the exact identifier to use when calling tools via `execute_tools`.",
@@ -126,7 +132,11 @@ fn meta_tool_definitions() -> Vec<Value> {
                 "required": ["query"]
             }
         }),
-        json!({
+    ];
+    if !js_mode {
+        return tools;
+    }
+    tools.push(json!({
             "name": "execute_tools",
             "description": concat!(
                 "Execute a JavaScript snippet that can call tools. ",
@@ -167,8 +177,8 @@ fn meta_tool_definitions() -> Vec<Value> {
                 },
                 "required": ["script"]
             }
-        }),
-    ]
+        }));
+    tools
 }
 
 /// POST /mcp/tools/list
@@ -177,13 +187,16 @@ async fn mcp_tools_list(
     Json(body): Json<JsonRpcBody>,
 ) -> Json<Value> {
     let js_mode = state.js_execution_mode.load(Ordering::Relaxed);
-    let meta_tools = meta_tool_definitions();
+    let meta_tools = meta_tool_definitions(js_mode);
 
     let tools: Vec<Value> = if js_mode {
-        // JS execution mode: only the 3 meta-tools
+        // JS execution mode: only the 3 meta-tools (incl. execute_tools)
         meta_tools
     } else {
-        // Normal mode: full prefixed catalog + 3 meta-tools
+        // Normal mode: full prefixed catalog + list/search meta-tools.
+        // execute_tools is intentionally hidden — it is gated on
+        // local_js_execution and the matching invocation-side check
+        // would reject any call to it.
         let catalog = state.registry.merged_catalog().await;
         let mut tools: Vec<Value> = catalog
             .into_iter()
@@ -257,6 +270,17 @@ async fn mcp_tools_call(
             }
         }
         "execute_tools" => {
+            // Symmetric to the catalog hide in `meta_tool_definitions`:
+            // execute_tools is only available when local_js_execution is on.
+            // A misbehaving or malicious client could still invoke it
+            // directly without going through tools/list, so reject here.
+            if !js_mode {
+                return Err(jsonrpc_error(
+                    body.id,
+                    -32601,
+                    "execute_tools is disabled — set relay.local_js_execution = true to enable the JS sandbox.",
+                ));
+            }
             let script = arguments
                 .get("script")
                 .and_then(|v| v.as_str())
@@ -1105,7 +1129,7 @@ mod tests {
 
     #[test]
     fn meta_tool_definitions_contains_expected_tools() {
-        let defs = meta_tool_definitions();
+        let defs = meta_tool_definitions(true);
         assert_eq!(defs.len(), 3);
 
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
@@ -1123,8 +1147,20 @@ mod tests {
     }
 
     #[test]
+    fn meta_tool_definitions_hides_execute_tools_when_js_off() {
+        let defs = meta_tool_definitions(false);
+        let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"list_tools"));
+        assert!(names.contains(&"search_tools"));
+        assert!(
+            !names.contains(&"execute_tools"),
+            "execute_tools must not be advertised when local_js_execution is off"
+        );
+    }
+
+    #[test]
     fn test_list_tools_description_documents_return_format() {
-        let defs = meta_tool_definitions();
+        let defs = meta_tool_definitions(true);
         let list_desc = defs.iter().find(|d| d["name"] == "list_tools").unwrap()["description"]
             .as_str()
             .unwrap();
@@ -1152,7 +1188,7 @@ mod tests {
 
     #[test]
     fn test_search_tools_description_documents_behavior() {
-        let defs = meta_tool_definitions();
+        let defs = meta_tool_definitions(true);
         let search_desc = defs.iter().find(|d| d["name"] == "search_tools").unwrap()["description"]
             .as_str()
             .unwrap();
@@ -1174,7 +1210,7 @@ mod tests {
 
     #[test]
     fn test_execute_tools_description_has_examples() {
-        let defs = meta_tool_definitions();
+        let defs = meta_tool_definitions(true);
         let exec_desc = defs.iter().find(|d| d["name"] == "execute_tools").unwrap()["description"]
             .as_str()
             .unwrap();
@@ -1256,12 +1292,14 @@ mod tests {
         let Json(resp) = mcp_tools_list(State(state), Json(body)).await;
         let tools = resp["result"]["tools"].as_array().unwrap();
 
-        // With no adapters registered, only the 3 meta-tools should appear
-        assert_eq!(tools.len(), 3);
+        // With no adapters registered and JS mode off, only list_tools and
+        // search_tools should appear. execute_tools is gated on
+        // local_js_execution and is hidden from the catalog when off.
+        assert_eq!(tools.len(), 2);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"list_tools"));
         assert!(names.contains(&"search_tools"));
-        assert!(names.contains(&"execute_tools"));
+        assert!(!names.contains(&"execute_tools"));
     }
 
     #[tokio::test]
@@ -1867,17 +1905,18 @@ mod tests {
         // After init, health should be Healthy
         assert_eq!(adapter.health(), crate::adapter::HealthStatus::Healthy);
 
-        // List tools — should return meta-tools
+        // List tools — should return meta-tools. JS mode is off in this
+        // fixture, so execute_tools is hidden from the catalog.
         let tools = adapter.list_tools().await.unwrap();
         assert!(
-            tools.len() >= 3,
-            "expected at least 3 meta-tools, got {}",
+            tools.len() >= 2,
+            "expected at least 2 meta-tools, got {}",
             tools.len()
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"list_tools"));
         assert!(names.contains(&"search_tools"));
-        assert!(names.contains(&"execute_tools"));
+        assert!(!names.contains(&"execute_tools"));
 
         adapter.shutdown().await.unwrap();
         server_handle.abort();
@@ -2081,18 +2120,13 @@ mod tests {
         let tools = resp["result"]["tools"].as_array().unwrap();
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        // Should be sorted: adapter tools + meta-tools, all alphabetical
-        // Expected: alpha, execute_tools, list_tools, mango, search_tools, zebra
+        // Should be sorted: adapter tools + meta-tools, all alphabetical.
+        // execute_tools is gated on local_js_execution and is hidden when
+        // JS mode is off (the default in this test).
+        // Expected: alpha, list_tools, mango, search_tools, zebra
         assert_eq!(
             names,
-            vec![
-                "alpha",
-                "execute_tools",
-                "list_tools",
-                "mango",
-                "search_tools",
-                "zebra"
-            ]
+            vec!["alpha", "list_tools", "mango", "search_tools", "zebra"]
         );
     }
 

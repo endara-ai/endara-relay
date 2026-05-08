@@ -24,7 +24,7 @@ fn echo_script_path() -> PathBuf {
         .join("echo_mcp_server.sh")
 }
 
-async fn setup_js_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
+async fn setup_js_server(js_mode: bool) -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let registry = AdapterRegistry::new();
     let config = StdioConfig {
         command: "bash".to_string(),
@@ -46,7 +46,7 @@ async fn setup_js_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let registry_arc = Arc::new(registry.clone());
     let state = AppState {
         registry: registry.clone(),
-        js_execution_mode: Arc::new(AtomicBool::new(false)),
+        js_execution_mode: Arc::new(AtomicBool::new(js_mode)),
         meta_tool_handler: Arc::new(MetaToolHandler::new(registry_arc, Duration::from_secs(30))),
         oauth_flow_manager: None,
         token_manager: None,
@@ -64,7 +64,8 @@ async fn setup_js_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
 
 #[tokio::test]
 async fn test_execute_tools_with_echo() {
-    let (addr, _handle) = setup_js_server().await;
+    // execute_tools is gated on local_js_execution; enable it for this test.
+    let (addr, _handle) = setup_js_server(true).await;
     let client = reqwest::Client::new();
 
     // Use execute_tools to run a JS script calling the echo tool.
@@ -104,7 +105,7 @@ async fn test_execute_tools_with_echo() {
 
 #[tokio::test]
 async fn test_list_tools_meta_tool() {
-    let (addr, _handle) = setup_js_server().await;
+    let (addr, _handle) = setup_js_server(false).await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -136,7 +137,7 @@ async fn test_list_tools_meta_tool() {
 
 #[tokio::test]
 async fn test_search_tools_meta_tool() {
-    let (addr, _handle) = setup_js_server().await;
+    let (addr, _handle) = setup_js_server(false).await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -163,5 +164,44 @@ async fn test_search_tools_meta_tool() {
     assert!(
         tools[0]["name"].as_str().unwrap().contains("echo"),
         "first result should contain 'echo'"
+    );
+}
+
+/// Defense-in-depth: even though `execute_tools` is hidden from the
+/// catalog when `local_js_execution` is off, a misbehaving or malicious
+/// client could call it directly. The invocation handler must reject it.
+#[tokio::test]
+async fn test_execute_tools_rejected_when_js_mode_off() {
+    let (addr, _handle) = setup_js_server(false).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("http://{}/mcp/tools/call", addr))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": {
+                "name": "execute_tools",
+                "arguments": { "script": "return 1;" }
+            },
+            "id": 99
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let error = body
+        .get("error")
+        .expect("expected JSON-RPC error when execute_tools is gated off");
+    assert_eq!(
+        error["code"].as_i64().unwrap(),
+        -32601,
+        "expected method-not-found code, got: {error}"
+    );
+    let msg = error["message"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("execute_tools"),
+        "error message should mention execute_tools, got: {msg}"
     );
 }

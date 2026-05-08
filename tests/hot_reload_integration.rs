@@ -57,6 +57,7 @@ async fn test_config_diff_add_endpoint() {
             machine_name: "testmachine".to_string(),
             local_js_execution: None,
             token_dir: None,
+            allow_insecure_oauth: None,
         },
         endpoints: vec![config::EndpointConfig {
             name: "echo-ep".to_string(),
@@ -83,6 +84,7 @@ async fn test_config_diff_add_endpoint() {
             machine_name: "testmachine".to_string(),
             local_js_execution: None,
             token_dir: None,
+            allow_insecure_oauth: None,
         },
         endpoints: vec![
             config::EndpointConfig {
@@ -196,6 +198,7 @@ async fn test_config_diff_remove_endpoint() {
             machine_name: "testmachine".to_string(),
             local_js_execution: None,
             token_dir: None,
+            allow_insecure_oauth: None,
         },
         endpoints: vec![
             config::EndpointConfig {
@@ -242,6 +245,7 @@ async fn test_config_diff_remove_endpoint() {
             machine_name: "testmachine".to_string(),
             local_js_execution: None,
             token_dir: None,
+            allow_insecure_oauth: None,
         },
         endpoints: vec![config::EndpointConfig {
             name: "echo-ep".to_string(),

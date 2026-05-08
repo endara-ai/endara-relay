@@ -20,6 +20,12 @@ pub struct RelayConfig {
     pub local_js_execution: Option<bool>,
     #[serde(default)]
     pub token_dir: Option<String>,
+    /// Permit `http://` URLs and loopback / link-local addresses for OAuth
+    /// discovery and Dynamic Client Registration. Defaults to `false`
+    /// (HTTPS-only, public addresses only) to mitigate SSRF and
+    /// confused-deputy attacks against the host running the relay.
+    #[serde(default)]
+    pub allow_insecure_oauth: Option<bool>,
 }
 
 /// Transport type for an endpoint.
@@ -193,6 +199,7 @@ pub fn default_config() -> Config {
             machine_name,
             local_js_execution: None,
             token_dir: None,
+            allow_insecure_oauth: None,
         },
         endpoints: Vec::new(),
     }
@@ -1054,6 +1061,7 @@ command = "echo"
                 machine_name: "test".to_string(),
                 local_js_execution: None,
                 token_dir: None,
+                allow_insecure_oauth: None,
             },
             endpoints,
         }

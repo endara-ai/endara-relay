@@ -24,6 +24,7 @@ fn empty_config() -> Config {
             machine_name: "test-machine".to_string(),
             local_js_execution: None,
             token_dir: None,
+            allow_insecure_oauth: Some(true),
         },
         endpoints: vec![EndpointConfig {
             name: "echo".to_string(),
