@@ -17,6 +17,40 @@ fn bad_server_bin() -> String {
     env!("CARGO_BIN_EXE_fixture-bad-server").to_string()
 }
 
+fn multi_tool_bin() -> String {
+    env!("CARGO_BIN_EXE_fixture-multi-tool-server").to_string()
+}
+
+/// Lead-in sentence required at the top of `instructions` per spec §3.2.
+const INSTRUCTIONS_LEAD_IN: &str = "Endara Relay aggregates MCP servers behind a single endpoint.";
+
+/// Poll `tools/list` until the `list_tools` description count suffix reads
+/// `N servers connected …`, or the timeout elapses.
+async fn wait_for_list_tools_count(harness: &RelayHarness, expected: usize, timeout: Duration) {
+    let needle = format!(" {} servers connected via Endara Relay", expected);
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let tools = raw_tools_list(harness).await;
+        if let Some(t) = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some("list_tools"))
+        {
+            if let Some(d) = t["description"].as_str() {
+                if d.contains(&needle) {
+                    return;
+                }
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!(
+                "timed out waiting for list_tools count to reach {} (needle: {:?})",
+                expected, needle
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
 /// Run a JSON-RPC `initialize` against the relay using a fresh client. We do
 /// **not** use `McpClient::initialize()` because that helper hard-codes a
 /// session and consumes the response — here we want the raw result.
@@ -112,7 +146,8 @@ async fn instructions_and_descriptions_reflect_healthy_server() {
         .as_str()
         .expect("instructions should be present once an adapter is Healthy");
     assert_eq!(
-        instructions, "Connected servers: bad-mcp",
+        instructions,
+        format!("{}\n\nConnected servers: bad-mcp", INSTRUCTIONS_LEAD_IN),
         "unexpected instructions string: {instructions}"
     );
 
@@ -151,7 +186,8 @@ async fn failed_adapters_are_not_advertised() {
         .as_str()
         .expect("instructions should be present");
     assert_eq!(
-        instructions, "Connected servers: bad-mcp",
+        instructions,
+        format!("{}\n\nConnected servers: bad-mcp", INSTRUCTIONS_LEAD_IN),
         "Failed adapter should be excluded; got: {instructions}"
     );
 
@@ -163,5 +199,208 @@ async fn failed_adapters_are_not_advertised() {
             " 1 servers connected via Endara Relay \u{2014} use search_tools to discover tools."
         ),
         "list_tools count must exclude Failed adapter: {list_desc}"
+    );
+}
+
+/// 4 — §5.3 row 1: three Healthy endpoints with three distinct serverInfo.name
+///     values render verbatim in `initialize.instructions`, `search_tools`, and
+///     count to 3 in `list_tools` / `execute_tools` (JS-mode off → list_tools
+///     count assertion only).
+#[tokio::test]
+async fn multi_distinct_types_rendered_in_alphabetical_order() {
+    let config = ConfigBuilder::new()
+        .add_stdio("ep-zebra", &multi_tool_bin(), &["--name", "zebra"])
+        .add_stdio("ep-alpha", &multi_tool_bin(), &["--name", "alpha"])
+        .add_stdio("ep-mango", &multi_tool_bin(), &["--name", "mango"])
+        .build();
+    let harness = RelayHarness::start(&config).await;
+    for ep in ["ep-zebra", "ep-alpha", "ep-mango"] {
+        harness
+            .wait_healthy(ep, Duration::from_secs(10))
+            .await
+            .unwrap_or_else(|_| panic!("{ep} did not become healthy"));
+    }
+
+    let expected_list = "alpha, mango, zebra";
+
+    let init = raw_initialize(&harness).await;
+    let instructions = init["result"]["instructions"]
+        .as_str()
+        .expect("instructions should be present with 3 Healthy adapters");
+    assert_eq!(
+        instructions,
+        format!(
+            "{}\n\nConnected servers: {}",
+            INSTRUCTIONS_LEAD_IN, expected_list
+        ),
+        "instructions string did not match spec §3.2 format: {instructions}"
+    );
+
+    let tools = raw_tools_list(&harness).await;
+    let list_desc = meta_tool_description(&tools, "list_tools");
+    assert!(
+        list_desc.ends_with(
+            " 3 servers connected via Endara Relay \u{2014} use search_tools to discover tools."
+        ),
+        "list_tools description missing count=3 suffix: {list_desc}"
+    );
+    let search_desc = meta_tool_description(&tools, "search_tools");
+    assert!(
+        search_desc.ends_with(&format!("\n\nConnected servers: {}", expected_list)),
+        "search_tools description does not end with full alphabetised list: {search_desc}"
+    );
+    // execute_tools is hidden when JS mode is off; covered separately.
+}
+
+/// 5 — §5.3 row 4 (kill endpoint): hot-reload removes one of three endpoints
+///     via config rewrite; the relay's file watcher applies the diff and the
+///     advertised type list / count drop accordingly.
+#[tokio::test]
+async fn hot_reload_kill_endpoint_drops_from_advertised_list() {
+    let initial = ConfigBuilder::new()
+        .add_stdio("ep-alpha", &multi_tool_bin(), &["--name", "alpha"])
+        .add_stdio("ep-mango", &multi_tool_bin(), &["--name", "mango"])
+        .add_stdio("ep-zebra", &multi_tool_bin(), &["--name", "zebra"])
+        .build();
+    let harness = RelayHarness::start(&initial).await;
+    for ep in ["ep-alpha", "ep-mango", "ep-zebra"] {
+        harness
+            .wait_healthy(ep, Duration::from_secs(10))
+            .await
+            .unwrap_or_else(|_| panic!("{ep} did not become healthy"));
+    }
+    wait_for_list_tools_count(&harness, 3, Duration::from_secs(5)).await;
+
+    // Rewrite config without ep-mango.
+    let updated = ConfigBuilder::new()
+        .add_stdio("ep-alpha", &multi_tool_bin(), &["--name", "alpha"])
+        .add_stdio("ep-zebra", &multi_tool_bin(), &["--name", "zebra"])
+        .build();
+    std::fs::write(&harness.config_path, updated).expect("failed to rewrite config");
+
+    // Watcher debounce is 500ms; allow extra slack for fs notify + reload.
+    wait_for_list_tools_count(&harness, 2, Duration::from_secs(15)).await;
+
+    let tools = raw_tools_list(&harness).await;
+    let search_desc = meta_tool_description(&tools, "search_tools");
+    assert!(
+        search_desc.ends_with("\n\nConnected servers: alpha, zebra"),
+        "expected mango to be removed from search_tools description: {search_desc}"
+    );
+    let init = raw_initialize(&harness).await;
+    let instructions = init["result"]["instructions"].as_str().unwrap_or("");
+    assert!(
+        !instructions.contains("mango"),
+        "instructions should not mention removed endpoint type: {instructions}"
+    );
+}
+
+/// 6 — §5.3 row 5 (add endpoint): hot-reload adds a new endpoint via config
+///     rewrite; the new type appears in `tools/list` and the count goes up.
+#[tokio::test]
+async fn hot_reload_add_endpoint_appears_in_advertised_list() {
+    let initial = ConfigBuilder::new()
+        .add_stdio("ep-alpha", &multi_tool_bin(), &["--name", "alpha"])
+        .add_stdio("ep-zebra", &multi_tool_bin(), &["--name", "zebra"])
+        .build();
+    let harness = RelayHarness::start(&initial).await;
+    for ep in ["ep-alpha", "ep-zebra"] {
+        harness
+            .wait_healthy(ep, Duration::from_secs(10))
+            .await
+            .unwrap_or_else(|_| panic!("{ep} did not become healthy"));
+    }
+    wait_for_list_tools_count(&harness, 2, Duration::from_secs(5)).await;
+
+    // Rewrite config with an extra endpoint reporting "mango".
+    let updated = ConfigBuilder::new()
+        .add_stdio("ep-alpha", &multi_tool_bin(), &["--name", "alpha"])
+        .add_stdio("ep-zebra", &multi_tool_bin(), &["--name", "zebra"])
+        .add_stdio("ep-mango", &multi_tool_bin(), &["--name", "mango"])
+        .build();
+    std::fs::write(&harness.config_path, updated).expect("failed to rewrite config");
+
+    harness
+        .wait_healthy("ep-mango", Duration::from_secs(15))
+        .await
+        .expect("ep-mango did not become healthy after hot-reload add");
+    wait_for_list_tools_count(&harness, 3, Duration::from_secs(15)).await;
+
+    let tools = raw_tools_list(&harness).await;
+    let search_desc = meta_tool_description(&tools, "search_tools");
+    assert!(
+        search_desc.ends_with("\n\nConnected servers: alpha, mango, zebra"),
+        "expected mango to appear in alphabetised list: {search_desc}"
+    );
+}
+
+/// 7 — §5.3 row 6 (second instance of existing type): two endpoints reporting
+///     the same `serverInfo.name`; the type list deduplicates but the count
+///     reflects both Healthy endpoints.
+#[tokio::test]
+async fn duplicate_type_dedupes_but_count_includes_both() {
+    let config = ConfigBuilder::new()
+        .add_stdio("ep-alpha-1", &multi_tool_bin(), &["--name", "alpha"])
+        .add_stdio("ep-alpha-2", &multi_tool_bin(), &["--name", "alpha"])
+        .build();
+    let harness = RelayHarness::start(&config).await;
+    for ep in ["ep-alpha-1", "ep-alpha-2"] {
+        harness
+            .wait_healthy(ep, Duration::from_secs(10))
+            .await
+            .unwrap_or_else(|_| panic!("{ep} did not become healthy"));
+    }
+    wait_for_list_tools_count(&harness, 2, Duration::from_secs(10)).await;
+
+    let init = raw_initialize(&harness).await;
+    let instructions = init["result"]["instructions"]
+        .as_str()
+        .expect("instructions should be present");
+    assert_eq!(
+        instructions,
+        format!("{}\n\nConnected servers: alpha", INSTRUCTIONS_LEAD_IN),
+        "duplicate type should dedupe to a single entry: {instructions}"
+    );
+
+    let tools = raw_tools_list(&harness).await;
+    let list_desc = meta_tool_description(&tools, "list_tools");
+    assert!(
+        list_desc.ends_with(
+            " 2 servers connected via Endara Relay \u{2014} use search_tools to discover tools."
+        ),
+        "list_tools count must reflect both Healthy endpoints: {list_desc}"
+    );
+    let search_desc = meta_tool_description(&tools, "search_tools");
+    assert!(
+        search_desc.ends_with("\n\nConnected servers: alpha"),
+        "search_tools description should carry deduplicated single entry: {search_desc}"
+    );
+}
+
+/// 8 — JS-execution-mode `execute_tools` carries the count suffix when at
+///     least one adapter is Healthy. Verifies the meta-tool is exposed and
+///     the description is built via `execute_tools_description`.
+#[tokio::test]
+async fn js_mode_execute_tools_carries_count_suffix() {
+    let config = ConfigBuilder::new()
+        .js_execution(true)
+        .add_stdio("ep-alpha", &multi_tool_bin(), &["--name", "alpha"])
+        .build();
+    let harness = RelayHarness::start(&config).await;
+    harness
+        .wait_healthy("ep-alpha", Duration::from_secs(10))
+        .await
+        .expect("ep-alpha did not become healthy");
+    wait_for_list_tools_count(&harness, 1, Duration::from_secs(10)).await;
+
+    let tools = raw_tools_list(&harness).await;
+    // execute_tools is only exposed in JS mode.
+    let exec_desc = meta_tool_description(&tools, "execute_tools");
+    assert!(
+        exec_desc.ends_with(
+            " 1 servers connected via Endara Relay \u{2014} use search_tools to discover tools."
+        ),
+        "execute_tools description missing count suffix in JS mode: ...{}",
+        &exec_desc[exec_desc.len().saturating_sub(160)..]
     );
 }

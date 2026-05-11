@@ -115,6 +115,12 @@ impl<'a> ServerTypeList<'a> {
     }
 }
 
+/// Lead-in sentence prepended to the `Connected servers: …` line in
+/// `InitializeResult.instructions`. Per Engineering Spec §3.2, the literal
+/// blank line between the lead-in and the server list is part of the payload.
+pub const INSTRUCTIONS_LEAD_IN: &str =
+    "Endara Relay aggregates MCP servers behind a single endpoint.";
+
 /// Build the `InitializeResult.instructions` string. Returns `None` when no
 /// adapter is currently `Healthy` with a `server_type`, so the field is
 /// omitted from the response (per spec §2.1).
@@ -122,7 +128,7 @@ pub async fn instructions(registry: &AdapterRegistry) -> Option<String> {
     ServerTypeList::new(registry)
         .render()
         .await
-        .map(|list| format!("Connected servers: {}", list))
+        .map(|list| format!("{}\n\nConnected servers: {}", INSTRUCTIONS_LEAD_IN, list))
 }
 
 /// Build the `search_tools` description. Appends `\n\nConnected servers: {list}`
@@ -376,6 +382,29 @@ mod tests {
             desc.ends_with(" 2 servers connected via Endara Relay \u{2014} use search_tools to discover tools."),
             "unexpected suffix: {}",
             &desc[desc.len().saturating_sub(120)..]
+        );
+    }
+
+    /// 50 synthetic distinct server-types render well under 1KB — sanity-check
+    /// the dedup/render path before the 8KB safety cap engages.
+    #[tokio::test]
+    async fn render_50_distinct_types_under_1024_bytes() {
+        let reg = AdapterRegistry::new();
+        for i in 0..50 {
+            let ty = format!("type-{:02}", i);
+            register(&reg, &format!("ep{}", i), MockAdapter::ready(&ty)).await;
+        }
+        let list = ServerTypeList::new(&reg).render().await.unwrap();
+        assert!(
+            list.len() < 1024,
+            "50 distinct types rendered to {} bytes, expected < 1024",
+            list.len()
+        );
+        // Defence in depth: confirm we didn't truncate.
+        assert!(
+            !list.ends_with(", \u{2026}"),
+            "50 types should fit without truncation: {}",
+            list
         );
     }
 }
