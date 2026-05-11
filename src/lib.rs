@@ -1,4 +1,5 @@
 pub mod adapter;
+pub mod advertise;
 pub mod config;
 pub mod js_sandbox;
 pub mod jsonrpc;

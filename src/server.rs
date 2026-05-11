@@ -84,20 +84,24 @@ fn jsonrpc_error(id: Option<Value>, code: i64, message: &str) -> (StatusCode, Js
 }
 
 /// POST /mcp/initialize
-async fn mcp_initialize(Json(body): Json<JsonRpcBody>) -> Json<Value> {
-    jsonrpc_response(
-        body.id,
-        json!({
-            "protocolVersion": "2025-03-26",
-            "capabilities": {
-                "tools": {}
-            },
-            "serverInfo": {
-                "name": "Endara Relay",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        }),
-    )
+async fn mcp_initialize(
+    State(state): State<AppState>,
+    Json(body): Json<JsonRpcBody>,
+) -> Json<Value> {
+    let mut result = json!({
+        "protocolVersion": "2025-03-26",
+        "capabilities": {
+            "tools": {}
+        },
+        "serverInfo": {
+            "name": "Endara Relay",
+            "version": env!("CARGO_PKG_VERSION")
+        }
+    });
+    if let Some(instructions) = crate::advertise::instructions(&state.registry).await {
+        result["instructions"] = Value::String(instructions);
+    }
+    jsonrpc_response(body.id, result)
 }
 
 /// Build the meta-tool definitions as JSON values.
@@ -106,12 +110,17 @@ async fn mcp_initialize(Json(body): Json<JsonRpcBody>) -> Json<Value> {
 /// only included when `js_mode` is on — this matches the invocation-side
 /// gate in `mcp_tools_call`, which rejects `execute_tools` calls when
 /// `local_js_execution` is disabled.
-#[allow(unused_mut)]
-fn meta_tool_definitions(js_mode: bool) -> Vec<Value> {
+///
+/// The descriptions are built dynamically against the supplied [`AdapterRegistry`]
+/// so each `tools/list` response advertises the currently-Healthy server set
+/// (see `crate::advertise`).
+async fn meta_tool_definitions(js_mode: bool, registry: &AdapterRegistry) -> Vec<Value> {
+    let list_desc = crate::advertise::list_tools_description(registry).await;
+    let search_desc = crate::advertise::search_tools_description(registry).await;
     let mut tools = vec![
         json!({
             "name": "list_tools",
-            "description": "List available tools with pagination. Returns `{ tools, total, limit, offset }`. Each tool has `name`, `description`, and `input_schema`. The `name` is the exact identifier to use when calling tools via `execute_tools`.",
+            "description": list_desc,
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -122,7 +131,7 @@ fn meta_tool_definitions(js_mode: bool) -> Vec<Value> {
         }),
         json!({
             "name": "search_tools",
-            "description": "Fuzzy search across tool name, description, server endpoint, and input-schema property names. Typo-tolerant (Levenshtein), case-insensitive, and aware of camelCase / snake_case / kebab-case boundaries. Results are ranked by relevance (exact > prefix > substring > fuzzy; name > description > endpoint); tools matching more query tokens rank higher. Returns an array of matching tools, each with `name`, `description`, and `input_schema`.",
+            "description": search_desc,
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -136,48 +145,18 @@ fn meta_tool_definitions(js_mode: bool) -> Vec<Value> {
     if !js_mode {
         return tools;
     }
+    let execute_desc = crate::advertise::execute_tools_description(registry).await;
     tools.push(json!({
-            "name": "execute_tools",
-            "description": concat!(
-                "Execute a JavaScript snippet that can call tools. ",
-                "Invoke a tool with `await call(\"tool_name\", { ...args })` — `call()` returns the unwrapped result directly, no manual envelope reading required. ",
-                "Behind the scenes it returns `structuredContent` when the tool provides it, parses `content[0].text` when it begins with `[` or `{`, returns the text as-is otherwise, and throws an `Error` on `isError` envelopes (the message includes the tool name and `content[0].text`). ",
-                "Multi-server tool names use `prefix__name` format (double underscore); single-server mode has no prefix. ",
-                "Use `tools[\"tool_name\"](args)` only when you need the raw MCP envelope (`{ content, structuredContent, isError }`) — for example to inspect `isError` without throwing or to read the literal `content[0].text`. ",
-                "Calling an unknown tool name throws an error that lists the closest matching tools. ",
-                "Pass `{ retry: 3 }` as the third argument (e.g. `await call(\"name\", args, { retry: 3 })`) to retry transient errors on tools whose annotations declare `readOnlyHint` or `idempotentHint`. ",
-                "Use `return` to send data back.\n\n",
-                "Examples:\n",
-                "```js\n",
-                "// call() returns the unwrapped result — no need to read content[0].text yourself.\n",
-                "const tasks = await call(\"todoist__get-tasks\", { limit: 5 });\n",
-                "return tasks;\n",
-                "```\n",
-                "```js\n",
-                "// Chain two tool calls and combine their results.\n",
-                "const projects = await call(\"todoist__get-projects\", {});\n",
-                "const tasks = await call(\"todoist__get-tasks\", { project_id: projects[0].id });\n",
-                "return { projects, tasks };\n",
-                "```\n",
-                "```js\n",
-                "// Opt into retry for read-only / idempotent tools.\n",
-                "const issues = await call(\"github__list-issues\", { repo: \"endara-ai/relay\" }, { retry: 3 });\n",
-                "return issues;\n",
-                "```\n",
-                "```js\n",
-                "// Use the tools[...] indexer when you need the raw MCP envelope.\n",
-                "const r = await tools[\"todoist__get-tasks\"]({ limit: 5 });\n",
-                "return r.structuredContent;\n",
-                "```",
-            ),
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "script": { "type": "string" }
-                },
-                "required": ["script"]
-            }
-        }));
+        "name": "execute_tools",
+        "description": execute_desc,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "script": { "type": "string" }
+            },
+            "required": ["script"]
+        }
+    }));
     tools
 }
 
@@ -187,7 +166,7 @@ async fn mcp_tools_list(
     Json(body): Json<JsonRpcBody>,
 ) -> Json<Value> {
     let js_mode = state.js_execution_mode.load(Ordering::Relaxed);
-    let meta_tools = meta_tool_definitions(js_mode);
+    let meta_tools = meta_tool_definitions(js_mode, &state.registry).await;
 
     let tools: Vec<Value> = if js_mode {
         // JS execution mode: only the 3 meta-tools (incl. execute_tools)
@@ -348,7 +327,7 @@ async fn handle_single_message(state: &AppState, msg: Value, headers_str: &str) 
     };
 
     let result: Result<Json<Value>, (StatusCode, Json<Value>)> = match method.as_str() {
-        "initialize" => Ok(mcp_initialize(Json(body)).await),
+        "initialize" => Ok(mcp_initialize(State(state.clone()), Json(body)).await),
         "tools/list" => Ok(mcp_tools_list(State(state.clone()), Json(body)).await),
         "tools/call" => mcp_tools_call(State(state.clone()), Json(body)).await,
         _ => Err(jsonrpc_error(
@@ -764,10 +743,10 @@ async fn oauth_callback(
 }
 
 /// Logged wrapper for POST /mcp/initialize (direct route).
-async fn mcp_initialize_logged(body: Json<JsonRpcBody>) -> Json<Value> {
+async fn mcp_initialize_logged(state: State<AppState>, body: Json<JsonRpcBody>) -> Json<Value> {
     let start = Instant::now();
     let req_bytes = serde_json::to_string(&body.0).map(|s| s.len()).unwrap_or(0);
-    let resp = mcp_initialize(body).await;
+    let resp = mcp_initialize(state, body).await;
     let elapsed_ms = start.elapsed().as_millis() as u64;
     let resp_bytes = serde_json::to_string(&resp.0).map(|s| s.len()).unwrap_or(0);
     info!(
@@ -1107,13 +1086,14 @@ mod tests {
 
     #[tokio::test]
     async fn mcp_initialize_returns_correct_response() {
+        let state = test_app_state();
         let body = JsonRpcBody {
             jsonrpc: Some("2.0".to_string()),
             method: Some("initialize".to_string()),
             params: None,
             id: Some(json!(1)),
         };
-        let Json(resp) = mcp_initialize(Json(body)).await;
+        let Json(resp) = mcp_initialize(State(state), Json(body)).await;
 
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 1);
@@ -1125,11 +1105,14 @@ mod tests {
         assert!(!result["serverInfo"]["version"].as_str().unwrap().is_empty());
         // Capabilities must include "tools"
         assert!(result["capabilities"]["tools"].is_object());
+        // No connected adapters → instructions field omitted (spec §2.1).
+        assert!(result.get("instructions").is_none());
     }
 
-    #[test]
-    fn meta_tool_definitions_contains_expected_tools() {
-        let defs = meta_tool_definitions(true);
+    #[tokio::test]
+    async fn meta_tool_definitions_contains_expected_tools() {
+        let registry = AdapterRegistry::new();
+        let defs = meta_tool_definitions(true, &registry).await;
         assert_eq!(defs.len(), 3);
 
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
@@ -1146,9 +1129,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn meta_tool_definitions_hides_execute_tools_when_js_off() {
-        let defs = meta_tool_definitions(false);
+    #[tokio::test]
+    async fn meta_tool_definitions_hides_execute_tools_when_js_off() {
+        let registry = AdapterRegistry::new();
+        let defs = meta_tool_definitions(false, &registry).await;
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"list_tools"));
         assert!(names.contains(&"search_tools"));
@@ -1158,9 +1142,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_list_tools_description_documents_return_format() {
-        let defs = meta_tool_definitions(true);
+    #[tokio::test]
+    async fn test_list_tools_description_documents_return_format() {
+        let registry = AdapterRegistry::new();
+        let defs = meta_tool_definitions(true, &registry).await;
         let list_desc = defs.iter().find(|d| d["name"] == "list_tools").unwrap()["description"]
             .as_str()
             .unwrap();
@@ -1186,9 +1171,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_search_tools_description_documents_behavior() {
-        let defs = meta_tool_definitions(true);
+    #[tokio::test]
+    async fn test_search_tools_description_documents_behavior() {
+        let registry = AdapterRegistry::new();
+        let defs = meta_tool_definitions(true, &registry).await;
         let search_desc = defs.iter().find(|d| d["name"] == "search_tools").unwrap()["description"]
             .as_str()
             .unwrap();
@@ -1208,9 +1194,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_execute_tools_description_has_examples() {
-        let defs = meta_tool_definitions(true);
+    #[tokio::test]
+    async fn test_execute_tools_description_has_examples() {
+        let registry = AdapterRegistry::new();
+        let defs = meta_tool_definitions(true, &registry).await;
         let exec_desc = defs.iter().find(|d| d["name"] == "execute_tools").unwrap()["description"]
             .as_str()
             .unwrap();

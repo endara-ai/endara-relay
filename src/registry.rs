@@ -1,6 +1,6 @@
 use crate::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::prefix;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -288,6 +288,33 @@ impl AdapterRegistry {
             .filter(|(_, entry)| matches!(entry.adapter.health(), HealthStatus::Healthy))
             .map(|(name, _)| name.clone())
             .collect()
+    }
+
+    /// Deduplicated, lower-cased server types reported by Healthy adapters.
+    ///
+    /// Walks the adapter map, filters to [`HealthStatus::Healthy`], calls
+    /// [`McpAdapter::server_type`], lowercases the result and collects into a
+    /// [`BTreeSet`] so the output is sorted. Adapters whose `server_type()`
+    /// returns `None` (not yet initialized or transport that does not record
+    /// it) are skipped.
+    pub async fn ready_server_types(&self) -> BTreeSet<String> {
+        let adapters = self.adapters.read().await;
+        adapters
+            .values()
+            .filter(|entry| matches!(entry.adapter.health(), HealthStatus::Healthy))
+            .filter_map(|entry| entry.adapter.server_type())
+            .map(|s| s.to_lowercase())
+            .collect()
+    }
+
+    /// Number of currently `Healthy` adapter instances (NOT deduplicated by
+    /// server type — three Gmail accounts count as three).
+    pub async fn ready_endpoint_count(&self) -> usize {
+        let adapters = self.adapters.read().await;
+        adapters
+            .values()
+            .filter(|entry| matches!(entry.adapter.health(), HealthStatus::Healthy))
+            .count()
     }
 
     /// Access the underlying adapters map (for management API use).
