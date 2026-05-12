@@ -7,6 +7,7 @@ mod token_manager;
 mod watcher;
 
 mod adapter;
+mod advertise;
 mod jsonrpc;
 mod prefix;
 mod registry;

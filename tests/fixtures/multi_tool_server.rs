@@ -1,5 +1,8 @@
 //! Multi-tool MCP server fixture — exposes 12 tools with varied input schemas.
-//! Usage: fixture-multi-tool-server
+//!
+//! Usage:
+//!   fixture-multi-tool-server                 # serverInfo.name = "multi-tool-mcp"
+//!   fixture-multi-tool-server --name <NAME>   # serverInfo.name = "<NAME>"
 
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
@@ -111,8 +114,26 @@ fn handle_tool_call(name: &str, args: &Value) -> String {
     }
 }
 
+fn parse_server_name() -> String {
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == "--name" {
+            if let Some(v) = args.next() {
+                return v;
+            }
+        } else if let Some(rest) = a.strip_prefix("--name=") {
+            return rest.to_string();
+        }
+    }
+    "multi-tool-mcp".to_string()
+}
+
 fn main() {
-    eprintln!("multi-tool-server: starting with 12 tools");
+    let server_name = parse_server_name();
+    eprintln!(
+        "multi-tool-server: starting with 12 tools (name={})",
+        server_name
+    );
     let stdin = io::stdin();
     let stdout = io::stdout();
 
@@ -138,7 +159,7 @@ fn main() {
         let response = match method {
             "initialize" => json!({"jsonrpc": "2.0", "result": {
                 "protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
-                "serverInfo": {"name": "multi-tool-mcp", "version": "0.1.0"}}, "id": id}),
+                "serverInfo": {"name": server_name.as_str(), "version": "0.1.0"}}, "id": id}),
             "tools/list" => {
                 json!({"jsonrpc": "2.0", "result": {"tools": tool_definitions()}, "id": id})
             }
