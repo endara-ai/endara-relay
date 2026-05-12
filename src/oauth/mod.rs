@@ -177,6 +177,10 @@ pub struct OAuthSetupSession {
     pub scopes: Option<String>,
     /// Tool prefix override (None = auto-derive from name).
     pub tool_prefix: Option<String>,
+    /// Optional override for the advertised server type. When `Some(_)`, this
+    /// value is sanitized and used in place of the upstream-derived server
+    /// name in `server_type()` and is persisted to `config.toml` on commit.
+    pub server_type_override: Option<String>,
     /// Discovered authorization endpoint.
     pub authorization_endpoint: Option<String>,
     /// Discovered token endpoint.
@@ -220,6 +224,7 @@ impl OAuthSetupManager {
         url: String,
         scopes: Option<String>,
         tool_prefix: Option<String>,
+        server_type_override: Option<String>,
     ) -> Uuid {
         let id = Uuid::new_v4();
         let session = OAuthSetupSession {
@@ -227,6 +232,7 @@ impl OAuthSetupManager {
             url,
             scopes,
             tool_prefix,
+            server_type_override,
             authorization_endpoint: None,
             token_endpoint: None,
             registration_endpoint: None,
@@ -454,6 +460,7 @@ mod tests {
                 "https://mcp.example.com".into(),
                 Some("read write".into()),
                 Some("test".into()),
+                None,
             )
             .await;
 
@@ -489,7 +496,7 @@ mod tests {
     async fn setup_manager_remove_session() {
         let mgr = OAuthSetupManager::new();
         let id = mgr
-            .create_session("ep".into(), "https://x.com".into(), None, None)
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
             .await;
 
         let removed = mgr.remove_session(&id).await;
@@ -504,7 +511,7 @@ mod tests {
     async fn setup_manager_mark_authorized() {
         let mgr = OAuthSetupManager::new();
         let id = mgr
-            .create_session("ep".into(), "https://x.com".into(), None, None)
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
             .await;
 
         let tokens = crate::token_manager::TokenSet {
@@ -544,7 +551,7 @@ mod tests {
     async fn setup_manager_expired_session_is_invisible() {
         let mgr = OAuthSetupManager::new();
         let id = mgr
-            .create_session("ep".into(), "https://x.com".into(), None, None)
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
             .await;
 
         // Manually expire the session
@@ -566,10 +573,10 @@ mod tests {
     async fn setup_manager_cleanup_stale() {
         let mgr = OAuthSetupManager::new();
         let fresh_id = mgr
-            .create_session("fresh".into(), "https://a.com".into(), None, None)
+            .create_session("fresh".into(), "https://a.com".into(), None, None, None)
             .await;
         let stale_id = mgr
-            .create_session("stale".into(), "https://b.com".into(), None, None)
+            .create_session("stale".into(), "https://b.com".into(), None, None, None)
             .await;
 
         // Make one session stale
@@ -592,7 +599,7 @@ mod tests {
     async fn setup_manager_get_session_mut_modifies() {
         let mgr = OAuthSetupManager::new();
         let id = mgr
-            .create_session("ep".into(), "https://x.com".into(), None, None)
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
             .await;
 
         mgr.get_session_mut(&id, |s| {

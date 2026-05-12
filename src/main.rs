@@ -307,6 +307,7 @@ async fn main() {
                         heartbeat_interval_secs: 30,
                         probe_timeout_secs: 10,
                         probe_failure_threshold: 3,
+                        server_type_override: ep.server_type_override.clone(),
                     };
 
                     let mut adapter = OAuthAdapter::new(oauth_config, token_manager.clone());

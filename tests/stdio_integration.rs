@@ -17,6 +17,7 @@ async fn test_stdio_full_lifecycle() {
         command: "bash".to_string(),
         args: vec![fixture_path().to_string_lossy().to_string()],
         env: HashMap::new(),
+        server_type_override: None,
     };
 
     let mut adapter = StdioAdapter::new(config);
@@ -58,6 +59,7 @@ async fn test_stdio_spawn_nonexistent_command() {
         command: "/nonexistent/command/that/does/not/exist".to_string(),
         args: vec![],
         env: HashMap::new(),
+        server_type_override: None,
     };
 
     let mut adapter = StdioAdapter::new(config);

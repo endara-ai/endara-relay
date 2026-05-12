@@ -1,4 +1,5 @@
 use super::server_name::{sanitize_server_name, ServerNameError};
+use super::server_type_resolution::effective_server_type;
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::jsonrpc::{self, JsonRpcResponse};
 use crate::shell_env;
@@ -15,11 +16,14 @@ use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 /// Configuration for spawning a STDIO MCP server.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct StdioConfig {
     pub command: String,
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
+    /// Optional override for the advertised `server_type` name. See
+    /// [`crate::adapter::server_type_resolution::effective_server_type`].
+    pub server_type_override: Option<String>,
 }
 
 /// Ring buffer that stores the last N lines of stderr output.
@@ -412,8 +416,25 @@ impl StdioAdapter {
             AdapterError::ProtocolError(e.to_string())
         })?;
 
-        info!(raw_name = %raw_name, sanitized = %sanitized, "MCP server reported serverInfo.name");
-        *self.server_type.write().await = Some(sanitized);
+        // Resolve the effective `server_type` from the optional per-endpoint
+        // override and the upstream-stripped sanitized name. Log a warning if
+        // the override was supplied but failed sanitization (the resolver
+        // falls back to the upstream-stripped name in that case).
+        if let Some(ref ov) = self.config.server_type_override {
+            if sanitize_server_name(ov).is_err() {
+                warn!(
+                    override = %ov,
+                    "server_type_override failed sanitization; falling back to upstream-derived name"
+                );
+            }
+        }
+        let effective = effective_server_type(
+            self.config.server_type_override.clone(),
+            Some(sanitized.clone()),
+        );
+
+        info!(raw_name = %raw_name, sanitized = %sanitized, effective = ?effective, "MCP server reported serverInfo.name");
+        *self.server_type.write().await = effective;
 
         info!("MCP initialize handshake complete");
         Ok(())
@@ -775,6 +796,7 @@ for line in sys.stdin:
             command: "python3".to_string(),
             args: vec!["-c".to_string(), script.to_string()],
             env: HashMap::new(),
+            ..Default::default()
         })
     }
 
@@ -856,6 +878,7 @@ for line in sys.stdin:
             command: "python3".to_string(),
             args: vec!["-c".to_string(), "import time; time.sleep(120)".to_string()],
             env: HashMap::new(),
+            ..Default::default()
         });
         adapter.spawn_process().await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -920,6 +943,7 @@ for line in sys.stdin:
             command: "python3".to_string(),
             args: vec!["-c".to_string(), script.to_string()],
             env: HashMap::new(),
+            ..Default::default()
         });
         adapter.spawn_process().await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -941,6 +965,7 @@ for line in sys.stdin:
             command: "python3".to_string(),
             args: vec!["-c".to_string(), "pass".to_string()],
             env: HashMap::new(),
+            ..Default::default()
         });
         assert!(
             (&adapter as &dyn McpAdapter)
@@ -976,6 +1001,7 @@ for line in sys.stdin:
             command: "python3".to_string(),
             args: vec!["-c".to_string(), script.to_string()],
             env: HashMap::new(),
+            ..Default::default()
         });
         adapter.spawn_process().await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1022,6 +1048,7 @@ for line in sys.stdin:
             command: "python3".to_string(),
             args: vec!["-c".to_string(), script.to_string()],
             env: HashMap::new(),
+            ..Default::default()
         });
         adapter.spawn_process().await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;

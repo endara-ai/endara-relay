@@ -83,6 +83,14 @@ pub struct EndpointConfig {
     pub scopes: Option<Vec<String>>,
     #[serde(default)]
     pub token_endpoint: Option<String>,
+    /// Optional override for the advertised `server_type` name. When set,
+    /// this value is sanitized through `sanitize_server_name` and used in
+    /// place of the upstream-derived name in the `instructions` field and
+    /// meta-tool descriptions. The auto-strip of `-mcp-server` and friends
+    /// is **never** applied to overrides — the user is taken at face value.
+    /// Tool-name routing (the `tool_prefix`) is unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_type_override: Option<String>,
 }
 
 impl EndpointConfig {
@@ -117,6 +125,7 @@ impl PartialEq for EndpointConfig {
             && self.client_id == other.client_id
             && self.client_secret == other.client_secret
             && self.scopes == other.scopes
+            && self.server_type_override == other.server_type_override
     }
 }
 
@@ -1085,6 +1094,7 @@ command = "echo"
             client_secret: None,
             scopes: None,
             token_endpoint: None,
+            server_type_override: None,
         }
     }
 
@@ -1106,6 +1116,7 @@ command = "echo"
             client_secret: None,
             scopes: None,
             token_endpoint: None,
+            server_type_override: None,
         }
     }
 
@@ -1540,6 +1551,7 @@ scopes = ["openid", "profile", "email"]
             client_secret: None,
             scopes: None,
             token_endpoint: None,
+            server_type_override: None,
         };
 
         let mut ep2 = ep1.clone();
@@ -1554,5 +1566,73 @@ scopes = ["openid", "profile", "email"]
             "OAuth field change should trigger diff"
         );
         assert!(diff.unchanged.is_empty());
+    }
+
+    // --- server_type_override tests ----------------------------------------
+
+    #[test]
+    fn parse_server_type_override_field() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "drive"
+transport = "oauth"
+url = "https://drivemcp.googleapis.com/mcp/v1"
+server_type_override = "google-drive"
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(
+            config.endpoints[0].server_type_override.as_deref(),
+            Some("google-drive")
+        );
+    }
+
+    #[test]
+    fn server_type_override_optional_defaults_to_none() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "echo"
+transport = "stdio"
+command = "echo"
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert!(config.endpoints[0].server_type_override.is_none());
+    }
+
+    #[test]
+    fn server_type_override_change_triggers_config_diff() {
+        // Hot-reload requirement: changing only the override must restart
+        // the adapter so the new advertised name takes effect.
+        let mut ep1 = sse_ep("remote", "http://localhost:3000/sse");
+        ep1.server_type_override = Some("old-name".to_string());
+        let mut ep2 = sse_ep("remote", "http://localhost:3000/sse");
+        ep2.server_type_override = Some("new-name".to_string());
+
+        let old = make_config(vec![ep1]);
+        let new = make_config(vec![ep2]);
+        let diff = diff_configs(&old, &new);
+        assert_eq!(
+            diff.changed.len(),
+            1,
+            "server_type_override change should trigger diff"
+        );
+        assert!(diff.unchanged.is_empty());
+    }
+
+    #[test]
+    fn server_type_override_added_or_removed_triggers_diff() {
+        let ep1 = sse_ep("remote", "http://localhost:3000/sse");
+        let mut ep2 = sse_ep("remote", "http://localhost:3000/sse");
+        ep2.server_type_override = Some("override".to_string());
+
+        let old = make_config(vec![ep1]);
+        let new = make_config(vec![ep2]);
+        let diff = diff_configs(&old, &new);
+        assert_eq!(diff.changed.len(), 1);
     }
 }

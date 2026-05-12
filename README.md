@@ -131,6 +131,22 @@ url = "http://localhost:3001/sse"  # Required for sse/http — server URL
 name = "http-server"
 transport = "http"
 url = "http://localhost:4000/mcp"  # Required for sse/http — server URL
+
+# Optional — override the advertised server_type
+# By default the relay derives the server_type from the upstream
+# `serverInfo.name`, then strips one of the suffixes
+# `-mcp-server`, `_mcp_server`, `-mcp`, `_mcp` (so `linear-mcp-server`
+# becomes `linear`). When that produces an awkward name, set
+# `server_type_override` to take control of what is advertised to the
+# model. The override is sanitized to a valid identifier but is **never**
+# auto-stripped — what you write is what gets used.
+[[endpoints]]
+name = "drive"
+transport = "oauth"
+url = "https://drivemcp.googleapis.com/mcp/v1"
+oauth_server_url = "https://accounts.google.com"
+client_id = "$GOOGLE_CLIENT_ID"
+server_type_override = "google-drive"  # Optional — overrides upstream-derived server_type
 ```
 
 ### Environment variable resolution

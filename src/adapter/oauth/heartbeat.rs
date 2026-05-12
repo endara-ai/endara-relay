@@ -311,6 +311,7 @@ mod tests {
             heartbeat_interval_secs: 30,
             probe_timeout_secs: 10,
             probe_failure_threshold: threshold,
+            server_type_override: None,
         }
     }
 

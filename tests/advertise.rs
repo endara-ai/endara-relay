@@ -128,7 +128,8 @@ async fn instructions_omitted_when_no_healthy_servers() {
 
 /// 2 — instructions present and meta-tool descriptions extended once a server
 ///     becomes Healthy. Uses the `bad-server` fixture without flags so it
-///     advertises serverInfo.name = "bad-mcp" and reaches Ready.
+///     advertises serverInfo.name = "bad-mcp"; the relay strips the `-mcp`
+///     suffix and advertises `bad`.
 #[tokio::test]
 async fn instructions_and_descriptions_reflect_healthy_server() {
     let config = ConfigBuilder::new()
@@ -147,7 +148,7 @@ async fn instructions_and_descriptions_reflect_healthy_server() {
         .expect("instructions should be present once an adapter is Healthy");
     assert_eq!(
         instructions,
-        format!("{}\n\nConnected servers: bad-mcp", INSTRUCTIONS_LEAD_IN),
+        format!("{}\n\nConnected servers: bad", INSTRUCTIONS_LEAD_IN),
         "unexpected instructions string: {instructions}"
     );
 
@@ -161,14 +162,15 @@ async fn instructions_and_descriptions_reflect_healthy_server() {
     );
     let search_desc = meta_tool_description(&tools, "search_tools");
     assert!(
-        search_desc.ends_with("\n\nConnected servers: bad-mcp"),
+        search_desc.ends_with("\n\nConnected servers: bad"),
         "search_tools description missing Connected servers footer: {search_desc}"
     );
 }
 
 /// 3 — Failed adapters are excluded from the advertised list even when sitting
 ///     alongside a Healthy one. Two adapters: one good (`good-server`,
-///     reports `bad-mcp`) and one Failed (`broken-server`).
+///     reports `bad-mcp` which is stripped to `bad`) and one Failed
+///     (`broken-server`).
 #[tokio::test]
 async fn failed_adapters_are_not_advertised() {
     let config = ConfigBuilder::new()
@@ -187,7 +189,7 @@ async fn failed_adapters_are_not_advertised() {
         .expect("instructions should be present");
     assert_eq!(
         instructions,
-        format!("{}\n\nConnected servers: bad-mcp", INSTRUCTIONS_LEAD_IN),
+        format!("{}\n\nConnected servers: bad", INSTRUCTIONS_LEAD_IN),
         "Failed adapter should be excluded; got: {instructions}"
     );
 
