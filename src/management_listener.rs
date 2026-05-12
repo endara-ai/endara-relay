@@ -8,11 +8,15 @@
 //!
 //! Path resolution (in order of preference):
 //!
-//! - **Linux**: `$XDG_RUNTIME_DIR/endara-relay/api.sock`
-//! - **macOS**: `$TMPDIR/endara-relay-<uid>/api.sock`
+//! - **Linux**: `$XDG_RUNTIME_DIR/endara-relay-<suffix>/api.sock`
+//! - **macOS**: `$TMPDIR/endara-relay-<uid>-<suffix>/api.sock`
 //! - **Windows**: `\\.\pipe\endara-relay-<sessionid>`
 //! - Fallback (any platform): `<data-dir>/api.sock` (or
 //!   `\\.\pipe\endara-relay-<data-dir-hash>` on Windows).
+//!
+//! `<suffix>` is an 8-char hex hash of the canonicalized `data_dir`. Including
+//! it lets a dev build (`~/.endara-dev`) and a prod build (`~/.endara`) share
+//! the same user/session without colliding on the same socket path.
 //!
 //! On Unix, the socket file is created with `0600` permissions and stale
 //! socket files are removed at startup if no live process is listening.
@@ -29,47 +33,78 @@ use tracing::{info, warn};
 /// Resolve the management-API socket / pipe path.
 ///
 /// Honors `ENDARA_API_SOCKET` for tests, otherwise picks a per-user runtime
-/// directory and falls back to `<data_dir>/api.sock` if the runtime dir is
-/// unavailable.
-#[allow(clippy::needless_return)]
-pub fn resolve_api_socket_path(#[allow(unused_variables)] data_dir: &Path) -> PathBuf {
+/// directory keyed on a stable hash of `data_dir` (so dev/prod builds with
+/// different data dirs do not collide), and falls back to
+/// `<data_dir>/api.sock` if the runtime dir is unavailable.
+pub fn resolve_api_socket_path(data_dir: &Path) -> PathBuf {
     if let Ok(path) = std::env::var("ENDARA_API_SOCKET") {
         return PathBuf::from(path);
     }
 
     #[cfg(target_os = "linux")]
     {
+        let suffix = data_dir_suffix(data_dir);
         if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
             let runtime = PathBuf::from(xdg);
             if !runtime.as_os_str().is_empty() {
-                return runtime.join("endara-relay").join("api.sock");
+                return runtime
+                    .join(format!("endara-relay-{suffix}"))
+                    .join("api.sock");
             }
         }
-        return data_dir.join("api.sock");
+        data_dir.join("api.sock")
     }
 
     #[cfg(target_os = "macos")]
     {
+        let suffix = data_dir_suffix(data_dir);
         let tmp = std::env::var("TMPDIR")
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("/tmp"));
         let uid = unsafe { geteuid_u32() };
-        return tmp.join(format!("endara-relay-{uid}")).join("api.sock");
+        tmp.join(format!("endara-relay-{uid}-{suffix}"))
+            .join("api.sock")
     }
 
     #[cfg(windows)]
     {
         let session_id = current_user_pipe_suffix(data_dir);
-        return PathBuf::from(format!(r"\\.\pipe\endara-relay-{session_id}"));
+        PathBuf::from(format!(r"\\.\pipe\endara-relay-{session_id}"))
     }
 
     // Final fallback for any other target (e.g. non-macOS unix variants not
-    // covered above). The platform-specific branches above all early-return,
-    // so this is only compiled where it can actually be reached.
+    // covered above). The platform-specific branches above are all single tail
+    // expressions, so this is only compiled where it can actually be reached.
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         data_dir.join("api.sock")
     }
+}
+
+/// Stable 8-char lowercase hex hash of `data_dir`.
+///
+/// Used as a suffix on macOS / Linux socket paths so that two relay processes
+/// running under the same `uid` / `$XDG_RUNTIME_DIR` (e.g. an installed prod
+/// build and a `pnpm tauri dev` instance) get distinct paths.
+///
+/// Lockstep contract with `packages/desktop/src-tauri/src/api_proxy.rs`'s copy
+/// of this helper: both crates MUST produce the same 8 hex chars for the same
+/// canonicalized path. Keep the algorithm byte-for-byte identical:
+/// 1. `Path::canonicalize` the input; on error, hash the input path as-is.
+/// 2. Hash with `std::collections::hash_map::DefaultHasher`.
+/// 3. Format the resulting `u64` as `format!("{:016x}", hash)`, then take the
+///    first 8 chars. (NOT `format!("{:08x}", hash as u32)` — that's a
+///    different value.)
+#[cfg_attr(windows, allow(dead_code))]
+fn data_dir_suffix(data_dir: &Path) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let canonical = data_dir.canonicalize().unwrap_or_else(|_| data_dir.into());
+    let mut h = DefaultHasher::new();
+    canonical.hash(&mut h);
+    let full = format!("{:016x}", h.finish());
+    full[..8].to_string()
 }
 
 #[cfg(unix)]
@@ -337,12 +372,94 @@ fn is_benign_connection_close(err: &(dyn std::error::Error + 'static)) -> bool {
 mod tests {
     use super::*;
 
+    // Serializes env-mutating tests in this module. Cargo runs tests in the
+    // same binary in parallel by default; without this, setting/removing
+    // `ENDARA_API_SOCKET`, `TMPDIR`, or `XDG_RUNTIME_DIR` could race between
+    // tests sharing the process-wide env.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn resolve_api_socket_path_honors_env_var() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("ENDARA_API_SOCKET", "/tmp/endara-test.sock");
         let p = resolve_api_socket_path(Path::new("/tmp"));
         assert_eq!(p, PathBuf::from("/tmp/endara-test.sock"));
         std::env::remove_var("ENDARA_API_SOCKET");
+    }
+
+    #[test]
+    fn data_dir_suffix_returns_eight_lowercase_hex_chars() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = data_dir_suffix(dir.path());
+        assert_eq!(s.len(), 8, "expected 8 chars, got {s:?}");
+        assert!(
+            s.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+            "expected lowercase hex, got {s:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolve_api_socket_path_macos_differs_per_data_dir() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ENDARA_API_SOCKET");
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let pa = resolve_api_socket_path(a.path());
+        let pb = resolve_api_socket_path(b.path());
+        assert_ne!(
+            pa, pb,
+            "different data_dirs should produce different socket paths"
+        );
+        let parent_a = pa.parent().unwrap().file_name().unwrap().to_string_lossy();
+        let parent_b = pb.parent().unwrap().file_name().unwrap().to_string_lossy();
+        assert!(parent_a.starts_with("endara-relay-"));
+        assert!(parent_b.starts_with("endara-relay-"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resolve_api_socket_path_macos_is_deterministic() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ENDARA_API_SOCKET");
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = resolve_api_socket_path(dir.path());
+        let p2 = resolve_api_socket_path(dir.path());
+        assert_eq!(p1, p2, "same data_dir should produce the same path");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_api_socket_path_linux_differs_per_data_dir() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ENDARA_API_SOCKET");
+        let xdg = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", xdg.path());
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let pa = resolve_api_socket_path(a.path());
+        let pb = resolve_api_socket_path(b.path());
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        assert_ne!(
+            pa, pb,
+            "different data_dirs should produce different socket paths"
+        );
+        assert!(pa.starts_with(xdg.path()));
+        assert!(pb.starts_with(xdg.path()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_api_socket_path_linux_is_deterministic() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ENDARA_API_SOCKET");
+        let xdg = tempfile::tempdir().unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", xdg.path());
+        let dir = tempfile::tempdir().unwrap();
+        let p1 = resolve_api_socket_path(dir.path());
+        let p2 = resolve_api_socket_path(dir.path());
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        assert_eq!(p1, p2, "same data_dir should produce the same path");
     }
 
     #[cfg(unix)]
