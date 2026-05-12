@@ -1609,6 +1609,10 @@ struct OAuthSetupRequest {
     /// If provided, use this URL as the discovery base instead of `url`.
     #[serde(default)]
     oauth_server_url: Option<String>,
+    /// Optional override for the advertised server type. Persisted into the
+    /// resulting `[[endpoints]]` entry as `server_type_override`.
+    #[serde(default)]
+    server_type_override: Option<String>,
 }
 
 /// Response for POST /api/oauth/setup
@@ -1688,6 +1692,7 @@ async fn oauth_setup(
             body.url.clone(),
             scopes_str.clone(),
             body.tool_prefix.clone(),
+            body.server_type_override.clone(),
         )
         .await;
 
@@ -2154,6 +2159,12 @@ async fn oauth_setup_commit(
     }
     if let Some(ref tp) = session.tool_prefix {
         ep_table.insert("tool_prefix".into(), toml::Value::String(tp.clone()));
+    }
+    if let Some(ref sto) = session.server_type_override {
+        ep_table.insert(
+            "server_type_override".into(),
+            toml::Value::String(sto.clone()),
+        );
     }
 
     // Append to the [[endpoints]] array
@@ -3983,7 +3994,7 @@ command = "echo"
         let state = test_state_with_setup().await;
         let setup_mgr = state.setup_manager.as_ref().unwrap();
         let session_id = setup_mgr
-            .create_session("ep".into(), "https://x.com".into(), None, None)
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
             .await;
 
         let app = management_routes(state);
@@ -4005,7 +4016,7 @@ command = "echo"
         let state = test_state_with_setup().await;
         let setup_mgr = state.setup_manager.as_ref().unwrap();
         let session_id = setup_mgr
-            .create_session("ep".into(), "https://x.com".into(), None, None)
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
             .await;
 
         // First cancel
@@ -4051,7 +4062,7 @@ command = "echo"
 
         let setup_mgr = state.setup_manager.as_ref().unwrap();
         let session_id = setup_mgr
-            .create_session("ep".into(), "https://x.com".into(), None, None)
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
             .await;
 
         // Session is in AwaitingCredentials status (not Authorized)
@@ -4074,7 +4085,7 @@ command = "echo"
         let state = test_state_with_setup().await;
         let setup_mgr = state.setup_manager.as_ref().unwrap();
         let session_id = setup_mgr
-            .create_session("ep".into(), "https://x.com".into(), None, None)
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
             .await;
 
         // Cancel the session
@@ -4098,7 +4109,13 @@ command = "echo"
         let state = test_state_with_setup().await;
         let setup_mgr = state.setup_manager.as_ref().unwrap();
         let session_id = setup_mgr
-            .create_session("my-ep".into(), "https://mcp.example.com".into(), None, None)
+            .create_session(
+                "my-ep".into(),
+                "https://mcp.example.com".into(),
+                None,
+                None,
+                None,
+            )
             .await;
 
         let app = management_routes(state);
@@ -4146,7 +4163,7 @@ command = "echo"
         let state = test_state_with_setup().await;
         let setup_mgr = state.setup_manager.as_ref().unwrap();
         let session_id = setup_mgr
-            .create_session("ep".into(), "https://x.com".into(), None, None)
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
             .await;
         // Set auth/token endpoints so credential submission can proceed
         setup_mgr
@@ -4195,6 +4212,7 @@ command = "echo"
                 "https://mcp.example.com".into(),
                 Some("read write".into()),
                 Some("newep".into()),
+                None,
             )
             .await;
 
@@ -4239,6 +4257,165 @@ command = "echo"
         assert!(contents.contains("oauth"));
     }
 
+    /// Round-trip: a commit driven by a session created with
+    /// `server_type_override = Some(...)` must write the field to config.toml.
+    #[tokio::test]
+    async fn oauth_setup_commit_persists_server_type_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let token_dir = tmp.path().join("tokens");
+        std::fs::create_dir_all(&token_dir).unwrap();
+
+        let mut state = test_state_with_setup().await;
+        state.config_path = Some(config_path.clone());
+        state.token_manager = Some(Arc::new(TokenManager::new(token_dir)));
+
+        let setup_mgr = state.setup_manager.as_ref().unwrap();
+        let session_id = setup_mgr
+            .create_session(
+                "drive-ep".into(),
+                "https://mcp.example.com".into(),
+                None,
+                None,
+                Some("google-drive".into()),
+            )
+            .await;
+
+        setup_mgr
+            .get_session_mut(&session_id, |s| {
+                s.authorization_endpoint = Some("https://auth.example.com/authorize".into());
+                s.token_endpoint = Some("https://auth.example.com/token".into());
+                s.client_id = Some("cid".into());
+                s.status = crate::oauth::SetupSessionStatus::Authorized;
+                s.tokens = Some(crate::token_manager::TokenSet {
+                    access_token: "tok".into(),
+                    refresh_token: None,
+                    expires_at: None,
+                    token_type: "Bearer".into(),
+                    scope: None,
+                    issued_at: None,
+                });
+            })
+            .await;
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Re-parse the written config and assert the field made it through.
+        // Parse as a raw toml::Table because the test fixture omits the
+        // mandatory `[relay]` section that `Config` deserialization requires.
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: toml::Table = contents.parse().unwrap();
+        let endpoints = parsed
+            .get("endpoints")
+            .and_then(|v| v.as_array())
+            .expect("endpoints array missing from written config");
+        let ep = endpoints
+            .iter()
+            .find(|v| v.get("name").and_then(|n| n.as_str()) == Some("drive-ep"))
+            .expect("committed endpoint missing from config");
+        assert_eq!(
+            ep.get("server_type_override").and_then(|v| v.as_str()),
+            Some("google-drive"),
+            "server_type_override missing from written endpoint entry"
+        );
+    }
+
+    /// Sanity check: when no override is supplied, the commit must not emit a
+    /// `server_type_override` key (avoids polluting config.toml with `None`).
+    #[tokio::test]
+    async fn oauth_setup_commit_omits_server_type_override_when_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let token_dir = tmp.path().join("tokens");
+        std::fs::create_dir_all(&token_dir).unwrap();
+
+        let mut state = test_state_with_setup().await;
+        state.config_path = Some(config_path.clone());
+        state.token_manager = Some(Arc::new(TokenManager::new(token_dir)));
+
+        let setup_mgr = state.setup_manager.as_ref().unwrap();
+        let session_id = setup_mgr
+            .create_session(
+                "plain-ep".into(),
+                "https://mcp.example.com".into(),
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        setup_mgr
+            .get_session_mut(&session_id, |s| {
+                s.authorization_endpoint = Some("https://auth.example.com/authorize".into());
+                s.token_endpoint = Some("https://auth.example.com/token".into());
+                s.client_id = Some("cid".into());
+                s.status = crate::oauth::SetupSessionStatus::Authorized;
+                s.tokens = Some(crate::token_manager::TokenSet {
+                    access_token: "tok".into(),
+                    refresh_token: None,
+                    expires_at: None,
+                    token_type: "Bearer".into(),
+                    scope: None,
+                    issued_at: None,
+                });
+            })
+            .await;
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !contents.contains("server_type_override"),
+            "expected no server_type_override key when override is None, got:\n{}",
+            contents
+        );
+    }
+
+    /// HTTP-layer round-trip: the request body's `server_type_override` field
+    /// must deserialize and be threaded into the resulting setup session.
+    #[tokio::test]
+    async fn oauth_setup_request_threads_server_type_override_into_session() {
+        // Deserialize via the public JSON contract and verify the field lands
+        // on the request struct that the handler uses.
+        let body: OAuthSetupRequest = serde_json::from_value(serde_json::json!({
+            "name": "drive-ep",
+            "url": "https://mcp.example.com",
+            "server_type_override": "google-drive"
+        }))
+        .unwrap();
+        assert_eq!(body.server_type_override.as_deref(), Some("google-drive"));
+
+        // And when omitted, it defaults to None.
+        let body_no_override: OAuthSetupRequest = serde_json::from_value(serde_json::json!({
+            "name": "x",
+            "url": "https://x.com"
+        }))
+        .unwrap();
+        assert!(body_no_override.server_type_override.is_none());
+    }
+
     #[tokio::test]
     async fn oauth_setup_double_commit_returns_not_found() {
         let tmp = tempfile::tempdir().unwrap();
@@ -4254,7 +4431,7 @@ command = "echo"
 
         let setup_mgr = state.setup_manager.as_ref().unwrap();
         let session_id = setup_mgr
-            .create_session("ep".into(), "https://x.com".into(), None, None)
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
             .await;
 
         // Mark as authorized
