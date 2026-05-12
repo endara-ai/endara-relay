@@ -64,6 +64,9 @@ pub struct OAuthAdapterConfig {
     /// `inner_health` to `Unhealthy("upstream unreachable")` (default: 3).
     /// Hysteresis to avoid flapping on a single transient timeout.
     pub probe_failure_threshold: u32,
+    /// Optional override for the advertised `server_type` name. Forwarded to
+    /// the inner [`HttpAdapter`] when it is constructed.
+    pub server_type_override: Option<String>,
 }
 
 /// Shared inner state for an OAuth adapter, wrapped in `Arc` so it can be
@@ -105,7 +108,11 @@ pub struct OAuthAdapterInner {
 
 impl OAuthAdapterInner {
     /// Build an inner HttpAdapter with a Bearer token in the default headers.
-    fn build_inner_adapter(url: &str, access_token: &str) -> HttpAdapter {
+    fn build_inner_adapter(
+        url: &str,
+        access_token: &str,
+        server_type_override: Option<String>,
+    ) -> HttpAdapter {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .default_headers({
@@ -125,7 +132,9 @@ impl OAuthAdapterInner {
             })
             .build()
             .expect("failed to build HTTP client");
-        HttpAdapter::new_with_client(HttpConfig::new(url), client)
+        let mut http_config = HttpConfig::new(url);
+        http_config.server_type_override = server_type_override;
+        HttpAdapter::new_with_client(http_config, client)
     }
 
     /// Transition to a new `OAuthState`.
@@ -354,7 +363,11 @@ impl OAuthAdapterInner {
 
         // 3. Rebuild inner adapter
         let access_token = token_set.access_token.clone();
-        let mut adapter = Self::build_inner_adapter(&self.config.url, &access_token);
+        let mut adapter = Self::build_inner_adapter(
+            &self.config.url,
+            &access_token,
+            self.config.server_type_override.clone(),
+        );
         match adapter.initialize().await {
             Ok(()) => {
                 // Reflect the freshly initialized inner adapter's health
@@ -881,6 +894,7 @@ mod tests {
             heartbeat_interval_secs: 30,
             probe_timeout_secs: 10,
             probe_failure_threshold: 3,
+            server_type_override: None,
         }
     }
 

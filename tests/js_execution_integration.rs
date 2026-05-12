@@ -30,6 +30,7 @@ async fn setup_js_server(js_mode: bool) -> (SocketAddr, tokio::task::JoinHandle<
         command: "bash".to_string(),
         args: vec![echo_script_path().to_string_lossy().to_string()],
         env: HashMap::new(),
+        server_type_override: None,
     };
     let mut adapter = StdioAdapter::new(config);
     adapter.initialize().await.expect("adapter init failed");

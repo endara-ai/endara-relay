@@ -534,6 +534,7 @@ pub(crate) async fn create_adapter(
                 command: ep.command.clone().unwrap_or_default(),
                 args: ep.args.clone().unwrap_or_default(),
                 env: ep.env.clone().unwrap_or_default(),
+                server_type_override: ep.server_type_override.clone(),
             };
             let mut adapter = StdioAdapter::new(stdio_config);
             match adapter.initialize().await {
@@ -548,6 +549,7 @@ pub(crate) async fn create_adapter(
             let url = ep.url.clone().unwrap_or_default();
             let mut sse_config = SseConfig::new(url);
             sse_config.headers = ep.headers.clone().unwrap_or_default();
+            sse_config.server_type_override = ep.server_type_override.clone();
             let mut adapter = SseAdapter::new(sse_config);
             match adapter.initialize().await {
                 Ok(()) => Box::new(adapter),
@@ -561,6 +563,7 @@ pub(crate) async fn create_adapter(
             let url = ep.url.clone().unwrap_or_default();
             let mut http_config = HttpConfig::new(url);
             http_config.headers = ep.headers.clone().unwrap_or_default();
+            http_config.server_type_override = ep.server_type_override.clone();
             let mut adapter = HttpAdapter::new(http_config);
             match adapter.initialize().await {
                 Ok(()) => Box::new(adapter),
@@ -587,6 +590,7 @@ pub(crate) async fn create_adapter(
                 heartbeat_interval_secs: 30,
                 probe_timeout_secs: 10,
                 probe_failure_threshold: 3,
+                server_type_override: ep.server_type_override.clone(),
             };
 
             let mut adapter = OAuthAdapter::new(oauth_config, token_manager.clone());
@@ -724,6 +728,7 @@ mod tests {
             client_secret: None,
             scopes: None,
             token_endpoint: None,
+            server_type_override: None,
         }
     }
 
@@ -840,6 +845,7 @@ mod tests {
             client_secret: None,
             scopes: None,
             token_endpoint: None,
+            server_type_override: None,
         };
         let diff = ConfigDiff {
             changed: vec![("ep".to_string(), changed_ep)],
@@ -874,6 +880,7 @@ mod tests {
             client_secret: None,
             scopes: None,
             token_endpoint: None,
+            server_type_override: None,
         };
         let diff = ConfigDiff {
             added: vec![new_ep],
@@ -966,6 +973,7 @@ mod tests {
             client_secret: None,
             scopes: None,
             token_endpoint: None,
+            server_type_override: None,
         };
         let diff = ConfigDiff {
             added: vec![new_ep],
@@ -1256,6 +1264,7 @@ mod tests {
             client_secret: client_secret.map(|s| s.to_string()),
             scopes: None,
             token_endpoint: None,
+            server_type_override: None,
         }
     }
 

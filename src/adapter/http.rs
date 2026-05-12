@@ -1,4 +1,5 @@
 use super::server_name::{sanitize_server_name, ServerNameError};
+use super::server_type_resolution::effective_server_type;
 use super::stdio::RingBuffer;
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::jsonrpc::{self, JsonRpcResponse};
@@ -22,6 +23,9 @@ pub struct HttpConfig {
     pub timeout_secs: u64,
     /// Custom HTTP headers to include in every request.
     pub headers: HashMap<String, String>,
+    /// Optional override for the advertised `server_type` name. See
+    /// [`crate::adapter::server_type_resolution::effective_server_type`].
+    pub server_type_override: Option<String>,
 }
 
 impl HttpConfig {
@@ -30,6 +34,7 @@ impl HttpConfig {
             url: url.into(),
             timeout_secs: 30,
             headers: HashMap::new(),
+            server_type_override: None,
         }
     }
 
@@ -342,8 +347,21 @@ impl McpAdapter for HttpAdapter {
             }
         };
 
-        info!(url = %self.config.url, raw_name = %raw_name, sanitized = %sanitized, "MCP server reported serverInfo.name");
-        *self.server_type.write().await = Some(sanitized);
+        if let Some(ref ov) = self.config.server_type_override {
+            if sanitize_server_name(ov).is_err() {
+                warn!(
+                    override = %ov,
+                    "server_type_override failed sanitization; falling back to upstream-derived name"
+                );
+            }
+        }
+        let effective = effective_server_type(
+            self.config.server_type_override.clone(),
+            Some(sanitized.clone()),
+        );
+
+        info!(url = %self.config.url, raw_name = %raw_name, sanitized = %sanitized, effective = ?effective, "MCP server reported serverInfo.name");
+        *self.server_type.write().await = effective;
 
         // Per the MCP spec the client MUST send a notifications/initialized
         // notification after a successful initialize exchange.

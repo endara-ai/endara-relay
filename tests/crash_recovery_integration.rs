@@ -24,6 +24,7 @@ async fn test_crash_server_successful_calls_then_failure() {
         command: crash_server_bin(),
         args: vec!["--crash-after".to_string(), "5".to_string()],
         env: HashMap::new(),
+        server_type_override: None,
     };
 
     let mut adapter = StdioAdapter::new(config);
@@ -89,6 +90,7 @@ async fn test_crash_server_immediate_crash() {
         command: crash_server_bin(),
         args: vec!["--crash-after".to_string(), "2".to_string()],
         env: HashMap::new(),
+        server_type_override: None,
     };
 
     let mut adapter = StdioAdapter::new(config);

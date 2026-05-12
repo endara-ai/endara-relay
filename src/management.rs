@@ -702,6 +702,7 @@ async fn test_connection(Json(req): Json<TestConnectionRequest>) -> impl IntoRes
                 command: req.command.unwrap_or_default(),
                 args: req.args.unwrap_or_default(),
                 env: req.env.unwrap_or_default(),
+                ..Default::default()
             };
             Box::new(StdioAdapter::new(config))
         }
@@ -2618,6 +2619,7 @@ mod tests {
                 client_secret: None,
                 scopes: None,
                 token_endpoint: None,
+                server_type_override: None,
             }],
         }
     }
@@ -3572,6 +3574,7 @@ command = "echo"
             heartbeat_interval_secs: 30,
             probe_timeout_secs: 10,
             probe_failure_threshold: 3,
+            server_type_override: None,
         }
     }
 
@@ -4405,6 +4408,7 @@ command = "echo"
                 client_secret: config_secret.map(|s| s.to_string()),
                 scopes: None,
                 token_endpoint: None,
+                server_type_override: None,
             }],
         };
         let state = ManagementState {

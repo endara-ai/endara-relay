@@ -82,11 +82,12 @@ async fn test_stdio_valid_server_name_enters_ready_state() {
             .await
             .expect("endpoint did not enter Ready state");
 
-    // Verify server_name is present
+    // Verify server_name is present. The upstream advertises `bad-mcp`;
+    // the relay strips the `-mcp` suffix to advertise `bad`.
     assert_eq!(
         endpoint["lifecycle"]["server_name"].as_str(),
-        Some("bad-mcp"),
-        "expected server_name to be 'bad-mcp'"
+        Some("bad"),
+        "expected server_name to be 'bad' (stripped from 'bad-mcp')"
     );
 }
 
@@ -156,8 +157,5 @@ async fn test_endpoints_api_shows_ready_with_server_name() {
 
     // Verify the lifecycle structure
     assert_eq!(endpoint["lifecycle"]["state"].as_str(), Some("Ready"));
-    assert_eq!(
-        endpoint["lifecycle"]["server_name"].as_str(),
-        Some("bad-mcp")
-    );
+    assert_eq!(endpoint["lifecycle"]["server_name"].as_str(), Some("bad"));
 }

@@ -34,6 +34,7 @@ async fn test_config_diff_add_endpoint() {
         command: "bash".to_string(),
         args: vec![echo_script_path().to_string_lossy().to_string()],
         env: HashMap::new(),
+        server_type_override: None,
     };
     let mut echo_adapter = StdioAdapter::new(echo_config);
     echo_adapter.initialize().await.expect("echo init failed");
@@ -76,6 +77,7 @@ async fn test_config_diff_add_endpoint() {
             client_secret: None,
             scopes: None,
             token_endpoint: None,
+            server_type_override: None,
         }],
     };
 
@@ -104,6 +106,7 @@ async fn test_config_diff_add_endpoint() {
                 client_secret: None,
                 scopes: None,
                 token_endpoint: None,
+                server_type_override: None,
             },
             config::EndpointConfig {
                 name: "multi-ep".to_string(),
@@ -122,6 +125,7 @@ async fn test_config_diff_add_endpoint() {
                 client_secret: None,
                 scopes: None,
                 token_endpoint: None,
+                server_type_override: None,
             },
         ],
     };
@@ -159,6 +163,7 @@ async fn test_config_diff_remove_endpoint() {
         command: "bash".to_string(),
         args: vec![echo_script_path().to_string_lossy().to_string()],
         env: HashMap::new(),
+        server_type_override: None,
     };
     let mut echo_adapter = StdioAdapter::new(echo_config);
     echo_adapter.initialize().await.expect("echo init failed");
@@ -176,6 +181,7 @@ async fn test_config_diff_remove_endpoint() {
         command: multi_tool_bin(),
         args: vec![],
         env: HashMap::new(),
+        server_type_override: None,
     };
     let mut multi_adapter = StdioAdapter::new(multi_config);
     multi_adapter.initialize().await.expect("multi init failed");
@@ -218,6 +224,7 @@ async fn test_config_diff_remove_endpoint() {
                 client_secret: None,
                 scopes: None,
                 token_endpoint: None,
+                server_type_override: None,
             },
             config::EndpointConfig {
                 name: "multi-ep".to_string(),
@@ -236,6 +243,7 @@ async fn test_config_diff_remove_endpoint() {
                 client_secret: None,
                 scopes: None,
                 token_endpoint: None,
+                server_type_override: None,
             },
         ],
     };
@@ -264,6 +272,7 @@ async fn test_config_diff_remove_endpoint() {
             client_secret: None,
             scopes: None,
             token_endpoint: None,
+            server_type_override: None,
         }],
     };
 

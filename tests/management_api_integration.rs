@@ -102,6 +102,7 @@ fn test_config() -> Config {
             client_secret: None,
             scopes: None,
             token_endpoint: None,
+            server_type_override: None,
         }],
     }
 }
