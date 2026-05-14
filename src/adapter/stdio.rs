@@ -1,5 +1,5 @@
 use super::server_name::{sanitize_server_name, ServerNameError};
-use super::server_type_resolution::effective_server_type;
+use super::server_type_resolution::{effective_server_type, strip_mcp_server_suffix};
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::jsonrpc::{self, JsonRpcResponse};
 use crate::shell_env;
@@ -158,6 +158,10 @@ pub struct StdioAdapter {
     crash_tracker: Arc<Mutex<CrashTracker>>,
     /// Sanitized server name from the MCP initialize response.
     server_type: Arc<RwLock<Option<String>>>,
+    /// Upstream-derived server name (sanitized + suffix-stripped), captured
+    /// before any `server_type_override` resolution. See
+    /// [`McpAdapter::upstream_server_name`].
+    upstream_server_name: Arc<RwLock<Option<String>>>,
     /// Broadcast sender used to fan out `notifications/tools/list_changed`
     /// observations to subscribers (the registry's listener loop). Capacity is
     /// 16; `SendError` (no subscribers) is intentionally ignored.
@@ -181,6 +185,7 @@ impl StdioAdapter {
             request_id: AtomicU64::new(1),
             crash_tracker: Arc::new(Mutex::new(CrashTracker::new())),
             server_type: Arc::new(RwLock::new(None)),
+            upstream_server_name: Arc::new(RwLock::new(None)),
             tools_changed_tx,
             _stderr_handle: Arc::new(Mutex::new(None)),
             _stdout_handle: Arc::new(Mutex::new(None)),
@@ -432,9 +437,11 @@ impl StdioAdapter {
             self.config.server_type_override.clone(),
             Some(sanitized.clone()),
         );
+        let upstream_stripped = strip_mcp_server_suffix(sanitized.clone());
 
         info!(raw_name = %raw_name, sanitized = %sanitized, effective = ?effective, "MCP server reported serverInfo.name");
         *self.server_type.write().await = effective;
+        *self.upstream_server_name.write().await = Some(upstream_stripped);
 
         info!("MCP initialize handshake complete");
         Ok(())
@@ -478,6 +485,13 @@ impl McpAdapter for StdioAdapter {
 
     fn server_type(&self) -> Option<String> {
         self.server_type.try_read().ok().and_then(|g| g.clone())
+    }
+
+    fn upstream_server_name(&self) -> Option<String> {
+        self.upstream_server_name
+            .try_read()
+            .ok()
+            .and_then(|g| g.clone())
     }
 
     fn subscribe_tools_changed(&self) -> Option<broadcast::Receiver<()>> {

@@ -1,5 +1,5 @@
 use super::server_name::{sanitize_server_name, ServerNameError};
-use super::server_type_resolution::effective_server_type;
+use super::server_type_resolution::{effective_server_type, strip_mcp_server_suffix};
 use super::stdio::RingBuffer;
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::jsonrpc::{self, JsonRpcResponse};
@@ -129,6 +129,10 @@ pub struct SseAdapter {
     crash_tracker: Arc<Mutex<CrashTracker>>,
     /// Sanitized server name from the MCP initialize response.
     server_type: Arc<RwLock<Option<String>>>,
+    /// Upstream-derived server name (sanitized + suffix-stripped), captured
+    /// before any `server_type_override` resolution. See
+    /// [`McpAdapter::upstream_server_name`].
+    upstream_server_name: Arc<RwLock<Option<String>>>,
     /// Ring buffer recording tool call activity.
     activity_log: Arc<RwLock<RingBuffer>>,
     /// Handle for the background reconnect supervisor task.
@@ -183,6 +187,7 @@ impl SseAdapter {
             sse_handle: Arc::new(Mutex::new(None)),
             crash_tracker: Arc::new(Mutex::new(CrashTracker::new())),
             server_type: Arc::new(RwLock::new(None)),
+            upstream_server_name: Arc::new(RwLock::new(None)),
             activity_log: Arc::new(RwLock::new(RingBuffer::new(1000))),
             reconnect_handle: Arc::new(Mutex::new(None)),
             reconnect_notify: Arc::new(Notify::new()),
@@ -550,9 +555,11 @@ impl SseAdapter {
             self.config.server_type_override.clone(),
             Some(sanitized.clone()),
         );
+        let upstream_stripped = strip_mcp_server_suffix(sanitized.clone());
 
         debug!(url = %self.config.url, raw_name = %raw_name, sanitized = %sanitized, effective = ?effective, "MCP server reported serverInfo.name");
         *self.server_type.write().await = effective;
+        *self.upstream_server_name.write().await = Some(upstream_stripped);
         *self.health.write().await = HealthStatus::Healthy;
         self.crash_tracker.lock().await.reset();
         // Emit a tick after every successful (re)connect + handshake so any
@@ -682,6 +689,13 @@ impl McpAdapter for SseAdapter {
 
     fn server_type(&self) -> Option<String> {
         self.server_type.try_read().ok().and_then(|g| g.clone())
+    }
+
+    fn upstream_server_name(&self) -> Option<String> {
+        self.upstream_server_name
+            .try_read()
+            .ok()
+            .and_then(|g| g.clone())
     }
 
     fn subscribe_tools_changed(&self) -> Option<broadcast::Receiver<()>> {

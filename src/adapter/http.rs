@@ -1,5 +1,5 @@
 use super::server_name::{sanitize_server_name, ServerNameError};
-use super::server_type_resolution::effective_server_type;
+use super::server_type_resolution::{effective_server_type, strip_mcp_server_suffix};
 use super::stdio::RingBuffer;
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::jsonrpc::{self, JsonRpcResponse};
@@ -53,6 +53,11 @@ pub struct HttpAdapter {
     request_id: AtomicU64,
     /// Sanitized server name from the MCP initialize response.
     server_type: Arc<RwLock<Option<String>>>,
+    /// Upstream-derived server name (sanitized + suffix-stripped), captured
+    /// before any `server_type_override` resolution. Surfaced via
+    /// [`McpAdapter::upstream_server_name`] so the management API can show the
+    /// default name the upstream reports.
+    upstream_server_name: Arc<RwLock<Option<String>>>,
     /// Ring buffer recording tool call activity.
     activity_log: Arc<RwLock<RingBuffer>>,
 }
@@ -100,6 +105,7 @@ impl HttpAdapter {
             health: Arc::new(RwLock::new(HealthStatus::Stopped)),
             request_id: AtomicU64::new(1),
             server_type: Arc::new(RwLock::new(None)),
+            upstream_server_name: Arc::new(RwLock::new(None)),
             activity_log: Arc::new(RwLock::new(RingBuffer::new(1000))),
         }
     }
@@ -114,6 +120,7 @@ impl HttpAdapter {
             health: Arc::new(RwLock::new(HealthStatus::Stopped)),
             request_id: AtomicU64::new(1),
             server_type: Arc::new(RwLock::new(None)),
+            upstream_server_name: Arc::new(RwLock::new(None)),
             activity_log: Arc::new(RwLock::new(RingBuffer::new(1000))),
         }
     }
@@ -359,9 +366,11 @@ impl McpAdapter for HttpAdapter {
             self.config.server_type_override.clone(),
             Some(sanitized.clone()),
         );
+        let upstream_stripped = strip_mcp_server_suffix(sanitized.clone());
 
         info!(url = %self.config.url, raw_name = %raw_name, sanitized = %sanitized, effective = ?effective, "MCP server reported serverInfo.name");
         *self.server_type.write().await = effective;
+        *self.upstream_server_name.write().await = Some(upstream_stripped);
 
         // Per the MCP spec the client MUST send a notifications/initialized
         // notification after a successful initialize exchange.
@@ -420,6 +429,13 @@ impl McpAdapter for HttpAdapter {
 
     fn server_type(&self) -> Option<String> {
         self.server_type.try_read().ok().and_then(|g| g.clone())
+    }
+
+    fn upstream_server_name(&self) -> Option<String> {
+        self.upstream_server_name
+            .try_read()
+            .ok()
+            .and_then(|g| g.clone())
     }
 
     async fn shutdown(&mut self) -> Result<(), AdapterError> {
