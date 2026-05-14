@@ -25,10 +25,6 @@ class EndaraRelay < Formula
       url "https://github.com/endara-ai/endara-relay/releases/download/v#{{version}}/endara-relay-v#{{version}}-aarch64-apple-darwin.tar.gz"
       sha256 "{sha_arm64_darwin}"
     end
-    on_intel do
-      url "https://github.com/endara-ai/endara-relay/releases/download/v#{{version}}/endara-relay-v#{{version}}-x86_64-apple-darwin.tar.gz"
-      sha256 "{sha_x64_darwin}"
-    end
   end
 
   on_linux do
@@ -56,14 +52,12 @@ end
 def render(
     version: str,
     sha_arm64_darwin: str,
-    sha_x64_darwin: str,
     sha_arm64_linux: str,
     sha_x64_linux: str,
 ) -> str:
     return FORMULA_TEMPLATE.format(
         version=version,
         sha_arm64_darwin=sha_arm64_darwin,
-        sha_x64_darwin=sha_x64_darwin,
         sha_arm64_linux=sha_arm64_linux,
         sha_x64_linux=sha_x64_linux,
     )
@@ -73,7 +67,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--version", required=True, help="Version without leading 'v', e.g. 0.1.1")
     parser.add_argument("--sha256-arm64-darwin", required=True, dest="sha_arm64_darwin")
-    parser.add_argument("--sha256-x64-darwin", required=True, dest="sha_x64_darwin")
     parser.add_argument("--sha256-arm64-linux", required=True, dest="sha_arm64_linux")
     parser.add_argument("--sha256-x64-linux", required=True, dest="sha_x64_linux")
     parser.add_argument(
@@ -93,7 +86,6 @@ def main(argv: list[str] | None = None) -> int:
     rendered = render(
         version=args.version,
         sha_arm64_darwin=args.sha_arm64_darwin,
-        sha_x64_darwin=args.sha_x64_darwin,
         sha_arm64_linux=args.sha_arm64_linux,
         sha_x64_linux=args.sha_x64_linux,
     )

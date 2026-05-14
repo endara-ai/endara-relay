@@ -24,9 +24,6 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             binary: endara-relay
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            binary: endara-relay
           - target: aarch64-apple-darwin
             os: macos-latest
             binary: endara-relay
@@ -187,7 +184,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p archives
-          for target in aarch64-apple-darwin x86_64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
+          for target in aarch64-apple-darwin aarch64-unknown-linux-gnu x86_64-unknown-linux-gnu; do
             asset="endara-relay-v${VERSION}-${target}.tar.gz"
             echo "Downloading ${asset} from release ${TAG}..."
             gh release download "${TAG}" \
@@ -220,12 +217,10 @@ jobs:
             printf '%s' "$sum"
           }
           sha_arm64_darwin=$(compute "archives/endara-relay-v${VERSION}-aarch64-apple-darwin.tar.gz")
-          sha_x64_darwin=$(compute "archives/endara-relay-v${VERSION}-x86_64-apple-darwin.tar.gz")
           sha_arm64_linux=$(compute "archives/endara-relay-v${VERSION}-aarch64-unknown-linux-gnu.tar.gz")
           sha_x64_linux=$(compute "archives/endara-relay-v${VERSION}-x86_64-unknown-linux-gnu.tar.gz")
           {
             echo "arm64_darwin=${sha_arm64_darwin}"
-            echo "x64_darwin=${sha_x64_darwin}"
             echo "arm64_linux=${sha_arm64_linux}"
             echo "x64_linux=${sha_x64_linux}"
           } >> "$GITHUB_OUTPUT"
@@ -258,7 +253,6 @@ jobs:
         env:
           VERSION: ${{ steps.version.outputs.version }}
           SHA_ARM64_DARWIN: ${{ steps.sha.outputs.arm64_darwin }}
-          SHA_X64_DARWIN: ${{ steps.sha.outputs.x64_darwin }}
           SHA_ARM64_LINUX: ${{ steps.sha.outputs.arm64_linux }}
           SHA_X64_LINUX: ${{ steps.sha.outputs.x64_linux }}
         run: |
@@ -266,7 +260,6 @@ jobs:
           python3 relay/scripts/update-formula.py \
             --version "$VERSION" \
             --sha256-arm64-darwin "$SHA_ARM64_DARWIN" \
-            --sha256-x64-darwin "$SHA_X64_DARWIN" \
             --sha256-arm64-linux "$SHA_ARM64_LINUX" \
             --sha256-x64-linux "$SHA_X64_LINUX" \
             --formula-path homebrew-tap/Formula/endara-relay.rb
