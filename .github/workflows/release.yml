@@ -43,6 +43,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}
+      # macos-latest (and sometimes pinned macOS images) ship a rustup-init
+      # shim at /usr/local/bin/cargo that wins on PATH over the
+      # dtolnay-installed ~/.cargo/bin/cargo. The shim rejects 'cargo build'
+      # with "error: unexpected argument 'build' found" and burned
+      # v0.1.6-rc.6 (run 25864172650). Remove the shims so the toolchain
+      # cargo wins.
+      - name: Clear rustup-init shim (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          sudo rm -f /usr/local/bin/cargo /usr/local/bin/rustc /usr/local/bin/rustup
+          which cargo
+          cargo --version
       - uses: swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: build-${{ matrix.target }}
