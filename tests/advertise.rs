@@ -1,7 +1,7 @@
 //! Integration tests for `Advertise Connected Servers to the Model` (spec §5).
 //!
 //! Verifies that:
-//!   * `InitializeResult.instructions` is present with `Connected servers: …`
+//!   * `InitializeResult.instructions` is present with `Connected server types: …`
 //!     when at least one adapter is `Healthy`, and omitted otherwise.
 //!   * The dynamic descriptions for `list_tools`, `search_tools`, and
 //!     `execute_tools` reflect the currently-Healthy server set.
@@ -96,7 +96,7 @@ fn meta_tool_description<'a>(tools: &'a [Value], name: &str) -> &'a str {
 #[tokio::test]
 async fn instructions_omitted_when_no_healthy_servers() {
     // bad-server with `--omit-server-name` enters Failed → registry has zero
-    // Healthy adapters → no instructions field, no `Connected servers:` suffix.
+    // Healthy adapters → no instructions field, no `Connected server types:` suffix.
     let config = ConfigBuilder::new()
         .add_stdio("bad-server", &bad_server_bin(), &["--omit-server-name"])
         .build();
@@ -121,8 +121,8 @@ async fn instructions_omitted_when_no_healthy_servers() {
     );
     let search_desc = meta_tool_description(&tools, "search_tools");
     assert!(
-        !search_desc.contains("Connected servers:"),
-        "search_tools must not append Connected servers list when none are Healthy: {search_desc}"
+        !search_desc.contains("Connected server types:"),
+        "search_tools must not append Connected server types list when none are Healthy: {search_desc}"
     );
 }
 
@@ -148,7 +148,7 @@ async fn instructions_and_descriptions_reflect_healthy_server() {
         .expect("instructions should be present once an adapter is Healthy");
     assert_eq!(
         instructions,
-        format!("{}\n\nConnected servers: bad", INSTRUCTIONS_LEAD_IN),
+        format!("{}\n\nConnected server types: bad", INSTRUCTIONS_LEAD_IN),
         "unexpected instructions string: {instructions}"
     );
 
@@ -162,8 +162,8 @@ async fn instructions_and_descriptions_reflect_healthy_server() {
     );
     let search_desc = meta_tool_description(&tools, "search_tools");
     assert!(
-        search_desc.ends_with("\n\nConnected servers: bad"),
-        "search_tools description missing Connected servers footer: {search_desc}"
+        search_desc.ends_with("\n\nConnected server types: bad"),
+        "search_tools description missing Connected server types footer: {search_desc}"
     );
 }
 
@@ -189,7 +189,7 @@ async fn failed_adapters_are_not_advertised() {
         .expect("instructions should be present");
     assert_eq!(
         instructions,
-        format!("{}\n\nConnected servers: bad", INSTRUCTIONS_LEAD_IN),
+        format!("{}\n\nConnected server types: bad", INSTRUCTIONS_LEAD_IN),
         "Failed adapter should be excluded; got: {instructions}"
     );
 
@@ -232,7 +232,7 @@ async fn multi_distinct_types_rendered_in_alphabetical_order() {
     assert_eq!(
         instructions,
         format!(
-            "{}\n\nConnected servers: {}",
+            "{}\n\nConnected server types: {}",
             INSTRUCTIONS_LEAD_IN, expected_list
         ),
         "instructions string did not match spec §3.2 format: {instructions}"
@@ -248,7 +248,7 @@ async fn multi_distinct_types_rendered_in_alphabetical_order() {
     );
     let search_desc = meta_tool_description(&tools, "search_tools");
     assert!(
-        search_desc.ends_with(&format!("\n\nConnected servers: {}", expected_list)),
+        search_desc.ends_with(&format!("\n\nConnected server types: {}", expected_list)),
         "search_tools description does not end with full alphabetised list: {search_desc}"
     );
     // execute_tools is hidden when JS mode is off; covered separately.
@@ -286,7 +286,7 @@ async fn hot_reload_kill_endpoint_drops_from_advertised_list() {
     let tools = raw_tools_list(&harness).await;
     let search_desc = meta_tool_description(&tools, "search_tools");
     assert!(
-        search_desc.ends_with("\n\nConnected servers: alpha, zebra"),
+        search_desc.ends_with("\n\nConnected server types: alpha, zebra"),
         "expected mango to be removed from search_tools description: {search_desc}"
     );
     let init = raw_initialize(&harness).await;
@@ -331,7 +331,7 @@ async fn hot_reload_add_endpoint_appears_in_advertised_list() {
     let tools = raw_tools_list(&harness).await;
     let search_desc = meta_tool_description(&tools, "search_tools");
     assert!(
-        search_desc.ends_with("\n\nConnected servers: alpha, mango, zebra"),
+        search_desc.ends_with("\n\nConnected server types: alpha, mango, zebra"),
         "expected mango to appear in alphabetised list: {search_desc}"
     );
 }
@@ -360,7 +360,7 @@ async fn duplicate_type_dedupes_but_count_includes_both() {
         .expect("instructions should be present");
     assert_eq!(
         instructions,
-        format!("{}\n\nConnected servers: alpha", INSTRUCTIONS_LEAD_IN),
+        format!("{}\n\nConnected server types: alpha", INSTRUCTIONS_LEAD_IN),
         "duplicate type should dedupe to a single entry: {instructions}"
     );
 
@@ -374,7 +374,7 @@ async fn duplicate_type_dedupes_but_count_includes_both() {
     );
     let search_desc = meta_tool_description(&tools, "search_tools");
     assert!(
-        search_desc.ends_with("\n\nConnected servers: alpha"),
+        search_desc.ends_with("\n\nConnected server types: alpha"),
         "search_tools description should carry deduplicated single entry: {search_desc}"
     );
 }
