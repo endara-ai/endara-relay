@@ -115,7 +115,7 @@ impl<'a> ServerTypeList<'a> {
     }
 }
 
-/// Lead-in sentence prepended to the `Connected servers: …` line in
+/// Lead-in sentence prepended to the `Connected server types: …` line in
 /// `InitializeResult.instructions`. Per Engineering Spec §3.2, the literal
 /// blank line between the lead-in and the server list is part of the payload.
 pub const INSTRUCTIONS_LEAD_IN: &str =
@@ -125,17 +125,19 @@ pub const INSTRUCTIONS_LEAD_IN: &str =
 /// adapter is currently `Healthy` with a `server_type`, so the field is
 /// omitted from the response (per spec §2.1).
 pub async fn instructions(registry: &AdapterRegistry) -> Option<String> {
-    ServerTypeList::new(registry)
-        .render()
-        .await
-        .map(|list| format!("{}\n\nConnected servers: {}", INSTRUCTIONS_LEAD_IN, list))
+    ServerTypeList::new(registry).render().await.map(|list| {
+        format!(
+            "{}\n\nConnected server types: {}",
+            INSTRUCTIONS_LEAD_IN, list
+        )
+    })
 }
 
-/// Build the `search_tools` description. Appends `\n\nConnected servers: {list}`
+/// Build the `search_tools` description. Appends `\n\nConnected server types: {list}`
 /// when the registry has at least one Healthy adapter with a `server_type`.
 pub async fn search_tools_description(registry: &AdapterRegistry) -> String {
     match ServerTypeList::new(registry).render().await {
-        Some(list) => format!("{}\n\nConnected servers: {}", SEARCH_TOOLS_BASE, list),
+        Some(list) => format!("{}\n\nConnected server types: {}", SEARCH_TOOLS_BASE, list),
         None => SEARCH_TOOLS_BASE.to_string(),
     }
 }
@@ -339,7 +341,7 @@ mod tests {
         register(&reg, "ep2", MockAdapter::ready("gmail")).await;
         let desc = search_tools_description(&reg).await;
         assert!(desc.starts_with(SEARCH_TOOLS_BASE));
-        assert!(desc.ends_with("\n\nConnected servers: github, gmail"));
+        assert!(desc.ends_with("\n\nConnected server types: github, gmail"));
     }
 
     #[tokio::test]
