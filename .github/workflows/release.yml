@@ -24,9 +24,9 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
             binary: endara-relay
-          # pinned to macos-14 — macos-latest (macos-15) ships a rustup-init shim that breaks 'cargo build' in our notarized release path; CI.yml on macos-latest stays unaffected. See burned tags v0.1.6-rc.{2,3,4} (run 25841684545).
+          # rustup-init shim on macos-latest is cleared explicitly by the 'Clear rustup-init shim (macOS)' step below, so macos-latest is safe again.
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-latest
             binary: endara-relay
           - target: x86_64-pc-windows-msvc
             os: windows-latest
