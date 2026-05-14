@@ -128,6 +128,19 @@ pub trait McpAdapter: Send + Sync {
         None
     }
 
+    /// Upstream-derived server name (sanitized + suffix-stripped) independent
+    /// of any `server_type_override`. Returns `None` until the initialize
+    /// handshake has populated it; adapters that do not capture
+    /// `serverInfo.name` keep the default.
+    ///
+    /// This mirrors what [`McpAdapter::server_type`] would have returned if no
+    /// override were configured, and lets the management API surface the
+    /// "default name the upstream reports" alongside the effective name so the
+    /// desktop UI can show users what they would revert to.
+    fn upstream_server_name(&self) -> Option<String> {
+        None
+    }
+
     /// Subscribe to MCP `notifications/tools/list_changed` ticks emitted by the
     /// underlying server. Each `recv()` represents at least one change
     /// notification observed since the previous receive; the registry treats

@@ -70,9 +70,16 @@ pub enum Lifecycle {
     Initializing,
     /// Adapter is ready and healthy.
     Ready {
-        /// Sanitized server name from MCP serverInfo.name.
+        /// Effective server name (after `server_type_override` resolution),
+        /// derived from the sanitized MCP `serverInfo.name`.
         #[serde(skip_serializing_if = "Option::is_none")]
         server_name: Option<String>,
+        /// Upstream-reported server name (sanitized + suffix-stripped),
+        /// independent of any `server_type_override`. Equals `server_name`
+        /// when no override is configured. Surfaced so the desktop UI can
+        /// show the user the default they would revert to.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        server_name_raw: Option<String>,
     },
     /// Adapter failed to initialize or is unhealthy.
     Failed {
@@ -228,11 +235,15 @@ async fn get_endpoints(State(state): State<ManagementState>) -> Json<Vec<Endpoin
                         .map(|t| t.len())
                         .unwrap_or(0);
                     let server_name = entry.adapter.server_type();
+                    let server_name_raw = entry.adapter.upstream_server_name();
                     (
                         "healthy".to_string(),
                         count,
                         None,
-                        Lifecycle::Ready { server_name },
+                        Lifecycle::Ready {
+                            server_name,
+                            server_name_raw,
+                        },
                     )
                 }
                 HealthStatus::Unhealthy(reason) => {

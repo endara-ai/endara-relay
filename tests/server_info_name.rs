@@ -158,4 +158,53 @@ async fn test_endpoints_api_shows_ready_with_server_name() {
     // Verify the lifecycle structure
     assert_eq!(endpoint["lifecycle"]["state"].as_str(), Some("Ready"));
     assert_eq!(endpoint["lifecycle"]["server_name"].as_str(), Some("bad"));
+    // Without a server_type_override, server_name_raw mirrors server_name
+    // (both derived from the sanitized + suffix-stripped upstream name).
+    assert_eq!(
+        endpoint["lifecycle"]["server_name_raw"].as_str(),
+        Some("bad"),
+        "expected server_name_raw to mirror server_name when no override is set"
+    );
+}
+
+/// Test 7: With `server_type_override` set, `server_name` reflects the override
+/// while `server_name_raw` continues to surface the upstream-derived name.
+#[tokio::test]
+async fn test_endpoints_api_server_name_raw_independent_of_override() {
+    // Build a config inline so we can set `server_type_override` on the
+    // endpoint without extending the shared ConfigBuilder.
+    let bin = bad_server_bin();
+    let config = format!(
+        "[relay]\n\
+         machine_name = \"integration-test\"\n\
+         allow_insecure_oauth = true\n\
+         \n\
+         [[endpoints]]\n\
+         name = \"good-server\"\n\
+         transport = \"stdio\"\n\
+         command = \"{}\"\n\
+         server_type_override = \"custom-name\"\n",
+        bin
+    );
+
+    let harness = RelayHarness::start(&config).await;
+
+    let endpoint =
+        wait_for_lifecycle_state(&harness, "good-server", "Ready", Duration::from_secs(10))
+            .await
+            .expect("endpoint did not enter Ready state");
+
+    assert_eq!(endpoint["lifecycle"]["state"].as_str(), Some("Ready"));
+    // Effective name reflects the override (no `-mcp` strip applied to overrides).
+    assert_eq!(
+        endpoint["lifecycle"]["server_name"].as_str(),
+        Some("custom-name"),
+        "expected server_name to reflect the override"
+    );
+    // Raw name continues to surface the upstream-derived value (`bad-mcp` → `bad`).
+    assert_eq!(
+        endpoint["lifecycle"]["server_name_raw"].as_str(),
+        Some("bad"),
+        "expected server_name_raw to surface the upstream-derived name independent of the override"
+    );
 }

@@ -827,6 +827,14 @@ impl McpAdapter for OAuthAdapter {
             .and_then(|g| g.as_ref().and_then(|a| a.server_type()))
     }
 
+    fn upstream_server_name(&self) -> Option<String> {
+        self.inner
+            .inner_adapter
+            .try_read()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|a| a.upstream_server_name()))
+    }
+
     async fn shutdown(&mut self) -> Result<(), AdapterError> {
         // Abort heartbeat task
         {
