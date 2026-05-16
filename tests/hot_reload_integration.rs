@@ -35,6 +35,7 @@ async fn test_config_diff_add_endpoint() {
         args: vec![echo_script_path().to_string_lossy().to_string()],
         env: HashMap::new(),
         server_type_override: None,
+        endpoint_name: "echo-ep".into(),
     };
     let mut echo_adapter = StdioAdapter::new(echo_config);
     echo_adapter.initialize().await.expect("echo init failed");
@@ -164,6 +165,7 @@ async fn test_config_diff_remove_endpoint() {
         args: vec![echo_script_path().to_string_lossy().to_string()],
         env: HashMap::new(),
         server_type_override: None,
+        endpoint_name: "echo-ep".into(),
     };
     let mut echo_adapter = StdioAdapter::new(echo_config);
     echo_adapter.initialize().await.expect("echo init failed");
@@ -182,6 +184,7 @@ async fn test_config_diff_remove_endpoint() {
         args: vec![],
         env: HashMap::new(),
         server_type_override: None,
+        endpoint_name: "multi-ep".into(),
     };
     let mut multi_adapter = StdioAdapter::new(multi_config);
     multi_adapter.initialize().await.expect("multi init failed");

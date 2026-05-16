@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::task::AbortHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// A registered adapter with its metadata.
 pub struct RegisteredAdapter {
@@ -487,6 +487,12 @@ impl AdapterRegistry {
             )));
         }
 
+        info!(
+            tool = %tool,
+            endpoint = %endpoint,
+            prefixed = %prefixed_name,
+            "Routing tool call"
+        );
         entry.adapter.call_tool(tool, arguments).await
     }
 }
