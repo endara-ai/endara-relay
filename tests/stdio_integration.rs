@@ -18,6 +18,7 @@ async fn test_stdio_full_lifecycle() {
         args: vec![fixture_path().to_string_lossy().to_string()],
         env: HashMap::new(),
         server_type_override: None,
+        endpoint_name: "stdio-test".into(),
     };
 
     let mut adapter = StdioAdapter::new(config);
@@ -60,6 +61,7 @@ async fn test_stdio_spawn_nonexistent_command() {
         args: vec![],
         env: HashMap::new(),
         server_type_override: None,
+        endpoint_name: "stdio-nonexistent".into(),
     };
 
     let mut adapter = StdioAdapter::new(config);

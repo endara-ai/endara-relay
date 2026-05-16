@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::time::{Duration, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 /// Configuration for spawning a STDIO MCP server.
 #[derive(Debug, Clone, Default)]
@@ -24,6 +24,10 @@ pub struct StdioConfig {
     /// Optional override for the advertised `server_type` name. See
     /// [`crate::adapter::server_type_resolution::effective_server_type`].
     pub server_type_override: Option<String>,
+    /// Endpoint name (used as the `endpoint` field on the adapter's
+    /// per-endpoint `tracing` span). Defaults to empty for direct test
+    /// construction; production paths set this from `EndpointConfig::name`.
+    pub endpoint_name: String,
 }
 
 /// Ring buffer that stores the last N lines of stderr output.
@@ -166,6 +170,10 @@ pub struct StdioAdapter {
     /// observations to subscribers (the registry's listener loop). Capacity is
     /// 16; `SendError` (no subscribers) is intentionally ignored.
     tools_changed_tx: broadcast::Sender<()>,
+    /// Per-endpoint tracing span. Every adapter method instruments its async
+    /// body with this span so events carry `endpoint`/`transport` (and
+    /// `server_type` once the MCP handshake completes).
+    span: tracing::Span,
     // Background task handles
     _stderr_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     _stdout_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -175,6 +183,12 @@ impl StdioAdapter {
     /// Create a new StdioAdapter with the given configuration.
     pub fn new(config: StdioConfig) -> Self {
         let (tools_changed_tx, _) = broadcast::channel(16);
+        let span = tracing::info_span!(
+            "endpoint",
+            endpoint = %config.endpoint_name,
+            transport = "stdio",
+            server_type = tracing::field::Empty,
+        );
         Self {
             config,
             child: Arc::new(Mutex::new(None)),
@@ -187,6 +201,7 @@ impl StdioAdapter {
             server_type: Arc::new(RwLock::new(None)),
             upstream_server_name: Arc::new(RwLock::new(None)),
             tools_changed_tx,
+            span,
             _stderr_handle: Arc::new(Mutex::new(None)),
             _stdout_handle: Arc::new(Mutex::new(None)),
         }
@@ -440,6 +455,10 @@ impl StdioAdapter {
         let upstream_stripped = strip_mcp_server_suffix(sanitized.clone());
 
         info!(raw_name = %raw_name, sanitized = %sanitized, effective = ?effective, "MCP server reported serverInfo.name");
+        if let Some(ref name) = effective {
+            self.span
+                .record("server_type", tracing::field::display(name));
+        }
         *self.server_type.write().await = effective;
         *self.upstream_server_name.write().await = Some(upstream_stripped);
 
@@ -451,28 +470,58 @@ impl StdioAdapter {
 #[async_trait]
 impl McpAdapter for StdioAdapter {
     async fn initialize(&mut self) -> Result<(), AdapterError> {
-        self.spawn_process().await?;
-        self.mcp_initialize().await?;
-        *self.health.write().await = HealthStatus::Healthy;
-        self.crash_tracker.lock().await.reset();
-        Ok(())
+        async {
+            self.spawn_process().await?;
+            self.mcp_initialize().await?;
+            *self.health.write().await = HealthStatus::Healthy;
+            self.crash_tracker.lock().await.reset();
+            Ok(())
+        }
+        .instrument(self.span.clone())
+        .await
     }
 
     async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
-        let result = self.send_request("tools/list", None).await?;
-        let tools_value = result
-            .get("tools")
-            .ok_or_else(|| AdapterError::ProtocolError("missing 'tools' field".into()))?;
-        let tools: Vec<ToolInfo> = serde_json::from_value(tools_value.clone())?;
-        Ok(tools)
+        async {
+            let result = self.send_request("tools/list", None).await?;
+            let tools_value = result
+                .get("tools")
+                .ok_or_else(|| AdapterError::ProtocolError("missing 'tools' field".into()))?;
+            let tools: Vec<ToolInfo> = serde_json::from_value(tools_value.clone())?;
+            Ok(tools)
+        }
+        .instrument(self.span.clone())
+        .await
     }
 
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
-        let params = json!({
-            "name": name,
-            "arguments": arguments,
-        });
-        self.send_request("tools/call", Some(params)).await
+        async {
+            let params = json!({
+                "name": name,
+                "arguments": arguments,
+            });
+            let start = Instant::now();
+            let result = self.send_request("tools/call", Some(params)).await;
+            let duration_ms = start.elapsed().as_millis();
+            match &result {
+                Ok(_) => tracing::info!(
+                    tool = %name,
+                    status = "ok",
+                    duration_ms = duration_ms,
+                    "Tool call completed"
+                ),
+                Err(e) => tracing::warn!(
+                    tool = %name,
+                    status = "error",
+                    duration_ms = duration_ms,
+                    error = %e,
+                    "Tool call failed"
+                ),
+            }
+            result
+        }
+        .instrument(self.span.clone())
+        .await
     }
 
     fn health(&self) -> HealthStatus {
@@ -509,53 +558,57 @@ impl McpAdapter for StdioAdapter {
     }
 
     async fn shutdown(&mut self) -> Result<(), AdapterError> {
-        *self.health.write().await = HealthStatus::Stopped;
+        async {
+            *self.health.write().await = HealthStatus::Stopped;
 
-        // Try graceful close via stdin
-        if let Some(stdin) = self.stdin_writer.lock().await.take() {
-            drop(stdin);
-        }
-
-        // Drop all pending request senders — waiting callers will get RecvError
-        {
-            let mut pending = self.pending_requests.lock().await;
-            let count = pending.len();
-            pending.clear();
-            if count > 0 {
-                debug!(count = count, "dropped pending requests during shutdown");
+            // Try graceful close via stdin
+            if let Some(stdin) = self.stdin_writer.lock().await.take() {
+                drop(stdin);
             }
-        }
 
-        // Try to kill the child process
-        if let Some(mut child) = self.child.lock().await.take() {
-            // Send SIGTERM (kill on unix sends SIGKILL, so we use start_kill)
-            let _ = child.start_kill();
-
-            // Wait up to 5 seconds for graceful shutdown
-            match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
-                Ok(Ok(status)) => {
-                    info!(exit_code = ?status.code(), "MCP server exited");
-                }
-                Ok(Err(e)) => {
-                    warn!(error = %e, "error waiting for MCP server exit");
-                }
-                Err(_) => {
-                    warn!("MCP server did not exit within 5s, force killing");
-                    let _ = child.kill().await;
+            // Drop all pending request senders — waiting callers will get RecvError
+            {
+                let mut pending = self.pending_requests.lock().await;
+                let count = pending.len();
+                pending.clear();
+                if count > 0 {
+                    debug!(count = count, "dropped pending requests during shutdown");
                 }
             }
-        }
 
-        // Abort background tasks
-        if let Some(h) = self._stderr_handle.lock().await.take() {
-            h.abort();
-        }
-        if let Some(h) = self._stdout_handle.lock().await.take() {
-            h.abort();
-        }
+            // Try to kill the child process
+            if let Some(mut child) = self.child.lock().await.take() {
+                // Send SIGTERM (kill on unix sends SIGKILL, so we use start_kill)
+                let _ = child.start_kill();
 
-        info!("STDIO adapter shut down");
-        Ok(())
+                // Wait up to 5 seconds for graceful shutdown
+                match tokio::time::timeout(Duration::from_secs(5), child.wait()).await {
+                    Ok(Ok(status)) => {
+                        info!(exit_code = ?status.code(), "MCP server exited");
+                    }
+                    Ok(Err(e)) => {
+                        warn!(error = %e, "error waiting for MCP server exit");
+                    }
+                    Err(_) => {
+                        warn!("MCP server did not exit within 5s, force killing");
+                        let _ = child.kill().await;
+                    }
+                }
+            }
+
+            // Abort background tasks
+            if let Some(h) = self._stderr_handle.lock().await.take() {
+                h.abort();
+            }
+            if let Some(h) = self._stdout_handle.lock().await.take() {
+                h.abort();
+            }
+
+            info!("STDIO adapter shut down");
+            Ok(())
+        }
+        .instrument(self.span.clone())
+        .await
     }
 }
 

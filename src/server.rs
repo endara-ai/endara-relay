@@ -24,7 +24,7 @@ use tokio::net::TcpListener;
 
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::{AllowOrigin, CorsLayer};
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, Instrument};
 
 /// Application state shared across all routes.
 #[derive(Clone)]
@@ -290,108 +290,117 @@ async fn mcp_tools_call(
 /// Handle a single JSON-RPC message object, returning `None` for notifications
 /// (which get 202 Accepted) or `Some(Value)` for requests that need a response.
 async fn handle_single_message(state: &AppState, msg: Value, headers_str: &str) -> Option<Value> {
-    let start = Instant::now();
     let method = msg
         .get("method")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    let is_notification = msg.get("id").is_none() || msg.get("id") == Some(&Value::Null);
-    let req_bytes = serde_json::to_string(&msg).map(|s| s.len()).unwrap_or(0);
+    let id_str = msg
+        .get("id")
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let span = tracing::info_span!("request", method = %method, id = %id_str);
+    async move {
+        let start = Instant::now();
+        let is_notification = msg.get("id").is_none() || msg.get("id") == Some(&Value::Null);
+        let req_bytes = serde_json::to_string(&msg).map(|s| s.len()).unwrap_or(0);
 
-    // Notifications (no `id` field) get 202 Accepted with no body per MCP spec.
-    if is_notification {
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        info!(
-            method = %method,
-            elapsed_ms = elapsed_ms,
-            req_bytes = req_bytes,
-            resp_bytes = 0,
-            status = 202,
-            headers = %headers_str,
-            "MCP notification"
-        );
-        return None;
-    }
-
-    // Deserialize as JsonRpcBody for dispatch
-    let body: JsonRpcBody = match serde_json::from_value(msg) {
-        Ok(b) => b,
-        Err(_) => {
-            return Some(json!({
-                "jsonrpc": "2.0",
-                "error": { "code": -32600, "message": "Invalid Request" },
-                "id": null,
-            }));
-        }
-    };
-
-    let result: Result<Json<Value>, (StatusCode, Json<Value>)> = match method.as_str() {
-        "initialize" => Ok(mcp_initialize(State(state.clone()), Json(body)).await),
-        "tools/list" => Ok(mcp_tools_list(State(state.clone()), Json(body)).await),
-        "tools/call" => mcp_tools_call(State(state.clone()), Json(body)).await,
-        _ => Err(jsonrpc_error(
-            body.id,
-            -32601,
-            &format!("method not found: {}", method),
-        )),
-    };
-
-    let elapsed_ms = start.elapsed().as_millis() as u64;
-    let resp_value = match result {
-        Ok(Json(resp)) => {
-            let resp_bytes = serde_json::to_string(&resp).map(|s| s.len()).unwrap_or(0);
+        // Notifications (no `id` field) get 202 Accepted with no body per MCP spec.
+        if is_notification {
+            let elapsed_ms = start.elapsed().as_millis() as u64;
             info!(
                 method = %method,
                 elapsed_ms = elapsed_ms,
                 req_bytes = req_bytes,
-                resp_bytes = resp_bytes,
-                status = 200,
+                resp_bytes = 0,
+                status = 202,
                 headers = %headers_str,
-                "MCP request"
+                "MCP notification"
             );
-            resp
+            return None;
         }
-        Err((status, Json(resp))) => {
-            let resp_bytes = serde_json::to_string(&resp).map(|s| s.len()).unwrap_or(0);
-            let status_code = status.as_u16();
-            if status_code >= 500 {
-                error!(
-                    method = %method,
-                    elapsed_ms = elapsed_ms,
-                    req_bytes = req_bytes,
-                    resp_bytes = resp_bytes,
-                    status = status_code,
-                    headers = %headers_str,
-                    "MCP request"
-                );
-            } else if status_code == 200 {
-                // JSON-RPC 2.0: errors are returned with HTTP 200, not a sign of trouble.
+
+        // Deserialize as JsonRpcBody for dispatch
+        let body: JsonRpcBody = match serde_json::from_value(msg) {
+            Ok(b) => b,
+            Err(_) => {
+                return Some(json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32600, "message": "Invalid Request" },
+                    "id": null,
+                }));
+            }
+        };
+
+        let result: Result<Json<Value>, (StatusCode, Json<Value>)> = match method.as_str() {
+            "initialize" => Ok(mcp_initialize(State(state.clone()), Json(body)).await),
+            "tools/list" => Ok(mcp_tools_list(State(state.clone()), Json(body)).await),
+            "tools/call" => mcp_tools_call(State(state.clone()), Json(body)).await,
+            _ => Err(jsonrpc_error(
+                body.id,
+                -32601,
+                &format!("method not found: {}", method),
+            )),
+        };
+
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let resp_value = match result {
+            Ok(Json(resp)) => {
+                let resp_bytes = serde_json::to_string(&resp).map(|s| s.len()).unwrap_or(0);
                 info!(
                     method = %method,
                     elapsed_ms = elapsed_ms,
                     req_bytes = req_bytes,
                     resp_bytes = resp_bytes,
-                    status = status_code,
+                    status = 200,
                     headers = %headers_str,
                     "MCP request"
                 );
-            } else {
-                warn!(
-                    method = %method,
-                    elapsed_ms = elapsed_ms,
-                    req_bytes = req_bytes,
-                    resp_bytes = resp_bytes,
-                    status = status_code,
-                    headers = %headers_str,
-                    "MCP request"
-                );
+                resp
             }
-            resp
-        }
-    };
+            Err((status, Json(resp))) => {
+                let resp_bytes = serde_json::to_string(&resp).map(|s| s.len()).unwrap_or(0);
+                let status_code = status.as_u16();
+                if status_code >= 500 {
+                    error!(
+                        method = %method,
+                        elapsed_ms = elapsed_ms,
+                        req_bytes = req_bytes,
+                        resp_bytes = resp_bytes,
+                        status = status_code,
+                        headers = %headers_str,
+                        "MCP request"
+                    );
+                } else if status_code == 200 {
+                    // JSON-RPC 2.0: errors are returned with HTTP 200, not a sign of trouble.
+                    info!(
+                        method = %method,
+                        elapsed_ms = elapsed_ms,
+                        req_bytes = req_bytes,
+                        resp_bytes = resp_bytes,
+                        status = status_code,
+                        headers = %headers_str,
+                        "MCP request"
+                    );
+                } else {
+                    warn!(
+                        method = %method,
+                        elapsed_ms = elapsed_ms,
+                        req_bytes = req_bytes,
+                        resp_bytes = resp_bytes,
+                        status = status_code,
+                        headers = %headers_str,
+                        "MCP request"
+                    );
+                }
+                resp
+            }
+        };
 
-    Some(resp_value)
+        Some(resp_value)
+    }
+    .instrument(span)
+    .await
 }
 
 /// POST /mcp — Unified Streamable HTTP transport endpoint.
@@ -744,38 +753,48 @@ async fn oauth_callback(
 
 /// Logged wrapper for POST /mcp/initialize (direct route).
 async fn mcp_initialize_logged(state: State<AppState>, body: Json<JsonRpcBody>) -> Json<Value> {
-    let start = Instant::now();
-    let req_bytes = serde_json::to_string(&body.0).map(|s| s.len()).unwrap_or(0);
-    let resp = mcp_initialize(state, body).await;
-    let elapsed_ms = start.elapsed().as_millis() as u64;
-    let resp_bytes = serde_json::to_string(&resp.0).map(|s| s.len()).unwrap_or(0);
-    info!(
-        method = "initialize",
-        elapsed_ms = elapsed_ms,
-        req_bytes = req_bytes,
-        resp_bytes = resp_bytes,
-        status = 200,
-        "MCP request"
-    );
-    resp
+    let span = tracing::info_span!("request", method = "initialize", id = ?body.id);
+    async move {
+        let start = Instant::now();
+        let req_bytes = serde_json::to_string(&body.0).map(|s| s.len()).unwrap_or(0);
+        let resp = mcp_initialize(state, body).await;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let resp_bytes = serde_json::to_string(&resp.0).map(|s| s.len()).unwrap_or(0);
+        info!(
+            method = "initialize",
+            elapsed_ms = elapsed_ms,
+            req_bytes = req_bytes,
+            resp_bytes = resp_bytes,
+            status = 200,
+            "MCP request"
+        );
+        resp
+    }
+    .instrument(span)
+    .await
 }
 
 /// Logged wrapper for POST /mcp/tools/list (direct route).
 async fn mcp_tools_list_logged(state: State<AppState>, body: Json<JsonRpcBody>) -> Json<Value> {
-    let start = Instant::now();
-    let req_bytes = serde_json::to_string(&body.0).map(|s| s.len()).unwrap_or(0);
-    let resp = mcp_tools_list(state, body).await;
-    let elapsed_ms = start.elapsed().as_millis() as u64;
-    let resp_bytes = serde_json::to_string(&resp.0).map(|s| s.len()).unwrap_or(0);
-    info!(
-        method = "tools/list",
-        elapsed_ms = elapsed_ms,
-        req_bytes = req_bytes,
-        resp_bytes = resp_bytes,
-        status = 200,
-        "MCP request"
-    );
-    resp
+    let span = tracing::info_span!("request", method = "tools/list", id = ?body.id);
+    async move {
+        let start = Instant::now();
+        let req_bytes = serde_json::to_string(&body.0).map(|s| s.len()).unwrap_or(0);
+        let resp = mcp_tools_list(state, body).await;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        let resp_bytes = serde_json::to_string(&resp.0).map(|s| s.len()).unwrap_or(0);
+        info!(
+            method = "tools/list",
+            elapsed_ms = elapsed_ms,
+            req_bytes = req_bytes,
+            resp_bytes = resp_bytes,
+            status = 200,
+            "MCP request"
+        );
+        resp
+    }
+    .instrument(span)
+    .await
 }
 
 /// Logged wrapper for POST /mcp/tools/call (direct route).
@@ -783,57 +802,62 @@ async fn mcp_tools_call_logged(
     state: State<AppState>,
     body: Json<JsonRpcBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let start = Instant::now();
-    let req_bytes = serde_json::to_string(&body.0).map(|s| s.len()).unwrap_or(0);
-    let result = mcp_tools_call(state, body).await;
-    let elapsed_ms = start.elapsed().as_millis() as u64;
-    match &result {
-        Ok(Json(resp)) => {
-            let resp_bytes = serde_json::to_string(resp).map(|s| s.len()).unwrap_or(0);
-            info!(
-                method = "tools/call",
-                elapsed_ms = elapsed_ms,
-                req_bytes = req_bytes,
-                resp_bytes = resp_bytes,
-                status = 200,
-                "MCP request"
-            );
-        }
-        Err((status, Json(resp))) => {
-            let resp_bytes = serde_json::to_string(resp).map(|s| s.len()).unwrap_or(0);
-            let status_code = status.as_u16();
-            if status_code >= 500 {
-                error!(
-                    method = "tools/call",
-                    elapsed_ms = elapsed_ms,
-                    req_bytes = req_bytes,
-                    resp_bytes = resp_bytes,
-                    status = status_code,
-                    "MCP request"
-                );
-            } else if status_code == 200 {
-                // JSON-RPC 2.0: errors are returned with HTTP 200, not a sign of trouble.
+    let span = tracing::info_span!("request", method = "tools/call", id = ?body.id);
+    async move {
+        let start = Instant::now();
+        let req_bytes = serde_json::to_string(&body.0).map(|s| s.len()).unwrap_or(0);
+        let result = mcp_tools_call(state, body).await;
+        let elapsed_ms = start.elapsed().as_millis() as u64;
+        match &result {
+            Ok(Json(resp)) => {
+                let resp_bytes = serde_json::to_string(resp).map(|s| s.len()).unwrap_or(0);
                 info!(
                     method = "tools/call",
                     elapsed_ms = elapsed_ms,
                     req_bytes = req_bytes,
                     resp_bytes = resp_bytes,
-                    status = status_code,
-                    "MCP request"
-                );
-            } else {
-                warn!(
-                    method = "tools/call",
-                    elapsed_ms = elapsed_ms,
-                    req_bytes = req_bytes,
-                    resp_bytes = resp_bytes,
-                    status = status_code,
+                    status = 200,
                     "MCP request"
                 );
             }
+            Err((status, Json(resp))) => {
+                let resp_bytes = serde_json::to_string(resp).map(|s| s.len()).unwrap_or(0);
+                let status_code = status.as_u16();
+                if status_code >= 500 {
+                    error!(
+                        method = "tools/call",
+                        elapsed_ms = elapsed_ms,
+                        req_bytes = req_bytes,
+                        resp_bytes = resp_bytes,
+                        status = status_code,
+                        "MCP request"
+                    );
+                } else if status_code == 200 {
+                    // JSON-RPC 2.0: errors are returned with HTTP 200, not a sign of trouble.
+                    info!(
+                        method = "tools/call",
+                        elapsed_ms = elapsed_ms,
+                        req_bytes = req_bytes,
+                        resp_bytes = resp_bytes,
+                        status = status_code,
+                        "MCP request"
+                    );
+                } else {
+                    warn!(
+                        method = "tools/call",
+                        elapsed_ms = elapsed_ms,
+                        req_bytes = req_bytes,
+                        resp_bytes = resp_bytes,
+                        status = status_code,
+                        "MCP request"
+                    );
+                }
+            }
         }
+        result
     }
-    result
+    .instrument(span)
+    .await
 }
 
 /// Handler for DELETE /mcp — returns 405 Method Not Allowed.

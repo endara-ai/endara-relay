@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
-use tracing::{error, info, trace, warn};
+use tracing::{error, info, trace, warn, Instrument};
 
 /// Configuration for the HTTP MCP adapter.
 #[derive(Debug, Clone)]
@@ -26,6 +26,10 @@ pub struct HttpConfig {
     /// Optional override for the advertised `server_type` name. See
     /// [`crate::adapter::server_type_resolution::effective_server_type`].
     pub server_type_override: Option<String>,
+    /// Endpoint name (used as the `endpoint` field on the adapter's
+    /// per-endpoint `tracing` span). Defaults to empty for direct test
+    /// construction; production paths set this from `EndpointConfig::name`.
+    pub endpoint_name: String,
 }
 
 impl HttpConfig {
@@ -35,6 +39,7 @@ impl HttpConfig {
             timeout_secs: 30,
             headers: HashMap::new(),
             server_type_override: None,
+            endpoint_name: String::new(),
         }
     }
 
@@ -60,6 +65,10 @@ pub struct HttpAdapter {
     upstream_server_name: Arc<RwLock<Option<String>>>,
     /// Ring buffer recording tool call activity.
     activity_log: Arc<RwLock<RingBuffer>>,
+    /// Per-endpoint tracing span. Every adapter method instruments its async
+    /// body with this span so events carry `endpoint`/`transport` (and
+    /// `server_type` once the MCP handshake completes).
+    span: tracing::Span,
 }
 
 impl HttpAdapter {
@@ -99,6 +108,12 @@ impl HttpAdapter {
             .build()
             .expect("failed to build HTTP client");
 
+        let span = tracing::info_span!(
+            "endpoint",
+            endpoint = %config.endpoint_name,
+            transport = "http",
+            server_type = tracing::field::Empty,
+        );
         Self {
             config,
             client,
@@ -107,6 +122,7 @@ impl HttpAdapter {
             server_type: Arc::new(RwLock::new(None)),
             upstream_server_name: Arc::new(RwLock::new(None)),
             activity_log: Arc::new(RwLock::new(RingBuffer::new(1000))),
+            span,
         }
     }
 
@@ -114,6 +130,12 @@ impl HttpAdapter {
     ///
     /// Used by OAuthAdapter to inject a client with Bearer token headers.
     pub fn new_with_client(config: HttpConfig, client: Client) -> Self {
+        let span = tracing::info_span!(
+            "endpoint",
+            endpoint = %config.endpoint_name,
+            transport = "http",
+            server_type = tracing::field::Empty,
+        );
         Self {
             config,
             client,
@@ -122,6 +144,7 @@ impl HttpAdapter {
             server_type: Arc::new(RwLock::new(None)),
             upstream_server_name: Arc::new(RwLock::new(None)),
             activity_log: Arc::new(RwLock::new(RingBuffer::new(1000))),
+            span,
         }
     }
 
@@ -306,118 +329,148 @@ impl HttpAdapter {
 #[async_trait]
 impl McpAdapter for HttpAdapter {
     async fn initialize(&mut self) -> Result<(), AdapterError> {
-        *self.health.write().await = HealthStatus::Starting;
+        async {
+            *self.health.write().await = HealthStatus::Starting;
 
-        let params = json!({
-            "protocolVersion": "2025-03-26",
-            "capabilities": {},
-            "clientInfo": {
-                "name": "endara-relay",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        });
+            let params = json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "endara-relay",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            });
 
-        let result = match self.send_request("initialize", Some(params)).await {
-            Ok(r) => r,
-            Err(e) => {
-                let msg = e.to_string();
-                *self.health.write().await = HealthStatus::Unhealthy(msg);
-                error!(url = %self.config.url, error = %e, "HTTP MCP adapter initialization failed");
-                return Err(e);
-            }
-        };
+            let result = match self.send_request("initialize", Some(params)).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let msg = e.to_string();
+                    *self.health.write().await = HealthStatus::Unhealthy(msg);
+                    error!(url = %self.config.url, error = %e, "HTTP MCP adapter initialization failed");
+                    return Err(e);
+                }
+            };
 
-        // Extract serverInfo.name — REQUIRED per MCP spec enforcement
-        let raw_name = match result
-            .get("serverInfo")
-            .and_then(|si| si.get("name"))
-            .and_then(|n| n.as_str())
-        {
-            Some(name) => name,
-            None => {
-                let err = ServerNameError::Missing;
-                let msg = err.to_string();
-                error!(url = %self.config.url, error = %msg, "MCP server did not provide serverInfo.name");
-                *self.health.write().await = HealthStatus::Unhealthy(msg.clone());
-                return Err(AdapterError::ProtocolError(msg));
-            }
-        };
+            // Extract serverInfo.name — REQUIRED per MCP spec enforcement
+            let raw_name = match result
+                .get("serverInfo")
+                .and_then(|si| si.get("name"))
+                .and_then(|n| n.as_str())
+            {
+                Some(name) => name,
+                None => {
+                    let err = ServerNameError::Missing;
+                    let msg = err.to_string();
+                    error!(url = %self.config.url, error = %msg, "MCP server did not provide serverInfo.name");
+                    *self.health.write().await = HealthStatus::Unhealthy(msg.clone());
+                    return Err(AdapterError::ProtocolError(msg));
+                }
+            };
 
-        // Validate and sanitize the server name
-        let sanitized = match sanitize_server_name(raw_name) {
-            Ok(s) => s,
-            Err(e) => {
-                let msg = e.to_string();
-                error!(url = %self.config.url, raw_name = %raw_name, error = %msg, "serverInfo.name validation failed");
-                *self.health.write().await = HealthStatus::Unhealthy(msg.clone());
-                return Err(AdapterError::ProtocolError(msg));
-            }
-        };
+            // Validate and sanitize the server name
+            let sanitized = match sanitize_server_name(raw_name) {
+                Ok(s) => s,
+                Err(e) => {
+                    let msg = e.to_string();
+                    error!(url = %self.config.url, raw_name = %raw_name, error = %msg, "serverInfo.name validation failed");
+                    *self.health.write().await = HealthStatus::Unhealthy(msg.clone());
+                    return Err(AdapterError::ProtocolError(msg));
+                }
+            };
 
-        if let Some(ref ov) = self.config.server_type_override {
-            if sanitize_server_name(ov).is_err() {
-                warn!(
-                    override = %ov,
-                    "server_type_override failed sanitization; falling back to upstream-derived name"
-                );
+            if let Some(ref ov) = self.config.server_type_override {
+                if sanitize_server_name(ov).is_err() {
+                    warn!(
+                        override = %ov,
+                        "server_type_override failed sanitization; falling back to upstream-derived name"
+                    );
+                }
             }
+            let effective = effective_server_type(
+                self.config.server_type_override.clone(),
+                Some(sanitized.clone()),
+            );
+            let upstream_stripped = strip_mcp_server_suffix(sanitized.clone());
+
+            info!(url = %self.config.url, raw_name = %raw_name, sanitized = %sanitized, effective = ?effective, "MCP server reported serverInfo.name");
+            if let Some(ref name) = effective {
+                self.span.record("server_type", tracing::field::display(name));
+            }
+            *self.server_type.write().await = effective;
+            *self.upstream_server_name.write().await = Some(upstream_stripped);
+
+            // Per the MCP spec the client MUST send a notifications/initialized
+            // notification after a successful initialize exchange.
+            if let Err(e) = self
+                .send_notification("notifications/initialized", None)
+                .await
+            {
+                warn!(url = %self.config.url, error = %e, "failed to send notifications/initialized");
+            }
+
+            *self.health.write().await = HealthStatus::Healthy;
+            info!(url = %self.config.url, "HTTP MCP adapter initialized");
+            Ok(())
         }
-        let effective = effective_server_type(
-            self.config.server_type_override.clone(),
-            Some(sanitized.clone()),
-        );
-        let upstream_stripped = strip_mcp_server_suffix(sanitized.clone());
-
-        info!(url = %self.config.url, raw_name = %raw_name, sanitized = %sanitized, effective = ?effective, "MCP server reported serverInfo.name");
-        *self.server_type.write().await = effective;
-        *self.upstream_server_name.write().await = Some(upstream_stripped);
-
-        // Per the MCP spec the client MUST send a notifications/initialized
-        // notification after a successful initialize exchange.
-        if let Err(e) = self
-            .send_notification("notifications/initialized", None)
-            .await
-        {
-            warn!(url = %self.config.url, error = %e, "failed to send notifications/initialized");
-        }
-
-        *self.health.write().await = HealthStatus::Healthy;
-        info!(url = %self.config.url, "HTTP MCP adapter initialized");
-        Ok(())
+        .instrument(self.span.clone())
+        .await
     }
 
     async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
-        let result = self.send_request("tools/list", None).await?;
-        let tools_value = result
-            .get("tools")
-            .ok_or_else(|| AdapterError::ProtocolError("missing 'tools' field".into()))?;
-        let tools: Vec<ToolInfo> = serde_json::from_value(tools_value.clone())?;
-        Ok(tools)
+        async {
+            let result = self.send_request("tools/list", None).await?;
+            let tools_value = result
+                .get("tools")
+                .ok_or_else(|| AdapterError::ProtocolError("missing 'tools' field".into()))?;
+            let tools: Vec<ToolInfo> = serde_json::from_value(tools_value.clone())?;
+            Ok(tools)
+        }
+        .instrument(self.span.clone())
+        .await
     }
 
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
-        let params = json!({
-            "name": name,
-            "arguments": arguments,
-        });
-        let start = Instant::now();
-        let result = self.send_request("tools/call", Some(params)).await;
-        let duration_ms = start.elapsed().as_millis();
-        let now = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
-        let log_line = match &result {
-            Ok(_) => format!(
-                "{}  INFO call_tool tool={} status=ok duration={}ms",
-                now, name, duration_ms
-            ),
-            Err(e) => format!(
-                "{}  WARN call_tool tool={} status=error duration={}ms error={}",
-                now, name, duration_ms, e
-            ),
-        };
-        self.activity_log.write().await.push(log_line);
-        result
+        async {
+            let params = json!({
+                "name": name,
+                "arguments": arguments,
+            });
+            let start = Instant::now();
+            let result = self.send_request("tools/call", Some(params)).await;
+            let duration_ms = start.elapsed().as_millis();
+            let now = chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string();
+            let log_line = match &result {
+                Ok(_) => format!(
+                    "{}  INFO call_tool tool={} status=ok duration={}ms",
+                    now, name, duration_ms
+                ),
+                Err(e) => format!(
+                    "{}  WARN call_tool tool={} status=error duration={}ms error={}",
+                    now, name, duration_ms, e
+                ),
+            };
+            self.activity_log.write().await.push(log_line);
+            match &result {
+                Ok(_) => tracing::info!(
+                    tool = %name,
+                    status = "ok",
+                    duration_ms = duration_ms,
+                    "Tool call completed"
+                ),
+                Err(e) => tracing::warn!(
+                    tool = %name,
+                    status = "error",
+                    duration_ms = duration_ms,
+                    error = %e,
+                    "Tool call failed"
+                ),
+            }
+            result
+        }
+        .instrument(self.span.clone())
+        .await
     }
 
     fn health(&self) -> HealthStatus {
@@ -439,9 +492,13 @@ impl McpAdapter for HttpAdapter {
     }
 
     async fn shutdown(&mut self) -> Result<(), AdapterError> {
-        *self.health.write().await = HealthStatus::Stopped;
-        info!(url = %self.config.url, "HTTP MCP adapter shut down");
-        Ok(())
+        async {
+            *self.health.write().await = HealthStatus::Stopped;
+            info!(url = %self.config.url, "HTTP MCP adapter shut down");
+            Ok(())
+        }
+        .instrument(self.span.clone())
+        .await
     }
 
     async fn activity_log(&self) -> Vec<String> {

@@ -38,6 +38,7 @@ async fn setup_multi_endpoint_server() -> (SocketAddr, AdapterRegistry, tokio::t
         args: vec![echo_script_path().to_string_lossy().to_string()],
         env: HashMap::new(),
         server_type_override: None,
+        endpoint_name: "echo-ep".into(),
     };
     let mut echo_adapter = StdioAdapter::new(echo_config);
     echo_adapter
@@ -60,6 +61,7 @@ async fn setup_multi_endpoint_server() -> (SocketAddr, AdapterRegistry, tokio::t
         args: vec![],
         env: HashMap::new(),
         server_type_override: None,
+        endpoint_name: "multi-ep".into(),
     };
     let mut multi_adapter = StdioAdapter::new(multi_config);
     multi_adapter
@@ -206,6 +208,7 @@ async fn test_multi_endpoint_overlapping_tool_names() {
             args: vec![],
             env: HashMap::new(),
             server_type_override: None,
+            endpoint_name: (*ep_name).into(),
         };
         let mut adapter = endara_relay::adapter::stdio::StdioAdapter::new(config);
         adapter

@@ -16,7 +16,7 @@ mod shell_env;
 
 use adapter::oauth::{OAuthAdapter, OAuthAdapterConfig, OAuthAdapterInner};
 use adapter::{FailedAdapter, McpAdapter, StartingAdapter};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use js_sandbox::MetaToolHandler;
 use oauth::{OAuthFlowManager, OAuthSetupManager};
 use registry::AdapterRegistry;
@@ -60,9 +60,24 @@ enum Commands {
         port: u16,
 
         /// Log output format
-        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        #[arg(long, default_value = "compact", value_parser = ["text", "compact", "json"])]
         log_format: String,
+
+        /// Colorize stdout logs (auto detects TTY)
+        #[arg(long, default_value = "auto", value_enum)]
+        color: ColorMode,
+
+        /// EnvFilter directive for the file log layer (default: debug,endara_relay=trace)
+        #[arg(long)]
+        file_log_level: Option<String>,
     },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+enum ColorMode {
+    Auto,
+    Always,
+    Never,
 }
 
 /// Expand a path string, replacing a leading `~` with the user's home directory.
@@ -78,40 +93,61 @@ fn expand_tilde(path: &str) -> PathBuf {
     }
 }
 
-fn init_tracing(log_format: &str, log_dir: &std::path::Path) {
+fn init_tracing(
+    color_mode: ColorMode,
+    log_format: &str,
+    file_log_level: Option<String>,
+    log_dir: &std::path::Path,
+) {
+    use std::io::IsTerminal;
     use tracing_subscriber::fmt;
     use tracing_subscriber::prelude::*;
-    use tracing_subscriber::EnvFilter;
+    use tracing_subscriber::{EnvFilter, Layer};
 
-    // Default: info for all crates, debug for endara_relay.
-    // Overridable via RUST_LOG env var.
-    let filter = EnvFilter::try_from_default_env()
+    let use_color = match color_mode {
+        ColorMode::Auto => std::io::stdout().is_terminal(),
+        ColorMode::Always => true,
+        ColorMode::Never => false,
+    };
+
+    // Stdout filter: RUST_LOG or default. Independent of the file filter so the
+    // two layers can run at different verbosity levels.
+    let stdout_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info,endara_relay=debug"));
+    let file_filter = EnvFilter::new(
+        file_log_level
+            .as_deref()
+            .unwrap_or("debug,endara_relay=trace"),
+    );
 
     let file_appender = tracing_appender::rolling::daily(log_dir, "relay.log");
     let file_layer = fmt::layer()
         .with_writer(file_appender)
         .with_ansi(false)
+        .with_filter(file_filter)
         .boxed();
 
-    match log_format {
-        "json" => {
-            let stdout_layer = fmt::layer().json().with_ansi(false).boxed();
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(stdout_layer)
-                .with(file_layer)
-                .init();
-        }
-        _ => {
-            let stdout_layer = fmt::layer().with_ansi(false).boxed();
-            tracing_subscriber::registry()
-                .with(filter)
-                .with(stdout_layer)
-                .with(file_layer)
-                .init();
-        }
-    }
+    let stdout_layer = match log_format {
+        "json" => fmt::layer()
+            .json()
+            .with_ansi(use_color)
+            .with_filter(stdout_filter)
+            .boxed(),
+        "compact" => fmt::layer()
+            .compact()
+            .with_ansi(use_color)
+            .with_filter(stdout_filter)
+            .boxed(),
+        _ => fmt::layer()
+            .with_ansi(use_color)
+            .with_filter(stdout_filter)
+            .boxed(),
+    };
+
+    tracing_subscriber::registry()
+        .with(stdout_layer)
+        .with(file_layer)
+        .init();
 }
 
 #[tokio::main]
@@ -124,13 +160,15 @@ async fn main() {
             config,
             port,
             log_format,
+            color,
+            file_log_level,
         } => {
             let data_dir_path = expand_tilde(&data_dir);
             let log_dir = data_dir_path.join("logs");
             let config_explicit = config.is_some();
             let config_path = config.unwrap_or_else(|| data_dir_path.join("config.toml"));
 
-            init_tracing(&log_format, &log_dir);
+            init_tracing(color, &log_format, file_log_level, &log_dir);
             info!(config = %config_path.display(), data_dir = %data_dir_path.display(), "Starting endara-relay");
 
             // First-run config copy: when using a non-default data dir without an

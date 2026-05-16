@@ -535,6 +535,7 @@ pub(crate) async fn create_adapter(
                 args: ep.args.clone().unwrap_or_default(),
                 env: ep.env.clone().unwrap_or_default(),
                 server_type_override: ep.server_type_override.clone(),
+                endpoint_name: ep.name.clone(),
             };
             let mut adapter = StdioAdapter::new(stdio_config);
             match adapter.initialize().await {
@@ -550,6 +551,7 @@ pub(crate) async fn create_adapter(
             let mut sse_config = SseConfig::new(url);
             sse_config.headers = ep.headers.clone().unwrap_or_default();
             sse_config.server_type_override = ep.server_type_override.clone();
+            sse_config.endpoint_name = ep.name.clone();
             let mut adapter = SseAdapter::new(sse_config);
             match adapter.initialize().await {
                 Ok(()) => Box::new(adapter),
@@ -564,6 +566,7 @@ pub(crate) async fn create_adapter(
             let mut http_config = HttpConfig::new(url);
             http_config.headers = ep.headers.clone().unwrap_or_default();
             http_config.server_type_override = ep.server_type_override.clone();
+            http_config.endpoint_name = ep.name.clone();
             let mut adapter = HttpAdapter::new(http_config);
             match adapter.initialize().await {
                 Ok(()) => Box::new(adapter),

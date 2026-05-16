@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, Notify, RwLock};
 use tokio::time::Instant;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 /// Configuration for the SSE MCP adapter.
 #[derive(Debug, Clone)]
@@ -26,6 +26,10 @@ pub struct SseConfig {
     /// Optional override for the advertised `server_type` name. See
     /// [`crate::adapter::server_type_resolution::effective_server_type`].
     pub server_type_override: Option<String>,
+    /// Endpoint name (used as the `endpoint` field on the adapter's
+    /// per-endpoint `tracing` span). Defaults to empty for direct test
+    /// construction; production paths set this from `EndpointConfig::name`.
+    pub endpoint_name: String,
 }
 
 impl SseConfig {
@@ -35,6 +39,7 @@ impl SseConfig {
             timeout_secs: 30,
             headers: HashMap::new(),
             server_type_override: None,
+            endpoint_name: String::new(),
         }
     }
 
@@ -144,6 +149,10 @@ pub struct SseAdapter {
     /// Broadcast emitter for `notifications/tools/list_changed` events. Each
     /// tick is an opaque cache-invalidation signal consumed by the registry.
     tools_changed_tx: broadcast::Sender<()>,
+    /// Per-endpoint tracing span. Every adapter method instruments its async
+    /// body with this span so events carry `endpoint`/`transport` (and
+    /// `server_type` once the MCP handshake completes).
+    span: tracing::Span,
 }
 
 impl SseAdapter {
@@ -177,6 +186,12 @@ impl SseAdapter {
 
         let (tools_changed_tx, _) = broadcast::channel(16);
 
+        let span = tracing::info_span!(
+            "endpoint",
+            endpoint = %config.endpoint_name,
+            transport = "sse",
+            server_type = tracing::field::Empty,
+        );
         Self {
             config,
             client,
@@ -193,6 +208,7 @@ impl SseAdapter {
             reconnect_notify: Arc::new(Notify::new()),
             shutdown_notify: Arc::new(Notify::new()),
             tools_changed_tx,
+            span,
         }
     }
 
@@ -558,6 +574,10 @@ impl SseAdapter {
         let upstream_stripped = strip_mcp_server_suffix(sanitized.clone());
 
         debug!(url = %self.config.url, raw_name = %raw_name, sanitized = %sanitized, effective = ?effective, "MCP server reported serverInfo.name");
+        if let Some(ref name) = effective {
+            self.span
+                .record("server_type", tracing::field::display(name));
+        }
         *self.server_type.write().await = effective;
         *self.upstream_server_name.write().await = Some(upstream_stripped);
         *self.health.write().await = HealthStatus::Healthy;
@@ -636,48 +656,75 @@ impl SseAdapter {
 #[async_trait]
 impl McpAdapter for SseAdapter {
     async fn initialize(&mut self) -> Result<(), AdapterError> {
-        if let Err(e) = self.connect_and_handshake().await {
-            error!(url = %self.config.url, error = %e, "SSE MCP adapter initialization failed");
-            return Err(e);
-        }
+        async {
+            if let Err(e) = self.connect_and_handshake().await {
+                error!(url = %self.config.url, error = %e, "SSE MCP adapter initialization failed");
+                return Err(e);
+            }
 
-        self.ensure_supervisor_running().await;
-        info!(url = %self.config.url, "SSE MCP adapter initialized");
-        Ok(())
+            self.ensure_supervisor_running().await;
+            info!(url = %self.config.url, "SSE MCP adapter initialized");
+            Ok(())
+        }
+        .instrument(self.span.clone())
+        .await
     }
 
     async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
-        let result = self.send_request("tools/list", None).await?;
-        let tools_value = result
-            .get("tools")
-            .ok_or_else(|| AdapterError::ProtocolError("missing 'tools' field".into()))?;
-        let tools: Vec<ToolInfo> = serde_json::from_value(tools_value.clone())?;
-        Ok(tools)
+        async {
+            let result = self.send_request("tools/list", None).await?;
+            let tools_value = result
+                .get("tools")
+                .ok_or_else(|| AdapterError::ProtocolError("missing 'tools' field".into()))?;
+            let tools: Vec<ToolInfo> = serde_json::from_value(tools_value.clone())?;
+            Ok(tools)
+        }
+        .instrument(self.span.clone())
+        .await
     }
 
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
-        let params = json!({
-            "name": name,
-            "arguments": arguments,
-        });
-        let start = Instant::now();
-        let result = self.send_request("tools/call", Some(params)).await;
-        let duration_ms = start.elapsed().as_millis();
-        let now = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
-        let log_line = match &result {
-            Ok(_) => format!(
-                "{}  INFO call_tool tool={} status=ok duration={}ms",
-                now, name, duration_ms
-            ),
-            Err(e) => format!(
-                "{}  WARN call_tool tool={} status=error duration={}ms error={}",
-                now, name, duration_ms, e
-            ),
-        };
-        self.activity_log.write().await.push(log_line);
-        result
+        async {
+            let params = json!({
+                "name": name,
+                "arguments": arguments,
+            });
+            let start = Instant::now();
+            let result = self.send_request("tools/call", Some(params)).await;
+            let duration_ms = start.elapsed().as_millis();
+            let now = chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string();
+            let log_line = match &result {
+                Ok(_) => format!(
+                    "{}  INFO call_tool tool={} status=ok duration={}ms",
+                    now, name, duration_ms
+                ),
+                Err(e) => format!(
+                    "{}  WARN call_tool tool={} status=error duration={}ms error={}",
+                    now, name, duration_ms, e
+                ),
+            };
+            self.activity_log.write().await.push(log_line);
+            match &result {
+                Ok(_) => tracing::info!(
+                    tool = %name,
+                    status = "ok",
+                    duration_ms = duration_ms,
+                    "Tool call completed"
+                ),
+                Err(e) => tracing::warn!(
+                    tool = %name,
+                    status = "error",
+                    duration_ms = duration_ms,
+                    error = %e,
+                    "Tool call failed"
+                ),
+            }
+            result
+        }
+        .instrument(self.span.clone())
+        .await
     }
 
     fn health(&self) -> HealthStatus {
@@ -703,30 +750,34 @@ impl McpAdapter for SseAdapter {
     }
 
     async fn shutdown(&mut self) -> Result<(), AdapterError> {
-        *self.health.write().await = HealthStatus::Stopped;
+        async {
+            *self.health.write().await = HealthStatus::Stopped;
 
-        // Tell the supervisor to wake up and exit (in case it's sleeping in
-        // backoff or waiting on a reconnect notification).
-        self.shutdown_notify.notify_waiters();
+            // Tell the supervisor to wake up and exit (in case it's sleeping in
+            // backoff or waiting on a reconnect notification).
+            self.shutdown_notify.notify_waiters();
 
-        // Abort the SSE listener task
-        if let Some(handle) = self.sse_handle.lock().await.take() {
-            handle.abort();
+            // Abort the SSE listener task
+            if let Some(handle) = self.sse_handle.lock().await.take() {
+                handle.abort();
+            }
+
+            // Abort the reconnect supervisor task
+            if let Some(handle) = self.reconnect_handle.lock().await.take() {
+                handle.abort();
+            }
+
+            // Clear the endpoint
+            *self.post_endpoint.write().await = None;
+
+            // Drop all pending requests
+            self.pending.lock().await.clear();
+
+            info!(url = %self.config.url, "SSE MCP adapter shut down");
+            Ok(())
         }
-
-        // Abort the reconnect supervisor task
-        if let Some(handle) = self.reconnect_handle.lock().await.take() {
-            handle.abort();
-        }
-
-        // Clear the endpoint
-        *self.post_endpoint.write().await = None;
-
-        // Drop all pending requests
-        self.pending.lock().await.clear();
-
-        info!(url = %self.config.url, "SSE MCP adapter shut down");
-        Ok(())
+        .instrument(self.span.clone())
+        .await
     }
 
     async fn activity_log(&self) -> Vec<String> {

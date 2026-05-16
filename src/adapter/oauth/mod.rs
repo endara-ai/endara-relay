@@ -19,7 +19,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::Instant;
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, Instrument};
 
 /// Returns the `Instant` at which a proactive refresh should fire when
 /// `issued_at` is unknown (or nonsensical relative to `expires_at`).
@@ -104,6 +104,12 @@ pub struct OAuthAdapterInner {
     /// Abort handle for the current inner→outer tools-changed forwarder task,
     /// if any. Re-bound on every inner-adapter swap.
     inner_forwarder_handle: Mutex<Option<AbortHandle>>,
+    /// Per-endpoint tracing span. Every adapter method instruments its async
+    /// body with this span so events emitted directly by `OAuthAdapter` /
+    /// `OAuthAdapterInner` (state transitions, refresh, heartbeat) carry
+    /// `endpoint`/`transport="oauth"` (and `server_type` once the inner MCP
+    /// handshake completes).
+    pub span: tracing::Span,
 }
 
 impl OAuthAdapterInner {
@@ -112,6 +118,7 @@ impl OAuthAdapterInner {
         url: &str,
         access_token: &str,
         server_type_override: Option<String>,
+        endpoint_name: String,
     ) -> HttpAdapter {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -134,6 +141,7 @@ impl OAuthAdapterInner {
             .expect("failed to build HTTP client");
         let mut http_config = HttpConfig::new(url);
         http_config.server_type_override = server_type_override;
+        http_config.endpoint_name = endpoint_name;
         HttpAdapter::new_with_client(http_config, client)
     }
 
@@ -367,9 +375,18 @@ impl OAuthAdapterInner {
             &self.config.url,
             &access_token,
             self.config.server_type_override.clone(),
+            self.config.endpoint_name.clone(),
         );
         match adapter.initialize().await {
             Ok(()) => {
+                // Mirror the stdio/sse/http adapters: once the inner MCP
+                // handshake reports a `server_type`, record it on the outer
+                // OAuth span so subsequent events render with the resolved
+                // name in the `endpoint:` header.
+                if let Some(name) = adapter.server_type() {
+                    self.span
+                        .record("server_type", tracing::field::display(&name));
+                }
                 // Reflect the freshly initialized inner adapter's health
                 // immediately so health() reports Healthy without waiting for
                 // the next heartbeat tick.
@@ -450,7 +467,8 @@ impl OAuthAdapterInner {
 
         if let Some(deadline) = deadline {
             let inner = self.clone();
-            let handle = tokio::spawn(async move {
+            let refresh_span = self.span.clone();
+            let fut = async move {
                 tokio::time::sleep_until(deadline).await;
                 info!(endpoint = %inner.config.endpoint_name, "Proactive refresh timer fired");
                 // Detach our own handle from the slot before re-entering
@@ -530,7 +548,8 @@ impl OAuthAdapterInner {
                         }
                     }
                 }
-            });
+            };
+            let handle = tokio::spawn(fut.instrument(refresh_span));
             self.refresh_task_handle.lock().await.replace(handle);
         }
     }
@@ -617,6 +636,12 @@ impl OAuthAdapter {
     /// Create a new OAuthAdapter.
     pub fn new(config: OAuthAdapterConfig, token_manager: Arc<TokenManager>) -> Self {
         let (outer_tools_changed_tx, _) = broadcast::channel(16);
+        let span = tracing::info_span!(
+            "endpoint",
+            endpoint = %config.endpoint_name,
+            transport = "oauth",
+            server_type = tracing::field::Empty,
+        );
         Self {
             inner: Arc::new(OAuthAdapterInner {
                 state: RwLock::new(OAuthState::NeedsLogin),
@@ -636,6 +661,7 @@ impl OAuthAdapter {
                 refresh_mutex: Mutex::new(()),
                 outer_tools_changed_tx,
                 inner_forwarder_handle: Mutex::new(None),
+                span,
             }),
         }
     }
@@ -649,174 +675,190 @@ impl OAuthAdapter {
 #[async_trait]
 impl McpAdapter for OAuthAdapter {
     async fn initialize(&mut self) -> Result<(), AdapterError> {
-        // Try to load existing tokens from disk
-        let loaded = self
-            .inner
-            .token_manager
-            .load(&self.inner.config.endpoint_name)
-            .await;
+        let span = self.inner.span.clone();
+        async {
+            // Try to load existing tokens from disk
+            let loaded = self
+                .inner
+                .token_manager
+                .load(&self.inner.config.endpoint_name)
+                .await;
 
-        if let Ok(Some(token_set)) = loaded {
-            if token_set.is_valid() {
-                info!(
-                    endpoint = %self.inner.config.endpoint_name,
-                    "Loaded valid OAuth tokens from disk"
-                );
-                self.inner.apply_tokens(token_set).await;
-            } else if token_set.refresh_token.is_some() {
-                info!(
-                    endpoint = %self.inner.config.endpoint_name,
-                    "Loaded expired tokens with refresh token, attempting refresh"
-                );
-                // Store expired tokens so refresh can use the refresh_token
-                *self.inner.tokens.write().await = Some(token_set);
-                match self.inner.do_token_refresh().await {
-                    Ok(new_tokens) => {
-                        self.inner.apply_tokens(new_tokens).await;
+            if let Ok(Some(token_set)) = loaded {
+                if token_set.is_valid() {
+                    info!(
+                        endpoint = %self.inner.config.endpoint_name,
+                        "Loaded valid OAuth tokens from disk"
+                    );
+                    self.inner.apply_tokens(token_set).await;
+                } else if token_set.refresh_token.is_some() {
+                    info!(
+                        endpoint = %self.inner.config.endpoint_name,
+                        "Loaded expired tokens with refresh token, attempting refresh"
+                    );
+                    // Store expired tokens so refresh can use the refresh_token
+                    *self.inner.tokens.write().await = Some(token_set);
+                    match self.inner.do_token_refresh().await {
+                        Ok(new_tokens) => {
+                            self.inner.apply_tokens(new_tokens).await;
+                        }
+                        Err(e) => {
+                            warn!(
+                                endpoint = %self.inner.config.endpoint_name,
+                                error = %e,
+                                "Token refresh at startup failed"
+                            );
+                            self.inner
+                                .transition_to(OAuthState::AuthRequired, "startup refresh failed")
+                                .await;
+                        }
                     }
-                    Err(e) => {
-                        warn!(
-                            endpoint = %self.inner.config.endpoint_name,
-                            error = %e,
-                            "Token refresh at startup failed"
-                        );
-                        self.inner
-                            .transition_to(OAuthState::AuthRequired, "startup refresh failed")
-                            .await;
-                    }
+                } else {
+                    self.inner
+                        .transition_to(
+                            OAuthState::AuthRequired,
+                            "expired tokens without refresh token",
+                        )
+                        .await;
                 }
             } else {
                 self.inner
-                    .transition_to(
-                        OAuthState::AuthRequired,
-                        "expired tokens without refresh token",
-                    )
+                    .transition_to(OAuthState::NeedsLogin, "no existing tokens at startup")
                     .await;
             }
-        } else {
+
+            // Spawn the heartbeat probe loop, instrumented with the per-endpoint
+            // span so events emitted from `heartbeat::apply_probe_action` render
+            // under the `endpoint:` span header.
+            let weak = Arc::downgrade(&self.inner);
+            let hb_span = self.inner.span.clone();
+            let handle = tokio::spawn(heartbeat::heartbeat_loop(weak).instrument(hb_span));
             self.inner
-                .transition_to(OAuthState::NeedsLogin, "no existing tokens at startup")
-                .await;
+                .heartbeat_task_handle
+                .lock()
+                .await
+                .replace(handle);
+
+            Ok(()) // initialize always succeeds for OAuth
         }
-
-        // Spawn the heartbeat probe loop
-        let weak = Arc::downgrade(&self.inner);
-        let handle = tokio::spawn(heartbeat::heartbeat_loop(weak));
-        self.inner
-            .heartbeat_task_handle
-            .lock()
-            .await
-            .replace(handle);
-
-        Ok(()) // initialize always succeeds for OAuth
+        .instrument(span)
+        .await
     }
 
     async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
-        let guard = self.inner.inner_adapter.read().await;
-        match guard.as_ref() {
-            Some(adapter) => {
-                match adapter.list_tools().await {
-                    Ok(tools) => Ok(tools),
-                    Err(AdapterError::HttpError { status: 401, .. }) => {
-                        // Drop the read lock before refreshing
-                        drop(guard);
+        async {
+            let guard = self.inner.inner_adapter.read().await;
+            match guard.as_ref() {
+                Some(adapter) => {
+                    match adapter.list_tools().await {
+                        Ok(tools) => Ok(tools),
+                        Err(AdapterError::HttpError { status: 401, .. }) => {
+                            // Drop the read lock before refreshing
+                            drop(guard);
 
-                        info!(
-                            endpoint = %self.inner.config.endpoint_name,
-                            "Got 401 on list_tools, attempting token refresh"
-                        );
+                            info!(
+                                endpoint = %self.inner.config.endpoint_name,
+                                "Got 401 on list_tools, attempting token refresh"
+                            );
 
-                        match self.inner.do_token_refresh().await {
-                            Ok(new_tokens) => {
-                                self.inner.apply_tokens(new_tokens).await;
-                                // Retry with new token
-                                let guard = self.inner.inner_adapter.read().await;
-                                match guard.as_ref() {
-                                    Some(adapter) => adapter.list_tools().await,
-                                    None => Ok(vec![]),
+                            match self.inner.do_token_refresh().await {
+                                Ok(new_tokens) => {
+                                    self.inner.apply_tokens(new_tokens).await;
+                                    // Retry with new token
+                                    let guard = self.inner.inner_adapter.read().await;
+                                    match guard.as_ref() {
+                                        Some(adapter) => adapter.list_tools().await,
+                                        None => Ok(vec![]),
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        endpoint = %self.inner.config.endpoint_name,
+                                        error = %e,
+                                        "Token refresh after 401 on list_tools failed"
+                                    );
+                                    self.inner
+                                        .transition_to(
+                                            OAuthState::AuthRequired,
+                                            "401 on list_tools, refresh failed",
+                                        )
+                                        .await;
+                                    Err(AdapterError::AuthenticationRequired {
+                                        endpoint: self.inner.config.endpoint_name.clone(),
+                                        message: "Token expired and refresh failed. Re-authenticate in Endara Desktop.".to_string(),
+                                    })
                                 }
                             }
-                            Err(e) => {
-                                warn!(
-                                    endpoint = %self.inner.config.endpoint_name,
-                                    error = %e,
-                                    "Token refresh after 401 on list_tools failed"
-                                );
-                                self.inner
-                                    .transition_to(
-                                        OAuthState::AuthRequired,
-                                        "401 on list_tools, refresh failed",
-                                    )
-                                    .await;
-                                Err(AdapterError::AuthenticationRequired {
-                                    endpoint: self.inner.config.endpoint_name.clone(),
-                                    message: "Token expired and refresh failed. Re-authenticate in Endara Desktop.".to_string(),
-                                })
-                            }
                         }
+                        Err(other) => Err(other),
                     }
-                    Err(other) => Err(other),
                 }
+                None => Ok(vec![]),
             }
-            None => Ok(vec![]),
         }
+        .instrument(self.inner.span.clone())
+        .await
     }
 
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
-        let guard = self.inner.inner_adapter.read().await;
-        let adapter = match guard.as_ref() {
-            Some(a) => a,
-            None => {
-                return Err(AdapterError::ConnectionFailed(
-                    "not authenticated — complete OAuth login first".to_string(),
-                ));
-            }
-        };
+        async {
+            let guard = self.inner.inner_adapter.read().await;
+            let adapter = match guard.as_ref() {
+                Some(a) => a,
+                None => {
+                    return Err(AdapterError::ConnectionFailed(
+                        "not authenticated — complete OAuth login first".to_string(),
+                    ));
+                }
+            };
 
-        match adapter.call_tool(name, arguments.clone()).await {
-            Ok(result) => Ok(result),
-            Err(AdapterError::HttpError { status: 401, .. }) => {
-                // Drop the read lock before refreshing
-                drop(guard);
+            match adapter.call_tool(name, arguments.clone()).await {
+                Ok(result) => Ok(result),
+                Err(AdapterError::HttpError { status: 401, .. }) => {
+                    // Drop the read lock before refreshing
+                    drop(guard);
 
-                info!(
-                    endpoint = %self.inner.config.endpoint_name,
-                    "Got 401, attempting token refresh"
-                );
+                    info!(
+                        endpoint = %self.inner.config.endpoint_name,
+                        "Got 401, attempting token refresh"
+                    );
 
-                match self.inner.do_token_refresh().await {
-                    Ok(new_tokens) => {
-                        self.inner.apply_tokens(new_tokens).await;
-                        // Retry with new token
-                        let guard = self.inner.inner_adapter.read().await;
-                        let adapter = guard.as_ref().ok_or_else(|| {
-                            AdapterError::ConnectionFailed(
-                                "Adapter lost during refresh".to_string(),
-                            )
-                        })?;
-                        adapter.call_tool(name, arguments).await
-                    }
-                    Err(e) => {
-                        warn!(
-                            endpoint = %self.inner.config.endpoint_name,
-                            error = %e,
-                            "Token refresh after 401 failed"
-                        );
-                        self.inner
-                            .transition_to(
-                                OAuthState::AuthRequired,
-                                "401 on call_tool, refresh failed",
-                            )
-                            .await;
-                        Err(AdapterError::AuthenticationRequired {
-                            endpoint: self.inner.config.endpoint_name.clone(),
-                            message: "Token expired and refresh failed. Re-authenticate in Endara Desktop.".to_string(),
-                        })
+                    match self.inner.do_token_refresh().await {
+                        Ok(new_tokens) => {
+                            self.inner.apply_tokens(new_tokens).await;
+                            // Retry with new token
+                            let guard = self.inner.inner_adapter.read().await;
+                            let adapter = guard.as_ref().ok_or_else(|| {
+                                AdapterError::ConnectionFailed(
+                                    "Adapter lost during refresh".to_string(),
+                                )
+                            })?;
+                            adapter.call_tool(name, arguments).await
+                        }
+                        Err(e) => {
+                            warn!(
+                                endpoint = %self.inner.config.endpoint_name,
+                                error = %e,
+                                "Token refresh after 401 failed"
+                            );
+                            self.inner
+                                .transition_to(
+                                    OAuthState::AuthRequired,
+                                    "401 on call_tool, refresh failed",
+                                )
+                                .await;
+                            Err(AdapterError::AuthenticationRequired {
+                                endpoint: self.inner.config.endpoint_name.clone(),
+                                message: "Token expired and refresh failed. Re-authenticate in Endara Desktop.".to_string(),
+                            })
+                        }
                     }
                 }
+                Err(other) => Err(other),
             }
-            Err(other) => Err(other),
         }
+        .instrument(self.inner.span.clone())
+        .await
     }
 
     fn server_type(&self) -> Option<String> {
@@ -836,31 +878,36 @@ impl McpAdapter for OAuthAdapter {
     }
 
     async fn shutdown(&mut self) -> Result<(), AdapterError> {
-        // Abort heartbeat task
-        {
-            let mut handle = self.inner.heartbeat_task_handle.lock().await;
-            if let Some(h) = handle.take() {
-                h.abort();
+        let span = self.inner.span.clone();
+        async {
+            // Abort heartbeat task
+            {
+                let mut handle = self.inner.heartbeat_task_handle.lock().await;
+                if let Some(h) = handle.take() {
+                    h.abort();
+                }
             }
-        }
-        // Abort refresh task
-        {
-            let mut handle = self.inner.refresh_task_handle.lock().await;
-            if let Some(h) = handle.take() {
-                h.abort();
+            // Abort refresh task
+            {
+                let mut handle = self.inner.refresh_task_handle.lock().await;
+                if let Some(h) = handle.take() {
+                    h.abort();
+                }
             }
+            // Abort inner→outer tools-changed forwarder
+            self.inner.swap_tools_forwarder(None).await;
+            let mut guard = self.inner.inner_adapter.write().await;
+            if let Some(ref mut adapter) = *guard {
+                adapter.shutdown().await?;
+            }
+            *guard = None;
+            self.inner
+                .transition_to(OAuthState::Disconnected, "shutdown")
+                .await;
+            Ok(())
         }
-        // Abort inner→outer tools-changed forwarder
-        self.inner.swap_tools_forwarder(None).await;
-        let mut guard = self.inner.inner_adapter.write().await;
-        if let Some(ref mut adapter) = *guard {
-            adapter.shutdown().await?;
-        }
-        *guard = None;
-        self.inner
-            .transition_to(OAuthState::Disconnected, "shutdown")
-            .await;
-        Ok(())
+        .instrument(span)
+        .await
     }
 
     fn subscribe_tools_changed(&self) -> Option<broadcast::Receiver<()>> {
