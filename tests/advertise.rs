@@ -2,9 +2,12 @@
 //!
 //! Verifies that:
 //!   * `InitializeResult.instructions` is present with `Connected server types: …`
-//!     when at least one adapter is `Healthy`, and omitted otherwise.
+//!     when at least one registered adapter has a rendered `server_type`,
+//!     present as just the lead-in when adapters are registered but none have
+//!     a rendered type, and omitted entirely when no adapters are registered.
 //!   * The dynamic descriptions for `list_tools`, `search_tools`, and
-//!     `execute_tools` reflect the currently-Healthy server set.
+//!     `execute_tools` reflect **all** registered adapters (not only the
+//!     `Healthy` ones).
 
 mod common;
 
@@ -92,11 +95,44 @@ fn meta_tool_description<'a>(tools: &'a [Value], name: &str) -> &'a str {
         .unwrap_or_else(|| panic!("'{}' description was not a string", name))
 }
 
-/// 1 — instructions field is omitted entirely when no adapters are Healthy.
+/// 1a — instructions field is omitted entirely when **no adapters at all**
+///       are registered in the relay config.
 #[tokio::test]
-async fn instructions_omitted_when_no_healthy_servers() {
-    // bad-server with `--omit-server-name` enters Failed → registry has zero
-    // Healthy adapters → no instructions field, no `Connected server types:` suffix.
+async fn instructions_omitted_when_no_endpoints_configured() {
+    // No endpoints in config → registry is empty → no instructions field, no
+    // `Connected server types:` suffix, and no count on list_tools.
+    let config = ConfigBuilder::new().build();
+    let harness = RelayHarness::start(&config).await;
+
+    let init = raw_initialize(&harness).await;
+    let result = &init["result"];
+    assert!(
+        result.get("instructions").is_none(),
+        "instructions should be omitted with zero registered adapters; got: {}",
+        result
+    );
+
+    let tools = raw_tools_list(&harness).await;
+    let list_desc = meta_tool_description(&tools, "list_tools");
+    assert!(
+        !list_desc.contains("servers connected"),
+        "list_tools must not advertise connected servers when none are registered: {list_desc}"
+    );
+    let search_desc = meta_tool_description(&tools, "search_tools");
+    assert!(
+        !search_desc.contains("Connected server types:"),
+        "search_tools must not append Connected server types list when none are registered: {search_desc}"
+    );
+}
+
+/// 1b — instructions field carries only the lead-in (no `Connected server
+///       types:` sub-line) when a registered adapter exists but neither
+///       handshook successfully nor carries a `server_type_override`.
+#[tokio::test]
+async fn instructions_lead_in_only_when_registered_adapter_has_no_renderable_type() {
+    // `bad-server --omit-server-name` enters Failed without capturing
+    // `serverInfo.name`; without a `server_type_override` it renders nothing,
+    // but the endpoint is still registered → lead-in present, list omitted.
     let config = ConfigBuilder::new()
         .add_stdio("bad-server", &bad_server_bin(), &["--omit-server-name"])
         .build();
@@ -107,22 +143,26 @@ async fn instructions_omitted_when_no_healthy_servers() {
 
     let init = raw_initialize(&harness).await;
     let result = &init["result"];
-    assert!(
-        result.get("instructions").is_none(),
-        "instructions should be omitted with zero Healthy adapters; got: {}",
-        result
+    let instructions = result["instructions"]
+        .as_str()
+        .expect("instructions should be present once an adapter is registered");
+    assert_eq!(
+        instructions, INSTRUCTIONS_LEAD_IN,
+        "instructions should be lead-in only when no server_type renders: {instructions}"
     );
 
     let tools = raw_tools_list(&harness).await;
     let list_desc = meta_tool_description(&tools, "list_tools");
     assert!(
-        !list_desc.contains("servers connected"),
-        "list_tools must not advertise connected servers when none are Healthy: {list_desc}"
+        list_desc.ends_with(
+            " 1 servers connected via Endara Relay \u{2014} use search_tools to discover tools."
+        ),
+        "list_tools count must include the registered adapter regardless of health: {list_desc}"
     );
     let search_desc = meta_tool_description(&tools, "search_tools");
     assert!(
         !search_desc.contains("Connected server types:"),
-        "search_tools must not append Connected server types list when none are Healthy: {search_desc}"
+        "search_tools must not append Connected server types list when nothing renders: {search_desc}"
     );
 }
 
@@ -167,21 +207,26 @@ async fn instructions_and_descriptions_reflect_healthy_server() {
     );
 }
 
-/// 3 — Failed adapters are excluded from the advertised list even when sitting
-///     alongside a Healthy one. Two adapters: one good (`good-server`,
-///     reports `bad-mcp` which is stripped to `bad`) and one Failed
-///     (`broken-server`).
+/// 3 — Failed adapters with a configured `server_type_override` are now
+///     **included** in the advertised list alongside Healthy ones, and the
+///     endpoint count covers all registered adapters regardless of health.
+///     Two adapters: one good (`good-server`, reports `bad-mcp` which is
+///     stripped to `bad`) and one Failed with override (`broken-server` with
+///     `server_type_override = "broken"`).
 #[tokio::test]
-async fn failed_adapters_are_not_advertised() {
+async fn failed_adapter_with_override_included_in_advertised_list() {
     let config = ConfigBuilder::new()
         .add_stdio("good-server", &bad_server_bin(), &[])
         .add_stdio("broken-server", &bad_server_bin(), &["--omit-server-name"])
+        .with_server_type_override("broken")
         .build();
     let harness = RelayHarness::start(&config).await;
     harness
         .wait_healthy("good-server", Duration::from_secs(10))
         .await
         .expect("good-server did not become healthy");
+    // Give broken-server a moment to attempt initialize and transition to Failed.
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     let init = raw_initialize(&harness).await;
     let instructions = init["result"]["instructions"]
@@ -189,18 +234,26 @@ async fn failed_adapters_are_not_advertised() {
         .expect("instructions should be present");
     assert_eq!(
         instructions,
-        format!("{}\n\nConnected server types: bad", INSTRUCTIONS_LEAD_IN),
-        "Failed adapter should be excluded; got: {instructions}"
+        format!(
+            "{}\n\nConnected server types: bad, broken",
+            INSTRUCTIONS_LEAD_IN
+        ),
+        "Failed adapter with override should now be included; got: {instructions}"
     );
 
     let tools = raw_tools_list(&harness).await;
     let list_desc = meta_tool_description(&tools, "list_tools");
-    // endpoint_count counts Healthy adapters only → 1, not 2.
+    // endpoint_count covers all registered adapters regardless of health → 2.
     assert!(
         list_desc.ends_with(
-            " 1 servers connected via Endara Relay \u{2014} use search_tools to discover tools."
+            " 2 servers connected via Endara Relay \u{2014} use search_tools to discover tools."
         ),
-        "list_tools count must exclude Failed adapter: {list_desc}"
+        "list_tools count must include the Failed adapter: {list_desc}"
+    );
+    let search_desc = meta_tool_description(&tools, "search_tools");
+    assert!(
+        search_desc.ends_with("\n\nConnected server types: bad, broken"),
+        "search_tools description must include the Failed adapter's override: {search_desc}"
     );
 }
 

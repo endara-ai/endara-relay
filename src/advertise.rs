@@ -1,13 +1,19 @@
 //! Server-type advertisement to connected models.
 //!
-//! Renders a deduplicated, alphabetised list of `server_type` values from
-//! adapters currently in [`HealthStatus::Healthy`][crate::adapter::HealthStatus::Healthy]
-//! state, and provides description builders for the meta-tools (`list_tools`,
+//! Renders a deduplicated, alphabetised list of `server_type` values across
+//! **all** currently-registered adapters (regardless of [`HealthStatus`]) and
+//! provides description builders for the meta-tools (`list_tools`,
 //! `search_tools`, `execute_tools`) so each `tools/list` response reflects the
 //! current registry. The same list also feeds `InitializeResult.instructions`.
+//! Each adapter's rendered `server_type` is sourced from the cached upstream
+//! handshake value when available and falls back to the configured
+//! `server_type_override`, so endpoints surface immediately even before their
+//! first successful `initialize`.
 //!
 //! See `Engineering Spec — Advertise Connected Servers to the Model` (§3) for
 //! the full design.
+//!
+//! [`HealthStatus`]: crate::adapter::HealthStatus
 
 use crate::registry::AdapterRegistry;
 
@@ -72,12 +78,13 @@ impl<'a> ServerTypeList<'a> {
         Self { registry }
     }
 
-    /// Returns `Some("a, b, c")` if at least one Healthy adapter has a
-    /// `server_type`; `None` otherwise. The list is enforced under the
+    /// Returns `Some("a, b, c")` if at least one registered adapter has a
+    /// rendered `server_type` (cached upstream value or configured
+    /// override); `None` otherwise. The list is enforced under the
     /// 8KB safety cap; trailing entries are dropped and a `, …` suffix
     /// appended if the cap is exceeded.
     pub async fn render(&self) -> Option<String> {
-        let types = self.registry.ready_server_types().await;
+        let types = self.registry.all_server_types().await;
         if types.is_empty() {
             return None;
         }
@@ -109,9 +116,10 @@ impl<'a> ServerTypeList<'a> {
         Some(out)
     }
 
-    /// Number of `Healthy` adapter instances (NOT deduplicated by type).
+    /// Number of registered adapter instances regardless of health (NOT
+    /// deduplicated by type).
     pub async fn endpoint_count(&self) -> usize {
-        self.registry.ready_endpoint_count().await
+        self.registry.all_endpoint_count().await
     }
 }
 
@@ -121,20 +129,30 @@ impl<'a> ServerTypeList<'a> {
 pub const INSTRUCTIONS_LEAD_IN: &str =
     "Endara Relay aggregates MCP servers behind a single endpoint.";
 
-/// Build the `InitializeResult.instructions` string. Returns `None` when no
-/// adapter is currently `Healthy` with a `server_type`, so the field is
-/// omitted from the response (per spec §2.1).
+/// Build the `InitializeResult.instructions` string.
+///
+/// - Returns `Some("{LEAD_IN}\n\nConnected server types: {list}")` whenever
+///   the rendered list is non-empty.
+/// - Returns `Some("{LEAD_IN}")` (just the lead-in, no `Connected server
+///   types:` line) when the registry has at least one registered adapter but
+///   no rendered server types.
+/// - Returns `None` when the registry has zero registered adapters so the
+///   field is omitted from the response.
 pub async fn instructions(registry: &AdapterRegistry) -> Option<String> {
-    ServerTypeList::new(registry).render().await.map(|list| {
-        format!(
+    let list = ServerTypeList::new(registry).render().await;
+    let count = registry.all_endpoint_count().await;
+    match (list, count) {
+        (Some(list), _) => Some(format!(
             "{}\n\nConnected server types: {}",
             INSTRUCTIONS_LEAD_IN, list
-        )
-    })
+        )),
+        (None, 0) => None,
+        (None, _) => Some(INSTRUCTIONS_LEAD_IN.to_string()),
+    }
 }
 
 /// Build the `search_tools` description. Appends `\n\nConnected server types: {list}`
-/// when the registry has at least one Healthy adapter with a `server_type`.
+/// when at least one registered adapter has a rendered `server_type`.
 pub async fn search_tools_description(registry: &AdapterRegistry) -> String {
     match ServerTypeList::new(registry).render().await {
         Some(list) => format!("{}\n\nConnected server types: {}", SEARCH_TOOLS_BASE, list),
@@ -143,7 +161,7 @@ pub async fn search_tools_description(registry: &AdapterRegistry) -> String {
 }
 
 /// Build the `list_tools` description. Appends `" {count} servers connected …"`
-/// when at least one adapter is `Healthy`.
+/// when the registry has at least one registered adapter.
 pub async fn list_tools_description(registry: &AdapterRegistry) -> String {
     let count = ServerTypeList::new(registry).endpoint_count().await;
     if count > 0 {
@@ -177,11 +195,13 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::Value;
 
-    /// Minimal mock adapter — `health` and `server_type` are configurable; the
-    /// rest is stubbed. Mirrors the pattern in `registry::tests::MockAdapter`.
+    /// Minimal mock adapter — `health`, `server_type`, and
+    /// `configured_server_type` are independently configurable; the rest is
+    /// stubbed. Mirrors the pattern in `registry::tests::MockAdapter`.
     struct MockAdapter {
         health: HealthStatus,
         server_type_val: Option<String>,
+        configured_val: Option<String>,
     }
 
     impl MockAdapter {
@@ -189,6 +209,7 @@ mod tests {
             Self {
                 health: HealthStatus::Healthy,
                 server_type_val: Some(server_type.to_string()),
+                configured_val: None,
             }
         }
 
@@ -196,6 +217,7 @@ mod tests {
             Self {
                 health: HealthStatus::Healthy,
                 server_type_val: None,
+                configured_val: None,
             }
         }
 
@@ -203,6 +225,7 @@ mod tests {
             Self {
                 health: HealthStatus::Unhealthy("test".into()),
                 server_type_val: Some("gmail".into()),
+                configured_val: None,
             }
         }
 
@@ -210,6 +233,29 @@ mod tests {
             Self {
                 health: HealthStatus::Starting,
                 server_type_val: Some("gmail".into()),
+                configured_val: None,
+            }
+        }
+
+        /// `Starting` adapter that has not yet captured an upstream
+        /// `serverInfo.name` but does carry a `server_type_override` — used
+        /// to exercise the override-only render path.
+        fn starting_with_override(override_val: &str) -> Self {
+            Self {
+                health: HealthStatus::Starting,
+                server_type_val: None,
+                configured_val: Some(override_val.to_string()),
+            }
+        }
+
+        /// Adapter with neither an upstream-captured `server_type` nor a
+        /// configured override — exercises the "registered but renders
+        /// nothing" path that drops the `Connected server types:` sub-line.
+        fn starting_no_type() -> Self {
+            Self {
+                health: HealthStatus::Starting,
+                server_type_val: None,
+                configured_val: None,
             }
         }
     }
@@ -231,6 +277,9 @@ mod tests {
         fn server_type(&self) -> Option<String> {
             self.server_type_val.clone()
         }
+        fn configured_server_type(&self) -> Option<String> {
+            self.configured_val.clone()
+        }
         async fn shutdown(&mut self) -> Result<(), AdapterError> {
             Ok(())
         }
@@ -248,19 +297,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn render_returns_none_when_no_healthy_adapters() {
+    async fn render_returns_none_when_registry_empty() {
         let reg = AdapterRegistry::new();
         assert!(ServerTypeList::new(&reg).render().await.is_none());
         assert_eq!(ServerTypeList::new(&reg).endpoint_count().await, 0);
     }
 
     #[tokio::test]
-    async fn render_returns_none_when_only_failed_or_starting() {
+    async fn render_includes_failed_and_starting_adapters_with_known_types() {
         let reg = AdapterRegistry::new();
         register(&reg, "a", MockAdapter::failed()).await;
         register(&reg, "b", MockAdapter::starting()).await;
-        assert!(ServerTypeList::new(&reg).render().await.is_none());
-        assert_eq!(ServerTypeList::new(&reg).endpoint_count().await, 0);
+        // Both adapters have server_type = "gmail" → deduped to a single entry.
+        let list = ServerTypeList::new(&reg).render().await.unwrap();
+        assert_eq!(list, "gmail");
+        // endpoint_count covers all registered adapters regardless of health.
+        assert_eq!(ServerTypeList::new(&reg).endpoint_count().await, 2);
     }
 
     #[tokio::test]
@@ -291,19 +343,62 @@ mod tests {
         register(&reg, "ep2", MockAdapter::ready_no_type()).await;
         let list = ServerTypeList::new(&reg).render().await.unwrap();
         assert_eq!(list, "notion");
-        // endpoint_count counts all Healthy adapters regardless of server_type.
+        // endpoint_count counts all registered adapters regardless of server_type.
         assert_eq!(ServerTypeList::new(&reg).endpoint_count().await, 2);
     }
 
     #[tokio::test]
-    async fn render_excludes_unhealthy_adapters() {
+    async fn render_includes_unhealthy_adapters_in_list_and_count() {
         let reg = AdapterRegistry::new();
         register(&reg, "ep1", MockAdapter::ready("notion")).await;
         register(&reg, "ep2", MockAdapter::failed()).await;
         register(&reg, "ep3", MockAdapter::starting()).await;
         let list = ServerTypeList::new(&reg).render().await.unwrap();
-        assert_eq!(list, "notion");
+        // Failed and Starting both carry server_type = "gmail" → deduped.
+        assert_eq!(list, "gmail, notion");
+        // endpoint_count includes the non-Healthy adapters.
+        assert_eq!(ServerTypeList::new(&reg).endpoint_count().await, 3);
+    }
+
+    /// New scenario: a `Failed` adapter that still has a cached upstream
+    /// `server_type` from an earlier successful handshake is included.
+    #[tokio::test]
+    async fn render_includes_failed_adapter_with_cached_server_type() {
+        let reg = AdapterRegistry::new();
+        register(&reg, "ep-healthy", MockAdapter::ready("notion")).await;
+        // `MockAdapter::failed()` carries `server_type_val = Some("gmail")`,
+        // matching an adapter that handshook successfully and later flipped to
+        // Unhealthy without losing its cached upstream name.
+        register(&reg, "ep-failed", MockAdapter::failed()).await;
+        let list = ServerTypeList::new(&reg).render().await.unwrap();
+        assert_eq!(list, "gmail, notion");
+    }
+
+    /// New scenario: a `Starting` adapter with no upstream value yet but with
+    /// a configured `server_type_override` renders via the override.
+    #[tokio::test]
+    async fn render_includes_starting_adapter_via_configured_override() {
+        let reg = AdapterRegistry::new();
+        register(
+            &reg,
+            "ep-pending",
+            MockAdapter::starting_with_override("gmail"),
+        )
+        .await;
+        let list = ServerTypeList::new(&reg).render().await.unwrap();
+        assert_eq!(list, "gmail");
         assert_eq!(ServerTypeList::new(&reg).endpoint_count().await, 1);
+    }
+
+    /// New scenario: the endpoint count includes non-Healthy adapters.
+    #[tokio::test]
+    async fn endpoint_count_includes_non_healthy_adapters() {
+        let reg = AdapterRegistry::new();
+        register(&reg, "ep1", MockAdapter::ready("notion")).await;
+        register(&reg, "ep2", MockAdapter::failed()).await;
+        register(&reg, "ep3", MockAdapter::starting()).await;
+        register(&reg, "ep4", MockAdapter::ready_no_type()).await;
+        assert_eq!(ServerTypeList::new(&reg).endpoint_count().await, 4);
     }
 
     #[tokio::test]
@@ -384,6 +479,40 @@ mod tests {
             desc.ends_with(" 2 servers connected via Endara Relay \u{2014} use search_tools to discover tools."),
             "unexpected suffix: {}",
             &desc[desc.len().saturating_sub(120)..]
+        );
+    }
+
+    #[tokio::test]
+    async fn instructions_none_when_registry_empty() {
+        let reg = AdapterRegistry::new();
+        assert!(instructions(&reg).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn instructions_lead_in_only_when_registered_but_no_types_render() {
+        let reg = AdapterRegistry::new();
+        // Registered adapter with neither an upstream type nor an override.
+        register(&reg, "ep1", MockAdapter::starting_no_type()).await;
+        let s = instructions(&reg).await.expect("instructions present");
+        assert_eq!(s, INSTRUCTIONS_LEAD_IN);
+        assert!(
+            !s.contains("Connected server types:"),
+            "no list expected when nothing renders: {s}"
+        );
+    }
+
+    #[tokio::test]
+    async fn instructions_full_form_when_types_render() {
+        let reg = AdapterRegistry::new();
+        register(&reg, "ep1", MockAdapter::ready("github")).await;
+        register(&reg, "ep2", MockAdapter::ready("gmail")).await;
+        let s = instructions(&reg).await.expect("instructions present");
+        assert_eq!(
+            s,
+            format!(
+                "{}\n\nConnected server types: github, gmail",
+                INSTRUCTIONS_LEAD_IN
+            )
         );
     }
 

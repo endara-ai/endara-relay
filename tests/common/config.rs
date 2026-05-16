@@ -12,6 +12,7 @@ struct EndpointEntry {
     oauth_server_url: Option<String>,
     client_id: Option<String>,
     env: Vec<(String, String)>,
+    server_type_override: Option<String>,
 }
 
 /// Builder for generating relay TOML config strings.
@@ -39,6 +40,7 @@ impl ConfigBuilder {
             oauth_server_url: None,
             client_id: None,
             env: Vec::new(),
+            server_type_override: None,
         });
         self
     }
@@ -63,6 +65,7 @@ impl ConfigBuilder {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            server_type_override: None,
         });
         self
     }
@@ -78,6 +81,7 @@ impl ConfigBuilder {
             oauth_server_url: None,
             client_id: None,
             env: Vec::new(),
+            server_type_override: None,
         });
         self
     }
@@ -93,6 +97,7 @@ impl ConfigBuilder {
             oauth_server_url: None,
             client_id: None,
             env: Vec::new(),
+            server_type_override: None,
         });
         self
     }
@@ -108,6 +113,7 @@ impl ConfigBuilder {
             oauth_server_url: oauth_server_url.map(|s| s.to_string()),
             client_id: None,
             env: Vec::new(),
+            server_type_override: None,
         });
         self
     }
@@ -129,7 +135,18 @@ impl ConfigBuilder {
             oauth_server_url: oauth_server_url.map(|s| s.to_string()),
             client_id: Some(client_id.to_string()),
             env: Vec::new(),
+            server_type_override: None,
         });
+        self
+    }
+
+    /// Attach a `server_type_override` to the most recently added endpoint.
+    pub fn with_server_type_override(mut self, server_type: &str) -> Self {
+        let last = self
+            .endpoints
+            .last_mut()
+            .expect("with_server_type_override called before any add_* method");
+        last.server_type_override = Some(server_type.to_string());
         self
     }
 
@@ -172,6 +189,9 @@ impl ConfigBuilder {
             }
             if let Some(ref cid) = ep.client_id {
                 out.push_str(&format!("client_id = \"{}\"\n", cid));
+            }
+            if let Some(ref ov) = ep.server_type_override {
+                out.push_str(&format!("server_type_override = \"{}\"\n", ov));
             }
             if !ep.env.is_empty() {
                 out.push_str("env = { ");

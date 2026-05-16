@@ -438,6 +438,11 @@ impl McpAdapter for HttpAdapter {
             .and_then(|g| g.clone())
     }
 
+    fn configured_server_type(&self) -> Option<String> {
+        effective_server_type(self.config.server_type_override.clone(), None)
+            .map(|s| s.to_lowercase())
+    }
+
     async fn shutdown(&mut self) -> Result<(), AdapterError> {
         *self.health.write().await = HealthStatus::Stopped;
         info!(url = %self.config.url, "HTTP MCP adapter shut down");

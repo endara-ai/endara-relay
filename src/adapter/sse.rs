@@ -698,6 +698,11 @@ impl McpAdapter for SseAdapter {
             .and_then(|g| g.clone())
     }
 
+    fn configured_server_type(&self) -> Option<String> {
+        effective_server_type(self.config.server_type_override.clone(), None)
+            .map(|s| s.to_lowercase())
+    }
+
     fn subscribe_tools_changed(&self) -> Option<broadcast::Receiver<()>> {
         Some(self.tools_changed_tx.subscribe())
     }
