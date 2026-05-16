@@ -275,7 +275,10 @@ async fn main() {
                 if warned_names.contains(&ep.name) {
                     let msg = warning_messages.get(&ep.name).cloned().unwrap_or_default();
                     warn!(endpoint = %ep.name, "Registering as failed due to validation error: {}", msg);
-                    let adapter: Box<dyn McpAdapter> = Box::new(FailedAdapter::new(msg));
+                    let adapter: Box<dyn McpAdapter> = Box::new(
+                        FailedAdapter::new(msg)
+                            .with_server_type_override(ep.server_type_override.clone()),
+                    );
                     registry
                         .register(
                             ep.name.clone(),

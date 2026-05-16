@@ -267,3 +267,28 @@ impl McpAdapter for StartingAdapter {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A validation-failed endpoint registered as a `FailedAdapter` should
+    /// still surface its configured `server_type_override` via
+    /// [`McpAdapter::configured_server_type`], mirroring the bootstrap path in
+    /// `main.rs` and the runtime path in `watcher.rs`.
+    #[test]
+    fn failed_adapter_surfaces_server_type_override() {
+        let adapter = FailedAdapter::new("validation failed".to_string())
+            .with_server_type_override(Some("Broken".to_string()));
+        assert_eq!(adapter.configured_server_type(), Some("broken".to_string()));
+    }
+
+    /// Without an override, `configured_server_type` returns `None` so the
+    /// endpoint is omitted from the advertisement list until it transitions
+    /// to a real adapter that knows its server type.
+    #[test]
+    fn failed_adapter_without_override_returns_none() {
+        let adapter = FailedAdapter::new("validation failed".to_string());
+        assert_eq!(adapter.configured_server_type(), None);
+    }
+}
