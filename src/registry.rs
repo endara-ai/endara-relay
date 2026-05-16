@@ -297,6 +297,7 @@ impl AdapterRegistry {
     /// [`BTreeSet`] so the output is sorted. Adapters whose `server_type()`
     /// returns `None` (not yet initialized or transport that does not record
     /// it) are skipped.
+    #[allow(dead_code)] // Superseded by `all_server_types`; kept for potential future Healthy-only callers.
     pub async fn ready_server_types(&self) -> BTreeSet<String> {
         let adapters = self.adapters.read().await;
         adapters
@@ -309,12 +310,44 @@ impl AdapterRegistry {
 
     /// Number of currently `Healthy` adapter instances (NOT deduplicated by
     /// server type — three Gmail accounts count as three).
+    #[allow(dead_code)] // Superseded by `all_endpoint_count`; kept for potential future Healthy-only callers.
     pub async fn ready_endpoint_count(&self) -> usize {
         let adapters = self.adapters.read().await;
         adapters
             .values()
             .filter(|entry| matches!(entry.adapter.health(), HealthStatus::Healthy))
             .count()
+    }
+
+    /// Deduplicated, lower-cased server types across **all** registered
+    /// adapters regardless of health.
+    ///
+    /// For each adapter, prefers the cached upstream-derived `server_type()`
+    /// (populated after a successful `initialize` handshake) and falls back
+    /// to [`McpAdapter::configured_server_type`] (the sanitized
+    /// `server_type_override`) so endpoints with a configured override
+    /// surface immediately, before they ever transition to Healthy.
+    /// Adapters with neither value are skipped.
+    pub async fn all_server_types(&self) -> BTreeSet<String> {
+        let adapters = self.adapters.read().await;
+        adapters
+            .values()
+            .filter_map(|entry| {
+                entry
+                    .adapter
+                    .server_type()
+                    .or_else(|| entry.adapter.configured_server_type())
+            })
+            .map(|s| s.to_lowercase())
+            .collect()
+    }
+
+    /// Total number of registered adapter instances regardless of health
+    /// (NOT deduplicated by server type — three Gmail accounts count as
+    /// three).
+    pub async fn all_endpoint_count(&self) -> usize {
+        let adapters = self.adapters.read().await;
+        adapters.len()
     }
 
     /// Access the underlying adapters map (for management API use).

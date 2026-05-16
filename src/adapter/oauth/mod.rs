@@ -7,6 +7,7 @@ pub use state::{derive_health, do_transition, refresh_deadline, OAuthState, Tran
 
 use self::metrics::{generate_correlation_id, OAuthMetrics};
 use super::http::{HttpAdapter, HttpConfig};
+use super::server_type_resolution::effective_server_type;
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::oauth::OAuthError;
 use crate::token_manager::{TokenManager, TokenSet};
@@ -875,6 +876,11 @@ impl McpAdapter for OAuthAdapter {
             .try_read()
             .ok()
             .and_then(|g| g.as_ref().and_then(|a| a.upstream_server_name()))
+    }
+
+    fn configured_server_type(&self) -> Option<String> {
+        effective_server_type(self.inner.config.server_type_override.clone(), None)
+            .map(|s| s.to_lowercase())
     }
 
     async fn shutdown(&mut self) -> Result<(), AdapterError> {

@@ -141,6 +141,14 @@ pub trait McpAdapter: Send + Sync {
         None
     }
 
+    /// Returns the configured `server_type_override` (sanitized through the
+    /// existing `effective_server_type` resolver with `None` for the upstream
+    /// value), or `None` if no override is configured. Used by the registry to
+    /// advertise endpoints before their first successful `initialize` handshake.
+    fn configured_server_type(&self) -> Option<String> {
+        None
+    }
+
     /// Subscribe to MCP `notifications/tools/list_changed` ticks emitted by the
     /// underlying server. Each `recv()` represents at least one change
     /// notification observed since the previous receive; the registry treats
@@ -162,12 +170,28 @@ pub trait McpAdapter: Send + Sync {
 /// `initialize()` on the real adapter again (handled by the restart endpoint).
 pub struct FailedAdapter {
     error_message: String,
+    /// Sanitized `server_type_override` carried over from the originating
+    /// `EndpointConfig`. Surfaced via [`McpAdapter::configured_server_type`]
+    /// so endpoints with a configured override still appear in the
+    /// advertisement list when their real adapter fails to initialize.
+    server_type_override: Option<String>,
 }
 
 impl FailedAdapter {
     /// Create a new failed adapter with the error message from initialization.
     pub fn new(error_message: String) -> Self {
-        Self { error_message }
+        Self {
+            error_message,
+            server_type_override: None,
+        }
+    }
+
+    /// Attach the originating endpoint's `server_type_override` so this
+    /// failed adapter still advertises its configured type via
+    /// [`McpAdapter::configured_server_type`].
+    pub fn with_server_type_override(mut self, override_field: Option<String>) -> Self {
+        self.server_type_override = override_field;
+        self
     }
 }
 
@@ -195,6 +219,14 @@ impl McpAdapter for FailedAdapter {
 
     fn health(&self) -> HealthStatus {
         HealthStatus::Unhealthy(self.error_message.clone())
+    }
+
+    fn configured_server_type(&self) -> Option<String> {
+        crate::adapter::server_type_resolution::effective_server_type(
+            self.server_type_override.clone(),
+            None,
+        )
+        .map(|s| s.to_lowercase())
     }
 
     async fn stderr_lines(&self) -> Vec<String> {
@@ -233,5 +265,30 @@ impl McpAdapter for StartingAdapter {
 
     async fn shutdown(&mut self) -> Result<(), AdapterError> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A validation-failed endpoint registered as a `FailedAdapter` should
+    /// still surface its configured `server_type_override` via
+    /// [`McpAdapter::configured_server_type`], mirroring the bootstrap path in
+    /// `main.rs` and the runtime path in `watcher.rs`.
+    #[test]
+    fn failed_adapter_surfaces_server_type_override() {
+        let adapter = FailedAdapter::new("validation failed".to_string())
+            .with_server_type_override(Some("Broken".to_string()));
+        assert_eq!(adapter.configured_server_type(), Some("broken".to_string()));
+    }
+
+    /// Without an override, `configured_server_type` returns `None` so the
+    /// endpoint is omitted from the advertisement list until it transitions
+    /// to a real adapter that knows its server type.
+    #[test]
+    fn failed_adapter_without_override_returns_none() {
+        let adapter = FailedAdapter::new("validation failed".to_string());
+        assert_eq!(adapter.configured_server_type(), None);
     }
 }

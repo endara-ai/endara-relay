@@ -349,7 +349,10 @@ pub async fn apply_diff_graceful(
             registry
                 .register(
                     name.clone(),
-                    Box::new(FailedAdapter::new(msg)),
+                    Box::new(
+                        FailedAdapter::new(msg)
+                            .with_server_type_override(new_ep.server_type_override.clone()),
+                    ),
                     new_ep.transport.to_string(),
                     new_ep.description.clone(),
                     new_ep.resolved_tool_prefix(),
@@ -415,7 +418,10 @@ pub async fn apply_diff_graceful(
             registry
                 .register(
                     ep.name.clone(),
-                    Box::new(FailedAdapter::new(msg)),
+                    Box::new(
+                        FailedAdapter::new(msg)
+                            .with_server_type_override(ep.server_type_override.clone()),
+                    ),
                     ep.transport.to_string(),
                     ep.description.clone(),
                     ep.resolved_tool_prefix(),
@@ -542,7 +548,10 @@ pub(crate) async fn create_adapter(
                 Ok(()) => Box::new(adapter),
                 Err(e) => {
                     warn!(endpoint = %ep.name, error = %e, "Failed to initialize stdio adapter, registering as failed");
-                    Box::new(FailedAdapter::new(e.to_string()))
+                    Box::new(
+                        FailedAdapter::new(e.to_string())
+                            .with_server_type_override(ep.server_type_override.clone()),
+                    )
                 }
             }
         }
@@ -557,7 +566,10 @@ pub(crate) async fn create_adapter(
                 Ok(()) => Box::new(adapter),
                 Err(e) => {
                     warn!(endpoint = %ep.name, error = %e, "Failed to initialize SSE adapter, registering as failed");
-                    Box::new(FailedAdapter::new(e.to_string()))
+                    Box::new(
+                        FailedAdapter::new(e.to_string())
+                            .with_server_type_override(ep.server_type_override.clone()),
+                    )
                 }
             }
         }
@@ -572,7 +584,10 @@ pub(crate) async fn create_adapter(
                 Ok(()) => Box::new(adapter),
                 Err(e) => {
                     warn!(endpoint = %ep.name, error = %e, "Failed to initialize HTTP adapter, registering as failed");
-                    Box::new(FailedAdapter::new(e.to_string()))
+                    Box::new(
+                        FailedAdapter::new(e.to_string())
+                            .with_server_type_override(ep.server_type_override.clone()),
+                    )
                 }
             }
         }
