@@ -339,12 +339,15 @@ async fn restart_endpoint(
         }
 
         // Look up the endpoint config to decide between rebuild and re-init.
-        let ep_config = {
+        let (ep_config, allow_insecure_oauth) = {
             let cfg = config.read().await;
-            cfg.endpoints
-                .iter()
-                .find(|ep| ep.name == task_name)
-                .cloned()
+            (
+                cfg.endpoints
+                    .iter()
+                    .find(|ep| ep.name == task_name)
+                    .cloned(),
+                cfg.relay.allow_insecure_oauth.unwrap_or(false),
+            )
         };
 
         let new_adapter: Box<dyn McpAdapter> = if let Some(ep) = ep_config {
@@ -354,7 +357,7 @@ async fn restart_endpoint(
                 )))
             });
             let oai = oauth_adapter_inners.unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new())));
-            crate::watcher::create_adapter(&ep, &tm, &oai).await
+            crate::watcher::create_adapter(&ep, &tm, &oai, allow_insecure_oauth).await
         } else {
             // Endpoint not in config: re-initialize the previous adapter in
             // place. On failure, surface the error via FailedAdapter so the
@@ -556,6 +559,7 @@ async fn reload_config(State(state): State<ManagementState>) -> Json<ActionRespo
         &warned_names,
         &token_manager,
         &oauth_adapter_inners,
+        new_config.relay.allow_insecure_oauth.unwrap_or(false),
     )
     .await;
 

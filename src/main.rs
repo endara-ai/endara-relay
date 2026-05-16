@@ -410,12 +410,14 @@ async fn main() {
             let registry = Arc::new(registry);
 
             // Spawn background initialization for deferred endpoints
+            let allow_insecure_oauth = cfg.relay.allow_insecure_oauth.unwrap_or(false);
             for ep in deferred_init {
                 let reg = registry.clone();
                 let tm = token_manager.clone();
                 let oai = oauth_adapter_inners.clone();
                 tokio::spawn(async move {
-                    let adapter = watcher::create_adapter(&ep, &tm, &oai).await;
+                    let adapter =
+                        watcher::create_adapter(&ep, &tm, &oai, allow_insecure_oauth).await;
                     let mut entries = reg.entries().write().await;
                     if let Some(entry) = entries.get_mut(ep.name.as_str()) {
                         entry.adapter = adapter;

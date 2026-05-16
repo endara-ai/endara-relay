@@ -139,6 +139,7 @@ async fn watch_loop(
             &warned_names,
             &token_manager,
             &oauth_adapter_inners,
+            new_config.relay.allow_insecure_oauth.unwrap_or(false),
         )
         .await;
 
@@ -166,6 +167,7 @@ pub async fn apply_diff(
     registry: &AdapterRegistry,
     token_manager: &Arc<TokenManager>,
     oauth_adapter_inners: &OAuthAdapterInners,
+    allow_insecure_oauth: bool,
 ) {
     // Remove endpoints
     for name in &diff.removed {
@@ -222,7 +224,7 @@ pub async fn apply_diff(
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
         tokio::spawn(async move {
-            let adapter = create_adapter(&ep_clone, &tm, &oai).await;
+            let adapter = create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth).await;
             let mut entries = reg.entries().write().await;
             if let Some(entry) = entries.get_mut(name_clone.as_str()) {
                 entry.adapter = adapter;
@@ -265,7 +267,7 @@ pub async fn apply_diff(
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
         tokio::spawn(async move {
-            let adapter = create_adapter(&ep_clone, &tm, &oai).await;
+            let adapter = create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth).await;
             let mut entries = reg.entries().write().await;
             if let Some(entry) = entries.get_mut(ep_clone.name.as_str()) {
                 entry.adapter = adapter;
@@ -297,6 +299,7 @@ pub async fn apply_diff_graceful(
     warned_names: &std::collections::HashSet<String>,
     token_manager: &Arc<TokenManager>,
     oauth_adapter_inners: &OAuthAdapterInners,
+    allow_insecure_oauth: bool,
 ) {
     // Build warning message map
     let warning_messages: std::collections::HashMap<String, String> = {
@@ -392,7 +395,7 @@ pub async fn apply_diff_graceful(
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
         tokio::spawn(async move {
-            let adapter = create_adapter(&ep_clone, &tm, &oai).await;
+            let adapter = create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth).await;
             let mut entries = reg.entries().write().await;
             if let Some(entry) = entries.get_mut(name_clone.as_str()) {
                 entry.adapter = adapter;
@@ -462,7 +465,7 @@ pub async fn apply_diff_graceful(
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
         tokio::spawn(async move {
-            let adapter = create_adapter(&ep_clone, &tm, &oai).await;
+            let adapter = create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth).await;
             let mut entries = reg.entries().write().await;
             if let Some(entry) = entries.get_mut(ep_clone.name.as_str()) {
                 entry.adapter = adapter;
@@ -533,6 +536,7 @@ pub(crate) async fn create_adapter(
     ep: &EndpointConfig,
     token_manager: &Arc<TokenManager>,
     oauth_adapter_inners: &OAuthAdapterInners,
+    allow_insecure_oauth: bool,
 ) -> Box<dyn McpAdapter> {
     match ep.transport {
         Transport::Stdio => {
@@ -609,13 +613,7 @@ pub(crate) async fn create_adapter(
                 probe_timeout_secs: 10,
                 probe_failure_threshold: 3,
                 server_type_override: ep.server_type_override.clone(),
-                // Refresh-time discovery fallback uses the same SSRF posture as
-                // production OAuth callers: HTTPS-only, no loopback. Threading
-                // the `relay.allow_insecure_oauth` flag through `create_adapter`
-                // would be a wider refactor; tests construct `OAuthAdapterConfig`
-                // directly and set this to `true` when they need to mock against
-                // 127.0.0.1.
-                allow_insecure_oauth: false,
+                allow_insecure_oauth,
             };
 
             let mut adapter = OAuthAdapter::new(oauth_config, token_manager.clone());
@@ -790,7 +788,7 @@ mod tests {
             )
             .await;
 
-        apply_diff(&empty_diff(), &registry, &tm, &inners).await;
+        apply_diff(&empty_diff(), &registry, &tm, &inners, false).await;
 
         // Existing adapter should still be there, not shut down
         assert!(!shutdown.load(std::sync::atomic::Ordering::SeqCst));
@@ -817,7 +815,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners).await;
+        apply_diff(&diff, &registry, &tm, &inners, false).await;
 
         assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
         assert!(registry.merged_catalog().await.is_empty());
@@ -833,7 +831,7 @@ mod tests {
         };
 
         // Should not panic
-        apply_diff(&diff, &registry, &tm, &inners).await;
+        apply_diff(&diff, &registry, &tm, &inners, false).await;
     }
 
     #[tokio::test]
@@ -877,7 +875,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners).await;
+        apply_diff(&diff, &registry, &tm, &inners, false).await;
 
         // Old adapter should have been shut down
         assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
@@ -912,7 +910,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners).await;
+        apply_diff(&diff, &registry, &tm, &inners, false).await;
 
         // Wait for background initialization to complete
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -964,7 +962,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners).await;
+        apply_diff(&diff, &registry, &tm, &inners, false).await;
 
         // "keep" should still be alive
         assert!(!shutdown_keep.load(std::sync::atomic::Ordering::SeqCst));
@@ -1005,7 +1003,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners).await;
+        apply_diff(&diff, &registry, &tm, &inners, false).await;
 
         // Wait for background initialization to complete
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1045,6 +1043,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn apply_diff_threads_allow_insecure_oauth_to_oauth_adapter_config() {
+        let registry = Arc::new(AdapterRegistry::new());
+        let (tm, inners) = test_oauth_infra();
+
+        let new_ep = EndpointConfig {
+            name: "oauth_insecure_ep".to_string(),
+            description: None,
+            tool_prefix: None,
+            transport: Transport::Oauth,
+            command: None,
+            args: None,
+            url: Some("http://127.0.0.1:5000/mcp".to_string()),
+            env: None,
+            headers: None,
+            disabled: false,
+            disabled_tools: Vec::new(),
+            oauth_server_url: Some("http://127.0.0.1:5001".to_string()),
+            client_id: Some("client123".to_string()),
+            client_secret: None,
+            scopes: None,
+            token_endpoint: None,
+            server_type_override: None,
+        };
+        let diff = ConfigDiff {
+            added: vec![new_ep],
+            ..empty_diff()
+        };
+
+        apply_diff(&diff, &registry, &tm, &inners, true).await;
+
+        // Wait for background initialization to register the OAuth adapter inner.
+        let stop = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if inners.read().await.contains_key("oauth_insecure_ep") {
+                break;
+            }
+            if std::time::Instant::now() >= stop {
+                panic!("OAuthAdapterInner was never registered");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let inner_map = inners.read().await;
+        let inner = inner_map
+            .get("oauth_insecure_ep")
+            .expect("inner registered");
+        assert!(
+            inner.config.allow_insecure_oauth,
+            "create_adapter must thread allow_insecure_oauth=true into OAuthAdapterConfig"
+        );
+    }
+
     // ---- G1: apply_diff_graceful direct coverage ------------------------
 
     #[tokio::test]
@@ -1060,7 +1111,16 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff_graceful(&diff, &registry, &[], &Default::default(), &tm, &inners).await;
+        apply_diff_graceful(
+            &diff,
+            &registry,
+            &[],
+            &Default::default(),
+            &tm,
+            &inners,
+            false,
+        )
+        .await;
 
         // Wait for the background spawn to swap StartingAdapter for the
         // (Failed) adapter produced by create_adapter.
@@ -1105,7 +1165,7 @@ mod tests {
         let warned: std::collections::HashSet<String> =
             warnings.iter().map(|w| w.endpoint_name.clone()).collect();
 
-        apply_diff_graceful(&diff, &registry, &warnings, &warned, &tm, &inners).await;
+        apply_diff_graceful(&diff, &registry, &warnings, &warned, &tm, &inners, false).await;
 
         // No background spawn for warned endpoints — entry is final immediately.
         let entries = registry.entries().read().await;
@@ -1155,7 +1215,7 @@ mod tests {
         }];
         let warned: std::collections::HashSet<String> = ["ep".to_string()].into_iter().collect();
 
-        apply_diff_graceful(&diff, &registry, &warnings, &warned, &tm, &inners).await;
+        apply_diff_graceful(&diff, &registry, &warnings, &warned, &tm, &inners, false).await;
 
         // Old adapter shut down synchronously.
         assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
