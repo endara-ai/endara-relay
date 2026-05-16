@@ -3597,6 +3597,7 @@ command = "echo"
             probe_timeout_secs: 10,
             probe_failure_threshold: 3,
             server_type_override: None,
+            allow_insecure_oauth: false,
         }
     }
 

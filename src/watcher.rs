@@ -609,6 +609,13 @@ pub(crate) async fn create_adapter(
                 probe_timeout_secs: 10,
                 probe_failure_threshold: 3,
                 server_type_override: ep.server_type_override.clone(),
+                // Refresh-time discovery fallback uses the same SSRF posture as
+                // production OAuth callers: HTTPS-only, no loopback. Threading
+                // the `relay.allow_insecure_oauth` flag through `create_adapter`
+                // would be a wider refactor; tests construct `OAuthAdapterConfig`
+                // directly and set this to `true` when they need to mock against
+                // 127.0.0.1.
+                allow_insecure_oauth: false,
             };
 
             let mut adapter = OAuthAdapter::new(oauth_config, token_manager.clone());

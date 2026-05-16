@@ -349,6 +349,11 @@ async fn main() {
                         probe_timeout_secs: 10,
                         probe_failure_threshold: 3,
                         server_type_override: ep.server_type_override.clone(),
+                        // Mirror the global SSRF posture for the refresh-time
+                        // discovery fallback so operators who already opted into
+                        // `relay.allow_insecure_oauth` for the initial discovery
+                        // see consistent behavior on rediscovery.
+                        allow_insecure_oauth: cfg.relay.allow_insecure_oauth.unwrap_or(false),
                     };
 
                     let mut adapter = OAuthAdapter::new(oauth_config, token_manager.clone());
