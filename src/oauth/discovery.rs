@@ -178,36 +178,58 @@ pub async fn discover_oauth_server(
         .ok_or(DiscoveryError::NoAuthorizationServer)?
         .clone();
 
-    // Step 2: Fetch authorization server metadata using a client pinned to
-    // the (potentially different and server-supplied) auth-server host.
-    let as_well_known = build_well_known_url(&auth_server_url, "oauth-authorization-server")
+    // Step 2: Fetch authorization server metadata (RFC 8414).
+    discover_authorization_server(&auth_server_url, allow_insecure).await
+}
+
+/// Discover OAuth authorization server metadata directly (RFC 8414 only).
+///
+/// Unlike [`discover_oauth_server`], this skips the RFC 9728 protected
+/// resource step and fetches the AS metadata against `auth_server_url`
+/// itself:
+///
+/// 1. `{origin}/.well-known/oauth-authorization-server{path}`
+///    - Falls back to `{origin}/.well-known/oauth-authorization-server`
+///      if 404 and `auth_server_url` has a path component.
+/// 2. Validates S256 PKCE support.
+///
+/// The input URL is validated through [`url_guard`] before any HTTP
+/// request is sent, and the request uses a per-host pinned client.
+///
+/// The returned `DiscoveryResult.auth_server_url` is set to the input
+/// `auth_server_url` so callers can label discovery output consistently.
+pub async fn discover_authorization_server(
+    auth_server_url: &str,
+    allow_insecure: bool,
+) -> Result<DiscoveryResult, DiscoveryError> {
+    let as_well_known = build_well_known_url(auth_server_url, "oauth-authorization-server")
         .map_err(|_| DiscoveryError::AuthServerMetadataNotFound {
-            url: auth_server_url.clone(),
+            url: auth_server_url.to_string(),
         })?;
     let as_client = url_guard::validated_client(&as_well_known, allow_insecure).await?;
 
-    let as_meta: AuthorizationServerMetadata =
-        match fetch_well_known(&as_client, &as_well_known).await {
-            Ok(resp) => resp.json().await?,
-            Err(DiscoveryError::MetadataNotFound { .. }) if has_path(&auth_server_url) => {
-                let root_url =
-                    build_well_known_url_root(&auth_server_url, "oauth-authorization-server")
-                        .map_err(|_| DiscoveryError::AuthServerMetadataNotFound {
-                            url: auth_server_url.clone(),
-                        })?;
-                fetch_well_known(&as_client, &root_url)
-                    .await
-                    .map_err(|_| DiscoveryError::AuthServerMetadataNotFound {
-                        url: as_well_known.clone(),
-                    })?
-                    .json()
-                    .await?
-            }
-            Err(DiscoveryError::MetadataNotFound { url }) => {
-                return Err(DiscoveryError::AuthServerMetadataNotFound { url });
-            }
-            Err(e) => return Err(e),
-        };
+    let as_meta: AuthorizationServerMetadata = match fetch_well_known(&as_client, &as_well_known)
+        .await
+    {
+        Ok(resp) => resp.json().await?,
+        Err(DiscoveryError::MetadataNotFound { .. }) if has_path(auth_server_url) => {
+            let root_url = build_well_known_url_root(auth_server_url, "oauth-authorization-server")
+                .map_err(|_| DiscoveryError::AuthServerMetadataNotFound {
+                    url: auth_server_url.to_string(),
+                })?;
+            fetch_well_known(&as_client, &root_url)
+                .await
+                .map_err(|_| DiscoveryError::AuthServerMetadataNotFound {
+                    url: as_well_known.clone(),
+                })?
+                .json()
+                .await?
+        }
+        Err(DiscoveryError::MetadataNotFound { url }) => {
+            return Err(DiscoveryError::AuthServerMetadataNotFound { url });
+        }
+        Err(e) => return Err(e),
+    };
 
     // Validate S256 is supported (required for PKCE)
     if !as_meta.code_challenge_methods_supported.is_empty()
@@ -219,7 +241,7 @@ pub async fn discover_oauth_server(
     }
 
     Ok(DiscoveryResult {
-        auth_server_url,
+        auth_server_url: auth_server_url.to_string(),
         authorization_endpoint: as_meta.authorization_endpoint,
         token_endpoint: as_meta.token_endpoint,
         registration_endpoint: as_meta.registration_endpoint,
@@ -644,5 +666,159 @@ mod tests {
             meta.scopes_supported,
             vec!["search:read.public", "chat:write"]
         );
+    }
+
+    // --- PR #69 audit gap 2a: trailing-slash regression ---------------------
+
+    /// `build_well_known_url` must collapse a trailing slash on the base URL
+    /// rather than producing `…//.well-known/…`. The originally reported bug
+    /// was against `https://accounts.google.com/`.
+    #[test]
+    fn test_build_well_known_url_trailing_slash_no_path() {
+        let url =
+            build_well_known_url("https://accounts.google.com/", "oauth-authorization-server")
+                .unwrap();
+        assert_eq!(
+            url,
+            "https://accounts.google.com/.well-known/oauth-authorization-server"
+        );
+    }
+
+    // --- PR #69 audit gap 3: discover_authorization_server direct tests -----
+
+    /// Spawn an axum server on `127.0.0.1:0` that serves AS metadata. Returns
+    /// `(base_url, handle)`. The `path_status` controls what the path-shaped
+    /// well-known URL returns; the root well-known URL always serves
+    /// `root_body` when provided.
+    async fn spawn_as_fixture(
+        path_status: axum::http::StatusCode,
+        root_body: Option<serde_json::Value>,
+        path_body: Option<serde_json::Value>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::extract::{Path as AxPath, State};
+        use axum::http::StatusCode;
+        use axum::{response::IntoResponse, routing::get, Json, Router};
+
+        #[derive(Clone)]
+        struct Fx {
+            path_status: StatusCode,
+            root_body: std::sync::Arc<Option<serde_json::Value>>,
+            path_body: std::sync::Arc<Option<serde_json::Value>>,
+        }
+
+        async fn root(State(fx): State<Fx>) -> axum::response::Response {
+            match fx.root_body.as_ref() {
+                Some(v) => (StatusCode::OK, Json(v.clone())).into_response(),
+                None => (StatusCode::NOT_FOUND, "not found").into_response(),
+            }
+        }
+        async fn path_handler(
+            State(fx): State<Fx>,
+            AxPath(_): AxPath<String>,
+        ) -> axum::response::Response {
+            if fx.path_status == StatusCode::OK {
+                match fx.path_body.as_ref() {
+                    Some(v) => (StatusCode::OK, Json(v.clone())).into_response(),
+                    None => (StatusCode::OK, "{}").into_response(),
+                }
+            } else {
+                (fx.path_status, "not found").into_response()
+            }
+        }
+
+        let fx = Fx {
+            path_status,
+            root_body: std::sync::Arc::new(root_body),
+            path_body: std::sync::Arc::new(path_body),
+        };
+
+        let router = Router::new()
+            .route("/.well-known/oauth-authorization-server", get(root))
+            .route(
+                "/.well-known/oauth-authorization-server/{*tail}",
+                get(path_handler),
+            )
+            .with_state(fx);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        // Tiny delay so the server is accepting connections.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}", addr.port()), handle)
+    }
+
+    /// 3a. URL has a path → path-shaped well-known 404 → root-only fallback
+    /// returns the parsed metadata.
+    #[tokio::test]
+    async fn discover_authorization_server_path_404_falls_back_to_root() {
+        use serde_json::json;
+        let root_meta = json!({
+            "issuer": "https://example.com",
+            "authorization_endpoint": "https://example.com/authorize",
+            "token_endpoint": "https://example.com/token",
+            "code_challenge_methods_supported": ["S256"],
+        });
+        let (base, server) = spawn_as_fixture(
+            axum::http::StatusCode::NOT_FOUND,
+            Some(root_meta.clone()),
+            None,
+        )
+        .await;
+
+        // Input URL has a path so build_well_known_url emits the path variant
+        // first; the fixture returns 404 there and the root fallback hits.
+        let url = format!("{}/some/path", base);
+        let result = discover_authorization_server(&url, true)
+            .await
+            .expect("root fallback must succeed");
+        assert_eq!(
+            result.authorization_endpoint,
+            "https://example.com/authorize"
+        );
+        assert_eq!(result.token_endpoint, "https://example.com/token");
+        assert_eq!(result.auth_server_url, url);
+
+        server.abort();
+    }
+
+    /// 3b. AS metadata advertises only `plain` (no `S256`) → S256NotSupported.
+    #[tokio::test]
+    async fn discover_authorization_server_rejects_when_s256_missing() {
+        use serde_json::json;
+        let root_meta = json!({
+            "issuer": "https://example.com",
+            "authorization_endpoint": "https://example.com/authorize",
+            "token_endpoint": "https://example.com/token",
+            "code_challenge_methods_supported": ["plain"],
+        });
+        // URL has no path so the first fetch hits the root well-known route;
+        // serve the metadata there.
+        let (base, server) =
+            spawn_as_fixture(axum::http::StatusCode::OK, Some(root_meta), None).await;
+
+        let result = discover_authorization_server(&base, true).await;
+        assert!(
+            matches!(result, Err(DiscoveryError::S256NotSupported)),
+            "expected S256NotSupported, got {:?}",
+            result.err()
+        );
+
+        server.abort();
+    }
+
+    /// 3c. SSRF guard rejects a loopback URL when `allow_insecure=false`,
+    /// surfaced as `DiscoveryError::UrlGuard`.
+    #[tokio::test]
+    async fn discover_authorization_server_ssrf_guard_rejects_loopback() {
+        // 127.0.0.1 is loopback → guard rejects when allow_insecure=false.
+        let result = discover_authorization_server("http://127.0.0.1:1/", false).await;
+        match result {
+            Err(DiscoveryError::UrlGuard(_)) => {}
+            Err(other) => panic!("expected DiscoveryError::UrlGuard, got {:?}", other),
+            Ok(_) => panic!("expected DiscoveryError::UrlGuard, got Ok(_)"),
+        }
     }
 }

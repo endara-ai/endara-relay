@@ -1304,3 +1304,203 @@ async fn test_oauth_server_info_name_enforcement() {
         tools.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// PR #69 audit gap 6: end-to-end refresh discovery fallback against a real
+// `OAuthAdapter`. Mocks the full RFC 9728 + RFC 8414 path with axum and
+// asserts (1) the 404 on `/old/token` rediscovers `/new/token`, (2) the
+// override is memoized, (3) a second refresh skips discovery, (4) the state
+// machine settles in `Ready`.
+// ---------------------------------------------------------------------------
+
+/// Shared counters for the gap-6 mock servers. Each axum route bumps its own
+/// `AtomicU64` so assertions can pin exact call counts.
+struct RefreshFallbackCounters {
+    pr_metadata_hits: AtomicU64,
+    as_metadata_hits: AtomicU64,
+    old_token_hits: AtomicU64,
+    new_token_hits: AtomicU64,
+}
+
+#[tokio::test]
+async fn refresh_404_triggers_discovery_then_caches_new_token_endpoint() {
+    use axum::routing::{get, post};
+    use axum::Router;
+    use endara_relay::adapter::oauth::{OAuthAdapter, OAuthAdapterConfig};
+    use endara_relay::token_manager::{TokenManager, TokenSet};
+
+    let counters = Arc::new(RefreshFallbackCounters {
+        pr_metadata_hits: AtomicU64::new(0),
+        as_metadata_hits: AtomicU64::new(0),
+        old_token_hits: AtomicU64::new(0),
+        new_token_hits: AtomicU64::new(0),
+    });
+
+    // Bind first so the router can self-reference its own URL in discovery
+    // metadata (mirrors how a real AS advertises its endpoints).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+
+    let pr_base = base.clone();
+    let pr_counters = counters.clone();
+    let pr_metadata = move || {
+        let base = pr_base.clone();
+        let counters = pr_counters.clone();
+        async move {
+            counters.pr_metadata_hits.fetch_add(1, Ordering::SeqCst);
+            axum::Json(json!({
+                "resource": base,
+                "authorization_servers": [base],
+                "bearer_methods_supported": ["header"],
+            }))
+        }
+    };
+
+    let as_base = base.clone();
+    let as_counters = counters.clone();
+    let as_metadata = move || {
+        let base = as_base.clone();
+        let counters = as_counters.clone();
+        async move {
+            counters.as_metadata_hits.fetch_add(1, Ordering::SeqCst);
+            axum::Json(json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{}/authorize", base),
+                "token_endpoint": format!("{}/new/token", base),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+    };
+
+    let old_counters = counters.clone();
+    let old_token = move || {
+        let counters = old_counters.clone();
+        async move {
+            counters.old_token_hits.fetch_add(1, Ordering::SeqCst);
+            (axum::http::StatusCode::NOT_FOUND, "not found".to_string())
+        }
+    };
+
+    let new_counters = counters.clone();
+    let new_token = move |body: String| {
+        let counters = new_counters.clone();
+        async move {
+            counters.new_token_hits.fetch_add(1, Ordering::SeqCst);
+            let params: HashMap<String, String> = url::form_urlencoded::parse(body.as_bytes())
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            let n = counters.new_token_hits.load(Ordering::SeqCst);
+            axum::Json(json!({
+                "access_token": format!("new-access-{}", n),
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": params
+                    .get("refresh_token")
+                    .cloned()
+                    .unwrap_or_else(|| "refresh-token".to_string()),
+                "scope": "read write",
+            }))
+        }
+    };
+
+    let app = Router::new()
+        .route("/.well-known/oauth-protected-resource", get(pr_metadata))
+        .route("/.well-known/oauth-authorization-server", get(as_metadata))
+        .route("/old/token", post(old_token))
+        .route("/new/token", post(new_token));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+
+    // Construct a real OAuthAdapter via the same public constructor that
+    // watcher::create_adapter uses for the OAuth transport.
+    let tmp = tempfile::tempdir().unwrap();
+    let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+    let config = OAuthAdapterConfig {
+        endpoint_name: "gap6-e2e".to_string(),
+        url: format!("{}/mcp", base),
+        token_endpoint_url: format!("{}/old/token", base),
+        client_id: "test-client".to_string(),
+        client_secret: None,
+        heartbeat_interval_secs: 30,
+        probe_timeout_secs: 10,
+        probe_failure_threshold: 3,
+        server_type_override: None,
+        // Required for the mock to be reachable via 127.0.0.1 from the
+        // SSRF-aware discovery client.
+        allow_insecure_oauth: true,
+    };
+    let adapter = OAuthAdapter::new(config, token_manager);
+    let inner = adapter.shared_inner();
+
+    // Pre-seed the refresh token the same way the in-tree
+    // `make_adapter_with_refresh_token` helper does, so `do_token_refresh`
+    // has something to send.
+    *inner.tokens.write().await = Some(TokenSet {
+        access_token: "stale-access".to_string(),
+        refresh_token: Some("rt-1".to_string()),
+        expires_at: None,
+        token_type: "Bearer".to_string(),
+        scope: None,
+        issued_at: None,
+    });
+
+    // First refresh: /old/token returns 404 -> discovery -> /new/token.
+    let tokens = inner
+        .do_token_refresh()
+        .await
+        .expect("refresh should succeed via discovery fallback");
+    assert_eq!(tokens.access_token, "new-access-1");
+
+    // Cached override and effective endpoint.
+    let effective = inner.effective_token_endpoint().await;
+    assert_eq!(effective, format!("{}/new/token", base));
+
+    // Tight per-counter assertions on the first refresh.
+    assert_eq!(counters.old_token_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.pr_metadata_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.as_metadata_hits.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.new_token_hits.load(Ordering::SeqCst), 1);
+
+    // `do_token_refresh` is the inner refresh primitive: on success it
+    // returns the `TokenSet` and leaves the state at `Refreshing` for the
+    // outer caller (`refresh()` / startup-restore) to `apply_tokens` and
+    // transition to `Authenticated`. Pin that contract so a future change
+    // to who owns the post-success transition is caught by this test.
+    let state = inner.state.read().await.clone();
+    assert_eq!(
+        state,
+        endara_relay::adapter::oauth::OAuthState::Refreshing,
+        "do_token_refresh must leave the state at Refreshing for the caller to finalize"
+    );
+
+    // Second refresh: must skip discovery entirely and post to /new/token.
+    let tokens2 = inner
+        .do_token_refresh()
+        .await
+        .expect("second refresh should succeed against memoized endpoint");
+    assert_eq!(tokens2.access_token, "new-access-2");
+
+    assert_eq!(
+        counters.old_token_hits.load(Ordering::SeqCst),
+        1,
+        "second refresh must NOT re-hit /old/token"
+    );
+    assert_eq!(
+        counters.pr_metadata_hits.load(Ordering::SeqCst),
+        1,
+        "second refresh must NOT re-run protected-resource discovery"
+    );
+    assert_eq!(
+        counters.as_metadata_hits.load(Ordering::SeqCst),
+        1,
+        "second refresh must NOT re-run authorization-server discovery"
+    );
+    assert_eq!(
+        counters.new_token_hits.load(Ordering::SeqCst),
+        2,
+        "second refresh must hit /new/token directly"
+    );
+
+    server.abort();
+}

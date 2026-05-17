@@ -9,6 +9,7 @@ use self::metrics::{generate_correlation_id, OAuthMetrics};
 use super::http::{HttpAdapter, HttpConfig};
 use super::server_type_resolution::effective_server_type;
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
+use crate::oauth::discovery::{discover_oauth_server, DiscoveryResult};
 use crate::oauth::OAuthError;
 use crate::token_manager::{TokenManager, TokenSet};
 use async_trait::async_trait;
@@ -68,6 +69,43 @@ pub struct OAuthAdapterConfig {
     /// Optional override for the advertised `server_type` name. Forwarded to
     /// the inner [`HttpAdapter`] when it is constructed.
     pub server_type_override: Option<String>,
+    /// Permit HTTP and loopback / link-local addresses when running OAuth
+    /// discovery against the resource URL during the refresh-time fallback.
+    /// Mirrors `config.relay.allow_insecure_oauth`; defaults to `false` for
+    /// production callers and is set to `true` only by tests that mock the
+    /// well-known endpoints on `127.0.0.1`.
+    pub allow_insecure_oauth: bool,
+}
+
+/// Outcome of a single POST to the OAuth token endpoint. Returned by
+/// `OAuthAdapterInner::execute_token_post` so the caller can special-case
+/// HTTP 404 (which triggers the discovery fallback) without prematurely
+/// transitioning the adapter state machine.
+#[derive(Debug)]
+enum TokenPostOutcome {
+    Success(TokenSet),
+    NotFound {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    HttpError {
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    Network(reqwest::Error),
+    InvalidJson(reqwest::Error),
+}
+
+impl TokenPostOutcome {
+    fn short_label(&self) -> &'static str {
+        match self {
+            TokenPostOutcome::Success(_) => "success",
+            TokenPostOutcome::NotFound { .. } => "not_found",
+            TokenPostOutcome::HttpError { .. } => "http_error",
+            TokenPostOutcome::Network(_) => "network",
+            TokenPostOutcome::InvalidJson(_) => "invalid_json",
+        }
+    }
 }
 
 /// Shared inner state for an OAuth adapter, wrapped in `Arc` so it can be
@@ -79,6 +117,13 @@ pub struct OAuthAdapterInner {
     pub tokens: RwLock<Option<TokenSet>>,
     /// Static configuration.
     pub config: OAuthAdapterConfig,
+    /// In-memory override of `config.token_endpoint_url`. Populated when a
+    /// refresh-time RFC 9728 → RFC 8414 rediscovery turns up a different
+    /// token endpoint than the one persisted in `config.toml`, so subsequent
+    /// refreshes skip the discovery round-trip and post directly to the new
+    /// URL. Cleared only on adapter reconstruction; not persisted to disk
+    /// (that is handled separately by the startup-time migration path).
+    token_endpoint_override: RwLock<Option<String>>,
     /// The inner HTTP/SSE adapter that talks to the upstream MCP server.
     inner_adapter: RwLock<Option<HttpAdapter>>,
     /// Token persistence layer.
@@ -167,11 +212,36 @@ impl OAuthAdapterInner {
         );
     }
 
+    /// Resolve the URL that the next token-refresh POST should target.
+    ///
+    /// Returns the in-memory `token_endpoint_override` if a previous refresh
+    /// rediscovered a new endpoint, otherwise the URL persisted in
+    /// `config.token_endpoint_url`. Checked at the top of every refresh
+    /// attempt so that the second and subsequent refreshes after a successful
+    /// rediscovery go straight to the new URL without re-running discovery.
+    pub async fn effective_token_endpoint(&self) -> String {
+        if let Some(url) = self.token_endpoint_override.read().await.clone() {
+            url
+        } else {
+            self.config.token_endpoint_url.clone()
+        }
+    }
+
     /// Perform a token refresh using the refresh_token grant.
     ///
-    /// POSTs to the token endpoint with grant_type=refresh_token.
-    /// On success, calls `apply_tokens_inner` with the new token set.
-    /// On failure, transitions to `AuthRequired`.
+    /// POSTs to the token endpoint (using `effective_token_endpoint`) with
+    /// grant_type=refresh_token. On success, returns the new `TokenSet`. On
+    /// failure, transitions to `AuthRequired` or `ConnectionFailed` to match
+    /// the failure category.
+    ///
+    /// When the POST returns HTTP 404, the adapter runs RFC 9728 → RFC 8414
+    /// discovery against `self.config.url` and, if the rediscovered token
+    /// endpoint differs from the one we just hit, updates the in-memory
+    /// override and retries the POST exactly once. If discovery is not
+    /// feasible (empty `config.url`), discovery fails, returns the same URL,
+    /// or the retry also fails, the original 404 error is returned and the
+    /// adapter transitions to `AuthRequired` (matching the pre-existing
+    /// non-2xx behavior).
     pub async fn do_token_refresh(self: &Arc<Self>) -> Result<TokenSet, OAuthError> {
         // Snapshot the current access token before acquiring the mutex.
         // If it changes while we wait, another concurrent refresh succeeded.
@@ -240,18 +310,38 @@ impl OAuthAdapterInner {
             .extend_pairs(form_parts.iter())
             .finish();
 
-        let resp = match self
-            .http_client
-            .post(&self.config.token_endpoint_url)
-            .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(form_body)
-            .send()
+        let initial_url = self.effective_token_endpoint().await;
+        match self
+            .execute_token_post(&form_body, &initial_url, &correlation_id)
             .await
         {
-            Ok(r) => r,
-            Err(e) => {
-                // Network/timeout error during refresh — leave Refreshing
-                // for ConnectionFailed so the state machine doesn't hang.
+            TokenPostOutcome::Success(token_set) => {
+                self.metrics.inc_refresh_success();
+                info!(
+                    endpoint = %self.config.endpoint_name,
+                    correlation_id = %correlation_id,
+                    "Token refresh successful"
+                );
+                Ok(token_set)
+            }
+            TokenPostOutcome::NotFound { status, body } => {
+                self.handle_refresh_404(&form_body, &initial_url, &correlation_id, status, body)
+                    .await
+            }
+            TokenPostOutcome::HttpError { status, body } => {
+                error!(
+                    endpoint = %self.config.endpoint_name,
+                    correlation_id = %correlation_id,
+                    %status,
+                    body = %body,
+                    "Token refresh failed"
+                );
+                self.metrics.inc_refresh_failure();
+                self.transition_to(OAuthState::AuthRequired, "token refresh failed")
+                    .await;
+                Err(OAuthError::RefreshFailed { status, body })
+            }
+            TokenPostOutcome::Network(e) => {
                 error!(
                     endpoint = %self.config.endpoint_name,
                     correlation_id = %correlation_id,
@@ -261,33 +351,9 @@ impl OAuthAdapterInner {
                 self.metrics.inc_refresh_failure();
                 self.transition_to(OAuthState::ConnectionFailed, "token refresh network error")
                     .await;
-                return Err(OAuthError::Http(e));
+                Err(OAuthError::Http(e))
             }
-        };
-
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let body = resp.text().await.unwrap_or_default();
-            error!(
-                endpoint = %self.config.endpoint_name,
-                correlation_id = %correlation_id,
-                %status,
-                body = %body,
-                "Token refresh failed"
-            );
-            self.metrics.inc_refresh_failure();
-            self.transition_to(OAuthState::AuthRequired, "token refresh failed")
-                .await;
-            return Err(OAuthError::RefreshFailed { status, body });
-        }
-
-        let token_json: serde_json::Value = match resp.json().await {
-            Ok(v) => v,
-            Err(e) => {
-                // Upstream returned 200 but the body is not parseable JSON.
-                // Treat as a transient connection-quality issue (retry may
-                // recover) and leave Refreshing for ConnectionFailed so the
-                // state machine doesn't hang.
+            TokenPostOutcome::InvalidJson(e) => {
                 error!(
                     endpoint = %self.config.endpoint_name,
                     correlation_id = %correlation_id,
@@ -300,8 +366,153 @@ impl OAuthAdapterInner {
                     "token refresh response not JSON",
                 )
                 .await;
-                return Err(OAuthError::Http(e));
+                Err(OAuthError::Http(e))
             }
+        }
+    }
+
+    /// Drive the discovery-and-retry fallback for an HTTP 404 from the token
+    /// POST. Returns the refreshed `TokenSet` if rediscovery yields a new
+    /// endpoint and the retry succeeds; otherwise returns the original
+    /// `RefreshFailed` error (the retry-failure path also transitions to
+    /// `AuthRequired`, matching the pre-existing non-2xx behavior).
+    async fn handle_refresh_404(
+        self: &Arc<Self>,
+        form_body: &str,
+        initial_url: &str,
+        correlation_id: &str,
+        status: reqwest::StatusCode,
+        body: String,
+    ) -> Result<TokenSet, OAuthError> {
+        let original_err = OAuthError::RefreshFailed {
+            status,
+            body: body.clone(),
+        };
+
+        // Discovery is only feasible if we know the resource URL.
+        if self.config.url.is_empty() {
+            warn!(
+                endpoint = %self.config.endpoint_name,
+                correlation_id = %correlation_id,
+                %status,
+                "Token refresh got 404 but resource URL is empty; skipping discovery fallback"
+            );
+            self.metrics.inc_refresh_failure();
+            self.transition_to(OAuthState::AuthRequired, "token refresh failed")
+                .await;
+            return Err(original_err);
+        }
+
+        info!(
+            endpoint = %self.config.endpoint_name,
+            correlation_id = %correlation_id,
+            %status,
+            attempted_url = %initial_url,
+            "Token endpoint returned 404; attempting OAuth discovery fallback"
+        );
+
+        let disc: DiscoveryResult =
+            match discover_oauth_server(&self.config.url, self.config.allow_insecure_oauth).await {
+                Ok(d) => d,
+                Err(e) => {
+                    warn!(
+                        endpoint = %self.config.endpoint_name,
+                        correlation_id = %correlation_id,
+                        error = %e,
+                        "OAuth discovery fallback failed; returning original 404"
+                    );
+                    self.metrics.inc_refresh_failure();
+                    self.transition_to(OAuthState::AuthRequired, "token refresh failed")
+                        .await;
+                    return Err(original_err);
+                }
+            };
+
+        if disc.token_endpoint == initial_url {
+            warn!(
+                endpoint = %self.config.endpoint_name,
+                correlation_id = %correlation_id,
+                token_endpoint = %disc.token_endpoint,
+                "OAuth discovery returned the same token endpoint that just 404'd; not retrying"
+            );
+            self.metrics.inc_refresh_failure();
+            self.transition_to(OAuthState::AuthRequired, "token refresh failed")
+                .await;
+            return Err(original_err);
+        }
+
+        info!(
+            endpoint = %self.config.endpoint_name,
+            correlation_id = %correlation_id,
+            old_token_endpoint = %initial_url,
+            new_token_endpoint = %disc.token_endpoint,
+            "OAuth discovery rediscovered a new token endpoint; retrying refresh once"
+        );
+        *self.token_endpoint_override.write().await = Some(disc.token_endpoint.clone());
+
+        match self
+            .execute_token_post(form_body, &disc.token_endpoint, correlation_id)
+            .await
+        {
+            TokenPostOutcome::Success(token_set) => {
+                self.metrics.inc_refresh_success();
+                info!(
+                    endpoint = %self.config.endpoint_name,
+                    correlation_id = %correlation_id,
+                    "Token refresh successful after rediscovery"
+                );
+                Ok(token_set)
+            }
+            other => {
+                warn!(
+                    endpoint = %self.config.endpoint_name,
+                    correlation_id = %correlation_id,
+                    retry_outcome = ?other.short_label(),
+                    "Token refresh retry after rediscovery failed; returning original 404"
+                );
+                self.metrics.inc_refresh_failure();
+                self.transition_to(OAuthState::AuthRequired, "token refresh failed")
+                    .await;
+                Err(original_err)
+            }
+        }
+    }
+
+    /// Execute a single POST to the token endpoint, returning a structured
+    /// outcome so callers can special-case HTTP 404. State transitions and
+    /// metric updates are intentionally NOT done here — the caller is
+    /// responsible for that so the rediscovery fallback can swallow a 404
+    /// without leaking a `RefreshFailed` transition.
+    async fn execute_token_post(
+        &self,
+        form_body: &str,
+        target_url: &str,
+        _correlation_id: &str,
+    ) -> TokenPostOutcome {
+        let resp = match self
+            .http_client
+            .post(target_url)
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(form_body.to_string())
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return TokenPostOutcome::Network(e),
+        };
+
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return TokenPostOutcome::NotFound { status, body };
+            }
+            return TokenPostOutcome::HttpError { status, body };
+        }
+
+        let token_json: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => return TokenPostOutcome::InvalidJson(e),
         };
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -335,13 +546,7 @@ impl OAuthAdapterInner {
             issued_at: Some(now_secs),
         };
 
-        self.metrics.inc_refresh_success();
-        info!(
-            endpoint = %self.config.endpoint_name,
-            correlation_id = %correlation_id,
-            "Token refresh successful"
-        );
-        Ok(new_token_set)
+        TokenPostOutcome::Success(new_token_set)
     }
 
     /// Apply a new token set: update in-memory state, persist to disk,
@@ -648,6 +853,7 @@ impl OAuthAdapter {
                 state: RwLock::new(OAuthState::NeedsLogin),
                 tokens: RwLock::new(None),
                 config,
+                token_endpoint_override: RwLock::new(None),
                 inner_adapter: RwLock::new(None),
                 token_manager,
                 http_client: Client::builder()
@@ -956,6 +1162,7 @@ mod tests {
             probe_timeout_secs: 10,
             probe_failure_threshold: 3,
             server_type_override: None,
+            allow_insecure_oauth: false,
         }
     }
 
@@ -2024,5 +2231,471 @@ mod tests {
             !recv_tick(&mut outer_rx, Duration::from_millis(150)).await,
             "no tick should reach outer subscriber after forwarder disabled"
         );
+    }
+
+    // --- Refresh-time token endpoint discovery fallback tests ---
+
+    /// Shared in/out counters and canned responses for the discovery test
+    /// fixture. `None` for any of the metadata fields means "respond 404".
+    #[derive(Clone, Default)]
+    struct DiscoveryFixtureOpts {
+        new_token_count: Arc<std::sync::atomic::AtomicUsize>,
+        old_token_count: Arc<std::sync::atomic::AtomicUsize>,
+        pr_count: Arc<std::sync::atomic::AtomicUsize>,
+        as_count: Arc<std::sync::atomic::AtomicUsize>,
+        pr_metadata: Option<serde_json::Value>,
+        as_metadata: Option<serde_json::Value>,
+        new_token_response: Option<serde_json::Value>,
+    }
+
+    /// Build a `DiscoveryFixtureOpts` pre-populated with a valid protected-
+    /// resource document pointing at the fixture's own host as the
+    /// authorization server, and a valid AS metadata document whose
+    /// `token_endpoint` is the fixture's `/new/token` URL.
+    fn happy_discovery_opts(base: &str) -> DiscoveryFixtureOpts {
+        use serde_json::json;
+        DiscoveryFixtureOpts {
+            pr_metadata: Some(json!({
+                "resource": base,
+                "authorization_servers": [base],
+            })),
+            as_metadata: Some(json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{}/authorize", base),
+                "token_endpoint": format!("{}/new/token", base),
+                "code_challenge_methods_supported": ["S256"],
+            })),
+            new_token_response: Some(json!({
+                "access_token": "rediscovered-access",
+                "token_type": "Bearer",
+                "expires_in": 3600u64,
+                "refresh_token": "rediscovered-refresh",
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// Bind a TCP listener on an ephemeral port without consuming it so we
+    /// know the URL the fixture will use before we spawn the server. The
+    /// listener is returned and dropped only when the caller hands it to the
+    /// fixture's `spawn_on`.
+    async fn reserve_port() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        (listener, format!("http://127.0.0.1:{}", addr.port()))
+    }
+
+    /// Variant of `spawn_discovery_fixture` that takes a pre-bound listener
+    /// so the test can build URLs referencing the eventual base URL before
+    /// the server starts.
+    async fn spawn_discovery_fixture_on(
+        listener: tokio::net::TcpListener,
+        opts: DiscoveryFixtureOpts,
+    ) -> tokio::task::JoinHandle<()> {
+        use axum::http::StatusCode;
+        use axum::{extract::State, response::IntoResponse, routing::post, Json, Router};
+        use serde_json::Value;
+
+        #[derive(Clone)]
+        struct Fx {
+            new_token_count: Arc<std::sync::atomic::AtomicUsize>,
+            old_token_count: Arc<std::sync::atomic::AtomicUsize>,
+            pr_count: Arc<std::sync::atomic::AtomicUsize>,
+            as_count: Arc<std::sync::atomic::AtomicUsize>,
+            pr_metadata: Arc<Option<Value>>,
+            as_metadata: Arc<Option<Value>>,
+            new_token_response: Arc<Option<Value>>,
+        }
+
+        async fn old_token(State(fx): State<Fx>) -> impl IntoResponse {
+            fx.old_token_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (StatusCode::NOT_FOUND, "not found").into_response()
+        }
+        async fn new_token(State(fx): State<Fx>) -> impl IntoResponse {
+            fx.new_token_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match fx.new_token_response.as_ref() {
+                Some(v) => (StatusCode::OK, Json(v.clone())).into_response(),
+                None => (StatusCode::NOT_FOUND, "not found").into_response(),
+            }
+        }
+        async fn pr_meta(State(fx): State<Fx>) -> axum::response::Response {
+            fx.pr_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match fx.pr_metadata.as_ref() {
+                Some(v) => (StatusCode::OK, Json(v.clone())).into_response(),
+                None => (StatusCode::NOT_FOUND, "not found").into_response(),
+            }
+        }
+        async fn as_meta(State(fx): State<Fx>) -> axum::response::Response {
+            fx.as_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            match fx.as_metadata.as_ref() {
+                Some(v) => (StatusCode::OK, Json(v.clone())).into_response(),
+                None => (StatusCode::NOT_FOUND, "not found").into_response(),
+            }
+        }
+
+        let fx = Fx {
+            new_token_count: opts.new_token_count,
+            old_token_count: opts.old_token_count,
+            pr_count: opts.pr_count,
+            as_count: opts.as_count,
+            pr_metadata: Arc::new(opts.pr_metadata),
+            as_metadata: Arc::new(opts.as_metadata),
+            new_token_response: Arc::new(opts.new_token_response),
+        };
+
+        let router = Router::new()
+            .route("/old/token", post(old_token))
+            .route("/new/token", post(new_token))
+            .route(
+                "/.well-known/oauth-protected-resource",
+                axum::routing::get(pr_meta),
+            )
+            .route(
+                "/.well-known/oauth-authorization-server",
+                axum::routing::get(as_meta),
+            )
+            .with_state(fx);
+
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        handle
+    }
+
+    /// Happy path: the configured token endpoint returns 404, discovery
+    /// succeeds, the rediscovered endpoint differs, and the retry succeeds.
+    /// The new tokens are returned and the in-memory override is populated.
+    #[tokio::test]
+    async fn refresh_discovery_fallback_success() {
+        let (listener, base) = reserve_port().await;
+        let opts = happy_discovery_opts(&base);
+        let server = spawn_discovery_fixture_on(listener, opts).await;
+
+        let mut config = make_config();
+        config.url = format!("{}/mcp", base);
+        config.token_endpoint_url = format!("{}/old/token", base);
+        config.allow_insecure_oauth = true;
+        let adapter = make_adapter_with_refresh_token(config).await;
+
+        let token_set = adapter
+            .inner
+            .do_token_refresh()
+            .await
+            .expect("refresh should succeed after rediscovery");
+        assert_eq!(token_set.access_token, "rediscovered-access");
+
+        let override_url = adapter.inner.token_endpoint_override.read().await.clone();
+        assert_eq!(override_url, Some(format!("{}/new/token", base)));
+
+        server.abort();
+    }
+
+    /// Discovery itself fails (no protected-resource metadata served).
+    /// The original 404 must be surfaced to the caller and the override must
+    /// remain unset so we don't poison subsequent refreshes.
+    #[tokio::test]
+    async fn refresh_discovery_fallback_failure_discovery_fails() {
+        let (listener, base) = reserve_port().await;
+        let opts = DiscoveryFixtureOpts {
+            pr_metadata: None,
+            as_metadata: None,
+            ..Default::default()
+        };
+        let server = spawn_discovery_fixture_on(listener, opts).await;
+
+        let mut config = make_config();
+        config.url = format!("{}/mcp", base);
+        config.token_endpoint_url = format!("{}/old/token", base);
+        config.allow_insecure_oauth = true;
+        let adapter = make_adapter_with_refresh_token(config).await;
+
+        let result = adapter.inner.do_token_refresh().await;
+        assert!(
+            matches!(result, Err(OAuthError::RefreshFailed { ref body, .. }) if body.contains("not found")),
+            "expected original 404 RefreshFailed, got {:?}",
+            result
+        );
+        assert!(adapter.inner.token_endpoint_override.read().await.is_none());
+
+        let state = adapter.inner.state.read().await.clone();
+        assert_eq!(state, OAuthState::AuthRequired);
+
+        server.abort();
+    }
+
+    /// Discovery succeeds but returns the same token endpoint URL we just
+    /// hit. The adapter must NOT retry (that would just 404 again) and must
+    /// surface the original 404.
+    #[tokio::test]
+    async fn refresh_discovery_fallback_failure_no_token_endpoint() {
+        use serde_json::json;
+        let (listener, base) = reserve_port().await;
+        let opts = DiscoveryFixtureOpts {
+            pr_metadata: Some(json!({
+                "resource": base,
+                "authorization_servers": [base.clone()],
+            })),
+            as_metadata: Some(json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{}/authorize", base),
+                // Discovery returns the SAME URL we just got a 404 from.
+                "token_endpoint": format!("{}/old/token", base),
+                "code_challenge_methods_supported": ["S256"],
+            })),
+            ..Default::default()
+        };
+        let server = spawn_discovery_fixture_on(listener, opts).await;
+
+        let mut config = make_config();
+        config.url = format!("{}/mcp", base);
+        config.token_endpoint_url = format!("{}/old/token", base);
+        config.allow_insecure_oauth = true;
+        let adapter = make_adapter_with_refresh_token(config).await;
+
+        let result = adapter.inner.do_token_refresh().await;
+        assert!(
+            matches!(result, Err(OAuthError::RefreshFailed { .. })),
+            "expected RefreshFailed, got {:?}",
+            result
+        );
+        assert!(adapter.inner.token_endpoint_override.read().await.is_none());
+        server.abort();
+    }
+
+    /// Memoization: after a successful rediscovery the override is cached, so
+    /// a second refresh posts directly to the new endpoint without re-running
+    /// discovery (and without touching the old endpoint).
+    #[tokio::test]
+    async fn refresh_discovery_fallback_memoized() {
+        let (listener, base) = reserve_port().await;
+        let opts = happy_discovery_opts(&base);
+        let pr_count = opts.pr_count.clone();
+        let as_count = opts.as_count.clone();
+        let new_token_count = opts.new_token_count.clone();
+        let old_token_count = opts.old_token_count.clone();
+        let server = spawn_discovery_fixture_on(listener, opts).await;
+
+        let mut config = make_config();
+        config.url = format!("{}/mcp", base);
+        config.token_endpoint_url = format!("{}/old/token", base);
+        config.allow_insecure_oauth = true;
+        let adapter = make_adapter_with_refresh_token(config).await;
+
+        // First refresh: discovery runs, override is populated.
+        let first = adapter
+            .inner
+            .do_token_refresh()
+            .await
+            .expect("first refresh");
+        assert_eq!(first.access_token, "rediscovered-access");
+        let pr_after_first = pr_count.load(std::sync::atomic::Ordering::SeqCst);
+        let as_after_first = as_count.load(std::sync::atomic::Ordering::SeqCst);
+        let new_token_after_first = new_token_count.load(std::sync::atomic::Ordering::SeqCst);
+        let old_token_after_first = old_token_count.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(pr_after_first >= 1, "discovery must hit protected-resource");
+        assert!(
+            as_after_first >= 1,
+            "discovery must hit auth-server metadata"
+        );
+        assert_eq!(
+            new_token_after_first, 1,
+            "new token endpoint must be POSTed exactly once"
+        );
+        assert_eq!(
+            old_token_after_first, 1,
+            "old token endpoint must be POSTed exactly once"
+        );
+
+        // Second refresh: must use the cached override; no new discovery hits
+        // and no hit on the old endpoint.
+        let second = adapter
+            .inner
+            .do_token_refresh()
+            .await
+            .expect("second refresh uses cached override");
+        assert_eq!(second.access_token, "rediscovered-access");
+        assert_eq!(
+            pr_count.load(std::sync::atomic::Ordering::SeqCst),
+            pr_after_first,
+            "second refresh must not re-run protected-resource discovery"
+        );
+        assert_eq!(
+            as_count.load(std::sync::atomic::Ordering::SeqCst),
+            as_after_first,
+            "second refresh must not re-run auth-server discovery"
+        );
+        assert_eq!(
+            old_token_count.load(std::sync::atomic::Ordering::SeqCst),
+            old_token_after_first,
+            "second refresh must not POST to the stale old token endpoint"
+        );
+        assert_eq!(
+            new_token_count.load(std::sync::atomic::Ordering::SeqCst),
+            new_token_after_first + 1,
+            "second refresh must POST to the new token endpoint once"
+        );
+
+        server.abort();
+    }
+
+    // --- PR #69 audit gap 1 & 5: discovery short-circuits -------------------
+
+    /// Gap 1: when the resource URL is empty, a 404 from the token endpoint
+    /// must NOT trigger RFC 9728 / 8414 discovery (discovery would have
+    /// nothing to discover against). The original 404 is surfaced.
+    #[tokio::test]
+    async fn refresh_404_with_empty_config_url_skips_discovery() {
+        let (listener, base) = reserve_port().await;
+        // Serve PR/AS metadata so we can prove they were NOT requested.
+        let opts = happy_discovery_opts(&base);
+        let pr_count = opts.pr_count.clone();
+        let as_count = opts.as_count.clone();
+        let new_token_count = opts.new_token_count.clone();
+        let old_token_count = opts.old_token_count.clone();
+        let server = spawn_discovery_fixture_on(listener, opts).await;
+
+        let mut config = make_config();
+        // `url` empty triggers the early-return branch in `handle_refresh_404`.
+        config.url = String::new();
+        config.token_endpoint_url = format!("{}/old/token", base);
+        config.allow_insecure_oauth = true;
+        let adapter = make_adapter_with_refresh_token(config).await;
+
+        let result = adapter.inner.do_token_refresh().await;
+        assert!(
+            matches!(result, Err(OAuthError::RefreshFailed { ref body, .. }) if body.contains("not found")),
+            "expected original 404 RefreshFailed, got {:?}",
+            result
+        );
+        assert!(adapter.inner.token_endpoint_override.read().await.is_none());
+
+        let state = adapter.inner.state.read().await.clone();
+        assert_eq!(state, OAuthState::AuthRequired);
+
+        assert_eq!(
+            old_token_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "old token endpoint must be hit exactly once"
+        );
+        assert_eq!(
+            pr_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "protected-resource discovery must NOT run when config.url is empty"
+        );
+        assert_eq!(
+            as_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "auth-server discovery must NOT run when config.url is empty"
+        );
+        assert_eq!(
+            new_token_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "new token endpoint must NOT be POSTed without discovery"
+        );
+
+        server.abort();
+    }
+
+    /// Gap 5: non-404 HTTP errors (5xx, 4xx other than 404) must NOT trigger
+    /// the discovery fallback — the original status is surfaced as-is and no
+    /// PR/AS metadata requests are issued.
+    #[tokio::test]
+    async fn refresh_5xx_does_not_trigger_discovery() {
+        use axum::http::StatusCode;
+        use axum::{response::IntoResponse, routing::get, routing::post, Router};
+
+        // Counters: token POSTs, plus would-be discovery hits.
+        let token_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pr_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let as_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        #[derive(Clone)]
+        struct Fx {
+            token_count: Arc<std::sync::atomic::AtomicUsize>,
+            pr_count: Arc<std::sync::atomic::AtomicUsize>,
+            as_count: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        async fn token_500(
+            axum::extract::State(fx): axum::extract::State<Fx>,
+        ) -> impl IntoResponse {
+            fx.token_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (StatusCode::INTERNAL_SERVER_ERROR, "upstream broke")
+        }
+        async fn pr(axum::extract::State(fx): axum::extract::State<Fx>) -> impl IntoResponse {
+            fx.pr_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (StatusCode::NOT_FOUND, "")
+        }
+        async fn r#as(axum::extract::State(fx): axum::extract::State<Fx>) -> impl IntoResponse {
+            fx.as_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (StatusCode::NOT_FOUND, "")
+        }
+
+        let fx = Fx {
+            token_count: token_count.clone(),
+            pr_count: pr_count.clone(),
+            as_count: as_count.clone(),
+        };
+        let router = Router::new()
+            .route("/token", post(token_500))
+            .route("/.well-known/oauth-protected-resource", get(pr))
+            .route("/.well-known/oauth-authorization-server", get(r#as))
+            .with_state(fx);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let base = format!("http://127.0.0.1:{}", addr.port());
+
+        let mut config = make_config();
+        config.url = format!("{}/mcp", base);
+        config.token_endpoint_url = format!("{}/token", base);
+        config.allow_insecure_oauth = true;
+        let adapter = make_adapter_with_refresh_token(config).await;
+
+        let result = adapter.inner.do_token_refresh().await;
+        match result {
+            Err(OAuthError::RefreshFailed { status, .. }) => {
+                assert_eq!(
+                    status,
+                    reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                    "non-404 status must surface unchanged"
+                );
+            }
+            other => panic!("expected RefreshFailed(500), got {:?}", other),
+        }
+
+        assert_eq!(
+            token_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "token endpoint must be POSTed exactly once (no retry)"
+        );
+        assert_eq!(
+            pr_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "5xx must NOT trigger protected-resource discovery"
+        );
+        assert_eq!(
+            as_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "5xx must NOT trigger auth-server discovery"
+        );
+        assert!(adapter.inner.token_endpoint_override.read().await.is_none());
+
+        let state = adapter.inner.state.read().await.clone();
+        assert_eq!(state, OAuthState::AuthRequired);
+
+        server.abort();
     }
 }

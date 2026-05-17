@@ -142,7 +142,14 @@ async fn test_config_diff_add_endpoint() {
     let oauth_adapter_inners: Arc<
         RwLock<HashMap<String, Arc<endara_relay::adapter::oauth::OAuthAdapterInner>>>,
     > = Arc::new(RwLock::new(HashMap::new()));
-    watcher::apply_diff(&diff, &registry, &token_manager, &oauth_adapter_inners).await;
+    watcher::apply_diff(
+        &diff,
+        &registry,
+        &token_manager,
+        &oauth_adapter_inners,
+        false,
+    )
+    .await;
 
     // Wait for background initialization to complete
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -288,7 +295,14 @@ async fn test_config_diff_remove_endpoint() {
     let oauth_adapter_inners2: Arc<
         RwLock<HashMap<String, Arc<endara_relay::adapter::oauth::OAuthAdapterInner>>>,
     > = Arc::new(RwLock::new(HashMap::new()));
-    watcher::apply_diff(&diff, &registry, &token_manager2, &oauth_adapter_inners2).await;
+    watcher::apply_diff(
+        &diff,
+        &registry,
+        &token_manager2,
+        &oauth_adapter_inners2,
+        false,
+    )
+    .await;
 
     // Verify the endpoint was removed
     let catalog = registry.merged_catalog().await;
