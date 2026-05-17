@@ -983,18 +983,43 @@ async fn oauth_start(
         discovered_scopes,
         auth_server_label,
     ) = if let Some(ref server_url) = oauth_server_url {
-        // Convention-based: derive from the configured base URL
-        let base = server_url.trim_end_matches('/');
-        let token_url = config_token_endpoint
-            .clone()
-            .unwrap_or_else(|| format!("{}/token", base));
-        (
-            format!("{}/authorize", base),
-            token_url,
-            None::<String>,
-            Vec::<String>::new(),
-            None::<String>,
-        )
+        // Prefer RFC 8414 discovery against the configured AS URL. If it
+        // succeeds, use the discovered endpoints (explicit token_endpoint
+        // config still wins). On any error, fall back to the legacy
+        // convention-based construction so behavior is unchanged for
+        // servers that don't expose AS metadata.
+        match discovery::discover_authorization_server(server_url, allow_insecure_oauth).await {
+            Ok(disc) => {
+                let token_url = config_token_endpoint
+                    .clone()
+                    .unwrap_or_else(|| disc.token_endpoint.clone());
+                (
+                    disc.authorization_endpoint,
+                    token_url,
+                    disc.registration_endpoint,
+                    disc.scopes_supported,
+                    Some(disc.auth_server_url),
+                )
+            }
+            Err(e) => {
+                warn!(
+                    endpoint = %name,
+                    error = %e,
+                    "RFC 8414 discovery against oauth_server_url failed; falling back to convention-based endpoints"
+                );
+                let base = server_url.trim_end_matches('/');
+                let token_url = config_token_endpoint
+                    .clone()
+                    .unwrap_or_else(|| format!("{}/token", base));
+                (
+                    format!("{}/authorize", base),
+                    token_url,
+                    None::<String>,
+                    Vec::<String>::new(),
+                    None::<String>,
+                )
+            }
+        }
     } else {
         // Try RFC 9728 discovery (URL guard + per-host pinned client live inside)
         match discovery::discover_oauth_server(&endpoint_url, allow_insecure_oauth).await {
@@ -4748,6 +4773,198 @@ command = "echo"
         assert_eq!(body["client_secret_set"], true);
         assert_eq!(body["source"], "config");
         assert!(body.get("client_secret").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // oauth_start: AS discovery when oauth_server_url is set
+    // -----------------------------------------------------------------------
+
+    /// Spawn a Router on 127.0.0.1:0 and return its base URL.
+    async fn spawn_mock_as(router: Router) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        // Tiny delay to let the server start accepting connections.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}", addr.port()), handle)
+    }
+
+    /// Build a ManagementState wired for `oauth_start` against a mock AS.
+    fn test_state_oauth_start(
+        name: &str,
+        oauth_server_url: &str,
+        token_endpoint: Option<&str>,
+    ) -> (ManagementState, Arc<OAuthFlowManager>) {
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let cfg = Config {
+            relay: RelayConfig {
+                machine_name: "test-machine".to_string(),
+                local_js_execution: None,
+                token_dir: None,
+                allow_insecure_oauth: Some(true),
+            },
+            endpoints: vec![EndpointConfig {
+                name: name.to_string(),
+                description: None,
+                tool_prefix: None,
+                transport: Transport::Oauth,
+                command: None,
+                args: None,
+                url: Some("http://127.0.0.1:9/mcp".to_string()),
+                env: None,
+                headers: None,
+                disabled: false,
+                disabled_tools: Vec::new(),
+                oauth_server_url: Some(oauth_server_url.to_string()),
+                client_id: Some("test-client".to_string()),
+                client_secret: None,
+                scopes: None,
+                token_endpoint: token_endpoint.map(|s| s.to_string()),
+                server_type_override: None,
+            }],
+        };
+        let state = ManagementState {
+            registry: Arc::new(AdapterRegistry::new()),
+            config: Arc::new(RwLock::new(cfg)),
+            start_time: Instant::now(),
+            config_path: None,
+            oauth_flow_manager: Some(flow_mgr.clone()),
+            relay_port: 9400,
+            oauth_adapter_inners: None,
+            token_manager: None,
+            setup_manager: None,
+        };
+        (state, flow_mgr)
+    }
+
+    /// Extract the `state` query parameter from an authorize URL.
+    fn extract_state_param(authorize_url: &str) -> String {
+        let url = url::Url::parse(authorize_url).expect("valid authorize URL");
+        url.query_pairs()
+            .find(|(k, _)| k == "state")
+            .map(|(_, v)| v.into_owned())
+            .expect("authorize URL has state param")
+    }
+
+    #[tokio::test]
+    async fn oauth_start_with_oauth_server_url_uses_discovery_when_available() {
+        // Mock AS: serve real-looking endpoints at /.well-known/oauth-authorization-server.
+        // Discovered URLs intentionally differ from the convention `{base}/authorize`
+        // and `{base}/token`.
+        async fn well_known() -> Json<Value> {
+            Json(serde_json::json!({
+                "issuer": "http://example.test",
+                "authorization_endpoint": "http://example.test/discovered-auth",
+                "token_endpoint": "http://example.test/discovered-token",
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        let router =
+            Router::new().route("/.well-known/oauth-authorization-server", get(well_known));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let (state, _flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        assert!(
+            authorize_url.starts_with("http://example.test/discovered-auth?"),
+            "expected discovered authorization_endpoint, got: {}",
+            authorize_url
+        );
+        assert_eq!(body["discovery"]["auth_server"], base_url);
+    }
+
+    #[tokio::test]
+    async fn oauth_start_with_oauth_server_url_falls_back_to_convention_on_404() {
+        // Mock AS: return 404 for the well-known. Discovery should fail and
+        // oauth_start should fall back to the convention `{base}/authorize`.
+        async fn not_found() -> StatusCode {
+            StatusCode::NOT_FOUND
+        }
+        let router = Router::new().route("/.well-known/oauth-authorization-server", get(not_found));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let (state, _flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Flow still proceeds — fallback is transparent to the caller.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        let expected_prefix = format!("{}/authorize?", base_url);
+        assert!(
+            authorize_url.starts_with(&expected_prefix),
+            "expected convention-constructed authorize URL `{}…`, got: {}",
+            expected_prefix,
+            authorize_url
+        );
+        // No discovery metadata on the fallback path.
+        assert!(body.get("discovery").is_none() || body["discovery"].is_null());
+    }
+
+    #[tokio::test]
+    async fn oauth_start_with_explicit_token_endpoint_overrides_discovery() {
+        // Mock AS: discovery succeeds but advertises a token_endpoint that
+        // differs from the operator-configured explicit override. The
+        // override must win.
+        async fn well_known() -> Json<Value> {
+            Json(serde_json::json!({
+                "issuer": "http://example.test",
+                "authorization_endpoint": "http://example.test/discovered-auth",
+                "token_endpoint": "http://example.test/discovered-token",
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        let router =
+            Router::new().route("/.well-known/oauth-authorization-server", get(well_known));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let explicit_token = "http://example.test/explicit-token";
+        let (state, flow_mgr) = test_state_oauth_start("ep1", &base_url, Some(explicit_token));
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        // Authorization endpoint still comes from discovery.
+        assert!(
+            authorize_url.starts_with("http://example.test/discovered-auth?"),
+            "expected discovered authorization_endpoint, got: {}",
+            authorize_url
+        );
+        // The registered pending flow must carry the EXPLICIT token endpoint.
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending flow was registered");
+        assert_eq!(flow.token_endpoint, explicit_token);
     }
 
     #[cfg(unix)]

@@ -178,36 +178,58 @@ pub async fn discover_oauth_server(
         .ok_or(DiscoveryError::NoAuthorizationServer)?
         .clone();
 
-    // Step 2: Fetch authorization server metadata using a client pinned to
-    // the (potentially different and server-supplied) auth-server host.
-    let as_well_known = build_well_known_url(&auth_server_url, "oauth-authorization-server")
+    // Step 2: Fetch authorization server metadata (RFC 8414).
+    discover_authorization_server(&auth_server_url, allow_insecure).await
+}
+
+/// Discover OAuth authorization server metadata directly (RFC 8414 only).
+///
+/// Unlike [`discover_oauth_server`], this skips the RFC 9728 protected
+/// resource step and fetches the AS metadata against `auth_server_url`
+/// itself:
+///
+/// 1. `{origin}/.well-known/oauth-authorization-server{path}`
+///    - Falls back to `{origin}/.well-known/oauth-authorization-server`
+///      if 404 and `auth_server_url` has a path component.
+/// 2. Validates S256 PKCE support.
+///
+/// The input URL is validated through [`url_guard`] before any HTTP
+/// request is sent, and the request uses a per-host pinned client.
+///
+/// The returned `DiscoveryResult.auth_server_url` is set to the input
+/// `auth_server_url` so callers can label discovery output consistently.
+pub async fn discover_authorization_server(
+    auth_server_url: &str,
+    allow_insecure: bool,
+) -> Result<DiscoveryResult, DiscoveryError> {
+    let as_well_known = build_well_known_url(auth_server_url, "oauth-authorization-server")
         .map_err(|_| DiscoveryError::AuthServerMetadataNotFound {
-            url: auth_server_url.clone(),
+            url: auth_server_url.to_string(),
         })?;
     let as_client = url_guard::validated_client(&as_well_known, allow_insecure).await?;
 
-    let as_meta: AuthorizationServerMetadata =
-        match fetch_well_known(&as_client, &as_well_known).await {
-            Ok(resp) => resp.json().await?,
-            Err(DiscoveryError::MetadataNotFound { .. }) if has_path(&auth_server_url) => {
-                let root_url =
-                    build_well_known_url_root(&auth_server_url, "oauth-authorization-server")
-                        .map_err(|_| DiscoveryError::AuthServerMetadataNotFound {
-                            url: auth_server_url.clone(),
-                        })?;
-                fetch_well_known(&as_client, &root_url)
-                    .await
-                    .map_err(|_| DiscoveryError::AuthServerMetadataNotFound {
-                        url: as_well_known.clone(),
-                    })?
-                    .json()
-                    .await?
-            }
-            Err(DiscoveryError::MetadataNotFound { url }) => {
-                return Err(DiscoveryError::AuthServerMetadataNotFound { url });
-            }
-            Err(e) => return Err(e),
-        };
+    let as_meta: AuthorizationServerMetadata = match fetch_well_known(&as_client, &as_well_known)
+        .await
+    {
+        Ok(resp) => resp.json().await?,
+        Err(DiscoveryError::MetadataNotFound { .. }) if has_path(auth_server_url) => {
+            let root_url = build_well_known_url_root(auth_server_url, "oauth-authorization-server")
+                .map_err(|_| DiscoveryError::AuthServerMetadataNotFound {
+                    url: auth_server_url.to_string(),
+                })?;
+            fetch_well_known(&as_client, &root_url)
+                .await
+                .map_err(|_| DiscoveryError::AuthServerMetadataNotFound {
+                    url: as_well_known.clone(),
+                })?
+                .json()
+                .await?
+        }
+        Err(DiscoveryError::MetadataNotFound { url }) => {
+            return Err(DiscoveryError::AuthServerMetadataNotFound { url });
+        }
+        Err(e) => return Err(e),
+    };
 
     // Validate S256 is supported (required for PKCE)
     if !as_meta.code_challenge_methods_supported.is_empty()
@@ -219,7 +241,7 @@ pub async fn discover_oauth_server(
     }
 
     Ok(DiscoveryResult {
-        auth_server_url,
+        auth_server_url: auth_server_url.to_string(),
         authorization_endpoint: as_meta.authorization_endpoint,
         token_endpoint: as_meta.token_endpoint,
         registration_endpoint: as_meta.registration_endpoint,
