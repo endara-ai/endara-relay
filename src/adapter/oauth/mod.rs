@@ -2542,4 +2542,160 @@ mod tests {
 
         server.abort();
     }
+
+    // --- PR #69 audit gap 1 & 5: discovery short-circuits -------------------
+
+    /// Gap 1: when the resource URL is empty, a 404 from the token endpoint
+    /// must NOT trigger RFC 9728 / 8414 discovery (discovery would have
+    /// nothing to discover against). The original 404 is surfaced.
+    #[tokio::test]
+    async fn refresh_404_with_empty_config_url_skips_discovery() {
+        let (listener, base) = reserve_port().await;
+        // Serve PR/AS metadata so we can prove they were NOT requested.
+        let opts = happy_discovery_opts(&base);
+        let pr_count = opts.pr_count.clone();
+        let as_count = opts.as_count.clone();
+        let new_token_count = opts.new_token_count.clone();
+        let old_token_count = opts.old_token_count.clone();
+        let server = spawn_discovery_fixture_on(listener, opts).await;
+
+        let mut config = make_config();
+        // `url` empty triggers the early-return branch in `handle_refresh_404`.
+        config.url = String::new();
+        config.token_endpoint_url = format!("{}/old/token", base);
+        config.allow_insecure_oauth = true;
+        let adapter = make_adapter_with_refresh_token(config).await;
+
+        let result = adapter.inner.do_token_refresh().await;
+        assert!(
+            matches!(result, Err(OAuthError::RefreshFailed { ref body, .. }) if body.contains("not found")),
+            "expected original 404 RefreshFailed, got {:?}",
+            result
+        );
+        assert!(adapter.inner.token_endpoint_override.read().await.is_none());
+
+        let state = adapter.inner.state.read().await.clone();
+        assert_eq!(state, OAuthState::AuthRequired);
+
+        assert_eq!(
+            old_token_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "old token endpoint must be hit exactly once"
+        );
+        assert_eq!(
+            pr_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "protected-resource discovery must NOT run when config.url is empty"
+        );
+        assert_eq!(
+            as_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "auth-server discovery must NOT run when config.url is empty"
+        );
+        assert_eq!(
+            new_token_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "new token endpoint must NOT be POSTed without discovery"
+        );
+
+        server.abort();
+    }
+
+    /// Gap 5: non-404 HTTP errors (5xx, 4xx other than 404) must NOT trigger
+    /// the discovery fallback — the original status is surfaced as-is and no
+    /// PR/AS metadata requests are issued.
+    #[tokio::test]
+    async fn refresh_5xx_does_not_trigger_discovery() {
+        use axum::http::StatusCode;
+        use axum::{response::IntoResponse, routing::get, routing::post, Router};
+
+        // Counters: token POSTs, plus would-be discovery hits.
+        let token_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pr_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let as_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        #[derive(Clone)]
+        struct Fx {
+            token_count: Arc<std::sync::atomic::AtomicUsize>,
+            pr_count: Arc<std::sync::atomic::AtomicUsize>,
+            as_count: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        async fn token_500(
+            axum::extract::State(fx): axum::extract::State<Fx>,
+        ) -> impl IntoResponse {
+            fx.token_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (StatusCode::INTERNAL_SERVER_ERROR, "upstream broke")
+        }
+        async fn pr(axum::extract::State(fx): axum::extract::State<Fx>) -> impl IntoResponse {
+            fx.pr_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (StatusCode::NOT_FOUND, "")
+        }
+        async fn r#as(axum::extract::State(fx): axum::extract::State<Fx>) -> impl IntoResponse {
+            fx.as_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (StatusCode::NOT_FOUND, "")
+        }
+
+        let fx = Fx {
+            token_count: token_count.clone(),
+            pr_count: pr_count.clone(),
+            as_count: as_count.clone(),
+        };
+        let router = Router::new()
+            .route("/token", post(token_500))
+            .route("/.well-known/oauth-protected-resource", get(pr))
+            .route("/.well-known/oauth-authorization-server", get(r#as))
+            .with_state(fx);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let base = format!("http://127.0.0.1:{}", addr.port());
+
+        let mut config = make_config();
+        config.url = format!("{}/mcp", base);
+        config.token_endpoint_url = format!("{}/token", base);
+        config.allow_insecure_oauth = true;
+        let adapter = make_adapter_with_refresh_token(config).await;
+
+        let result = adapter.inner.do_token_refresh().await;
+        match result {
+            Err(OAuthError::RefreshFailed { status, .. }) => {
+                assert_eq!(
+                    status,
+                    reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+                    "non-404 status must surface unchanged"
+                );
+            }
+            other => panic!("expected RefreshFailed(500), got {:?}", other),
+        }
+
+        assert_eq!(
+            token_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "token endpoint must be POSTed exactly once (no retry)"
+        );
+        assert_eq!(
+            pr_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "5xx must NOT trigger protected-resource discovery"
+        );
+        assert_eq!(
+            as_count.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "5xx must NOT trigger auth-server discovery"
+        );
+        assert!(adapter.inner.token_endpoint_override.read().await.is_none());
+
+        let state = adapter.inner.state.read().await.clone();
+        assert_eq!(state, OAuthState::AuthRequired);
+
+        server.abort();
+    }
 }

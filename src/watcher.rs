@@ -1229,6 +1229,66 @@ mod tests {
         assert!(entry.disabled_tools.contains("preexisting"));
     }
 
+    /// PR #69 audit gap 4: apply_diff_graceful must thread
+    /// `allow_insecure_oauth` into the OAuth adapter config for added OAuth
+    /// endpoints, exactly like `apply_diff` does. Without this, the watcher's
+    /// graceful path could silently drop the flag and any subsequent
+    /// loopback-targeting refresh would be rejected by the SSRF guard.
+    #[tokio::test]
+    async fn apply_diff_graceful_threads_allow_insecure_oauth_to_oauth_adapter_config() {
+        let registry = Arc::new(AdapterRegistry::new());
+        let (tm, inners) = test_oauth_infra();
+
+        let new_ep = EndpointConfig {
+            name: "oauth_graceful_insecure".to_string(),
+            description: None,
+            tool_prefix: None,
+            transport: Transport::Oauth,
+            command: None,
+            args: None,
+            url: Some("http://127.0.0.1:5000/mcp".to_string()),
+            env: None,
+            headers: None,
+            disabled: false,
+            disabled_tools: Vec::new(),
+            oauth_server_url: Some("http://127.0.0.1:5001".to_string()),
+            client_id: Some("client123".to_string()),
+            client_secret: None,
+            scopes: None,
+            token_endpoint: None,
+            server_type_override: None,
+        };
+        let diff = ConfigDiff {
+            added: vec![new_ep],
+            ..empty_diff()
+        };
+        let warnings: Vec<config::EndpointValidationWarning> = vec![];
+        let warned: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        apply_diff_graceful(&diff, &registry, &warnings, &warned, &tm, &inners, true).await;
+
+        // Wait for background initialization to register the OAuth adapter inner.
+        let stop = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if inners.read().await.contains_key("oauth_graceful_insecure") {
+                break;
+            }
+            if std::time::Instant::now() >= stop {
+                panic!("OAuthAdapterInner was never registered");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let inner_map = inners.read().await;
+        let inner = inner_map
+            .get("oauth_graceful_insecure")
+            .expect("inner registered");
+        assert!(
+            inner.config.allow_insecure_oauth,
+            "apply_diff_graceful must thread allow_insecure_oauth=true into OAuthAdapterConfig"
+        );
+    }
+
     // ---- G2: registry rewires tools-changed listener after swap --------
 
     #[tokio::test]

@@ -4967,6 +4967,272 @@ command = "echo"
         assert_eq!(flow.token_endpoint, explicit_token);
     }
 
+    // -----------------------------------------------------------------------
+    // PR #69 audit gap 2b: oauth_start with a trailing-slash oauth_server_url
+    // must not produce a double-slash well-known URL during AS discovery.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn oauth_start_with_trailing_slash_oauth_server_url_no_double_slash_discovery() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Counters for both possible request shapes. The trailing-slash
+        // oauth_server_url must produce `/.well-known/...`; a buggy
+        // concatenation would produce `//.well-known/...`.
+        let well_known_hits = Arc::new(AtomicUsize::new(0));
+        let bad_double_slash_hits = Arc::new(AtomicUsize::new(0));
+        let wk = well_known_hits.clone();
+        let bad = bad_double_slash_hits.clone();
+
+        let well_known_handler = move || {
+            let wk = wk.clone();
+            async move {
+                wk.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({
+                    "issuer": "http://example.test",
+                    "authorization_endpoint": "http://example.test/discovered-auth",
+                    "token_endpoint": "http://example.test/discovered-token",
+                    "code_challenge_methods_supported": ["S256"],
+                }))
+            }
+        };
+        let bad_handler = move || {
+            let bad = bad.clone();
+            async move {
+                bad.fetch_add(1, Ordering::SeqCst);
+                StatusCode::IM_A_TEAPOT
+            }
+        };
+        let router = Router::new()
+            .route(
+                "/.well-known/oauth-authorization-server",
+                get(well_known_handler),
+            )
+            // A double-slash path would route to this matcher if the bug
+            // re-appeared; bumping the counter makes the failure explicit.
+            .route("//.well-known/oauth-authorization-server", get(bad_handler));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        // Trailing slash, exactly like `https://accounts.google.com/`.
+        let trailing = format!("{}/", base_url);
+        let (state, flow_mgr) = test_state_oauth_start("ep1", &trailing, None);
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        assert!(
+            authorize_url.starts_with("http://example.test/discovered-auth?"),
+            "expected discovered authorization_endpoint, got: {}",
+            authorize_url
+        );
+        // The discovered token endpoint must be registered with the pending
+        // flow, proving discovery succeeded against the trailing-slash URL.
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending flow was registered");
+        assert_eq!(flow.token_endpoint, "http://example.test/discovered-token");
+        // Exact counter assertions pin down the bug shape.
+        assert_eq!(
+            well_known_hits.load(Ordering::SeqCst),
+            1,
+            "well-known endpoint must be hit exactly once"
+        );
+        assert_eq!(
+            bad_double_slash_hits.load(Ordering::SeqCst),
+            0,
+            "double-slash well-known path must NOT be hit"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PR #69 audit gap 4: allow_insecure_oauth threading through
+    // restart_endpoint and reload_config (mirrors the existing watcher tests
+    // for apply_diff / apply_diff_graceful).
+    // -----------------------------------------------------------------------
+
+    /// Wait for `name` to appear in the OAuthAdapterInners map, returning the
+    /// shared inner. Panics on timeout.
+    async fn wait_for_inner(
+        inners: &OAuthAdapterInners,
+        name: &str,
+    ) -> Arc<crate::adapter::oauth::OAuthAdapterInner> {
+        let stop = Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Some(inner) = inners.read().await.get(name).cloned() {
+                return inner;
+            }
+            if Instant::now() >= stop {
+                panic!("OAuthAdapterInner for `{}` was never registered", name);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Build a config containing a single OAuth endpoint with the given
+    /// `allow_insecure_oauth` toggle. Used by the threading tests below.
+    fn oauth_config_with_insecure(name: &str, allow_insecure_oauth: bool) -> Config {
+        Config {
+            relay: RelayConfig {
+                machine_name: "test-machine".to_string(),
+                local_js_execution: None,
+                token_dir: None,
+                allow_insecure_oauth: Some(allow_insecure_oauth),
+            },
+            endpoints: vec![EndpointConfig {
+                name: name.to_string(),
+                description: None,
+                tool_prefix: None,
+                transport: Transport::Oauth,
+                command: None,
+                args: None,
+                url: Some("http://127.0.0.1:5000/mcp".to_string()),
+                env: None,
+                headers: None,
+                disabled: false,
+                disabled_tools: Vec::new(),
+                oauth_server_url: Some("http://127.0.0.1:5001".to_string()),
+                client_id: Some("client123".to_string()),
+                client_secret: None,
+                scopes: None,
+                token_endpoint: None,
+                server_type_override: None,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn restart_endpoint_threads_allow_insecure_oauth_to_rebuilt_adapter() {
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let oauth_inners: OAuthAdapterInners =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        // Seed the registry with a placeholder MockAdapter under the OAuth
+        // endpoint's name. restart_endpoint will replace it via
+        // watcher::create_adapter, which reads allow_insecure_oauth from
+        // state.config.relay.
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "oauth_restart_ep".to_string(),
+                Box::new(MockAdapter::healthy_with_tools(vec![])),
+                "oauth".to_string(),
+                None,
+                Some("oauth_restart_ep".to_string()),
+            )
+            .await;
+
+        let state = ManagementState {
+            registry: Arc::new(registry),
+            config: Arc::new(RwLock::new(oauth_config_with_insecure(
+                "oauth_restart_ep",
+                true,
+            ))),
+            start_time: Instant::now(),
+            config_path: None,
+            oauth_flow_manager: None,
+            relay_port: 9400,
+            oauth_adapter_inners: Some(oauth_inners.clone()),
+            token_manager: Some(token_manager),
+            setup_manager: None,
+        };
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/oauth_restart_ep/restart")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let inner = wait_for_inner(&oauth_inners, "oauth_restart_ep").await;
+        assert!(
+            inner.config.allow_insecure_oauth,
+            "restart_endpoint must thread allow_insecure_oauth=true into the rebuilt OAuthAdapterConfig"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_config_threads_allow_insecure_oauth_to_new_adapter() {
+        // Write a config file on disk whose [relay] section has
+        // allow_insecure_oauth = true and a single OAuth endpoint. The
+        // in-memory baseline starts with NO endpoints, so the reload sees
+        // the OAuth endpoint as "added" and routes it through
+        // apply_diff_graceful -> create_adapter with the flag.
+        let tmp = tempfile::tempdir().unwrap();
+        let token_dir = tmp.path().join("tokens");
+        std::fs::create_dir_all(&token_dir).unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let toml = r#"
+[relay]
+machine_name = "test-machine"
+allow_insecure_oauth = true
+
+[[endpoints]]
+name = "oauth_reload_ep"
+transport = "oauth"
+url = "http://127.0.0.1:5000/mcp"
+oauth_server_url = "http://127.0.0.1:5001"
+client_id = "client123"
+"#;
+        std::fs::write(&config_path, toml).unwrap();
+
+        let token_manager = Arc::new(TokenManager::new(token_dir));
+        let oauth_inners: OAuthAdapterInners =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        let baseline = Config {
+            relay: RelayConfig {
+                machine_name: "test-machine".to_string(),
+                local_js_execution: None,
+                token_dir: None,
+                allow_insecure_oauth: Some(false),
+            },
+            endpoints: vec![],
+        };
+        let state = ManagementState {
+            registry: Arc::new(AdapterRegistry::new()),
+            config: Arc::new(RwLock::new(baseline)),
+            start_time: Instant::now(),
+            config_path: Some(config_path),
+            oauth_flow_manager: None,
+            relay_port: 9400,
+            oauth_adapter_inners: Some(oauth_inners.clone()),
+            token_manager: Some(token_manager),
+            setup_manager: None,
+        };
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/config/reload")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["ok"], true);
+
+        let inner = wait_for_inner(&oauth_inners, "oauth_reload_ep").await;
+        assert!(
+            inner.config.allow_insecure_oauth,
+            "reload_config must thread allow_insecure_oauth=true from the on-disk config into the new OAuthAdapterConfig"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn config_toml_written_with_0600_on_unix() {
