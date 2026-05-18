@@ -1046,84 +1046,99 @@ async fn oauth_start(
     };
 
     // ── Step 2: Resolve client credentials ─────────────────────────────
-    let (client_id, client_secret, dcr_used) = if let Some(cid) = config_client_id {
-        // Explicit config takes precedence
-        (cid, config_client_secret, false)
-    } else {
-        // Try persisted DCR credentials
-        let persisted = if let Some(ref tm) = state.token_manager {
-            match tm.load_dcr(&name).await {
-                Ok(Some(creds)) => Some(creds),
-                Ok(None) => None,
-                Err(e) => {
-                    warn!(endpoint = %name, error = %e, "Failed to load DCR credentials");
-                    None
-                }
+    // Always attempt to load DCR credentials so that endpoints whose
+    // `client_id` lives in TOML but whose `client_secret` is persisted only
+    // in the DCR file (chmod 0600, written by `add_endpoint` /
+    // `oauth_setup_credentials`) re-authorize correctly. This mirrors
+    // `watcher::resolve_oauth_client_creds`, which already prefers DCR.
+    let persisted_dcr = if let Some(ref tm) = state.token_manager {
+        match tm.load_dcr(&name).await {
+            Ok(Some(creds)) => Some(creds),
+            Ok(None) => None,
+            Err(e) => {
+                warn!(endpoint = %name, error = %e, "Failed to load DCR credentials");
+                None
             }
-        } else {
-            None
-        };
-
-        if let Some(creds) = persisted {
-            (creds.client_id, creds.client_secret, true)
-        } else if let Some(ref reg_endpoint) = registration_endpoint {
-            // Attempt dynamic client registration (URL guard + pinned client inside)
-            match dcr::register_client(reg_endpoint, &redirect_uri, &name, allow_insecure_oauth)
-                .await
-            {
-                Ok(resp) => {
-                    // Persist the new credentials
-                    if let Some(ref tm) = state.token_manager {
-                        let creds = DcrCredentials {
-                            client_id: resp.client_id.clone(),
-                            client_secret: resp.client_secret.clone(),
-                            client_secret_expires_at: resp.client_secret_expires_at,
-                            registered_at: std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_secs(),
-                        };
-                        if let Err(e) = tm.save_dcr(&name, &creds).await {
-                            warn!(endpoint = %name, error = %e, "Failed to persist DCR credentials");
-                        }
-                    }
-                    (resp.client_id, resp.client_secret, true)
-                }
-                Err(e) => {
-                    warn!(endpoint = %name, error = %e, "DCR registration failed");
-                    return (
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        Json(OAuthDcrUnsupportedResponse {
-                            error: "dcr_unsupported".to_string(),
-                            message: format!(
-                                "Dynamic Client Registration failed: {e}. \
-                                 Submit credentials manually via POST /api/endpoints/{name}/oauth/credentials."
-                            ),
-                            authorization_endpoint: Some(authorization_endpoint.clone()),
-                            token_endpoint: Some(token_endpoint.clone()),
-                            scopes_supported: discovered_scopes.clone(),
-                        }),
-                    )
-                        .into_response();
-                }
-            }
-        } else {
-            // No registration endpoint — DCR not available
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(OAuthDcrUnsupportedResponse {
-                    error: "dcr_unsupported".to_string(),
-                    message: format!(
-                        "No client_id configured and server does not support Dynamic Client Registration. \
-                         Submit credentials manually via POST /api/endpoints/{name}/oauth/credentials."
-                    ),
-                    authorization_endpoint: Some(authorization_endpoint.clone()),
-                    token_endpoint: Some(token_endpoint.clone()),
-                    scopes_supported: discovered_scopes.clone(),
-                }),
-            )
-                .into_response();
         }
+    } else {
+        None
+    };
+
+    let (client_id, client_secret, dcr_used) = if let Some(cid) = config_client_id {
+        // TOML has a client_id. Prefer the DCR-persisted client_secret when
+        // the DCR record's client_id matches; otherwise fall back to whatever
+        // is in TOML (which may be None for endpoints added via the desktop
+        // UI — that is the bug this branch fixes).
+        match persisted_dcr {
+            Some(creds) if creds.client_id == cid => (cid, creds.client_secret, false),
+            Some(creds) => {
+                warn!(
+                    endpoint = %name,
+                    dcr_client_id = %creds.client_id,
+                    config_client_id = %cid,
+                    "DCR client_id does not match config client_id; using config credentials"
+                );
+                (cid, config_client_secret, false)
+            }
+            None => (cid, config_client_secret, false),
+        }
+    } else if let Some(creds) = persisted_dcr {
+        (creds.client_id, creds.client_secret, true)
+    } else if let Some(ref reg_endpoint) = registration_endpoint {
+        // Attempt dynamic client registration (URL guard + pinned client inside)
+        match dcr::register_client(reg_endpoint, &redirect_uri, &name, allow_insecure_oauth).await {
+            Ok(resp) => {
+                // Persist the new credentials
+                if let Some(ref tm) = state.token_manager {
+                    let creds = DcrCredentials {
+                        client_id: resp.client_id.clone(),
+                        client_secret: resp.client_secret.clone(),
+                        client_secret_expires_at: resp.client_secret_expires_at,
+                        registered_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    };
+                    if let Err(e) = tm.save_dcr(&name, &creds).await {
+                        warn!(endpoint = %name, error = %e, "Failed to persist DCR credentials");
+                    }
+                }
+                (resp.client_id, resp.client_secret, true)
+            }
+            Err(e) => {
+                warn!(endpoint = %name, error = %e, "DCR registration failed");
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(OAuthDcrUnsupportedResponse {
+                        error: "dcr_unsupported".to_string(),
+                        message: format!(
+                            "Dynamic Client Registration failed: {e}. \
+                             Submit credentials manually via POST /api/endpoints/{name}/oauth/credentials."
+                        ),
+                        authorization_endpoint: Some(authorization_endpoint.clone()),
+                        token_endpoint: Some(token_endpoint.clone()),
+                        scopes_supported: discovered_scopes.clone(),
+                    }),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        // No registration endpoint — DCR not available
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(OAuthDcrUnsupportedResponse {
+                error: "dcr_unsupported".to_string(),
+                message: format!(
+                    "No client_id configured and server does not support Dynamic Client Registration. \
+                     Submit credentials manually via POST /api/endpoints/{name}/oauth/credentials."
+                ),
+                authorization_endpoint: Some(authorization_endpoint.clone()),
+                token_endpoint: Some(token_endpoint.clone()),
+                scopes_supported: discovered_scopes.clone(),
+            }),
+        )
+            .into_response();
     };
 
     // ── Step 3: Build PKCE + register flow ─────────────────────────────
@@ -5052,6 +5067,132 @@ command = "echo"
             0,
             "double-slash well-known path must NOT be hit"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Regression: oauth_start must prefer the DCR-persisted client_secret
+    // when TOML only has client_id (e.g. endpoints added via the desktop UI
+    // that write client_id to TOML but client_secret only to the DCR file).
+    // Without this, Google Drive re-auth fails with `client_secret is missing`.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn oauth_start_prefers_dcr_client_secret_when_toml_only_has_client_id() {
+        async fn well_known() -> Json<Value> {
+            Json(serde_json::json!({
+                "issuer": "http://example.test",
+                "authorization_endpoint": "http://example.test/authorize",
+                "token_endpoint": "http://example.test/token",
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        let router =
+            Router::new().route("/.well-known/oauth-authorization-server", get(well_known));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        // Build state with a TokenManager and an endpoint that has client_id
+        // in TOML but no client_secret in TOML.
+        let tmp = tempfile::tempdir().unwrap();
+        let token_dir = tmp.path().to_path_buf();
+        let token_manager = Arc::new(TokenManager::new(token_dir));
+
+        // Pre-populate the DCR file: matching client_id, real client_secret.
+        let creds = DcrCredentials {
+            client_id: "from-toml".to_string(),
+            client_secret: Some("from-dcr".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 0,
+        };
+        token_manager.save_dcr("ep1", &creds).await.unwrap();
+
+        let (mut state, flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        // Override the seeded client_id so it matches the DCR record.
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].client_id = Some("from-toml".to_string());
+            cfg.endpoints[0].client_secret = None;
+        }
+        state.token_manager = Some(token_manager);
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending flow was registered");
+        assert_eq!(flow.client_id, "from-toml");
+        assert_eq!(
+            flow.client_secret,
+            Some("from-dcr".to_string()),
+            "oauth_start must load client_secret from the DCR file when TOML has only client_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_start_falls_back_to_config_when_dcr_client_id_mismatches() {
+        async fn well_known() -> Json<Value> {
+            Json(serde_json::json!({
+                "issuer": "http://example.test",
+                "authorization_endpoint": "http://example.test/authorize",
+                "token_endpoint": "http://example.test/token",
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        let router =
+            Router::new().route("/.well-known/oauth-authorization-server", get(well_known));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+
+        // DCR record has a different client_id than the TOML config; the
+        // DCR secret must NOT be paired with the mismatching TOML client_id.
+        let creds = DcrCredentials {
+            client_id: "stale-dcr-id".to_string(),
+            client_secret: Some("stale-dcr-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 0,
+        };
+        token_manager.save_dcr("ep1", &creds).await.unwrap();
+
+        let (mut state, flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].client_id = Some("toml-id".to_string());
+            cfg.endpoints[0].client_secret = Some("toml-secret".to_string());
+        }
+        state.token_manager = Some(token_manager);
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending flow was registered");
+        assert_eq!(flow.client_id, "toml-id");
+        assert_eq!(flow.client_secret, Some("toml-secret".to_string()));
     }
 
     // -----------------------------------------------------------------------
