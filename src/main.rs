@@ -333,16 +333,15 @@ async fn main() {
 
                 // OAuth endpoints initialize inline (always fast)
                 if ep.transport == config::Transport::Oauth {
-                    let base = ep.oauth_server_url.as_deref().unwrap_or_default();
+                    let allow_insecure_oauth = cfg.relay.allow_insecure_oauth.unwrap_or(false);
                     let (client_id, client_secret) =
                         watcher::resolve_oauth_client_creds(ep, token_manager.as_ref()).await;
+                    let token_endpoint_url =
+                        watcher::resolve_oauth_token_endpoint(ep, allow_insecure_oauth).await;
                     let oauth_config = OAuthAdapterConfig {
                         endpoint_name: ep.name.clone(),
                         url: ep.url.clone().unwrap_or_default(),
-                        token_endpoint_url: ep
-                            .token_endpoint
-                            .clone()
-                            .unwrap_or_else(|| format!("{}/token", base)),
+                        token_endpoint_url,
                         client_id,
                         client_secret,
                         heartbeat_interval_secs: 30,
@@ -353,7 +352,7 @@ async fn main() {
                         // discovery fallback so operators who already opted into
                         // `relay.allow_insecure_oauth` for the initial discovery
                         // see consistent behavior on rediscovery.
-                        allow_insecure_oauth: cfg.relay.allow_insecure_oauth.unwrap_or(false),
+                        allow_insecure_oauth,
                     };
 
                     let mut adapter = OAuthAdapter::new(oauth_config, token_manager.clone());

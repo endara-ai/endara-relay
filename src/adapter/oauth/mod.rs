@@ -227,6 +227,18 @@ impl OAuthAdapterInner {
         }
     }
 
+    /// Install (or replace) the in-memory token endpoint override.
+    ///
+    /// Used by the management `/oauth/callback` handler to propagate the
+    /// token endpoint freshly discovered via RFC 8414 during an
+    /// authorization-code exchange, so that the next proactive refresh POSTs
+    /// to the discovered URL instead of any stale `config.token_endpoint_url`
+    /// baked in at startup. Mirrors the override-write path in
+    /// `handle_refresh_404`.
+    pub async fn set_token_endpoint_override(&self, url: String) {
+        *self.token_endpoint_override.write().await = Some(url);
+    }
+
     /// Perform a token refresh using the refresh_token grant.
     ///
     /// POSTs to the token endpoint (using `effective_token_endpoint`) with

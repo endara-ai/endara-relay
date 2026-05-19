@@ -494,6 +494,72 @@ pub async fn apply_diff_graceful(
 /// compatibility. When a TOML `client_secret` is the only source we emit a
 /// one-time WARN so operators notice they should re-provision via the new
 /// `POST /api/endpoints/{name}/credentials` route.
+/// Build the conventional `{oauth_server_url}/token` endpoint, trimming a
+/// single trailing slash on the base so that `https://accounts.google.com/`
+/// produces `https://accounts.google.com/token` (not `…//token`). Used as
+/// the defense-in-depth fallback when no explicit `token_endpoint` is
+/// configured AND RFC 8414 discovery has not produced a URL.
+pub(crate) fn conventional_token_endpoint(oauth_server_url: &str) -> String {
+    format!("{}/token", oauth_server_url.trim_end_matches('/'))
+}
+
+/// Resolve the URL that an OAuth adapter should target for refresh-token
+/// POSTs at construction time.
+///
+/// Priority:
+/// 1. Explicit `ep.token_endpoint` from config (always wins).
+/// 2. RFC 8414 discovery against `ep.oauth_server_url` — same code path the
+///    management auth flow uses (`management.rs`).
+/// 3. Slash-safe `{oauth_server_url}/token` conventional fallback.
+///
+/// Called from `main.rs` (initial endpoint registration) and from
+/// `create_adapter` (config-watcher reconciliation). On discovery failure
+/// emits a WARN matching the management flow style and continues with the
+/// conventional URL so adapter construction never blocks indefinitely.
+pub(crate) async fn resolve_oauth_token_endpoint(
+    ep: &EndpointConfig,
+    allow_insecure_oauth: bool,
+) -> String {
+    if let Some(explicit) = ep
+        .token_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return explicit.to_string();
+    }
+
+    let Some(base) = ep
+        .oauth_server_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return conventional_token_endpoint("");
+    };
+
+    match crate::oauth::discovery::discover_authorization_server(base, allow_insecure_oauth).await {
+        Ok(disc) => {
+            info!(
+                endpoint = %ep.name,
+                token_endpoint = %disc.token_endpoint,
+                "RFC 8414 discovery resolved token endpoint at adapter init"
+            );
+            disc.token_endpoint
+        }
+        Err(e) => {
+            let fallback = conventional_token_endpoint(base);
+            warn!(
+                endpoint = %ep.name,
+                error = %e,
+                fallback = %fallback,
+                "RFC 8414 discovery against oauth_server_url failed at adapter init; falling back to convention-based token endpoint"
+            );
+            fallback
+        }
+    }
+}
+
 pub(crate) async fn resolve_oauth_client_creds(
     ep: &EndpointConfig,
     token_manager: &TokenManager,

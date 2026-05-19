@@ -736,12 +736,23 @@ async fn oauth_callback(
         }
     }
 
-    // Apply tokens to the adapter's shared inner state
+    // Apply tokens to the adapter's shared inner state. Also propagate the
+    // freshly discovered token endpoint used for this code exchange into the
+    // adapter's in-memory override so the next proactive refresh POSTs to
+    // the same URL we just succeeded against — without depending on whether
+    // startup-time discovery ran or returned the same result.
     if let Some(ref inners) = state.oauth_adapter_inners {
         let inners = inners.read().await;
         if let Some(inner) = inners.get(&flow.endpoint_name) {
+            inner
+                .set_token_endpoint_override(flow.token_endpoint.clone())
+                .await;
             inner.apply_tokens(token_set.clone()).await;
-            info!(endpoint = %flow.endpoint_name, "Tokens applied to OAuth adapter");
+            info!(
+                endpoint = %flow.endpoint_name,
+                token_endpoint = %flow.token_endpoint,
+                "Tokens applied to OAuth adapter; token endpoint override updated"
+            );
         }
     }
 
