@@ -1266,6 +1266,42 @@ mod tests {
         assert_eq!(adapter.health(), HealthStatus::Stopped);
     }
 
+    /// `set_token_endpoint_override` populates the in-memory override so that
+    /// `effective_token_endpoint` returns the new URL on the next refresh.
+    /// Covers the management `/oauth/callback` propagation path (the bug
+    /// where a freshly discovered token endpoint was not seen by the
+    /// proactive refresh fired ~45 minutes later).
+    #[tokio::test]
+    async fn set_token_endpoint_override_takes_effect() {
+        let adapter = make_adapter(make_config());
+        // Before the override is set, `effective_token_endpoint` returns the
+        // URL from `config.token_endpoint_url`.
+        assert_eq!(
+            adapter.inner.effective_token_endpoint().await,
+            "http://localhost/token"
+        );
+
+        adapter
+            .inner
+            .set_token_endpoint_override("https://oauth2.googleapis.com/token".to_string())
+            .await;
+
+        assert_eq!(
+            adapter.inner.effective_token_endpoint().await,
+            "https://oauth2.googleapis.com/token"
+        );
+
+        // Replacing again overwrites the previous value (idempotent setter).
+        adapter
+            .inner
+            .set_token_endpoint_override("https://oauth2.googleapis.com/v2/token".to_string())
+            .await;
+        assert_eq!(
+            adapter.inner.effective_token_endpoint().await,
+            "https://oauth2.googleapis.com/v2/token"
+        );
+    }
+
     #[tokio::test]
     async fn apply_tokens_then_disconnect() {
         let tmp = tempfile::tempdir().unwrap();
