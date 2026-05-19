@@ -227,6 +227,18 @@ impl OAuthAdapterInner {
         }
     }
 
+    /// Install (or replace) the in-memory token endpoint override.
+    ///
+    /// Used by the management `/oauth/callback` handler to propagate the
+    /// token endpoint freshly discovered via RFC 8414 during an
+    /// authorization-code exchange, so that the next proactive refresh POSTs
+    /// to the discovered URL instead of any stale `config.token_endpoint_url`
+    /// baked in at startup. Mirrors the override-write path in
+    /// `handle_refresh_404`.
+    pub async fn set_token_endpoint_override(&self, url: String) {
+        *self.token_endpoint_override.write().await = Some(url);
+    }
+
     /// Perform a token refresh using the refresh_token grant.
     ///
     /// POSTs to the token endpoint (using `effective_token_endpoint`) with
@@ -1252,6 +1264,42 @@ mod tests {
         adapter.initialize().await.unwrap();
         adapter.shutdown().await.unwrap();
         assert_eq!(adapter.health(), HealthStatus::Stopped);
+    }
+
+    /// `set_token_endpoint_override` populates the in-memory override so that
+    /// `effective_token_endpoint` returns the new URL on the next refresh.
+    /// Covers the management `/oauth/callback` propagation path (the bug
+    /// where a freshly discovered token endpoint was not seen by the
+    /// proactive refresh fired ~45 minutes later).
+    #[tokio::test]
+    async fn set_token_endpoint_override_takes_effect() {
+        let adapter = make_adapter(make_config());
+        // Before the override is set, `effective_token_endpoint` returns the
+        // URL from `config.token_endpoint_url`.
+        assert_eq!(
+            adapter.inner.effective_token_endpoint().await,
+            "http://localhost/token"
+        );
+
+        adapter
+            .inner
+            .set_token_endpoint_override("https://oauth2.googleapis.com/token".to_string())
+            .await;
+
+        assert_eq!(
+            adapter.inner.effective_token_endpoint().await,
+            "https://oauth2.googleapis.com/token"
+        );
+
+        // Replacing again overwrites the previous value (idempotent setter).
+        adapter
+            .inner
+            .set_token_endpoint_override("https://oauth2.googleapis.com/v2/token".to_string())
+            .await;
+        assert_eq!(
+            adapter.inner.effective_token_endpoint().await,
+            "https://oauth2.googleapis.com/v2/token"
+        );
     }
 
     #[tokio::test]

@@ -494,6 +494,72 @@ pub async fn apply_diff_graceful(
 /// compatibility. When a TOML `client_secret` is the only source we emit a
 /// one-time WARN so operators notice they should re-provision via the new
 /// `POST /api/endpoints/{name}/credentials` route.
+/// Build the conventional `{oauth_server_url}/token` endpoint, trimming a
+/// single trailing slash on the base so that `https://accounts.google.com/`
+/// produces `https://accounts.google.com/token` (not `…//token`). Used as
+/// the defense-in-depth fallback when no explicit `token_endpoint` is
+/// configured AND RFC 8414 discovery has not produced a URL.
+pub(crate) fn conventional_token_endpoint(oauth_server_url: &str) -> String {
+    format!("{}/token", oauth_server_url.trim_end_matches('/'))
+}
+
+/// Resolve the URL that an OAuth adapter should target for refresh-token
+/// POSTs at construction time.
+///
+/// Priority:
+/// 1. Explicit `ep.token_endpoint` from config (always wins).
+/// 2. RFC 8414 discovery against `ep.oauth_server_url` — same code path the
+///    management auth flow uses (`management.rs`).
+/// 3. Slash-safe `{oauth_server_url}/token` conventional fallback.
+///
+/// Called from `main.rs` (initial endpoint registration) and from
+/// `create_adapter` (config-watcher reconciliation). On discovery failure
+/// emits a WARN matching the management flow style and continues with the
+/// conventional URL so adapter construction never blocks indefinitely.
+pub(crate) async fn resolve_oauth_token_endpoint(
+    ep: &EndpointConfig,
+    allow_insecure_oauth: bool,
+) -> String {
+    if let Some(explicit) = ep
+        .token_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return explicit.to_string();
+    }
+
+    let Some(base) = ep
+        .oauth_server_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return conventional_token_endpoint("");
+    };
+
+    match crate::oauth::discovery::discover_authorization_server(base, allow_insecure_oauth).await {
+        Ok(disc) => {
+            info!(
+                endpoint = %ep.name,
+                token_endpoint = %disc.token_endpoint,
+                "RFC 8414 discovery resolved token endpoint at adapter init"
+            );
+            disc.token_endpoint
+        }
+        Err(e) => {
+            let fallback = conventional_token_endpoint(base);
+            warn!(
+                endpoint = %ep.name,
+                error = %e,
+                fallback = %fallback,
+                "RFC 8414 discovery against oauth_server_url failed at adapter init; falling back to convention-based token endpoint"
+            );
+            fallback
+        }
+    }
+}
+
 pub(crate) async fn resolve_oauth_client_creds(
     ep: &EndpointConfig,
     token_manager: &TokenManager,
@@ -598,15 +664,11 @@ pub(crate) async fn create_adapter(
         Transport::Oauth => {
             let (client_id, client_secret) =
                 resolve_oauth_client_creds(ep, token_manager.as_ref()).await;
+            let token_endpoint_url = resolve_oauth_token_endpoint(ep, allow_insecure_oauth).await;
             let oauth_config = OAuthAdapterConfig {
                 endpoint_name: ep.name.clone(),
                 url: ep.url.clone().unwrap_or_default(),
-                token_endpoint_url: ep.token_endpoint.clone().unwrap_or_else(|| {
-                    format!(
-                        "{}/token",
-                        ep.oauth_server_url.as_deref().unwrap_or_default()
-                    )
-                }),
+                token_endpoint_url,
                 client_id,
                 client_secret,
                 heartbeat_interval_secs: 30,
@@ -1502,5 +1564,112 @@ mod tests {
             captured.contains("legacy `client_secret`") && captured.contains("warned-ep"),
             "expected WARN log mentioning legacy client_secret and the endpoint name; got: {captured}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_oauth_token_endpoint / conventional_token_endpoint tests
+    // -----------------------------------------------------------------------
+
+    /// Helper: build an OAuth endpoint with explicit `oauth_server_url` and
+    /// optional explicit `token_endpoint`. Used by the resolver tests below.
+    fn oauth_endpoint_with(
+        name: &str,
+        oauth_server_url: Option<&str>,
+        token_endpoint: Option<&str>,
+    ) -> EndpointConfig {
+        EndpointConfig {
+            name: name.to_string(),
+            description: None,
+            tool_prefix: None,
+            transport: Transport::Oauth,
+            command: None,
+            args: None,
+            url: Some("https://mcp.example.com".to_string()),
+            env: None,
+            headers: None,
+            disabled: false,
+            disabled_tools: Vec::new(),
+            oauth_server_url: oauth_server_url.map(|s| s.to_string()),
+            client_id: Some("cid".to_string()),
+            client_secret: None,
+            scopes: None,
+            token_endpoint: token_endpoint.map(|s| s.to_string()),
+            server_type_override: None,
+        }
+    }
+
+    /// `conventional_token_endpoint` must trim a single trailing slash on the
+    /// base so that `https://accounts.google.com/` does NOT produce the
+    /// malformed `https://accounts.google.com//token` URL that triggers the
+    /// Google `invalid_request` refresh failures called out in the spec.
+    #[test]
+    fn conventional_token_endpoint_strips_trailing_slash() {
+        assert_eq!(
+            conventional_token_endpoint("https://accounts.google.com/"),
+            "https://accounts.google.com/token"
+        );
+        assert_eq!(
+            conventional_token_endpoint("https://accounts.google.com"),
+            "https://accounts.google.com/token"
+        );
+        // Multiple trailing slashes also collapse (defense-in-depth).
+        assert_eq!(
+            conventional_token_endpoint("https://example.com///"),
+            "https://example.com/token"
+        );
+    }
+
+    /// Explicit `ep.token_endpoint` always wins — discovery must NOT run when
+    /// the operator has configured the endpoint URL directly.
+    #[tokio::test]
+    async fn resolve_oauth_token_endpoint_prefers_explicit() {
+        let ep = oauth_endpoint_with(
+            "ep",
+            Some("https://accounts.google.com/"),
+            Some("https://oauth2.googleapis.com/token"),
+        );
+        let resolved = resolve_oauth_token_endpoint(&ep, false).await;
+        assert_eq!(resolved, "https://oauth2.googleapis.com/token");
+    }
+
+    /// Whitespace-only `token_endpoint` is treated as "not set" so we fall
+    /// through to discovery / convention rather than POSTing to an empty URL.
+    #[tokio::test]
+    async fn resolve_oauth_token_endpoint_treats_blank_explicit_as_unset() {
+        let ep = oauth_endpoint_with("ep", Some("https://accounts.google.com/"), Some("   "));
+        // Discovery against accounts.google.com would hit the network; use a
+        // loopback URL instead which the SSRF guard rejects fast so we reach
+        // the conventional fallback deterministically. Replace oauth_server_url.
+        let mut ep = ep;
+        ep.oauth_server_url = Some("http://127.0.0.1:1/".to_string());
+        let resolved = resolve_oauth_token_endpoint(&ep, false).await;
+        assert_eq!(resolved, "http://127.0.0.1:1/token");
+    }
+
+    /// When discovery fails (here: SSRF guard rejects loopback with
+    /// `allow_insecure=false`), the resolver falls back to
+    /// `conventional_token_endpoint(oauth_server_url)` and the result must NOT
+    /// contain a `//token` segment — this is the regression the spec calls
+    /// out for Google Drive's trailing-slash `oauth_server_url`.
+    #[tokio::test]
+    async fn resolve_oauth_token_endpoint_falls_back_slash_safely_on_discovery_failure() {
+        let ep = oauth_endpoint_with("ep", Some("http://127.0.0.1:1/"), None);
+        let resolved = resolve_oauth_token_endpoint(&ep, false).await;
+        assert_eq!(resolved, "http://127.0.0.1:1/token");
+        assert!(
+            !resolved.contains("//token"),
+            "fallback must not produce //token; got: {resolved}"
+        );
+    }
+
+    /// Missing `oauth_server_url` AND missing `token_endpoint` produces
+    /// `"/token"` — preserving the prior empty-base behaviour so existing
+    /// misconfigured endpoints fail the same way they did before this change
+    /// (rather than panicking or hanging on discovery).
+    #[tokio::test]
+    async fn resolve_oauth_token_endpoint_empty_base_returns_slash_token() {
+        let ep = oauth_endpoint_with("ep", None, None);
+        let resolved = resolve_oauth_token_endpoint(&ep, false).await;
+        assert_eq!(resolved, "/token");
     }
 }
