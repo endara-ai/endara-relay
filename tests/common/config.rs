@@ -19,6 +19,7 @@ struct EndpointEntry {
 pub struct ConfigBuilder {
     endpoints: Vec<EndpointEntry>,
     js_execution_mode: bool,
+    toon_output: Option<bool>,
 }
 
 impl ConfigBuilder {
@@ -26,6 +27,7 @@ impl ConfigBuilder {
         Self {
             endpoints: Vec::new(),
             js_execution_mode: false,
+            toon_output: None,
         }
     }
 
@@ -156,6 +158,13 @@ impl ConfigBuilder {
         self
     }
 
+    /// Explicitly set the `toon_output` flag. `None` (default) emits no
+    /// `toon_output` line, so the relay's own default (`true`) wins.
+    pub fn toon_output(mut self, enabled: bool) -> Self {
+        self.toon_output = Some(enabled);
+        self
+    }
+
     /// Serialize the config to a TOML string.
     pub fn build(self) -> String {
         let mut out = String::new();
@@ -167,6 +176,9 @@ impl ConfigBuilder {
         out.push_str("allow_insecure_oauth = true\n");
         if self.js_execution_mode {
             out.push_str("local_js_execution = true\n");
+        }
+        if let Some(toon) = self.toon_output {
+            out.push_str(&format!("toon_output = {}\n", toon));
         }
         out.push('\n');
 

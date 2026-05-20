@@ -26,6 +26,12 @@ pub struct RelayConfig {
     /// confused-deputy attacks against the host running the relay.
     #[serde(default)]
     pub allow_insecure_oauth: Option<bool>,
+    /// Convert JSON tool-call responses to TOON (Token-Oriented Object
+    /// Notation) before they reach the MCP client. Defaults to `true` when
+    /// omitted; set to `false` (or pass `--no-toon` on the command line) to
+    /// restore raw JSON pass-through.
+    #[serde(default)]
+    pub toon_output: Option<bool>,
 }
 
 /// Transport type for an endpoint.
@@ -209,6 +215,7 @@ pub fn default_config() -> Config {
             local_js_execution: None,
             token_dir: None,
             allow_insecure_oauth: None,
+            toon_output: None,
         },
         endpoints: Vec::new(),
     }
@@ -1071,6 +1078,7 @@ command = "echo"
                 local_js_execution: None,
                 token_dir: None,
                 allow_insecure_oauth: None,
+                toon_output: None,
             },
             endpoints,
         }
