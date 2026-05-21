@@ -128,7 +128,10 @@ impl HttpAdapter {
 
     /// Create a new HttpAdapter with a pre-built reqwest::Client.
     ///
-    /// Used by OAuthAdapter to inject a client with Bearer token headers.
+    /// Top-level constructor kept for completeness; OAuth wrapping uses
+    /// [`HttpAdapter::new_with_client_inner`] instead so the inner adapter
+    /// does not create its own `endpoint` tracing span.
+    #[allow(dead_code)]
     pub fn new_with_client(config: HttpConfig, client: Client) -> Self {
         let span = tracing::info_span!(
             "endpoint",
@@ -136,6 +139,20 @@ impl HttpAdapter {
             transport = "http",
             server_type = tracing::field::Empty,
         );
+        Self::with_span(config, client, span)
+    }
+
+    /// Create a new HttpAdapter intended to be wrapped by another adapter
+    /// (currently `OAuthAdapter`) that already owns the per-endpoint
+    /// `endpoint` tracing span. The inner adapter uses `tracing::Span::none()`
+    /// so its `.instrument(self.span.clone())` calls become no-ops and events
+    /// are attached to the enclosing wrapper's span instead, avoiding a
+    /// duplicated `endpoint=<name>` field.
+    pub fn new_with_client_inner(config: HttpConfig, client: Client) -> Self {
+        Self::with_span(config, client, tracing::Span::none())
+    }
+
+    fn with_span(config: HttpConfig, client: Client, span: tracing::Span) -> Self {
         Self {
             config,
             client,
