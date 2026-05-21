@@ -111,6 +111,7 @@ The config file is TOML. Here's a complete reference:
 [relay]
 machine_name = "my-laptop"        # Required — identifies this machine
 local_js_execution = true         # Optional — enable JS execution mode (default: false)
+toon_output = true                # Optional — convert JSON tool responses to TOON (default: true)
 
 # STDIO endpoint — spawns a child process
 [[endpoints]]
@@ -218,6 +219,12 @@ return { repos: repos.length, firstRepoIssues: issues };
 ```
 
 The JS sandbox is powered by [boa_engine](https://crates.io/crates/boa_engine) and runs entirely in-process — no external runtime needed.
+
+### TOON tool output
+
+By default, Relay converts JSON tool responses to [TOON](https://crates.io/crates/toon-format) (Token-Oriented Object Notation) before they reach your MCP client. TOON is an indentation-driven format with tabular array headers that produces ~40–60% fewer tokens than JSON on the structured shapes most MCP tools return, while remaining losslessly round-trippable.
+
+Scalars, non-JSON text, image/resource content, `structuredContent`, and error responses pass through unchanged. To opt out, set `toon_output = false` under `[relay]` in your config, or pass `--no-toon` on the command line.
 
 ---
 
