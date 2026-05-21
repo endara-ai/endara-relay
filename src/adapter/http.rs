@@ -10,9 +10,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, Mutex, Notify, RwLock};
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use tracing::{error, info, trace, warn, Instrument};
+use tracing::{debug, error, info, trace, warn, Instrument};
 
 /// Configuration for the HTTP MCP adapter.
 #[derive(Debug, Clone)]
@@ -69,6 +70,27 @@ pub struct HttpAdapter {
     /// body with this span so events carry `endpoint`/`transport` (and
     /// `server_type` once the MCP handshake completes).
     span: tracing::Span,
+    /// Broadcast emitter for `notifications/tools/list_changed` events
+    /// observed from the upstream server. Ticks come from two sources:
+    ///
+    ///   1. The background `GET <url>` SSE listener spawned during
+    ///      [`HttpAdapter::initialize`] (the Streamable HTTP transport's
+    ///      "server-initiated stream" channel).
+    ///   2. Inline notifications mixed into a POST response's SSE body,
+    ///      dispatched by [`HttpAdapter::parse_sse_response`].
+    ///
+    /// Either path is sufficient; the spec allows servers to use either or
+    /// both, so the adapter wires both unconditionally. Each tick is an
+    /// opaque cache-invalidation signal consumed by the registry.
+    tools_changed_tx: broadcast::Sender<()>,
+    /// Handle to the background `GET <url>` SSE listener task spawned during
+    /// [`HttpAdapter::initialize`]. Aborted on [`HttpAdapter::shutdown`] and
+    /// when the adapter is dropped so the task never outlives the adapter.
+    listener_handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    /// Signaled by [`HttpAdapter::shutdown`] (and by [`Drop`]) so the GET
+    /// listener loop exits cleanly between SSE reads and reconnect backoffs
+    /// instead of waiting out the current sleep / network read.
+    shutdown_notify: Arc<Notify>,
 }
 
 impl HttpAdapter {
@@ -114,6 +136,7 @@ impl HttpAdapter {
             transport = "http",
             server_type = tracing::field::Empty,
         );
+        let (tools_changed_tx, _) = broadcast::channel(16);
         Self {
             config,
             client,
@@ -123,6 +146,9 @@ impl HttpAdapter {
             upstream_server_name: Arc::new(RwLock::new(None)),
             activity_log: Arc::new(RwLock::new(RingBuffer::new(1000))),
             span,
+            tools_changed_tx,
+            listener_handle: Arc::new(Mutex::new(None)),
+            shutdown_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -153,6 +179,7 @@ impl HttpAdapter {
     }
 
     fn with_span(config: HttpConfig, client: Client, span: tracing::Span) -> Self {
+        let (tools_changed_tx, _) = broadcast::channel(16);
         Self {
             config,
             client,
@@ -162,6 +189,9 @@ impl HttpAdapter {
             upstream_server_name: Arc::new(RwLock::new(None)),
             activity_log: Arc::new(RwLock::new(RingBuffer::new(1000))),
             span,
+            tools_changed_tx,
+            listener_handle: Arc::new(Mutex::new(None)),
+            shutdown_notify: Arc::new(Notify::new()),
         }
     }
 
@@ -176,7 +206,19 @@ impl HttpAdapter {
     /// `data:` lines whose payloads are concatenated (with newline separators)
     /// to form the event data.  We look for the first event whose data
     /// deserialises to a `JsonRpcResponse` with a matching `id`.
-    fn parse_sse_response(body: &str, id: u64) -> Result<JsonRpcResponse, AdapterError> {
+    ///
+    /// When `tools_changed_tx` is `Some`, any event in the stream that decodes
+    /// as a JSON-RPC notification (i.e. no `id`) with `method ==
+    /// "notifications/tools/list_changed"` is dispatched as a tick on that
+    /// broadcast. This is how POST inline notifications (the Streamable HTTP
+    /// spec's "mix notifications into a POST SSE response" path) reach the
+    /// registry alongside the long-lived `GET` listener.
+    fn parse_sse_response(
+        body: &str,
+        id: u64,
+        tools_changed_tx: Option<&broadcast::Sender<()>>,
+    ) -> Result<JsonRpcResponse, AdapterError> {
+        let mut matched: Option<JsonRpcResponse> = None;
         for event in body.split("\n\n") {
             let event = event.trim();
             if event.is_empty() {
@@ -199,12 +241,39 @@ impl HttpAdapter {
             }
 
             let data = data_parts.join("\n");
-            if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&data) {
-                // Match on id — notifications (id == None) are skipped.
-                if response.id == Some(id) {
-                    return Ok(response);
+
+            // Dispatch tools-changed notifications inline as we walk the
+            // stream so they aren't lost when a POST SSE body carries both a
+            // response and a notification (Streamable HTTP spec allows this).
+            // We only check `tools_changed_tx` when it's provided — pure-parse
+            // callers (tests) pass `None` and the dispatch is a no-op.
+            if let Some(tx) = tools_changed_tx {
+                if let Ok(value) = serde_json::from_str::<Value>(&data) {
+                    if value.get("id").is_none() {
+                        if let Some("notifications/tools/list_changed") =
+                            value.get("method").and_then(|m| m.as_str())
+                        {
+                            debug!(
+                                "received tools/list_changed notification inline with POST SSE response"
+                            );
+                            let _ = tx.send(());
+                        }
+                    }
                 }
             }
+
+            if matched.is_none() {
+                if let Ok(response) = serde_json::from_str::<JsonRpcResponse>(&data) {
+                    // Match on id — notifications (id == None) are skipped.
+                    if response.id == Some(id) {
+                        matched = Some(response);
+                    }
+                }
+            }
+        }
+
+        if let Some(resp) = matched {
+            return Ok(resp);
         }
 
         Err(AdapterError::ProtocolError(
@@ -322,7 +391,7 @@ impl HttpAdapter {
             let body = resp.text().await.map_err(|e| {
                 AdapterError::ProtocolError(format!("failed to read SSE body: {}", e))
             })?;
-            Self::parse_sse_response(&body, id)?
+            Self::parse_sse_response(&body, id, Some(&self.tools_changed_tx))?
         } else {
             resp.json().await.map_err(|e| {
                 AdapterError::ProtocolError(format!("invalid JSON-RPC response: {}", e))
@@ -340,6 +409,139 @@ impl HttpAdapter {
         response
             .result
             .ok_or_else(|| AdapterError::ProtocolError("response has no result".into()))
+    }
+
+    /// Long-lived `GET <url>` SSE listener body. Streamable HTTP transport
+    /// allows servers to push server-initiated messages (including
+    /// `notifications/tools/list_changed`) via a GET request that opens an
+    /// SSE channel separate from the request/response POST path.
+    ///
+    /// On any of: transport error, non-2xx response (notably 404/405 from
+    /// servers that don't implement the GET stream), or shutdown signal, the
+    /// task exits quietly — inline POST notifications still reach the
+    /// broadcast via [`HttpAdapter::parse_sse_response`].
+    async fn run_get_listener(
+        url: String,
+        headers: HashMap<String, String>,
+        tools_changed_tx: broadcast::Sender<()>,
+        shutdown: Arc<Notify>,
+    ) {
+        // Separate client for the long-lived stream — the per-request timeout
+        // on the main client (30s by default) would tear down the stream.
+        let mut default_headers = reqwest::header::HeaderMap::new();
+        default_headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("text/event-stream"),
+        );
+        for (key, value) in &headers {
+            if key.eq_ignore_ascii_case("accept") || key.eq_ignore_ascii_case("content-type") {
+                continue;
+            }
+            if let (Ok(name), Ok(val)) = (
+                reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+                reqwest::header::HeaderValue::from_str(value),
+            ) {
+                default_headers.insert(name, val);
+            }
+        }
+        let client = match Client::builder().default_headers(default_headers).build() {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(error = %e, "GET listener: failed to build HTTP client; exiting");
+                return;
+            }
+        };
+
+        let resp = tokio::select! {
+            _ = shutdown.notified() => return,
+            r = client.get(&url).header(reqwest::header::ACCEPT, "text/event-stream").send() => match r {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!(error = %e, "GET listener: connect/send failed; exiting");
+                    return;
+                }
+            }
+        };
+
+        let status = resp.status();
+        if !status.is_success() {
+            debug!(
+                status = %status,
+                "GET listener: non-2xx response (upstream likely doesn't support server-initiated streams); exiting"
+            );
+            return;
+        }
+
+        use futures_util::StreamExt;
+        let mut bytes_stream = resp.bytes_stream();
+        let mut buffer = String::new();
+        let mut data_lines: Vec<String> = Vec::new();
+
+        loop {
+            let chunk_result = tokio::select! {
+                _ = shutdown.notified() => {
+                    debug!("GET listener: shutdown requested; exiting");
+                    return;
+                }
+                next = bytes_stream.next() => match next {
+                    Some(r) => r,
+                    None => {
+                        debug!("GET listener: upstream stream ended; exiting");
+                        return;
+                    }
+                }
+            };
+
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(e) => {
+                    debug!(error = %e, "GET listener: stream error; exiting");
+                    return;
+                }
+            };
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(newline_pos) = buffer.find('\n') {
+                let line = buffer[..newline_pos].trim_end_matches('\r').to_string();
+                buffer.drain(..=newline_pos);
+
+                if line.is_empty() {
+                    if !data_lines.is_empty() {
+                        let data = data_lines.join("\n");
+                        data_lines.clear();
+                        if let Ok(value) = serde_json::from_str::<Value>(&data) {
+                            if value.get("id").is_none()
+                                && value.get("method").and_then(|m| m.as_str())
+                                    == Some("notifications/tools/list_changed")
+                            {
+                                debug!("GET listener: received tools/list_changed notification");
+                                let _ = tools_changed_tx.send(());
+                            }
+                        }
+                    }
+                } else if let Some(rest) = line.strip_prefix("data:") {
+                    let rest = rest.strip_prefix(' ').unwrap_or(rest);
+                    data_lines.push(rest.to_string());
+                }
+                // Other SSE fields (event:, id:, retry:, comments) are ignored.
+            }
+        }
+    }
+}
+
+impl Drop for HttpAdapter {
+    fn drop(&mut self) {
+        // Wake any pending `shutdown.notified()` in the GET listener so it
+        // exits at the next `tokio::select!` tick. Drop is synchronous, so we
+        // can't `.await` the handle; a best-effort `try_lock` lets us abort
+        // the join handle immediately when uncontended, otherwise we rely on
+        // the notification alone.
+        self.shutdown_notify.notify_waiters();
+        if let Ok(mut guard) = self.listener_handle.try_lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
     }
 }
 
@@ -424,6 +626,25 @@ impl McpAdapter for HttpAdapter {
             {
                 warn!(url = %self.config.url, error = %e, "failed to send notifications/initialized");
             }
+
+            // Spawn the long-lived `GET <url>` SSE listener. Streamable HTTP
+            // servers may deliver server-initiated notifications (notably
+            // `notifications/tools/list_changed`) via this channel. Upstreams
+            // that don't support it return 404/405 and the task exits
+            // quietly — inline POST notifications still reach the broadcast
+            // via `parse_sse_response`.
+            let url = self.config.url.clone();
+            let headers = self.config.headers.clone();
+            let tx = self.tools_changed_tx.clone();
+            let shutdown = self.shutdown_notify.clone();
+            let listener_span = self.span.clone();
+            let handle = tokio::spawn(
+                async move {
+                    Self::run_get_listener(url, headers, tx, shutdown).await;
+                }
+                .instrument(listener_span),
+            );
+            *self.listener_handle.lock().await = Some(handle);
 
             *self.health.write().await = HealthStatus::Healthy;
             info!(url = %self.config.url, "HTTP MCP adapter initialized");
@@ -513,8 +734,19 @@ impl McpAdapter for HttpAdapter {
             .map(|s| s.to_lowercase())
     }
 
+    fn subscribe_tools_changed(&self) -> Option<broadcast::Receiver<()>> {
+        Some(self.tools_changed_tx.subscribe())
+    }
+
     async fn shutdown(&mut self) -> Result<(), AdapterError> {
         async {
+            // Signal the GET listener to exit at the next select tick, then
+            // await its handle so it tears down before the adapter does.
+            self.shutdown_notify.notify_waiters();
+            if let Some(handle) = self.listener_handle.lock().await.take() {
+                handle.abort();
+                let _ = handle.await;
+            }
             *self.health.write().await = HealthStatus::Stopped;
             info!(url = %self.config.url, "HTTP MCP adapter shut down");
             Ok(())
@@ -626,7 +858,7 @@ mod tests {
     fn test_parse_sse_simple_response() {
         let body =
             "event: message\ndata: {\"jsonrpc\":\"2.0\",\"result\":{\"tools\":[]},\"id\":1}\n\n";
-        let resp = HttpAdapter::parse_sse_response(body, 1).unwrap();
+        let resp = HttpAdapter::parse_sse_response(body, 1, None).unwrap();
         assert_eq!(resp.id, Some(1));
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
@@ -636,7 +868,7 @@ mod tests {
     fn test_parse_sse_without_event_field() {
         // Some servers only send `data:` lines, no `event:` line.
         let body = "data: {\"jsonrpc\":\"2.0\",\"result\":{\"ok\":true},\"id\":5}\n\n";
-        let resp = HttpAdapter::parse_sse_response(body, 5).unwrap();
+        let resp = HttpAdapter::parse_sse_response(body, 5, None).unwrap();
         assert_eq!(resp.id, Some(5));
         assert!(resp.result.is_some());
     }
@@ -648,14 +880,14 @@ mod tests {
             "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n",
             "data: {\"jsonrpc\":\"2.0\",\"result\":{\"done\":true},\"id\":3}\n\n",
         );
-        let resp = HttpAdapter::parse_sse_response(body, 3).unwrap();
+        let resp = HttpAdapter::parse_sse_response(body, 3, None).unwrap();
         assert_eq!(resp.id, Some(3));
     }
 
     #[test]
     fn test_parse_sse_no_matching_id() {
         let body = "data: {\"jsonrpc\":\"2.0\",\"result\":{},\"id\":99}\n\n";
-        let err = HttpAdapter::parse_sse_response(body, 1).unwrap_err();
+        let err = HttpAdapter::parse_sse_response(body, 1, None).unwrap_err();
         assert!(
             matches!(err, AdapterError::ProtocolError(_)),
             "expected ProtocolError, got {:?}",
@@ -665,14 +897,14 @@ mod tests {
 
     #[test]
     fn test_parse_sse_empty_body() {
-        let err = HttpAdapter::parse_sse_response("", 1).unwrap_err();
+        let err = HttpAdapter::parse_sse_response("", 1, None).unwrap_err();
         assert!(matches!(err, AdapterError::ProtocolError(_)));
     }
 
     #[test]
     fn test_parse_sse_error_response() {
         let body = "data: {\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"Method not found\"},\"id\":2}\n\n";
-        let resp = HttpAdapter::parse_sse_response(body, 2).unwrap();
+        let resp = HttpAdapter::parse_sse_response(body, 2, None).unwrap();
         assert_eq!(resp.id, Some(2));
         assert!(resp.error.is_some());
         let err = resp.error.unwrap();
@@ -683,7 +915,7 @@ mod tests {
     fn test_parse_sse_multiline_data_invalid_json() {
         // If multi-line data concatenation produces invalid JSON, the event is skipped.
         let body = "data: {\"incomplete\":\ndata: true}\n\n";
-        let err = HttpAdapter::parse_sse_response(body, 1).unwrap_err();
+        let err = HttpAdapter::parse_sse_response(body, 1, None).unwrap_err();
         assert!(matches!(err, AdapterError::ProtocolError(_)));
     }
 
@@ -691,14 +923,14 @@ mod tests {
     fn test_parse_sse_data_no_space_after_colon() {
         // SSE spec says space after colon is optional.
         let body = "data:{\"jsonrpc\":\"2.0\",\"result\":{\"x\":1},\"id\":4}\n\n";
-        let resp = HttpAdapter::parse_sse_response(body, 4).unwrap();
+        let resp = HttpAdapter::parse_sse_response(body, 4, None).unwrap();
         assert_eq!(resp.id, Some(4));
     }
 
     #[test]
     fn test_parse_sse_ignores_non_data_lines() {
         let body = "event: message\nid: 123\nretry: 5000\ndata: {\"jsonrpc\":\"2.0\",\"result\":{},\"id\":1}\n\n";
-        let resp = HttpAdapter::parse_sse_response(body, 1).unwrap();
+        let resp = HttpAdapter::parse_sse_response(body, 1, None).unwrap();
         assert_eq!(resp.id, Some(1));
     }
 
@@ -714,7 +946,7 @@ mod tests {
             "data: ,\"id\":1}\n",
             "\n",
         );
-        let resp = HttpAdapter::parse_sse_response(body, 1).unwrap();
+        let resp = HttpAdapter::parse_sse_response(body, 1, None).unwrap();
         assert_eq!(resp.id, Some(1));
         let tools = resp.result.unwrap();
         let arr = tools.get("tools").unwrap().as_array().unwrap();
@@ -726,7 +958,7 @@ mod tests {
     fn test_parse_sse_todoist_style_initialize_response() {
         // Realistic MCP initialize response with serverInfo, capabilities, protocolVersion.
         let body = "data: {\"jsonrpc\":\"2.0\",\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{\"tools\":{\"listChanged\":true}},\"serverInfo\":{\"name\":\"todoist-mcp\",\"version\":\"1.0.0\"}},\"id\":1}\n\n";
-        let resp = HttpAdapter::parse_sse_response(body, 1).unwrap();
+        let resp = HttpAdapter::parse_sse_response(body, 1, None).unwrap();
         assert_eq!(resp.id, Some(1));
         let result = resp.result.unwrap();
         assert_eq!(result["protocolVersion"], "2025-03-26");
@@ -753,7 +985,7 @@ mod tests {
             "id": 2
         });
         let body = format!("data: {}\n\n", serde_json::to_string(&tools_json).unwrap());
-        let resp = HttpAdapter::parse_sse_response(&body, 2).unwrap();
+        let resp = HttpAdapter::parse_sse_response(&body, 2, None).unwrap();
         assert_eq!(resp.id, Some(2));
         let tools = resp.result.unwrap();
         let arr = tools.get("tools").unwrap().as_array().unwrap();
@@ -776,7 +1008,7 @@ mod tests {
             "data: {\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32600,\"message\":\"Invalid request\"},\"id\":99}\n\n",
             "data: {\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Hello\"}]},\"id\":7}\n\n",
         );
-        let resp = HttpAdapter::parse_sse_response(body, 7).unwrap();
+        let resp = HttpAdapter::parse_sse_response(body, 7, None).unwrap();
         assert_eq!(resp.id, Some(7));
         assert!(resp.result.is_some());
         assert!(resp.error.is_none());
@@ -790,7 +1022,7 @@ mod tests {
         // The parser should still handle this because split("\n\n") finds
         // the double-newline within \r\n\r\n, and trim() strips leftover \r.
         let body = "data: {\"jsonrpc\":\"2.0\",\"result\":{\"ok\":true},\"id\":1}\r\n\r\n";
-        let resp = HttpAdapter::parse_sse_response(body, 1).unwrap();
+        let resp = HttpAdapter::parse_sse_response(body, 1, None).unwrap();
         assert_eq!(resp.id, Some(1));
         assert!(resp.result.is_some());
         assert_eq!(resp.result.unwrap()["ok"], true);
@@ -810,7 +1042,7 @@ mod tests {
         // Also test the actual SSE parsing works with a body that would come
         // from such a content type.
         let body = "data: {\"jsonrpc\":\"2.0\",\"result\":{\"encoding\":\"utf-8\"},\"id\":10}\n\n";
-        let resp = HttpAdapter::parse_sse_response(body, 10).unwrap();
+        let resp = HttpAdapter::parse_sse_response(body, 10, None).unwrap();
         assert_eq!(resp.id, Some(10));
     }
 
@@ -828,7 +1060,7 @@ mod tests {
             "\n\n",
             "\n\n",
         );
-        let resp = HttpAdapter::parse_sse_response(body, 3).unwrap();
+        let resp = HttpAdapter::parse_sse_response(body, 3, None).unwrap();
         assert_eq!(resp.id, Some(3));
         assert_eq!(resp.result.unwrap()["status"], "ok");
     }
@@ -844,9 +1076,214 @@ mod tests {
             "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n\n",
             "data: {\"jsonrpc\":\"2.0\",\"result\":{\"protocolVersion\":\"2025-03-26\",\"capabilities\":{},\"serverInfo\":{\"name\":\"test\",\"version\":\"0.1\"}},\"id\":1}\n\n",
         );
-        let resp = HttpAdapter::parse_sse_response(body, 1).unwrap();
+        let resp = HttpAdapter::parse_sse_response(body, 1, None).unwrap();
         assert_eq!(resp.id, Some(1));
         let result = resp.result.unwrap();
         assert_eq!(result["protocolVersion"], "2025-03-26");
+    }
+
+    // --- tools/list_changed dispatch tests ---
+
+    /// Inline POST path: a POST SSE response body containing both a
+    /// `notifications/tools/list_changed` event AND the matching JSON-RPC
+    /// response dispatches the notification to the broadcast and still
+    /// returns the response.
+    #[test]
+    fn test_parse_sse_dispatches_inline_tools_changed_notification() {
+        let (tx, mut rx) = broadcast::channel::<()>(8);
+        let body = concat!(
+            "data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}\n\n",
+            "data: {\"jsonrpc\":\"2.0\",\"result\":{\"ok\":true},\"id\":42}\n\n",
+        );
+        let resp = HttpAdapter::parse_sse_response(body, 42, Some(&tx)).unwrap();
+        assert_eq!(resp.id, Some(42));
+        assert_eq!(resp.result.unwrap()["ok"], true);
+        assert!(
+            rx.try_recv().is_ok(),
+            "broadcast receiver should have received a tick"
+        );
+    }
+
+    // --- GET listener integration tests (in-process axum server) ---
+
+    use axum::extract::State;
+    use axum::http::StatusCode;
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use axum::response::IntoResponse;
+    use axum::routing::any;
+    use axum::{Json, Router};
+    use std::convert::Infallible;
+    use std::sync::atomic::AtomicBool;
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+
+    #[derive(Clone)]
+    struct GetListenerAppState {
+        /// When true, GET /mcp returns 405. When false, GET /mcp returns an
+        /// SSE stream that emits a single `notifications/tools/list_changed`
+        /// event after a short delay and keeps the connection open.
+        get_returns_405: Arc<AtomicBool>,
+    }
+
+    async fn handle_get_listener(
+        State(app): State<GetListenerAppState>,
+    ) -> axum::response::Response {
+        if app.get_returns_405.load(Ordering::SeqCst) {
+            return (StatusCode::METHOD_NOT_ALLOWED, "GET not supported").into_response();
+        }
+        let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(8);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx
+                .send(Ok(Event::default().data(
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}",
+                )))
+                .await;
+            // Keep the channel alive (and thus the connection open) by holding
+            // the sender until the receiver is dropped (client disconnect).
+            tx.closed().await;
+        });
+        Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .keep_alive(KeepAlive::default())
+            .into_response()
+    }
+
+    async fn handle_post_initialize(Json(body): Json<Value>) -> impl IntoResponse {
+        let id = body["id"].as_u64().unwrap_or(0);
+        let method = body["method"].as_str().unwrap_or("");
+        if method == "initialize" {
+            Json(json!({
+                "jsonrpc": "2.0",
+                "result": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"tools": {"listChanged": true}},
+                    "serverInfo": {"name": "fake-http", "version": "0.0.0"}
+                },
+                "id": id,
+            }))
+            .into_response()
+        } else if body.get("id").is_none() {
+            // notifications/initialized and other JSON-RPC notifications
+            (StatusCode::ACCEPTED, "").into_response()
+        } else {
+            Json(json!({
+                "jsonrpc": "2.0",
+                "result": {"ok": true},
+                "id": id,
+            }))
+            .into_response()
+        }
+    }
+
+    async fn start_fake_http_server(
+        get_returns_405: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let state = GetListenerAppState {
+            get_returns_405: Arc::new(AtomicBool::new(get_returns_405)),
+        };
+        let app = Router::new()
+            .route("/mcp", any(get_handler_dispatch))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}/mcp", addr);
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (url, handle)
+    }
+
+    async fn get_handler_dispatch(
+        State(app): State<GetListenerAppState>,
+        req: axum::extract::Request,
+    ) -> axum::response::Response {
+        if req.method() == axum::http::Method::GET {
+            handle_get_listener(State(app)).await
+        } else if req.method() == axum::http::Method::POST {
+            let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
+                Ok(b) => b,
+                Err(_) => return (StatusCode::BAD_REQUEST, "bad body").into_response(),
+            };
+            let value: Value = match serde_json::from_slice(&body_bytes) {
+                Ok(v) => v,
+                Err(_) => return (StatusCode::BAD_REQUEST, "bad json").into_response(),
+            };
+            handle_post_initialize(Json(value)).await.into_response()
+        } else {
+            (StatusCode::METHOD_NOT_ALLOWED, "").into_response()
+        }
+    }
+
+    /// GET listener happy path: server emits an SSE event containing
+    /// `notifications/tools/list_changed`; the broadcast receiver gets a tick
+    /// within 2s. Dropping the adapter causes the listener task to exit.
+    #[tokio::test]
+    async fn test_get_listener_dispatches_tools_changed_and_exits_on_drop() {
+        let (url, server) = start_fake_http_server(false).await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        let mut rx = adapter.subscribe_tools_changed().expect("Some receiver");
+        adapter.initialize().await.expect("initialize succeeds");
+
+        let tick = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        assert!(tick.is_ok(), "broadcast should receive a tick within 2s");
+        assert!(tick.unwrap().is_ok(), "tick should not be a lag/closed err");
+
+        // Grab the listener handle before drop so we can assert it stops.
+        let listener = {
+            let mut guard = adapter.listener_handle.lock().await;
+            guard
+                .take()
+                .expect("listener handle present after initialize")
+        };
+        drop(adapter);
+        // Give the listener a moment to observe the shutdown notification.
+        for _ in 0..20 {
+            if listener.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            listener.is_finished(),
+            "GET listener should exit after adapter is dropped"
+        );
+        server.abort();
+    }
+
+    /// GET 405 fallback: server replies 405 to GET; the listener task exits
+    /// without panicking, and the inline POST path still works for a
+    /// subsequent `send_request`.
+    #[tokio::test]
+    async fn test_get_listener_405_fallback_keeps_post_working() {
+        let (url, server) = start_fake_http_server(true).await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+
+        // Listener should observe the 405 and exit quickly.
+        let listener = {
+            let mut guard = adapter.listener_handle.lock().await;
+            guard
+                .take()
+                .expect("listener handle present after initialize")
+        };
+        for _ in 0..20 {
+            if listener.is_finished() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            listener.is_finished(),
+            "GET listener should exit promptly on 405"
+        );
+
+        // Inline POST still works.
+        let result = adapter
+            .send_request("tools/call", Some(json!({"name": "x"})))
+            .await
+            .expect("POST send_request still works after GET 405");
+        assert_eq!(result["ok"], true);
+
+        server.abort();
     }
 }
