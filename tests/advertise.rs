@@ -202,7 +202,7 @@ async fn instructions_and_descriptions_reflect_healthy_server() {
     );
     let search_desc = meta_tool_description(&tools, "search_tools");
     assert!(
-        search_desc.ends_with("\n\nConnected server types: bad"),
+        search_desc.contains("\n\nConnected server types: bad"),
         "search_tools description missing Connected server types footer: {search_desc}"
     );
 }
@@ -252,7 +252,7 @@ async fn failed_adapter_with_override_included_in_advertised_list() {
     );
     let search_desc = meta_tool_description(&tools, "search_tools");
     assert!(
-        search_desc.ends_with("\n\nConnected server types: bad, broken"),
+        search_desc.contains("\n\nConnected server types: bad, broken"),
         "search_tools description must include the Failed adapter's override: {search_desc}"
     );
 }
@@ -301,7 +301,7 @@ async fn multi_distinct_types_rendered_in_alphabetical_order() {
     );
     let search_desc = meta_tool_description(&tools, "search_tools");
     assert!(
-        search_desc.ends_with(&format!("\n\nConnected server types: {}", expected_list)),
+        search_desc.contains(&format!("\n\nConnected server types: {}", expected_list)),
         "search_tools description does not end with full alphabetised list: {search_desc}"
     );
     // execute_tools is hidden when JS mode is off; covered separately.
@@ -339,7 +339,7 @@ async fn hot_reload_kill_endpoint_drops_from_advertised_list() {
     let tools = raw_tools_list(&harness).await;
     let search_desc = meta_tool_description(&tools, "search_tools");
     assert!(
-        search_desc.ends_with("\n\nConnected server types: alpha, zebra"),
+        search_desc.contains("\n\nConnected server types: alpha, zebra"),
         "expected mango to be removed from search_tools description: {search_desc}"
     );
     let init = raw_initialize(&harness).await;
@@ -384,7 +384,7 @@ async fn hot_reload_add_endpoint_appears_in_advertised_list() {
     let tools = raw_tools_list(&harness).await;
     let search_desc = meta_tool_description(&tools, "search_tools");
     assert!(
-        search_desc.ends_with("\n\nConnected server types: alpha, mango, zebra"),
+        search_desc.contains("\n\nConnected server types: alpha, mango, zebra"),
         "expected mango to appear in alphabetised list: {search_desc}"
     );
 }
@@ -427,7 +427,7 @@ async fn duplicate_type_dedupes_but_count_includes_both() {
     );
     let search_desc = meta_tool_description(&tools, "search_tools");
     assert!(
-        search_desc.ends_with("\n\nConnected server types: alpha"),
+        search_desc.contains("\n\nConnected server types: alpha"),
         "search_tools description should carry deduplicated single entry: {search_desc}"
     );
 }

@@ -12,6 +12,7 @@ pub mod server;
 pub mod shell_env;
 pub mod token_manager;
 pub mod token_security;
+pub mod toon_convert;
 pub mod watcher;
 
 use adapter::oauth::OAuthAdapterInner;

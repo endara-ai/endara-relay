@@ -1,9 +1,10 @@
+use async_trait::async_trait;
 use endara_relay::adapter::stdio::{StdioAdapter, StdioConfig};
-use endara_relay::adapter::McpAdapter;
+use endara_relay::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use endara_relay::js_sandbox::MetaToolHandler;
 use endara_relay::registry::AdapterRegistry;
 use endara_relay::server::{build_router, start_server, AppState};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -50,6 +51,7 @@ async fn setup_server() -> (SocketAddr, AdapterRegistry, tokio::task::JoinHandle
         oauth_adapter_inners: None,
         setup_manager: None,
         started_at: std::time::Instant::now(),
+        toon_enabled: false,
     };
     let router = build_router(state);
     // Bind to port 0 to get a random available port
@@ -174,4 +176,152 @@ async fn test_mcp_tools_call_invalid_prefix() {
     assert!(resp.status().is_success());
     let body: serde_json::Value = resp.json().await.unwrap();
     assert!(body["error"].is_object(), "expected error response");
+}
+
+/// Mock adapter whose `call_tool` returns a `CallToolResult` envelope with
+/// a JSON-serialized object in its single TextContent entry. Used by the
+/// route-level integration tests for the native `tools/call` branch
+/// (§5 row 14) to verify TOON gating end-to-end.
+struct JsonPayloadAdapter;
+
+#[async_trait]
+impl McpAdapter for JsonPayloadAdapter {
+    async fn initialize(&mut self) -> Result<(), AdapterError> {
+        Ok(())
+    }
+    async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+        Ok(vec![ToolInfo {
+            name: "json_tool".to_string(),
+            description: Some("returns a JSON object in TextContent".to_string()),
+            input_schema: json!({"type": "object"}),
+            annotations: None,
+        }])
+    }
+    async fn call_tool(&self, _name: &str, _args: Value) -> Result<Value, AdapterError> {
+        Ok(json!({
+            "content": [{
+                "type": "text",
+                "text": "{\"users\":[{\"id\":1,\"name\":\"a\"},{\"id\":2,\"name\":\"b\"}]}"
+            }]
+        }))
+    }
+    fn health(&self) -> HealthStatus {
+        HealthStatus::Healthy
+    }
+    async fn shutdown(&mut self) -> Result<(), AdapterError> {
+        Ok(())
+    }
+}
+
+/// Build a relay server backed by a single `JsonPayloadAdapter`, with the
+/// requested `toon_enabled` flag. Returns the bound HTTP address.
+async fn setup_native_toon_server(toon_enabled: bool) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let registry = AdapterRegistry::new();
+    registry
+        .register(
+            "mock-ep".into(),
+            Box::new(JsonPayloadAdapter),
+            "stdio".into(),
+            None,
+            None,
+        )
+        .await;
+
+    let registry_arc = Arc::new(registry.clone());
+    let state = AppState {
+        registry,
+        js_execution_mode: Arc::new(AtomicBool::new(false)),
+        meta_tool_handler: Arc::new(MetaToolHandler::new(registry_arc, Duration::from_secs(30))),
+        oauth_flow_manager: None,
+        token_manager: None,
+        oauth_adapter_inners: None,
+        setup_manager: None,
+        started_at: std::time::Instant::now(),
+        toon_enabled,
+    };
+    let router = build_router(state);
+    let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+    let (bound_addr, handle) = start_server(router, addr)
+        .await
+        .expect("server start failed");
+    (bound_addr, handle)
+}
+
+/// §5 row 14 — route-level: the native `tools/call` branch encodes JSON
+/// TextContent into TOON when `toon_enabled` is on.
+#[tokio::test]
+async fn tools_call_native_response_is_toon_when_enabled() {
+    let (addr, _handle) = setup_native_toon_server(true).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("http://{}/mcp/tools/call", addr))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": { "name": "json_tool", "arguments": {} },
+            "id": 1
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text field missing");
+
+    // The native branch must have re-encoded the JSON object string as TOON,
+    // which is never valid JSON and never starts with `{` or `[`.
+    assert!(
+        serde_json::from_str::<Value>(text).is_err(),
+        "expected TOON output, got JSON-parseable text: {text}"
+    );
+    let first = text.chars().next().expect("non-empty TOON output");
+    assert!(
+        first != '{' && first != '[',
+        "expected TOON output (no leading `{{`/`[`), got: {text}"
+    );
+    // TOON tabular header for the inner `users` array — uniquely identifies
+    // TOON output and would not appear in the JSON pass-through.
+    assert!(
+        text.contains("{id,name}"),
+        "expected TOON tabular header `{{id,name}}` in: {text}"
+    );
+}
+
+/// §5 row 14 sibling — route-level: the native `tools/call` branch leaves
+/// the JSON TextContent untouched when `toon_enabled` is off.
+#[tokio::test]
+async fn tools_call_native_response_is_json_when_disabled() {
+    let (addr, _handle) = setup_native_toon_server(false).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("http://{}/mcp/tools/call", addr))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "params": { "name": "json_tool", "arguments": {} },
+            "id": 1
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    let text = body["result"]["content"][0]["text"]
+        .as_str()
+        .expect("text field missing");
+
+    // With TOON disabled, the adapter's JSON object string passes through
+    // unchanged and must round-trip via `serde_json::from_str`.
+    let parsed: Value =
+        serde_json::from_str(text).expect("expected JSON pass-through, got non-JSON text");
+    assert_eq!(parsed["users"][0]["id"], 1);
+    assert_eq!(parsed["users"][0]["name"], "a");
+    assert_eq!(parsed["users"][1]["id"], 2);
+    assert_eq!(parsed["users"][1]["name"], "b");
 }

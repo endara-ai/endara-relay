@@ -151,12 +151,23 @@ pub async fn instructions(registry: &AdapterRegistry) -> Option<String> {
     }
 }
 
+/// Hint appended to the `search_tools` description when TOON output is
+/// enabled. Tells the model that tool responses arrive in TOON (Token-Oriented
+/// Object Notation) instead of JSON, so it doesn't try to `JSON.parse()` them.
+pub const TOON_OUTPUT_HINT: &str = "Tool responses are returned in TOON format (Token-Oriented Object Notation) for reduced token usage. TOON is a compact alternative to JSON — indentation-based, no braces, tabular arrays. Parse it like structured text.";
+
 /// Build the `search_tools` description. Appends `\n\nConnected server types: {list}`
-/// when at least one registered adapter has a rendered `server_type`.
-pub async fn search_tools_description(registry: &AdapterRegistry) -> String {
-    match ServerTypeList::new(registry).render().await {
+/// when at least one registered adapter has a rendered `server_type`, and
+/// the TOON hint when `toon_enabled` is true.
+pub async fn search_tools_description(registry: &AdapterRegistry, toon_enabled: bool) -> String {
+    let base = match ServerTypeList::new(registry).render().await {
         Some(list) => format!("{}\n\nConnected server types: {}", SEARCH_TOOLS_BASE, list),
         None => SEARCH_TOOLS_BASE.to_string(),
+    };
+    if toon_enabled {
+        format!("{}\n\n{}", base, TOON_OUTPUT_HINT)
+    } else {
+        base
     }
 }
 
@@ -425,7 +436,7 @@ mod tests {
     #[tokio::test]
     async fn search_tools_description_no_servers() {
         let reg = AdapterRegistry::new();
-        let desc = search_tools_description(&reg).await;
+        let desc = search_tools_description(&reg, false).await;
         assert_eq!(desc, SEARCH_TOOLS_BASE);
     }
 
@@ -434,9 +445,35 @@ mod tests {
         let reg = AdapterRegistry::new();
         register(&reg, "ep1", MockAdapter::ready("github")).await;
         register(&reg, "ep2", MockAdapter::ready("gmail")).await;
-        let desc = search_tools_description(&reg).await;
+        let desc = search_tools_description(&reg, false).await;
         assert!(desc.starts_with(SEARCH_TOOLS_BASE));
         assert!(desc.ends_with("\n\nConnected server types: github, gmail"));
+    }
+
+    #[tokio::test]
+    async fn search_tools_description_appends_toon_hint_when_enabled() {
+        let reg = AdapterRegistry::new();
+        let desc = search_tools_description(&reg, true).await;
+        assert!(desc.starts_with(SEARCH_TOOLS_BASE));
+        assert!(desc.ends_with(TOON_OUTPUT_HINT));
+        assert!(desc.contains("TOON format"));
+    }
+
+    #[tokio::test]
+    async fn search_tools_description_omits_toon_hint_when_disabled() {
+        let reg = AdapterRegistry::new();
+        let desc = search_tools_description(&reg, false).await;
+        assert!(!desc.contains("TOON"));
+    }
+
+    #[tokio::test]
+    async fn search_tools_description_combines_servers_and_toon_hint() {
+        let reg = AdapterRegistry::new();
+        register(&reg, "ep1", MockAdapter::ready("github")).await;
+        let desc = search_tools_description(&reg, true).await;
+        assert!(desc.starts_with(SEARCH_TOOLS_BASE));
+        assert!(desc.contains("Connected server types: github"));
+        assert!(desc.ends_with(TOON_OUTPUT_HINT));
     }
 
     #[tokio::test]

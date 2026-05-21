@@ -60,6 +60,7 @@ async fn test_config_diff_add_endpoint() {
             local_js_execution: None,
             token_dir: None,
             allow_insecure_oauth: None,
+            toon_output: None,
         },
         endpoints: vec![config::EndpointConfig {
             name: "echo-ep".to_string(),
@@ -88,6 +89,7 @@ async fn test_config_diff_add_endpoint() {
             local_js_execution: None,
             token_dir: None,
             allow_insecure_oauth: None,
+            toon_output: None,
         },
         endpoints: vec![
             config::EndpointConfig {
@@ -215,6 +217,7 @@ async fn test_config_diff_remove_endpoint() {
             local_js_execution: None,
             token_dir: None,
             allow_insecure_oauth: None,
+            toon_output: None,
         },
         endpoints: vec![
             config::EndpointConfig {
@@ -264,6 +267,7 @@ async fn test_config_diff_remove_endpoint() {
             local_js_execution: None,
             token_dir: None,
             allow_insecure_oauth: None,
+            toon_output: None,
         },
         endpoints: vec![config::EndpointConfig {
             name: "echo-ep".to_string(),

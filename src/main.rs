@@ -13,6 +13,7 @@ mod prefix;
 mod registry;
 mod server;
 mod shell_env;
+mod toon_convert;
 
 use adapter::oauth::{OAuthAdapter, OAuthAdapterConfig, OAuthAdapterInner};
 use adapter::{FailedAdapter, McpAdapter, StartingAdapter};
@@ -70,6 +71,12 @@ enum Commands {
         /// EnvFilter directive for the file log layer (default: debug,endara_relay=trace)
         #[arg(long)]
         file_log_level: Option<String>,
+
+        /// Disable TOON (Token-Oriented Object Notation) conversion of JSON
+        /// tool responses. Overrides `relay.toon_output` from config.toml.
+        /// When unset, TOON conversion defaults to on.
+        #[arg(long, default_value_t = false)]
+        no_toon: bool,
     },
 }
 
@@ -162,6 +169,7 @@ async fn main() {
             log_format,
             color,
             file_log_level,
+            no_toon,
         } => {
             let data_dir_path = expand_tilde(&data_dir);
             let log_dir = data_dir_path.join("logs");
@@ -438,6 +446,15 @@ async fn main() {
                 Duration::from_secs(30),
             ));
             let setup_manager = Arc::new(OAuthSetupManager::new());
+            // TOON output: CLI `--no-toon` forces off; otherwise honour
+            // `relay.toon_output` from config.toml; default on when neither
+            // is set.
+            let toon_enabled = if no_toon {
+                false
+            } else {
+                cfg.relay.toon_output.unwrap_or(true)
+            };
+            info!(toon_enabled, "TOON output conversion configured");
             let state = AppState {
                 registry: (*registry).clone(),
                 js_execution_mode: js_execution_mode.clone(),
@@ -447,6 +464,7 @@ async fn main() {
                 oauth_adapter_inners: Some(oauth_adapter_inners.clone()),
                 setup_manager: Some(setup_manager.clone()),
                 started_at: std::time::Instant::now(),
+                toon_enabled,
             };
             let mgmt_state = management::ManagementState {
                 registry: registry.clone(),

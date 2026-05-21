@@ -6,7 +6,7 @@
 
 mod common;
 
-use common::config::{everything_config, ConfigBuilder};
+use common::config::ConfigBuilder;
 use common::harness::RelayHarness;
 use common::mcp_client::McpClient;
 use common::toolchain::require_node;
@@ -24,6 +24,7 @@ async fn setup_js_on() -> (RelayHarness, McpClient) {
             &["-y", "@modelcontextprotocol/server-everything"],
         )
         .js_execution(true)
+        .toon_output(false)
         .build();
     let harness = RelayHarness::start(&config).await;
     harness
@@ -37,7 +38,14 @@ async fn setup_js_on() -> (RelayHarness, McpClient) {
 
 /// Helper: start relay with everything server + JS execution OFF, wait healthy, initialize client.
 async fn setup_js_off() -> (RelayHarness, McpClient) {
-    let config = everything_config();
+    let config = ConfigBuilder::new()
+        .add_stdio(
+            "everything",
+            "npx",
+            &["-y", "@modelcontextprotocol/server-everything"],
+        )
+        .toon_output(false)
+        .build();
     let harness = RelayHarness::start(&config).await;
     harness
         .wait_healthy("everything", Duration::from_secs(30))
