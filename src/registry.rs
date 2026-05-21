@@ -99,6 +99,14 @@ pub struct AdapterRegistry {
     /// cache) can use this as an authoritative invalidation signal without
     /// needing to diff catalog contents.
     catalog_generation: Arc<AtomicU64>,
+    /// Relay-wide tools-changed broadcast. Fan-in for every per-endpoint
+    /// `subscribe_tools_changed` tick observed by
+    /// [`AdapterRegistry::tools_changed_listener_loop`]. Downstream consumers
+    /// (e.g. the `/mcp/sse` handler) subscribe via
+    /// [`AdapterRegistry::subscribe_tools_changed`] to forward
+    /// `notifications/tools/list_changed` to connected MCP clients without
+    /// caring which upstream endpoint emitted the change.
+    tools_changed_tx: broadcast::Sender<()>,
 }
 
 impl Default for AdapterRegistry {
@@ -110,11 +118,31 @@ impl Default for AdapterRegistry {
 impl AdapterRegistry {
     /// Create a new, empty adapter registry.
     pub fn new() -> Self {
+        let (tools_changed_tx, _) = broadcast::channel(16);
         Self {
             adapters: Arc::new(RwLock::new(HashMap::new())),
             catalog_cache: Arc::new(RwLock::new(None)),
             catalog_generation: Arc::new(AtomicU64::new(0)),
+            tools_changed_tx,
         }
+    }
+
+    /// Subscribe to the relay-wide tools-changed broadcast. Each `recv()`
+    /// represents at least one `notifications/tools/list_changed` tick from
+    /// some registered adapter since the previous receive. Mirrors the
+    /// per-adapter [`McpAdapter::subscribe_tools_changed`] policy: `Lagged`
+    /// is also surfaced as a tick by the fan-in loop, and `Closed` only
+    /// happens when the registry itself is dropped.
+    pub fn subscribe_tools_changed(&self) -> broadcast::Receiver<()> {
+        self.tools_changed_tx.subscribe()
+    }
+
+    /// Send a synthetic tools-changed tick on the relay-wide broadcast.
+    /// Test-only escape hatch so server-side handler tests can exercise the
+    /// fan-out path without standing up a real adapter and listener task.
+    #[cfg(test)]
+    pub(crate) fn tick_tools_changed_for_test(&self) {
+        let _ = self.tools_changed_tx.send(());
     }
 
     /// Register an adapter under the given endpoint name.
@@ -184,7 +212,10 @@ impl AdapterRegistry {
     /// Listener loop driven by `subscribe_tools_changed`. Each successful tick
     /// — as well as a `Lagged` error (treated as a missed-but-coalesced tick)
     /// — invalidates the per-endpoint tools cache followed by the merged
-    /// catalog cache. A `Closed` receiver terminates the loop.
+    /// catalog cache, then fans the tick into the relay-wide
+    /// `tools_changed_tx` so downstream consumers (e.g. the `/mcp/sse`
+    /// handler) can forward `notifications/tools/list_changed` to connected
+    /// MCP clients. A `Closed` receiver terminates the loop.
     async fn tools_changed_listener_loop(
         registry: Self,
         endpoint: String,
@@ -195,6 +226,7 @@ impl AdapterRegistry {
                 Ok(()) => {
                     registry.invalidate_endpoint_tool_cache(&endpoint).await;
                     registry.invalidate_catalog_cache().await;
+                    let _ = registry.tools_changed_tx.send(());
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     debug!(
@@ -204,6 +236,7 @@ impl AdapterRegistry {
                     );
                     registry.invalidate_endpoint_tool_cache(&endpoint).await;
                     registry.invalidate_catalog_cache().await;
+                    let _ = registry.tools_changed_tx.send(());
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     debug!(endpoint = %endpoint, "tools-changed listener channel closed");
@@ -1962,6 +1995,35 @@ mod tests {
             registry.catalog_generation(),
             gen_before,
             "no listener should remain to bump the generation"
+        );
+    }
+
+    /// A per-endpoint adapter tick must also fan into the relay-wide
+    /// `subscribe_tools_changed` channel so server-side consumers (e.g. the
+    /// `/mcp/sse` handler) can forward `notifications/tools/list_changed`
+    /// to MCP clients.
+    #[tokio::test]
+    async fn test_tools_changed_tick_fans_in_to_relay_subscribers() {
+        let registry = AdapterRegistry::new();
+        let mut relay_rx = registry.subscribe_tools_changed();
+        let (adapter, _calls, tx) = NotifyingAdapter::new(vec![make_tool("a")], 8);
+        registry
+            .register(
+                "ep".into(),
+                Box::new(adapter),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        // Drive a per-endpoint tick; the listener loop should observe it and
+        // fan it into the relay-wide broadcast.
+        tx.send(()).unwrap();
+        let recv = tokio::time::timeout(std::time::Duration::from_secs(1), relay_rx.recv()).await;
+        assert!(
+            matches!(recv, Ok(Ok(()))),
+            "relay-wide tools-changed subscriber should receive the fanned-in tick (got {recv:?})"
         );
     }
 

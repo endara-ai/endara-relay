@@ -102,7 +102,7 @@ async fn mcp_initialize(
     let mut result = json!({
         "protocolVersion": "2025-03-26",
         "capabilities": {
-            "tools": {}
+            "tools": { "listChanged": true }
         },
         "serverInfo": {
             "name": "Endara Relay",
@@ -530,14 +530,44 @@ async fn mcp_unified(
     }
 }
 
-/// GET /mcp/sse — basic SSE transport (sends a connection ack, then keeps alive)
-async fn mcp_sse() -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+/// GET /mcp/sse — basic SSE transport.
+///
+/// Sends the initial `endpoint` event (`data: /mcp`) so legacy SSE clients
+/// learn where to POST JSON-RPC requests, then forwards every
+/// `notifications/tools/list_changed` tick from the registry-wide broadcast
+/// as a JSON-RPC notification frame so subscribers can re-fetch
+/// `tools/list`. An Axum keep-alive layer prevents idle proxies from
+/// dropping the connection.
+///
+/// Caveat: clients that only POST to `/mcp` (the unified request/response
+/// endpoint, no SSE subscription) will not receive these notifications even
+/// though `mcp_initialize` advertises `tools.listChanged: true`. That is
+/// intentional — `listChanged` describes server capability, not per-
+/// transport delivery — and POST-only clients are expected to re-fetch
+/// `tools/list` on their own cadence.
+async fn mcp_sse(
+    State(state): State<AppState>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    use tokio::sync::broadcast::error::RecvError;
+
     let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let mut tools_rx = state.registry.subscribe_tools_changed();
 
     tokio::spawn(async move {
-        let _ = tx
+        if tx
             .send(Ok(Event::default().event("endpoint").data("/mcp")))
-            .await;
+            .await
+            .is_err()
+        {
+            return;
+        }
+        while let Ok(()) | Err(RecvError::Lagged(_)) = tools_rx.recv().await {
+            let frame = Event::default()
+                .data(r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#);
+            if tx.send(Ok(frame)).await.is_err() {
+                break;
+            }
+        }
     });
 
     Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default())
@@ -2389,5 +2419,121 @@ mod tests {
         let body_str = String::from_utf8(body.to_vec()).unwrap();
         assert!(body_str.contains("&lt;script&gt;"), "body = {body_str}");
         assert!(!body_str.contains("<script>"));
+    }
+
+    // --- /mcp/sse + initialize tools.listChanged capability ---
+
+    /// `initialize` must advertise `tools.listChanged: true` so MCP clients
+    /// know to consume `notifications/tools/list_changed` over `/mcp/sse`.
+    #[tokio::test]
+    async fn mcp_initialize_advertises_tools_list_changed() {
+        let state = test_app_state();
+        let body = JsonRpcBody {
+            jsonrpc: Some("2.0".to_string()),
+            method: Some("initialize".to_string()),
+            params: None,
+            id: Some(json!(7)),
+        };
+        let Json(resp) = mcp_initialize(State(state), Json(body)).await;
+        assert_eq!(
+            resp["result"]["capabilities"]["tools"]["listChanged"], true,
+            "initialize must advertise tools.listChanged: true (got {resp})"
+        );
+    }
+
+    /// Helper: read the SSE response body as a UTF-8 string, accumulating
+    /// chunks until `predicate` returns true or `timeout` elapses. Returns
+    /// the accumulated text either way so tests can produce useful failure
+    /// messages.
+    async fn read_sse_until<F: Fn(&str) -> bool>(
+        resp: axum::response::Response,
+        timeout: Duration,
+        predicate: F,
+    ) -> String {
+        use futures_util::StreamExt;
+        let mut stream = resp.into_body().into_data_stream();
+        let mut collected = String::new();
+        let deadline = tokio::time::Instant::now() + timeout;
+        while tokio::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, stream.next()).await {
+                Ok(Some(Ok(chunk))) => {
+                    collected.push_str(&String::from_utf8_lossy(&chunk));
+                    if predicate(&collected) {
+                        break;
+                    }
+                }
+                Ok(Some(Err(_))) | Ok(None) | Err(_) => break,
+            }
+        }
+        collected
+    }
+
+    /// `mcp_sse` emits the initial `endpoint` event with `data: /mcp` so
+    /// legacy SSE clients learn where to POST JSON-RPC requests.
+    #[tokio::test]
+    async fn mcp_sse_emits_initial_endpoint_event() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+        let state = test_app_state();
+        let router = build_router(state);
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/mcp/sse")
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = read_sse_until(resp, Duration::from_secs(2), |s| {
+            s.contains("event: endpoint") && s.contains("data: /mcp")
+        })
+        .await;
+        assert!(
+            text.contains("event: endpoint") && text.contains("data: /mcp"),
+            "first SSE frame should be the endpoint event (got: {text:?})"
+        );
+    }
+
+    /// `mcp_sse` forwards every relay-wide tools-changed tick as a JSON-RPC
+    /// `notifications/tools/list_changed` SSE frame.
+    #[tokio::test]
+    async fn mcp_sse_forwards_tools_changed_notification() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+        let state = test_app_state();
+        let registry = state.registry.clone();
+        let router = build_router(state);
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/mcp/sse")
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Drive a tick once the spawned forwarder is wired up. The forwarder
+        // subscribes synchronously inside the handler, but the broadcast send
+        // races with the subscriber, so retry the tick until the frame lands.
+        let driver = tokio::spawn(async move {
+            for _ in 0..40 {
+                registry.tick_tools_changed_for_test();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        let text = read_sse_until(resp, Duration::from_secs(2), |s| {
+            s.contains("notifications/tools/list_changed")
+        })
+        .await;
+        driver.abort();
+        assert!(
+            text.contains("notifications/tools/list_changed"),
+            "expected tools/list_changed frame within timeout (got: {text:?})"
+        );
+        assert!(
+            text.contains("\"jsonrpc\":\"2.0\""),
+            "frame should be a JSON-RPC notification (got: {text:?})"
+        );
     }
 }
