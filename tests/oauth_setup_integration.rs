@@ -26,6 +26,7 @@ fn empty_config() -> Config {
             token_dir: None,
             allow_insecure_oauth: Some(true),
             toon_output: None,
+            startup_init_timeout_secs: None,
         },
         endpoints: vec![EndpointConfig {
             name: "echo".to_string(),

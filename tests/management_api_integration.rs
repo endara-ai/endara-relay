@@ -85,6 +85,7 @@ fn test_config() -> Config {
             token_dir: None,
             allow_insecure_oauth: None,
             toon_output: None,
+            startup_init_timeout_secs: None,
         },
         endpoints: vec![EndpointConfig {
             name: "echo".to_string(),
