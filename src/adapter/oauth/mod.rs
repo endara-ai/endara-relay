@@ -188,7 +188,7 @@ impl OAuthAdapterInner {
         let mut http_config = HttpConfig::new(url);
         http_config.server_type_override = server_type_override;
         http_config.endpoint_name = endpoint_name;
-        HttpAdapter::new_with_client(http_config, client)
+        HttpAdapter::new_with_client_inner(http_config, client)
     }
 
     /// Transition to a new `OAuthState`.
@@ -203,7 +203,6 @@ impl OAuthAdapterInner {
         let old = do_transition(&mut state, new_state.clone(), reason, &mut history);
         self.metrics.inc_state_transition();
         info!(
-            endpoint = %self.config.endpoint_name,
             from = ?old,
             to = ?new_state,
             oauth_state = ?new_state,
@@ -285,7 +284,6 @@ impl OAuthAdapterInner {
                 Some(rt) => rt,
                 None => {
                     warn!(
-                        endpoint = %self.config.endpoint_name,
                         correlation_id = %correlation_id,
                         "No refresh token available"
                     );
@@ -300,7 +298,6 @@ impl OAuthAdapterInner {
         };
 
         info!(
-            endpoint = %self.config.endpoint_name,
             correlation_id = %correlation_id,
             "Starting token refresh"
         );
@@ -330,7 +327,6 @@ impl OAuthAdapterInner {
             TokenPostOutcome::Success(token_set) => {
                 self.metrics.inc_refresh_success();
                 info!(
-                    endpoint = %self.config.endpoint_name,
                     correlation_id = %correlation_id,
                     "Token refresh successful"
                 );
@@ -342,7 +338,6 @@ impl OAuthAdapterInner {
             }
             TokenPostOutcome::HttpError { status, body } => {
                 error!(
-                    endpoint = %self.config.endpoint_name,
                     correlation_id = %correlation_id,
                     %status,
                     body = %body,
@@ -355,7 +350,6 @@ impl OAuthAdapterInner {
             }
             TokenPostOutcome::Network(e) => {
                 error!(
-                    endpoint = %self.config.endpoint_name,
                     correlation_id = %correlation_id,
                     error = %e,
                     "Token refresh network error"
@@ -367,7 +361,6 @@ impl OAuthAdapterInner {
             }
             TokenPostOutcome::InvalidJson(e) => {
                 error!(
-                    endpoint = %self.config.endpoint_name,
                     correlation_id = %correlation_id,
                     error = %e,
                     "Token refresh JSON parse error"
@@ -404,7 +397,6 @@ impl OAuthAdapterInner {
         // Discovery is only feasible if we know the resource URL.
         if self.config.url.is_empty() {
             warn!(
-                endpoint = %self.config.endpoint_name,
                 correlation_id = %correlation_id,
                 %status,
                 "Token refresh got 404 but resource URL is empty; skipping discovery fallback"
@@ -416,7 +408,6 @@ impl OAuthAdapterInner {
         }
 
         info!(
-            endpoint = %self.config.endpoint_name,
             correlation_id = %correlation_id,
             %status,
             attempted_url = %initial_url,
@@ -428,7 +419,6 @@ impl OAuthAdapterInner {
                 Ok(d) => d,
                 Err(e) => {
                     warn!(
-                        endpoint = %self.config.endpoint_name,
                         correlation_id = %correlation_id,
                         error = %e,
                         "OAuth discovery fallback failed; returning original 404"
@@ -442,7 +432,6 @@ impl OAuthAdapterInner {
 
         if disc.token_endpoint == initial_url {
             warn!(
-                endpoint = %self.config.endpoint_name,
                 correlation_id = %correlation_id,
                 token_endpoint = %disc.token_endpoint,
                 "OAuth discovery returned the same token endpoint that just 404'd; not retrying"
@@ -454,7 +443,6 @@ impl OAuthAdapterInner {
         }
 
         info!(
-            endpoint = %self.config.endpoint_name,
             correlation_id = %correlation_id,
             old_token_endpoint = %initial_url,
             new_token_endpoint = %disc.token_endpoint,
@@ -469,7 +457,6 @@ impl OAuthAdapterInner {
             TokenPostOutcome::Success(token_set) => {
                 self.metrics.inc_refresh_success();
                 info!(
-                    endpoint = %self.config.endpoint_name,
                     correlation_id = %correlation_id,
                     "Token refresh successful after rediscovery"
                 );
@@ -477,7 +464,6 @@ impl OAuthAdapterInner {
             }
             other => {
                 warn!(
-                    endpoint = %self.config.endpoint_name,
                     correlation_id = %correlation_id,
                     retry_outcome = ?other.short_label(),
                     "Token refresh retry after rediscovery failed; returning original 404"
@@ -576,7 +562,7 @@ impl OAuthAdapterInner {
 
         // 1. Persist to disk
         if let Err(e) = self.token_manager.save(endpoint, &token_set).await {
-            error!(endpoint = %endpoint, error = %e, "Failed to persist tokens");
+            error!(error = %e, "Failed to persist tokens");
         }
 
         // 2. Abort old refresh task
@@ -650,7 +636,7 @@ impl OAuthAdapterInner {
         //    with `issued_at: None` (it's `#[serde(default)]`), but still
         //    deserve a proactive refresh.
         let deadline = if !has_refresh_token {
-            info!(endpoint = %endpoint, "No refresh token, skipping proactive refresh");
+            info!("No refresh token, skipping proactive refresh");
             None
         } else if let Some(expires) = expires_at_secs {
             let now_secs = std::time::SystemTime::now()
@@ -676,10 +662,7 @@ impl OAuthAdapterInner {
                 }
             }
         } else {
-            info!(
-                endpoint = %endpoint,
-                "No expires_at on token, skipping proactive refresh"
-            );
+            info!("No expires_at on token, skipping proactive refresh");
             None
         };
 
@@ -688,7 +671,7 @@ impl OAuthAdapterInner {
             let refresh_span = self.span.clone();
             let fut = async move {
                 tokio::time::sleep_until(deadline).await;
-                info!(endpoint = %inner.config.endpoint_name, "Proactive refresh timer fired");
+                info!("Proactive refresh timer fired");
                 // Detach our own handle from the slot before re-entering
                 // `apply_tokens`. Step 2 of `apply_tokens_inner`
                 // (`refresh_task_handle.take()` followed by `h.abort()`)
@@ -709,14 +692,12 @@ impl OAuthAdapterInner {
                         let state = inner.state.read().await.clone();
                         if matches!(state, OAuthState::Refreshing) {
                             warn!(
-                                endpoint = %inner.config.endpoint_name,
                                 "Proactive refresh recursive apply_tokens returned with state still Refreshing — possible regression"
                             );
                         }
                     }
                     Err(e) => {
                         warn!(
-                            endpoint = %inner.config.endpoint_name,
                             error = %e,
                             "Proactive refresh failed, retrying in 60s"
                         );
@@ -736,7 +717,6 @@ impl OAuthAdapterInner {
                                 let state = inner.state.read().await.clone();
                                 if matches!(state, OAuthState::Refreshing) {
                                     warn!(
-                                        endpoint = %inner.config.endpoint_name,
                                         "Proactive refresh retry recursive apply_tokens returned with state still Refreshing — possible regression"
                                     );
                                 }
@@ -750,7 +730,6 @@ impl OAuthAdapterInner {
                                 // (auth-style failure) or ConnectionFailed
                                 // (network/JSON failure).
                                 warn!(
-                                    endpoint = %inner.config.endpoint_name,
                                     error = %retry_err,
                                     "Proactive refresh retry also failed"
                                 );
@@ -828,12 +807,12 @@ impl OAuthAdapterInner {
 
         // Delete tokens from disk
         if let Err(e) = self.token_manager.delete(endpoint).await {
-            error!(endpoint = %endpoint, error = %e, "Failed to delete tokens from disk");
+            error!(error = %e, "Failed to delete tokens from disk");
         }
 
         // Delete DCR credentials from disk
         if let Err(e) = self.token_manager.delete_dcr(endpoint).await {
-            error!(endpoint = %endpoint, error = %e, "Failed to delete DCR credentials from disk");
+            error!(error = %e, "Failed to delete DCR credentials from disk");
         }
 
         // Set state
@@ -905,16 +884,10 @@ impl McpAdapter for OAuthAdapter {
 
             if let Ok(Some(token_set)) = loaded {
                 if token_set.is_valid() {
-                    info!(
-                        endpoint = %self.inner.config.endpoint_name,
-                        "Loaded valid OAuth tokens from disk"
-                    );
+                    info!("Loaded valid OAuth tokens from disk");
                     self.inner.apply_tokens(token_set).await;
                 } else if token_set.refresh_token.is_some() {
-                    info!(
-                        endpoint = %self.inner.config.endpoint_name,
-                        "Loaded expired tokens with refresh token, attempting refresh"
-                    );
+                    info!("Loaded expired tokens with refresh token, attempting refresh");
                     // Store expired tokens so refresh can use the refresh_token
                     *self.inner.tokens.write().await = Some(token_set);
                     match self.inner.do_token_refresh().await {
@@ -923,7 +896,6 @@ impl McpAdapter for OAuthAdapter {
                         }
                         Err(e) => {
                             warn!(
-                                endpoint = %self.inner.config.endpoint_name,
                                 error = %e,
                                 "Token refresh at startup failed"
                             );
@@ -975,10 +947,7 @@ impl McpAdapter for OAuthAdapter {
                             // Drop the read lock before refreshing
                             drop(guard);
 
-                            info!(
-                                endpoint = %self.inner.config.endpoint_name,
-                                "Got 401 on list_tools, attempting token refresh"
-                            );
+                            info!("Got 401 on list_tools, attempting token refresh");
 
                             match self.inner.do_token_refresh().await {
                                 Ok(new_tokens) => {
@@ -992,7 +961,6 @@ impl McpAdapter for OAuthAdapter {
                                 }
                                 Err(e) => {
                                     warn!(
-                                        endpoint = %self.inner.config.endpoint_name,
                                         error = %e,
                                         "Token refresh after 401 on list_tools failed"
                                     );
@@ -1037,10 +1005,7 @@ impl McpAdapter for OAuthAdapter {
                     // Drop the read lock before refreshing
                     drop(guard);
 
-                    info!(
-                        endpoint = %self.inner.config.endpoint_name,
-                        "Got 401, attempting token refresh"
-                    );
+                    info!("Got 401, attempting token refresh");
 
                     match self.inner.do_token_refresh().await {
                         Ok(new_tokens) => {
@@ -1056,7 +1021,6 @@ impl McpAdapter for OAuthAdapter {
                         }
                         Err(e) => {
                             warn!(
-                                endpoint = %self.inner.config.endpoint_name,
                                 error = %e,
                                 "Token refresh after 401 failed"
                             );

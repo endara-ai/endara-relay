@@ -136,13 +136,11 @@ async fn apply_probe_action(
     threshold: u32,
     oauth_state: &OAuthState,
 ) {
-    let endpoint = &adapter.config.endpoint_name;
     match action {
         ProbeAction::MarkHealthy => {
             *adapter.inner_health.write().await = HealthStatus::Healthy;
             adapter.metrics.inc_heartbeat_healthy();
             trace!(
-                endpoint = %endpoint,
                 oauth_state = ?oauth_state,
                 result = "healthy",
                 "heartbeat probe succeeded"
@@ -150,7 +148,6 @@ async fn apply_probe_action(
         }
         ProbeAction::BelowThreshold { failures, reason } => {
             debug!(
-                endpoint = %endpoint,
                 oauth_state = ?oauth_state,
                 result = "transient",
                 failures = failures,
@@ -164,7 +161,6 @@ async fn apply_probe_action(
                 HealthStatus::Unhealthy("upstream unreachable".into());
             adapter.metrics.inc_heartbeat_unhealthy();
             warn!(
-                endpoint = %endpoint,
                 oauth_state = ?oauth_state,
                 result = "unhealthy",
                 threshold = threshold,
@@ -175,7 +171,6 @@ async fn apply_probe_action(
         ProbeAction::AuthFailed => {
             adapter.metrics.inc_heartbeat_unhealthy();
             warn!(
-                endpoint = %endpoint,
                 oauth_state = ?oauth_state,
                 result = "unhealthy",
                 "heartbeat probe got 401, transitioning to AuthRequired"
