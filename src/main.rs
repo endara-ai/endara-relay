@@ -307,6 +307,21 @@ async fn main() {
 
             // Collect endpoints that need background initialization
             let mut deferred_init: Vec<config::EndpointConfig> = Vec::new();
+            // OAuth endpoints constructed synchronously but whose `initialize()`
+            // must run in the background. We keep the built `OAuthAdapter` here
+            // (out of the registry) and swap it in once `initialize` completes,
+            // while a `StartingAdapter` placeholder occupies the registry slot.
+            // The optional `discovery` field `(base_url, allow_insecure)` tells
+            // the spawn task to run RFC 8414 discovery against `base_url` and
+            // patch the adapter's token endpoint via `set_token_endpoint_override`
+            // before `initialize()` — keeping the potentially-slow HTTP call
+            // off the main per-endpoint loop.
+            struct DeferredOAuthInit {
+                name: String,
+                adapter: OAuthAdapter,
+                discovery: Option<(String, bool)>,
+            }
+            let mut deferred_oauth_init: Vec<DeferredOAuthInit> = Vec::new();
 
             // Register adapters for each endpoint (non-blocking)
             for ep in &cfg.endpoints {
@@ -339,17 +354,52 @@ async fn main() {
 
                 info!(name = %ep.name, transport = %ep.transport, "Configuring endpoint");
 
-                // OAuth endpoints initialize inline (always fast)
+                // OAuth endpoints: construct synchronously (so `shared_inner`
+                // is in `oauth_adapter_inners` before the management listener
+                // binds), register a `StartingAdapter` placeholder, and defer
+                // the slow `initialize().await` to a background task.
+                //
+                // Resolution of the OAuth token endpoint is **deliberately
+                // synchronous-only here**: we use the explicit `token_endpoint`
+                // when set, otherwise the conventional `{oauth_server_url}/token`
+                // fallback. The full RFC 8414 discovery (which can do unbounded
+                // network I/O against an unreachable `oauth_server_url`) is
+                // moved into the OAuth spawn task below and applied via
+                // `set_token_endpoint_override`. This keeps the per-endpoint
+                // loop O(file-read) per OAuth endpoint so a single unreachable
+                // upstream cannot stall every other endpoint's registration.
                 if ep.transport == config::Transport::Oauth {
                     let allow_insecure_oauth = cfg.relay.allow_insecure_oauth.unwrap_or(false);
                     let (client_id, client_secret) =
                         watcher::resolve_oauth_client_creds(ep, token_manager.as_ref()).await;
-                    let token_endpoint_url =
-                        watcher::resolve_oauth_token_endpoint(ep, allow_insecure_oauth).await;
+
+                    let explicit_token_endpoint = ep
+                        .token_endpoint
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let oauth_base = ep
+                        .oauth_server_url
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string);
+                    let initial_token_endpoint =
+                        explicit_token_endpoint.clone().unwrap_or_else(|| {
+                            watcher::conventional_token_endpoint(
+                                oauth_base.as_deref().unwrap_or(""),
+                            )
+                        });
+                    let discovery_params = match (&explicit_token_endpoint, &oauth_base) {
+                        (None, Some(base)) => Some((base.clone(), allow_insecure_oauth)),
+                        _ => None,
+                    };
+
                     let oauth_config = OAuthAdapterConfig {
                         endpoint_name: ep.name.clone(),
                         url: ep.url.clone().unwrap_or_default(),
-                        token_endpoint_url,
+                        token_endpoint_url: initial_token_endpoint,
                         client_id,
                         client_secret,
                         heartbeat_interval_secs: 30,
@@ -363,24 +413,27 @@ async fn main() {
                         allow_insecure_oauth,
                     };
 
-                    let mut adapter = OAuthAdapter::new(oauth_config, token_manager.clone());
+                    let adapter = OAuthAdapter::new(oauth_config, token_manager.clone());
                     let shared_inner = adapter.shared_inner();
                     oauth_adapter_inners
                         .write()
                         .await
                         .insert(ep.name.clone(), shared_inner);
 
-                    adapter.initialize().await.ok();
-                    info!(endpoint = %ep.name, "OAuth adapter initialized");
                     registry
                         .register(
                             ep.name.clone(),
-                            Box::new(adapter),
+                            Box::new(StartingAdapter),
                             ep.transport.to_string(),
                             ep.description.clone(),
                             ep.resolved_tool_prefix(),
                         )
                         .await;
+                    deferred_oauth_init.push(DeferredOAuthInit {
+                        name: ep.name.clone(),
+                        adapter,
+                        discovery: discovery_params,
+                    });
                     continue;
                 }
 
@@ -416,13 +469,23 @@ async fn main() {
             // Build and start HTTP server
             let registry = Arc::new(registry);
 
-            // Spawn background initialization for deferred endpoints
+            // Spawn background initialization for every endpoint and collect
+            // their JoinHandles so `main()` can wait for them to settle (or
+            // give up after `startup_init_timeout_secs`) before binding the
+            // MCP TCP listener. The handles are detached if the wait times
+            // out — dropping a tokio JoinHandle does not abort the task, so
+            // late-arriving adapters keep initializing and publish their
+            // tools to the registry via the existing `invalidate_catalog_cache`
+            // tail.
+            let settled_inits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut init_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
             let allow_insecure_oauth = cfg.relay.allow_insecure_oauth.unwrap_or(false);
             for ep in deferred_init {
                 let reg = registry.clone();
                 let tm = token_manager.clone();
                 let oai = oauth_adapter_inners.clone();
-                tokio::spawn(async move {
+                let settled = settled_inits.clone();
+                let handle = tokio::spawn(async move {
                     let adapter =
                         watcher::create_adapter(&ep, &tm, &oai, allow_insecure_oauth).await;
                     let mut entries = reg.entries().write().await;
@@ -436,8 +499,74 @@ async fn main() {
                     reg.rewire_tools_changed_listener(&ep.name).await;
                     reg.invalidate_catalog_cache().await;
                     info!(endpoint = %ep.name, "Adapter initialized");
+                    settled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 });
+                init_handles.push(handle);
             }
+
+            // Spawn background initialization for OAuth endpoints. Their
+            // `shared_inner` is already in `oauth_adapter_inners` so the
+            // callback handler and "Reauthenticate" flow work immediately;
+            // the slow `initialize().await` (apply_tokens → inner HttpAdapter
+            // → MCP handshake) runs here and swaps the real adapter in.
+            //
+            // RFC 8414 discovery against `oauth_server_url` also happens here
+            // (not on the main task), so an unreachable upstream OAuth server
+            // cannot stall the per-endpoint registration loop.
+            for DeferredOAuthInit {
+                name,
+                mut adapter,
+                discovery,
+            } in deferred_oauth_init
+            {
+                let reg = registry.clone();
+                let settled = settled_inits.clone();
+                let handle = tokio::spawn(async move {
+                    if let Some((base, allow_insecure)) = discovery {
+                        match crate::oauth::discovery::discover_authorization_server(
+                            &base,
+                            allow_insecure,
+                        )
+                        .await
+                        {
+                            Ok(disc) => {
+                                info!(
+                                    endpoint = %name,
+                                    token_endpoint = %disc.token_endpoint,
+                                    "RFC 8414 discovery resolved token endpoint at OAuth startup"
+                                );
+                                adapter
+                                    .shared_inner()
+                                    .set_token_endpoint_override(disc.token_endpoint)
+                                    .await;
+                            }
+                            Err(e) => {
+                                warn!(
+                                    endpoint = %name,
+                                    error = %e,
+                                    "RFC 8414 discovery against oauth_server_url failed at OAuth startup; \
+                                     falling back to convention-based token endpoint"
+                                );
+                            }
+                        }
+                    }
+                    adapter.initialize().await.ok();
+                    info!(endpoint = %name, "OAuth adapter initialized");
+                    let mut entries = reg.entries().write().await;
+                    if let Some(entry) = entries.get_mut(name.as_str()) {
+                        entry.adapter = Box::new(adapter);
+                        if entry.disabled {
+                            let _ = entry.adapter.shutdown().await;
+                        }
+                    }
+                    drop(entries);
+                    reg.rewire_tools_changed_listener(&name).await;
+                    reg.invalidate_catalog_cache().await;
+                    settled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                });
+                init_handles.push(handle);
+            }
+            let total_inits = init_handles.len();
             let js_execution_mode = Arc::new(AtomicBool::new(
                 cfg.relay.local_js_execution.unwrap_or(false),
             ));
@@ -488,11 +617,13 @@ async fn main() {
             // Bind to loopback only; the relay is a local-only service.
             let addr: SocketAddr = ([127, 0, 0, 1], port).into();
 
-            // Start the management listener on its IPC path. We do this before
-            // starting the TCP listener so that callers observing the TCP port
-            // already see a fully-initialized control plane.
+            // Start the management listener on its IPC path. We do this
+            // *before* binding the MCP TCP listener so that callers observing
+            // the management socket see every endpoint in its
+            // `Initializing` placeholder state immediately, even when the
+            // background adapter inits take seconds to complete.
             let api_socket_path = management_listener::resolve_api_socket_path(&data_dir_path);
-            let _mgmt_handle = match management_listener::serve_management_api(
+            let mgmt_handle = match management_listener::serve_management_api(
                 mgmt_router,
                 api_socket_path.clone(),
             )
@@ -507,6 +638,92 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
+
+            // Wait for adapter inits to settle, up to `startup_init_timeout_secs`
+            // (default 60s). A configured value of `0` skips the wait
+            // entirely and binds MCP TCP immediately. Dropping the
+            // JoinHandles when the timeout fires does NOT abort the tasks —
+            // late-arriving adapters keep running and publish their tools
+            // via the registry's catalog invalidation tail.
+            let timeout_secs = cfg
+                .relay
+                .startup_init_timeout_secs
+                .unwrap_or(config::DEFAULT_STARTUP_INIT_TIMEOUT_SECS);
+            let mut shutdown_during_wait = false;
+            if total_inits > 0 && timeout_secs > 0 {
+                let timeout = Duration::from_secs(timeout_secs);
+                let wait_start = std::time::Instant::now();
+                let all_settled = futures_util::future::join_all(init_handles);
+                tokio::select! {
+                    _ = all_settled => {
+                        info!(
+                            elapsed_ms = wait_start.elapsed().as_millis() as u64,
+                            total = total_inits,
+                            "All adapter initializations settled"
+                        );
+                    }
+                    _ = tokio::time::sleep(timeout) => {
+                        // Handles are dropped here; tasks keep running.
+                    }
+                    _ = server::shutdown_signal() => {
+                        shutdown_during_wait = true;
+                    }
+                }
+            } else if total_inits == 0 {
+                info!("No adapter initializations to await");
+            } else {
+                info!("startup_init_timeout_secs=0; binding MCP TCP without waiting for adapter inits");
+            }
+
+            // Summarize Ready / Failed / still-Initializing endpoint counts
+            // so operators can tell from the logs whether we bound TCP eagerly
+            // because of the timeout.
+            let (ready_n, failed_n, initializing_n) = {
+                use adapter::HealthStatus;
+                let entries = registry.entries().read().await;
+                let mut ready = 0usize;
+                let mut failed = 0usize;
+                let mut initializing = 0usize;
+                for (_, entry) in entries.iter() {
+                    if entry.disabled {
+                        continue;
+                    }
+                    match entry.adapter.health() {
+                        HealthStatus::Healthy => ready += 1,
+                        HealthStatus::Unhealthy(_) => failed += 1,
+                        HealthStatus::Starting => initializing += 1,
+                        HealthStatus::Stopped => {}
+                    }
+                }
+                (ready, failed, initializing)
+            };
+            let settled_n = settled_inits.load(std::sync::atomic::Ordering::Relaxed);
+            info!(
+                ready = ready_n,
+                failed = failed_n,
+                initializing = initializing_n,
+                settled_inits = settled_n,
+                total_inits,
+                timeout_secs,
+                "Startup init phase complete"
+            );
+
+            if shutdown_during_wait {
+                info!("Shutdown signal received during startup wait; tearing down");
+                mgmt_handle.abort();
+                let mut entries = registry.entries().write().await;
+                for (name, entry) in entries.iter_mut() {
+                    info!(endpoint = %name, "Shutting down adapter");
+                    if let Err(e) = entry.adapter.shutdown().await {
+                        warn!(endpoint = %name, error = %e, "Error shutting down adapter");
+                    }
+                }
+                info!("All adapters shut down, exiting");
+                return;
+            }
+
+            // Keep the management handle alive for the rest of the process.
+            let _mgmt_handle = mgmt_handle;
 
             match start_server(router, addr).await {
                 Ok((bound_addr, handle)) => {

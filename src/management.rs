@@ -2665,6 +2665,7 @@ mod tests {
                 token_dir: None,
                 allow_insecure_oauth: None,
                 toon_output: None,
+                startup_init_timeout_secs: None,
             },
             endpoints: vec![EndpointConfig {
                 name: "echo".to_string(),
@@ -4625,6 +4626,7 @@ command = "echo"
                 token_dir: None,
                 allow_insecure_oauth: None,
                 toon_output: None,
+                startup_init_timeout_secs: None,
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
@@ -4822,6 +4824,7 @@ command = "echo"
                 token_dir: None,
                 allow_insecure_oauth: Some(true),
                 toon_output: None,
+                startup_init_timeout_secs: None,
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
@@ -5232,6 +5235,7 @@ command = "echo"
                 token_dir: None,
                 allow_insecure_oauth: Some(allow_insecure_oauth),
                 toon_output: None,
+                startup_init_timeout_secs: None,
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
@@ -5345,6 +5349,7 @@ client_id = "client123"
                 token_dir: None,
                 allow_insecure_oauth: Some(false),
                 toon_output: None,
+                startup_init_timeout_secs: None,
             },
             endpoints: vec![],
         };

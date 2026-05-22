@@ -32,7 +32,18 @@ pub struct RelayConfig {
     /// restore raw JSON pass-through.
     #[serde(default)]
     pub toon_output: Option<bool>,
+    /// How long `main()` waits for background adapter initializations to
+    /// settle before binding the MCP TCP listener on port 9400. When `None`
+    /// the effective default is 60 seconds. A value of `0` skips the wait
+    /// entirely: the MCP TCP listener binds immediately after the management
+    /// socket and adapters keep initializing in the background.
+    #[serde(default)]
+    pub startup_init_timeout_secs: Option<u64>,
 }
+
+/// Effective default for `RelayConfig::startup_init_timeout_secs` when the
+/// field is omitted from `config.toml`.
+pub const DEFAULT_STARTUP_INIT_TIMEOUT_SECS: u64 = 60;
 
 /// Transport type for an endpoint.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -216,6 +227,7 @@ pub fn default_config() -> Config {
             token_dir: None,
             allow_insecure_oauth: None,
             toon_output: None,
+            startup_init_timeout_secs: None,
         },
         endpoints: Vec::new(),
     }
@@ -903,6 +915,38 @@ machine_name = "test"
         assert!(config.endpoints.is_empty());
     }
 
+    #[test]
+    fn startup_init_timeout_defaults_to_none() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(config.relay.startup_init_timeout_secs, None);
+    }
+
+    #[test]
+    fn startup_init_timeout_zero_parses() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+startup_init_timeout_secs = 0
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(config.relay.startup_init_timeout_secs, Some(0));
+    }
+
+    #[test]
+    fn startup_init_timeout_nonzero_parses() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+startup_init_timeout_secs = 5
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(config.relay.startup_init_timeout_secs, Some(5));
+    }
+
     // --- Endpoint name format validation tests ---
 
     #[test]
@@ -1079,6 +1123,7 @@ command = "echo"
                 token_dir: None,
                 allow_insecure_oauth: None,
                 toon_output: None,
+                startup_init_timeout_secs: None,
             },
             endpoints,
         }

@@ -1023,7 +1023,7 @@ async fn healthz(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 /// Create a future that resolves when a shutdown signal (SIGINT, SIGTERM, or SIGHUP) is received.
-async fn shutdown_signal() {
+pub(crate) async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await

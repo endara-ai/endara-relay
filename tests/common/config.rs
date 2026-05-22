@@ -174,6 +174,13 @@ impl ConfigBuilder {
         // out of the SSRF / DNS-rebinding guard so discovery + DCR can reach
         // them without requiring TLS or a public address.
         out.push_str("allow_insecure_oauth = true\n");
+        // Default the startup-init wait to 0 for harness-based tests so MCP
+        // TCP binds immediately. Tests that depend on adapter readiness
+        // opt in via `RelayHarness::wait_healthy`, so the production default
+        // (60 s) is the wrong choice here — a slow / never-settling fixture
+        // would otherwise block the MCP TCP bind for the full window and
+        // make every `rpc()` call connection-refused.
+        out.push_str("startup_init_timeout_secs = 0\n");
         if self.js_execution_mode {
             out.push_str("local_js_execution = true\n");
         }
