@@ -2689,6 +2689,7 @@ mod tests {
                 token_endpoint: None,
                 server_type_override: None,
             }],
+            profiles: None,
         }
     }
 
@@ -4647,6 +4648,7 @@ command = "echo"
                 token_endpoint: None,
                 server_type_override: None,
             }],
+            profiles: None,
         };
         let state = ManagementState {
             registry: Arc::new(AdapterRegistry::new()),
@@ -4845,6 +4847,7 @@ command = "echo"
                 token_endpoint: token_endpoint.map(|s| s.to_string()),
                 server_type_override: None,
             }],
+            profiles: None,
         };
         let state = ManagementState {
             registry: Arc::new(AdapterRegistry::new()),
@@ -5256,6 +5259,7 @@ command = "echo"
                 token_endpoint: None,
                 server_type_override: None,
             }],
+            profiles: None,
         }
     }
 
@@ -5352,6 +5356,7 @@ client_id = "client123"
                 startup_init_timeout_secs: None,
             },
             endpoints: vec![],
+            profiles: None,
         };
         let state = ManagementState {
             registry: Arc::new(AdapterRegistry::new()),

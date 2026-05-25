@@ -10,6 +10,12 @@ pub struct Config {
     pub relay: RelayConfig,
     #[serde(default)]
     pub endpoints: Vec<EndpointConfig>,
+    /// Named subsets of `endpoints` served at `/mcp/{path}` with their own
+    /// JS-execution and TOON-output toggles. `None` and `Some(empty)` are
+    /// equivalent: no profiles configured. Per recon §D1, the TOML key is
+    /// plural `[[profiles]]` to match the existing `[[endpoints]]` convention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profiles: Option<Vec<ProfileConfig>>,
 }
 
 /// Relay-specific configuration.
@@ -63,6 +69,123 @@ impl fmt::Display for Transport {
             Transport::Http => write!(f, "http"),
             Transport::Oauth => write!(f, "oauth"),
         }
+    }
+}
+
+/// Reserved profile paths — would collide with existing relay routes
+/// (`/mcp/sse`, `/mcp/initialize`, `/mcp/tools/...`, `/oauth/...`, `/healthz`).
+/// Matched case-insensitively per spec §2.3.
+pub const RESERVED_PROFILE_PATHS: &[&str] = &["sse", "initialize", "tools", "oauth", "healthz"];
+
+/// Configuration for a named endpoint profile.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ProfileConfig {
+    /// Human-friendly display name (freeform string).
+    pub name: String,
+    /// URL path segment — the profile is served at `/mcp/{path}`. Must
+    /// satisfy [`validate_profile_path`].
+    pub path: String,
+    /// Endpoint names (matching [`EndpointConfig::name`]) included in this
+    /// profile. Order is cosmetic — the merged catalog is sorted by the
+    /// registry layer.
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+    /// Per-profile JS-execution mode. When `Some(true)`, this profile's
+    /// `/mcp/{path}` exposes the meta-tools (`list_tools`, `search_tools`,
+    /// `execute_tools`) and hides direct tool calls. When `None`, inherits
+    /// from [`RelayConfig::local_js_execution`].
+    #[serde(default)]
+    pub js_execution: Option<bool>,
+    /// Per-profile TOON output. When `Some(true)`, tool responses on this
+    /// profile are converted to TOON. When `None`, inherits from
+    /// [`RelayConfig::toon_output`].
+    #[serde(default)]
+    pub toon_output: Option<bool>,
+}
+
+/// Validate a profile path slug.
+///
+/// A valid path:
+/// 1. Matches `^[a-zA-Z0-9][a-zA-Z0-9_-]*$` (starts alphanumeric, then
+///    alphanumeric / underscore / hyphen).
+/// 2. Is not in [`RESERVED_PROFILE_PATHS`] (case-insensitive).
+///
+/// Returns `Err(message)` on failure; the message is suitable for surfacing
+/// to the user.
+pub fn validate_profile_path(path: &str) -> Result<(), String> {
+    if path.is_empty() {
+        return Err("profile path must not be empty".into());
+    }
+    static PATH_RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = PATH_RE.get_or_init(|| regex::Regex::new(r"^[a-zA-Z0-9][a-zA-Z0-9_-]*$").unwrap());
+    if !re.is_match(path) {
+        return Err(format!(
+            "profile path '{}' contains invalid characters — \
+             use letters, digits, hyphens, or underscores (must start with a letter or digit)",
+            path
+        ));
+    }
+    if RESERVED_PROFILE_PATHS
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(path))
+    {
+        return Err(format!("profile path '{}' is reserved by the relay", path));
+    }
+    Ok(())
+}
+
+/// Validate the top-level `profiles` block.
+///
+/// Fail-fast: any invalid path, duplicate path (case-insensitive), duplicate
+/// profile name, or reference to an unknown endpoint becomes a hard startup
+/// error per spec §2.4. Empty `endpoints` lists are allowed (a profile may
+/// exist with no members and simply serve an empty catalog).
+pub fn validate_profiles(config: &Config) -> Result<(), Vec<String>> {
+    let profiles = match &config.profiles {
+        Some(p) if !p.is_empty() => p,
+        _ => return Ok(()),
+    };
+
+    let mut errors: Vec<String> = Vec::new();
+    let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let endpoint_names: std::collections::HashSet<&str> =
+        config.endpoints.iter().map(|e| e.name.as_str()).collect();
+
+    for profile in profiles {
+        if profile.name.trim().is_empty() {
+            errors.push("Profile name must not be empty".to_string());
+        } else if !seen_names.insert(profile.name.clone()) {
+            errors.push(format!("Duplicate profile name: '{}'", profile.name));
+        }
+
+        if let Err(msg) = validate_profile_path(&profile.path) {
+            errors.push(format!("Profile '{}': {}", profile.name, msg));
+        } else {
+            let path_key = profile.path.to_ascii_lowercase();
+            if !seen_paths.insert(path_key) {
+                errors.push(format!(
+                    "Duplicate profile path '{}' (paths are case-insensitive)",
+                    profile.path
+                ));
+            }
+        }
+
+        for ep_name in &profile.endpoints {
+            if !endpoint_names.contains(ep_name.as_str()) {
+                errors.push(format!(
+                    "Profile '{}' references unknown endpoint '{}'",
+                    profile.name, ep_name
+                ));
+            }
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
     }
 }
 
@@ -230,6 +353,7 @@ pub fn default_config() -> Config {
             startup_init_timeout_secs: None,
         },
         endpoints: Vec::new(),
+        profiles: None,
     }
 }
 
@@ -277,6 +401,7 @@ pub fn parse_and_validate(contents: &str) -> Result<Config, ConfigError> {
     let mut config: Config = toml::from_str(contents)?;
     resolve_env_vars(&mut config)?;
     validate(&config)?;
+    validate_profiles(&config).map_err(|errors| ConfigError::ValidationError(errors.join("; ")))?;
     Ok(config)
 }
 
@@ -298,6 +423,11 @@ pub fn parse_and_validate_graceful(
 
     // Validate per-endpoint, collecting failures as warnings
     validate_graceful(&config, &mut warnings);
+
+    // Profile validation is fail-fast (per spec §2.4): invalid paths,
+    // duplicate paths, and missing endpoint refs are hard startup errors,
+    // never per-endpoint warnings.
+    validate_profiles(&config).map_err(|errors| ConfigError::ValidationError(errors.join("; ")))?;
 
     Ok((config, warnings))
 }
@@ -1113,6 +1243,237 @@ command = "echo"
         assert!(errors.iter().any(|e| e.contains("Duplicate tool_prefix")));
     }
 
+    // --- Profile validation tests (spec §11 rows #1–#6) ---
+
+    /// §11 row #1 — valid paths.
+    #[test]
+    fn profile_path_accepts_valid() {
+        for p in &["work", "my-project", "A1", "abc_123", "0", "a", "Project-2"] {
+            assert!(
+                validate_profile_path(p).is_ok(),
+                "expected '{}' to be a valid profile path",
+                p
+            );
+        }
+    }
+
+    /// §11 row #2 — invalid paths.
+    #[test]
+    fn profile_path_rejects_invalid_chars() {
+        for p in &[
+            "",
+            "-leading-hyphen",
+            "_leads_underscore",
+            "has space",
+            "café",
+        ] {
+            assert!(
+                validate_profile_path(p).is_err(),
+                "expected '{}' to be rejected",
+                p
+            );
+        }
+    }
+
+    /// §11 row #3 — reserved paths (case-insensitive).
+    #[test]
+    fn profile_path_rejects_reserved() {
+        for p in &[
+            "sse",
+            "SSE",
+            "Sse",
+            "initialize",
+            "INITIALIZE",
+            "tools",
+            "Tools",
+            "oauth",
+            "OAuth",
+            "healthz",
+            "Healthz",
+        ] {
+            let err = validate_profile_path(p)
+                .err()
+                .unwrap_or_else(|| panic!("'{}' should be reserved", p));
+            assert!(
+                err.contains("reserved"),
+                "error for '{}' should mention 'reserved': {}",
+                p,
+                err
+            );
+        }
+    }
+
+    /// §11 row #4 — TOML with `[[profiles]]` parses correctly.
+    #[test]
+    fn profile_toml_parses() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "gmail"
+transport = "stdio"
+command = "echo"
+
+[[endpoints]]
+name = "linear"
+transport = "stdio"
+command = "cat"
+
+[[profiles]]
+name = "Work"
+path = "work"
+endpoints = ["gmail", "linear"]
+js_execution = true
+toon_output = true
+
+[[profiles]]
+name = "Personal"
+path = "personal"
+endpoints = ["gmail"]
+"#;
+        let config = parse_and_validate(toml_str).expect("config should parse");
+        let profiles = config.profiles.expect("profiles should be present");
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].name, "Work");
+        assert_eq!(profiles[0].path, "work");
+        assert_eq!(profiles[0].endpoints, vec!["gmail", "linear"]);
+        assert_eq!(profiles[0].js_execution, Some(true));
+        assert_eq!(profiles[0].toon_output, Some(true));
+        assert_eq!(profiles[1].js_execution, None);
+        assert_eq!(profiles[1].toon_output, None);
+    }
+
+    /// §11 row #5 — profile referencing a non-existent endpoint is a startup error.
+    #[test]
+    fn profile_missing_endpoint_ref_errors() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "gmail"
+transport = "stdio"
+command = "echo"
+
+[[profiles]]
+name = "Work"
+path = "work"
+endpoints = ["gmail", "ghost"]
+"#;
+        let err = parse_and_validate(toml_str).unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                assert!(
+                    msg.contains("ghost"),
+                    "error should mention 'ghost': {}",
+                    msg
+                );
+                assert!(
+                    msg.to_lowercase().contains("unknown endpoint"),
+                    "error should mention unknown endpoint: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected ValidationError, got: {:?}", other),
+        }
+    }
+
+    /// §11 row #6 — duplicate paths (case-insensitive) are a startup error.
+    #[test]
+    fn profile_duplicate_paths_error() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[profiles]]
+name = "Lower"
+path = "shared"
+
+[[profiles]]
+name = "Upper"
+path = "SHARED"
+"#;
+        let err = parse_and_validate(toml_str).unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                assert!(
+                    msg.to_lowercase().contains("duplicate profile path"),
+                    "error should flag duplicate profile path: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected ValidationError, got: {:?}", other),
+        }
+    }
+
+    /// Graceful path also enforces profile validation as a hard error.
+    #[test]
+    fn profile_validation_is_hard_error_on_graceful_path() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[profiles]]
+name = "Bad"
+path = "sse"
+"#;
+        let err = parse_and_validate_graceful(toml_str).unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                assert!(
+                    msg.contains("reserved"),
+                    "error should mention reserved: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected ValidationError, got: {:?}", other),
+        }
+    }
+
+    /// Duplicate profile names are also caught.
+    #[test]
+    fn profile_duplicate_names_error() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[profiles]]
+name = "Work"
+path = "work-a"
+
+[[profiles]]
+name = "Work"
+path = "work-b"
+"#;
+        let err = parse_and_validate(toml_str).unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                assert!(
+                    msg.contains("Duplicate profile name"),
+                    "error should flag duplicate name: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected ValidationError, got: {:?}", other),
+        }
+    }
+
+    /// Empty `endpoints` list on a profile is allowed.
+    #[test]
+    fn profile_with_no_endpoints_is_ok() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[profiles]]
+name = "Empty"
+path = "empty"
+"#;
+        let config = parse_and_validate(toml_str).expect("empty profile should be valid");
+        assert_eq!(config.profiles.as_ref().unwrap()[0].endpoints.len(), 0);
+    }
+
     // --- Config diff tests ---
 
     fn make_config(endpoints: Vec<EndpointConfig>) -> Config {
@@ -1126,6 +1487,7 @@ command = "echo"
                 startup_init_timeout_secs: None,
             },
             endpoints,
+            profiles: None,
         }
     }
 

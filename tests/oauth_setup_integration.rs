@@ -47,6 +47,7 @@ fn empty_config() -> Config {
             token_endpoint: None,
             server_type_override: None,
         }],
+        profiles: None,
     }
 }
 
