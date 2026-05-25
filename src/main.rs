@@ -746,6 +746,7 @@ async fn main() {
                         registry.clone(),
                         cfg.relay.machine_name.clone(),
                         js_execution_mode.clone(),
+                        profile_registry.clone(),
                         token_manager.clone(),
                         oauth_flow_manager.clone(),
                         oauth_adapter_inners.clone(),

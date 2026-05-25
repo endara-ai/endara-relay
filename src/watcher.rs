@@ -3,14 +3,15 @@ use crate::adapter::oauth::{OAuthAdapter, OAuthAdapterConfig};
 use crate::adapter::sse::{SseAdapter, SseConfig};
 use crate::adapter::stdio::{StdioAdapter, StdioConfig};
 use crate::adapter::{FailedAdapter, McpAdapter, StartingAdapter};
-use crate::config::{self, ConfigDiff, EndpointConfig, Transport};
+use crate::config::{self, Config, ConfigDiff, EndpointConfig, Transport};
 use crate::oauth::OAuthFlowManager;
+use crate::profile_registry::ProfileRegistry;
 use crate::registry::AdapterRegistry;
 use crate::token_manager::TokenManager;
 use crate::OAuthAdapterInners;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -29,11 +30,13 @@ impl ConfigWatcher {
     /// registry (adding/removing/restarting adapters as needed).
     ///
     /// Returns a `JoinHandle` for the background task.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         config_path: PathBuf,
         registry: Arc<AdapterRegistry>,
         machine_name: String,
         js_execution_mode: Arc<AtomicBool>,
+        profile_registry: Arc<ProfileRegistry>,
         token_manager: Arc<TokenManager>,
         _oauth_flow_manager: Arc<OAuthFlowManager>,
         oauth_adapter_inners: OAuthAdapterInners,
@@ -44,6 +47,7 @@ impl ConfigWatcher {
                 registry,
                 machine_name,
                 js_execution_mode,
+                profile_registry,
                 token_manager,
                 oauth_adapter_inners,
             )
@@ -60,6 +64,7 @@ async fn watch_loop(
     registry: Arc<AdapterRegistry>,
     _machine_name: String,
     js_execution_mode: Arc<AtomicBool>,
+    profile_registry: Arc<ProfileRegistry>,
     token_manager: Arc<TokenManager>,
     oauth_adapter_inners: OAuthAdapterInners,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -112,49 +117,98 @@ async fn watch_loop(
 
         info!(path = %config_path.display(), "Config file change detected, reloading");
 
-        // Parse new config gracefully
-        let (new_config, warnings) = match config::load_config_graceful(&config_path) {
-            Ok(result) => result,
-            Err(e) => {
-                warn!(error = %e, "Failed to parse updated config, keeping current config");
-                continue;
-            }
-        };
-
-        for w in &warnings {
-            warn!("{}", w);
-        }
-
-        let warned_names = config::warned_endpoint_names(&warnings);
-
-        // Diff and apply
-        let old_config = current_config.lock().await;
-        let diff = config::diff_configs(&old_config, &new_config);
-        drop(old_config);
-
-        apply_diff_graceful(
-            &diff,
+        let _ = reload_and_apply(
+            &config_path,
+            &current_config,
             &registry,
-            &warnings,
-            &warned_names,
+            &js_execution_mode,
+            &profile_registry,
             &token_manager,
             &oauth_adapter_inners,
-            new_config.relay.allow_insecure_oauth.unwrap_or(false),
+        )
+        .await;
+    }
+
+    Ok(())
+}
+
+/// Reload `config_path` from disk and reconcile it into the running relay.
+///
+/// Performs **keep-last-good** semantics: if the file fails to parse OR fails
+/// fail-fast profile validation (`[[profiles]]` block — see
+/// [`config::validate_profiles`]), the previous registry state is preserved
+/// untouched and an `Err` is returned with the parse/validation error logged.
+/// Per-endpoint validation failures are surfaced as warnings (FailedAdapter
+/// registrations) rather than aborting the reload, matching the pre-existing
+/// hot-reload behaviour.
+///
+/// Returns `Ok(())` when the reload was applied (including warning-only
+/// reloads); returns `Err(ConfigError)` when nothing was applied because the
+/// new config could not be parsed or its profile block was invalid.
+async fn reload_and_apply(
+    config_path: &Path,
+    current_config: &Arc<Mutex<Config>>,
+    registry: &Arc<AdapterRegistry>,
+    js_execution_mode: &Arc<AtomicBool>,
+    profile_registry: &Arc<ProfileRegistry>,
+    token_manager: &Arc<TokenManager>,
+    oauth_adapter_inners: &OAuthAdapterInners,
+) -> Result<(), config::ConfigError> {
+    // Parse new config gracefully. Fatal errors (parse failure or
+    // fail-fast profile-validation failure) bail out without touching the
+    // running registry — that is the keep-last-good guarantee.
+    let (new_config, warnings) = match config::load_config_graceful(config_path) {
+        Ok(result) => result,
+        Err(e) => {
+            warn!(error = %e, "Failed to parse updated config, keeping current config");
+            return Err(e);
+        }
+    };
+
+    for w in &warnings {
+        warn!("{}", w);
+    }
+
+    let warned_names = config::warned_endpoint_names(&warnings);
+
+    // Diff and apply endpoint changes.
+    let old_config = current_config.lock().await;
+    let diff = config::diff_configs(&old_config, &new_config);
+    drop(old_config);
+
+    apply_diff_graceful(
+        &diff,
+        registry,
+        &warnings,
+        &warned_names,
+        token_manager,
+        oauth_adapter_inners,
+        new_config.relay.allow_insecure_oauth.unwrap_or(false),
+    )
+    .await;
+
+    // Update JS execution mode flag if it changed.
+    let new_js_mode = new_config.relay.local_js_execution.unwrap_or(false);
+    let old_js_mode = js_execution_mode.load(Ordering::Relaxed);
+    if new_js_mode != old_js_mode {
+        js_execution_mode.store(new_js_mode, Ordering::Relaxed);
+        info!(js_execution_mode = new_js_mode, "JS execution mode updated");
+    }
+
+    // Rebuild the profile registry from the reloaded config. Per recon §D4
+    // the watcher is the source of truth for profile state, mirroring how
+    // `js_execution_mode` is propagated above. `rebuild` performs a single
+    // write-lock swap so requests in flight see either the old or the new
+    // map atomically.
+    profile_registry
+        .rebuild(
+            new_config.profiles.as_deref().unwrap_or(&[]),
+            &new_config.relay,
         )
         .await;
 
-        // Update JS execution mode flag if it changed
-        let new_js_mode = new_config.relay.local_js_execution.unwrap_or(false);
-        let old_js_mode = js_execution_mode.load(Ordering::Relaxed);
-        if new_js_mode != old_js_mode {
-            js_execution_mode.store(new_js_mode, Ordering::Relaxed);
-            info!(js_execution_mode = new_js_mode, "JS execution mode updated");
-        }
-
-        // Update baseline
-        *current_config.lock().await = new_config;
-    }
-
+    // Update baseline.
+    *current_config.lock().await = new_config;
     Ok(())
 }
 
@@ -1671,5 +1725,236 @@ mod tests {
         let ep = oauth_endpoint_with("ep", None, None);
         let resolved = resolve_oauth_token_endpoint(&ep, false).await;
         assert_eq!(resolved, "/token");
+    }
+
+    // ---- R4.B: hot reload of ProfileRegistry ----------------------------
+    //
+    // The matrix rows under §11 (#18 add, #19 remove, #20 invalid keep-last-
+    // good) are exercised by `reload_and_apply`: it is the extracted body of
+    // the watcher loop, so driving it directly with on-disk config files
+    // mirrors the watcher tick without the filesystem-event timing flakiness.
+    mod hot_reload {
+        mod profile {
+            use super::super::*;
+            use crate::config::Config;
+            use crate::profile_registry::ProfileRegistry;
+            use std::path::PathBuf;
+            use std::sync::atomic::AtomicBool;
+            use std::sync::Arc;
+            use tokio::sync::Mutex;
+
+            /// Build the initial in-memory state the watcher would have after
+            /// loading `config.toml` for the first time at startup.
+            async fn setup_initial(
+                initial_toml: &str,
+            ) -> (
+                tempfile::TempDir,
+                PathBuf,
+                Arc<Mutex<Config>>,
+                Arc<AdapterRegistry>,
+                Arc<ProfileRegistry>,
+                Arc<AtomicBool>,
+                Arc<TokenManager>,
+                OAuthAdapterInners,
+            ) {
+                let tmp = tempfile::tempdir().unwrap();
+                let path = tmp.path().join("config.toml");
+                std::fs::write(&path, initial_toml).unwrap();
+                let (initial, _warnings) = config::load_config_graceful(&path).unwrap();
+
+                let registry = Arc::new(AdapterRegistry::new());
+                let profile_registry = Arc::new(ProfileRegistry::new((*registry).clone()));
+                // Mirror main.rs: rebuild once at startup against the initial
+                // config so the watcher's first reload sees a populated map.
+                profile_registry
+                    .rebuild(initial.profiles.as_deref().unwrap_or(&[]), &initial.relay)
+                    .await;
+
+                let current_config = Arc::new(Mutex::new(initial));
+                let js_mode = Arc::new(AtomicBool::new(false));
+                let (token_manager, inners) = test_oauth_infra();
+                (
+                    tmp,
+                    path,
+                    current_config,
+                    registry,
+                    profile_registry,
+                    js_mode,
+                    token_manager,
+                    inners,
+                )
+            }
+
+            const CONFIG_NO_PROFILES: &str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "ep1"
+transport = "stdio"
+command = "/bin/true"
+"#;
+
+            const CONFIG_ONE_PROFILE: &str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "ep1"
+transport = "stdio"
+command = "/bin/true"
+
+[[profiles]]
+name = "Work"
+path = "work"
+endpoints = ["ep1"]
+"#;
+
+            /// Matrix #18: adding a `[[profiles]]` block to `config.toml`
+            /// makes the new profile discoverable on the next watcher tick.
+            #[tokio::test]
+            async fn add_profile_appears_in_registry_after_reload() {
+                let (_tmp, path, current_config, registry, profile_registry, js_mode, tm, inners) =
+                    setup_initial(CONFIG_NO_PROFILES).await;
+
+                assert!(profile_registry.get("work").await.is_none());
+
+                std::fs::write(&path, CONFIG_ONE_PROFILE).unwrap();
+                reload_and_apply(
+                    &path,
+                    &current_config,
+                    &registry,
+                    &js_mode,
+                    &profile_registry,
+                    &tm,
+                    &inners,
+                )
+                .await
+                .expect("reload should succeed");
+
+                let ctx = profile_registry
+                    .get("work")
+                    .await
+                    .expect("profile 'work' should be served after reload");
+                assert_eq!(ctx.config.name, "Work");
+                assert_eq!(ctx.config.endpoints, vec!["ep1".to_string()]);
+                assert_eq!(
+                    current_config
+                        .lock()
+                        .await
+                        .profiles
+                        .as_deref()
+                        .unwrap()
+                        .len(),
+                    1
+                );
+            }
+
+            /// Matrix #19: removing a `[[profiles]]` block from
+            /// `config.toml` makes the prior profile vanish from the
+            /// registry on the next watcher tick (its `/mcp/{path}` route
+            /// then 404s via `ProfileRegistry::get` returning `None`).
+            #[tokio::test]
+            async fn remove_profile_disappears_from_registry_after_reload() {
+                let (_tmp, path, current_config, registry, profile_registry, js_mode, tm, inners) =
+                    setup_initial(CONFIG_ONE_PROFILE).await;
+
+                assert!(profile_registry.get("work").await.is_some());
+
+                std::fs::write(&path, CONFIG_NO_PROFILES).unwrap();
+                reload_and_apply(
+                    &path,
+                    &current_config,
+                    &registry,
+                    &js_mode,
+                    &profile_registry,
+                    &tm,
+                    &inners,
+                )
+                .await
+                .expect("reload should succeed");
+
+                assert!(
+                    profile_registry.get("work").await.is_none(),
+                    "removed profile must no longer be served"
+                );
+                assert!(profile_registry.list().await.is_empty());
+            }
+
+            /// Matrix #20: an updated `config.toml` whose `[[profiles]]`
+            /// block fails fail-fast validation (here: references an
+            /// undeclared endpoint) is rejected. `reload_and_apply` returns
+            /// `Err` and the previously-served profile registry is kept
+            /// intact — keep-last-good semantics per spec §11.
+            #[tokio::test]
+            async fn invalid_profile_reload_keeps_last_good_registry() {
+                let (_tmp, path, current_config, registry, profile_registry, js_mode, tm, inners) =
+                    setup_initial(CONFIG_ONE_PROFILE).await;
+
+                let good_before = profile_registry
+                    .get("work")
+                    .await
+                    .expect("baseline profile must be served");
+                assert_eq!(good_before.config.endpoints, vec!["ep1".to_string()]);
+
+                // New config references an endpoint that does not exist —
+                // `validate_profiles` returns a ValidationError, so
+                // `load_config_graceful` (and therefore `reload_and_apply`)
+                // bails out without touching the registry.
+                let invalid = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "ep1"
+transport = "stdio"
+command = "/bin/true"
+
+[[profiles]]
+name = "Broken"
+path = "broken"
+endpoints = ["does-not-exist"]
+"#;
+                std::fs::write(&path, invalid).unwrap();
+
+                let err = reload_and_apply(
+                    &path,
+                    &current_config,
+                    &registry,
+                    &js_mode,
+                    &profile_registry,
+                    &tm,
+                    &inners,
+                )
+                .await
+                .expect_err("invalid profile config must be rejected");
+                assert!(
+                    matches!(err, config::ConfigError::ValidationError(_)),
+                    "expected ValidationError, got {err:?}"
+                );
+
+                // The previously-served profile is still reachable, the
+                // broken one was never installed, and the baseline config
+                // snapshot was not advanced.
+                let good_after = profile_registry
+                    .get("work")
+                    .await
+                    .expect("last-good profile must remain after failed reload");
+                assert_eq!(good_after.config.endpoints, vec!["ep1".to_string()]);
+                assert!(
+                    profile_registry.get("broken").await.is_none(),
+                    "broken profile must never be installed"
+                );
+                let baseline = current_config.lock().await;
+                let baseline_names: Vec<String> = baseline
+                    .profiles
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .map(|p| p.name.clone())
+                    .collect();
+                assert_eq!(baseline_names, vec!["Work".to_string()]);
+            }
+        }
     }
 }
