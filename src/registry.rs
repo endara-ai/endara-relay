@@ -1,5 +1,7 @@
 use crate::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::prefix;
+use async_trait::async_trait;
+use serde_json::Value;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -388,6 +390,35 @@ impl AdapterRegistry {
         adapters.len()
     }
 
+    /// Profile-scoped variant of [`Self::all_server_types`] — only adapters
+    /// whose endpoint name is in `allowed_endpoints` contribute. Used by the
+    /// `_for_profile` advertising builders so per-profile `instructions` and
+    /// meta-tool descriptions list only the profile's server types.
+    pub async fn server_types_in(&self, allowed_endpoints: &HashSet<String>) -> BTreeSet<String> {
+        let adapters = self.adapters.read().await;
+        adapters
+            .iter()
+            .filter(|(name, _)| allowed_endpoints.contains(*name))
+            .filter_map(|(_, entry)| {
+                entry
+                    .adapter
+                    .server_type()
+                    .or_else(|| entry.adapter.configured_server_type())
+            })
+            .map(|s| s.to_lowercase())
+            .collect()
+    }
+
+    /// Profile-scoped variant of [`Self::all_endpoint_count`] — counts only
+    /// adapters whose endpoint name is in `allowed_endpoints`.
+    pub async fn endpoint_count_in(&self, allowed_endpoints: &HashSet<String>) -> usize {
+        let adapters = self.adapters.read().await;
+        adapters
+            .keys()
+            .filter(|name| allowed_endpoints.contains(*name))
+            .count()
+    }
+
     /// Access the underlying adapters map (for management API use).
     pub fn entries(&self) -> &Arc<RwLock<HashMap<String, RegisteredAdapter>>> {
         &self.adapters
@@ -565,6 +596,89 @@ impl AdapterRegistry {
             "Routing tool call"
         );
         entry.adapter.call_tool(tool, arguments).await
+    }
+}
+
+/// Abstraction over the catalog/routing surface used by [`MetaToolHandler`]
+/// and the JS sandbox, so they can operate on either the global
+/// [`AdapterRegistry`] or a per-profile filtered view
+/// (`profile_registry::ProfileRegistryView`).
+///
+/// Per locked decision Relay #2 the surface is intentionally narrow:
+/// `merged_catalog`, `merged_catalog_with_lookup`, `route_tool_call`, and
+/// `subscribe_tools_changed`. `catalog_generation` is also included because
+/// `MetaToolHandler::search_tools` uses it as a cache invalidation key — a
+/// per-profile view delegates to the underlying registry's counter so
+/// catalog mutations correctly invalidate per-profile caches too.
+#[async_trait]
+pub trait MetaToolRegistry: Send + Sync {
+    /// Build (or fetch the cached) merged tool catalog visible to this
+    /// scope. Names are prefixed per the adapter's `tool_prefix` (see
+    /// [`AdapterRegistry::merged_catalog`]); profile-scoped impls filter to
+    /// tools owned by in-profile endpoints.
+    async fn merged_catalog(&self) -> Vec<ToolInfo>;
+
+    /// Variant of [`Self::merged_catalog`] that also returns the
+    /// `prefixed_name → (endpoint, raw_name)` reverse lookup map, filtered
+    /// to the same scope as the catalog.
+    ///
+    /// `allow(dead_code)`: callers in the bin compilation unit reach
+    /// this method through `MetaToolHandler` which is built only by
+    /// `ProfileRegistry::rebuild` and `main.rs` — the bin's dead-code
+    /// pass doesn't see those call sites uniformly, so this and
+    /// [`Self::subscribe_tools_changed`] are annotated explicitly.
+    #[allow(dead_code)]
+    async fn merged_catalog_with_lookup(
+        &self,
+    ) -> (Vec<ToolInfo>, HashMap<String, (String, String)>);
+
+    /// Route a prefixed tool call. Profile-scoped impls reject tools whose
+    /// owning endpoint is not in the profile.
+    async fn route_tool_call(
+        &self,
+        prefixed_name: &str,
+        arguments: Value,
+    ) -> Result<Value, AdapterError>;
+
+    /// Current catalog generation. Monotonically increases on every
+    /// catalog-affecting mutation; profile-scoped impls delegate to the
+    /// underlying registry's counter.
+    fn catalog_generation(&self) -> u64;
+
+    /// Subscribe to the relay-wide tools-changed broadcast. Each tick
+    /// yields the endpoint name that emitted the change. Profile-scoped
+    /// impls delegate to the underlying registry — consumers (e.g. the
+    /// SSE handler in R3.D) filter on endpoint membership.
+    #[allow(dead_code)]
+    fn subscribe_tools_changed(&self) -> broadcast::Receiver<String>;
+}
+
+#[async_trait]
+impl MetaToolRegistry for AdapterRegistry {
+    async fn merged_catalog(&self) -> Vec<ToolInfo> {
+        AdapterRegistry::merged_catalog(self).await
+    }
+
+    async fn merged_catalog_with_lookup(
+        &self,
+    ) -> (Vec<ToolInfo>, HashMap<String, (String, String)>) {
+        AdapterRegistry::merged_catalog_with_lookup(self).await
+    }
+
+    async fn route_tool_call(
+        &self,
+        prefixed_name: &str,
+        arguments: Value,
+    ) -> Result<Value, AdapterError> {
+        AdapterRegistry::route_tool_call(self, prefixed_name, arguments).await
+    }
+
+    fn catalog_generation(&self) -> u64 {
+        AdapterRegistry::catalog_generation(self)
+    }
+
+    fn subscribe_tools_changed(&self) -> broadcast::Receiver<String> {
+        AdapterRegistry::subscribe_tools_changed(self)
     }
 }
 

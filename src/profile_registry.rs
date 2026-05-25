@@ -21,14 +21,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
+use async_trait::async_trait;
 use serde_json::Value;
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 
 use crate::adapter::{AdapterError, ToolInfo};
 use crate::config::{ProfileConfig, RelayConfig};
 use crate::js_sandbox::MetaToolHandler;
-use crate::registry::AdapterRegistry;
+use crate::registry::{AdapterRegistry, MetaToolRegistry};
 
 /// Effective default for [`RelayConfig::local_js_execution`] when the field
 /// is omitted from `config.toml`. Mirrors the main.rs startup default.
@@ -146,6 +148,46 @@ impl ProfileRegistryView {
     }
 }
 
+#[async_trait]
+impl MetaToolRegistry for ProfileRegistryView {
+    async fn merged_catalog(&self) -> Vec<ToolInfo> {
+        ProfileRegistryView::merged_catalog(self).await
+    }
+
+    async fn merged_catalog_with_lookup(
+        &self,
+    ) -> (Vec<ToolInfo>, HashMap<String, (String, String)>) {
+        ProfileRegistryView::merged_catalog_with_lookup(self).await
+    }
+
+    async fn route_tool_call(
+        &self,
+        prefixed_name: &str,
+        arguments: Value,
+    ) -> Result<Value, AdapterError> {
+        ProfileRegistryView::route_tool_call(self, prefixed_name, arguments).await
+    }
+
+    fn catalog_generation(&self) -> u64 {
+        // Delegate to the underlying registry. A profile view is a strict
+        // subset of the global catalog, so any mutation that bumps the
+        // global generation also implicitly invalidates per-profile
+        // search-index caches keyed on this counter.
+        self.inner.catalog_generation()
+    }
+
+    fn subscribe_tools_changed(&self) -> broadcast::Receiver<String> {
+        // Delegate to the underlying registry — R3.D's SSE handler is the
+        // consumer that filters ticks against
+        // [`Self::allowed_endpoints`].
+        self.inner.subscribe_tools_changed()
+    }
+}
+
+/// Default per-profile JS sandbox timeout, in seconds. Mirrors the value
+/// passed to the global [`MetaToolHandler`] in `main.rs`.
+const DEFAULT_SANDBOX_TIMEOUT_SECS: u64 = 30;
+
 /// Relay-wide profile registry. Thread-safe, hot-reload-aware.
 ///
 /// Profiles are keyed by their lowercased [`ProfileConfig::path`] — path
@@ -155,15 +197,36 @@ impl ProfileRegistryView {
 pub struct ProfileRegistry {
     profiles: Arc<RwLock<HashMap<String, Arc<ProfileContext>>>>,
     adapter_registry: AdapterRegistry,
+    /// Per-profile JS sandbox timeout passed through to each profile's
+    /// [`MetaToolHandler`] at rebuild time. Held on the registry (not on
+    /// each [`ProfileContext`]) so it stays in lockstep with the global
+    /// handler's value and is reapplied on every hot reload.
+    sandbox_timeout: Duration,
 }
 
 impl ProfileRegistry {
-    /// Create an empty registry. Call [`Self::rebuild`] before serving any
-    /// requests.
+    /// Create an empty registry with the default sandbox timeout
+    /// ([`DEFAULT_SANDBOX_TIMEOUT_SECS`]). Call [`Self::rebuild`] before
+    /// serving any requests.
     pub fn new(adapter_registry: AdapterRegistry) -> Self {
+        Self::with_sandbox_timeout(
+            adapter_registry,
+            Duration::from_secs(DEFAULT_SANDBOX_TIMEOUT_SECS),
+        )
+    }
+
+    /// Create an empty registry with a custom sandbox timeout. Used by
+    /// tests that want a tighter budget; production callers should use
+    /// [`Self::new`] so the per-profile timeout matches the global
+    /// `MetaToolHandler`.
+    pub fn with_sandbox_timeout(
+        adapter_registry: AdapterRegistry,
+        sandbox_timeout: Duration,
+    ) -> Self {
         Self {
             profiles: Arc::new(RwLock::new(HashMap::new())),
             adapter_registry,
+            sandbox_timeout,
         }
     }
 
@@ -184,12 +247,17 @@ impl ProfileRegistry {
         for profile in profiles {
             let allowed: HashSet<String> = profile.endpoints.iter().cloned().collect();
             let view = ProfileRegistryView::new(self.adapter_registry.clone(), allowed);
+            // Per-profile `MetaToolHandler` parameterised over the filtered
+            // view (locked decision Relay #2). The handler's search-index
+            // cache is private to this context, so per-profile catalogs
+            // never bleed into a different profile's search results.
+            let handler = MetaToolHandler::new(Arc::new(view.clone()), self.sandbox_timeout);
             let ctx = ProfileContext {
                 config: profile.clone(),
                 registry_view: view,
                 js_execution: profile.js_execution.unwrap_or(global_js),
                 toon_output: profile.toon_output.unwrap_or(global_toon),
-                meta_tool_handler: None,
+                meta_tool_handler: Some(Arc::new(handler)),
             };
             new_map.insert(profile.path.to_ascii_lowercase(), Arc::new(ctx));
         }
@@ -478,8 +546,11 @@ mod tests {
         assert!(override_ctx.toon_output);
     }
 
+    /// R3.A: every profile gets its own [`MetaToolHandler`] at rebuild
+    /// time, wrapping the profile's [`ProfileRegistryView`]. The placeholder
+    /// `None` from R2.A is gone.
     #[tokio::test]
-    async fn meta_tool_handler_is_none_until_r3a() {
+    async fn rebuild_populates_per_profile_meta_tool_handler() {
         let pr = ProfileRegistry::new(AdapterRegistry::new());
         pr.rebuild(
             &[ProfileConfig {
@@ -492,6 +563,176 @@ mod tests {
             &relay_cfg(),
         )
         .await;
-        assert!(pr.get("p").await.unwrap().meta_tool_handler.is_none());
+        assert!(pr.get("p").await.unwrap().meta_tool_handler.is_some());
+    }
+
+    /// Per-profile `MetaToolHandler::list_tools` sees only the profile's
+    /// allowed-endpoint tools, not the global catalog.
+    #[tokio::test]
+    async fn per_profile_handler_scopes_list_tools() {
+        let registry = registry_with_four_endpoints().await;
+        let pr = ProfileRegistry::new(registry);
+        pr.rebuild(
+            &[ProfileConfig {
+                name: "Work".into(),
+                path: "work".into(),
+                endpoints: vec!["gmail".into(), "linear".into()],
+                js_execution: None,
+                toon_output: None,
+            }],
+            &relay_cfg(),
+        )
+        .await;
+
+        let ctx = pr.get("work").await.unwrap();
+        let handler = ctx
+            .meta_tool_handler
+            .as_ref()
+            .expect("R3.A populates the per-profile handler");
+        let result = handler
+            .list_tools(None, None)
+            .await
+            .expect("list_tools must succeed");
+        let tools = result["tools"].as_array().expect("tools array");
+        let names: HashSet<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            tools.len(),
+            2,
+            "expected 2 in-profile tools, got {:?}",
+            names
+        );
+        assert!(names.contains("gmail__send_email"));
+        assert!(names.contains("linear__create_issue"));
+        assert!(!names.contains("todoist__add_task"));
+        assert!(!names.contains("notes__search_notes"));
+    }
+
+    /// Test-matrix row #15: per-profile `MetaToolHandler::search_tools`
+    /// only returns tools whose owning endpoint is in the profile's allowed
+    /// set, even when the query would otherwise match a global,
+    /// out-of-profile tool (`notes__search_notes` here scores on `"search"`
+    /// but the profile view never surfaces it).
+    #[tokio::test]
+    async fn per_profile_handler_scopes_search_tools() {
+        let registry = registry_with_four_endpoints().await;
+        let pr = ProfileRegistry::new(registry);
+        pr.rebuild(
+            &[ProfileConfig {
+                name: "Work".into(),
+                path: "work".into(),
+                endpoints: vec!["gmail".into(), "linear".into()],
+                js_execution: None,
+                toon_output: None,
+            }],
+            &relay_cfg(),
+        )
+        .await;
+
+        let ctx = pr.get("work").await.unwrap();
+        let handler = ctx
+            .meta_tool_handler
+            .as_ref()
+            .expect("R3.A populates the per-profile handler");
+
+        // Empty query → first-page slice of the profile-filtered catalog,
+        // so the result is exactly the profile's two tools.
+        let page = handler
+            .search_tools("", None)
+            .await
+            .expect("search_tools (empty query) must succeed");
+        let page_arr = page.as_array().expect("search result is a JSON array");
+        let page_names: HashSet<&str> = page_arr
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            page_arr.len(),
+            2,
+            "empty-query page should match profile catalog size, got {:?}",
+            page_names
+        );
+        assert!(page_names.contains("gmail__send_email"));
+        assert!(page_names.contains("linear__create_issue"));
+        assert!(!page_names.contains("todoist__add_task"));
+        assert!(!page_names.contains("notes__search_notes"));
+
+        // Token query → out-of-profile `notes__search_notes` would normally
+        // match "search" but must not appear because the per-profile handler
+        // never sees it.
+        let matches = handler
+            .search_tools("search", None)
+            .await
+            .expect("search_tools (token query) must succeed");
+        let matches_arr = matches.as_array().expect("search result is an array");
+        let match_names: HashSet<&str> = matches_arr
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or(""))
+            .collect();
+        assert!(
+            !match_names.contains("notes__search_notes"),
+            "out-of-profile tool must not appear in per-profile search, got {:?}",
+            match_names
+        );
+        assert!(
+            !match_names.contains("todoist__add_task"),
+            "out-of-profile tool must not appear in per-profile search, got {:?}",
+            match_names
+        );
+    }
+
+    /// Test-matrix row #12: an `execute_tools` script run by the per-profile
+    /// [`MetaToolHandler`] cannot reach a tool whose owning endpoint is
+    /// outside the profile. The sandbox sees only the profile-filtered
+    /// catalog, so `call("todoist__add_task")` from inside the script
+    /// surfaces the "unknown tool" error rather than reaching the global
+    /// registry.
+    #[tokio::test]
+    async fn per_profile_handler_execute_tools_rejects_out_of_profile_call() {
+        let registry = registry_with_four_endpoints().await;
+        let pr = ProfileRegistry::with_sandbox_timeout(registry, Duration::from_secs(5));
+        pr.rebuild(
+            &[ProfileConfig {
+                name: "Work".into(),
+                path: "work".into(),
+                endpoints: vec!["gmail".into(), "linear".into()],
+                js_execution: None,
+                toon_output: None,
+            }],
+            &relay_cfg(),
+        )
+        .await;
+
+        let ctx = pr.get("work").await.unwrap();
+        let handler = ctx
+            .meta_tool_handler
+            .as_ref()
+            .expect("R3.A populates the per-profile handler");
+
+        // Wrap the call so the script surfaces the underlying JS error
+        // string from `tools.call` rather than propagating it out as a
+        // sandbox-level error.
+        let script = r#"
+            try {
+                call("todoist__add_task", { content: "x" });
+                return { ok: true };
+            } catch (e) {
+                return { error: String(e && e.message ? e.message : e) };
+            }
+        "#;
+        let result = handler
+            .execute_tools(script)
+            .await
+            .expect("execute_tools should return the script's error value");
+        let err_msg = result
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(
+            err_msg.contains("todoist__add_task"),
+            "expected error to mention the out-of-profile tool, got: {err_msg}"
+        );
     }
 }

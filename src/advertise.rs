@@ -15,6 +15,9 @@
 //!
 //! [`HealthStatus`]: crate::adapter::HealthStatus
 
+use std::collections::HashSet;
+
+use crate::profile_registry::ProfileRegistryView;
 use crate::registry::AdapterRegistry;
 
 /// Safety cap on the rendered server-type list. With deduplication a typical
@@ -68,23 +71,49 @@ pub const EXECUTE_TOOLS_BASE: &str = concat!(
 );
 
 /// Renders the deduplicated, sorted server-type list for a registry.
+///
+/// When `allowed_endpoints` is `Some`, the rendered list and the endpoint
+/// count are restricted to adapters whose endpoint name is in the set —
+/// this powers the `_for_profile` advertising variants. When `None`, the
+/// renderer reflects every registered adapter (the global `/mcp` path).
 pub struct ServerTypeList<'a> {
     registry: &'a AdapterRegistry,
+    allowed_endpoints: Option<&'a HashSet<String>>,
 }
 
 impl<'a> ServerTypeList<'a> {
-    /// Bind a renderer to the given registry.
+    /// Bind a renderer to the given registry (unfiltered — every
+    /// registered adapter contributes).
     pub fn new(registry: &'a AdapterRegistry) -> Self {
-        Self { registry }
+        Self {
+            registry,
+            allowed_endpoints: None,
+        }
     }
 
-    /// Returns `Some("a, b, c")` if at least one registered adapter has a
+    /// Bind a renderer scoped to a profile's allowed endpoint set. Adapters
+    /// whose endpoint name is not in `allowed_endpoints` are skipped in
+    /// both [`Self::render`] and [`Self::endpoint_count`].
+    pub fn for_profile(
+        registry: &'a AdapterRegistry,
+        allowed_endpoints: &'a HashSet<String>,
+    ) -> Self {
+        Self {
+            registry,
+            allowed_endpoints: Some(allowed_endpoints),
+        }
+    }
+
+    /// Returns `Some("a, b, c")` if at least one in-scope adapter has a
     /// rendered `server_type` (cached upstream value or configured
     /// override); `None` otherwise. The list is enforced under the
     /// 8KB safety cap; trailing entries are dropped and a `, …` suffix
     /// appended if the cap is exceeded.
     pub async fn render(&self) -> Option<String> {
-        let types = self.registry.all_server_types().await;
+        let types = match self.allowed_endpoints {
+            Some(allowed) => self.registry.server_types_in(allowed).await,
+            None => self.registry.all_server_types().await,
+        };
         if types.is_empty() {
             return None;
         }
@@ -116,10 +145,14 @@ impl<'a> ServerTypeList<'a> {
         Some(out)
     }
 
-    /// Number of registered adapter instances regardless of health (NOT
-    /// deduplicated by type).
+    /// Number of in-scope adapter instances regardless of health (NOT
+    /// deduplicated by type). When scoped to a profile, only adapters
+    /// whose endpoint name is in `allowed_endpoints` are counted.
     pub async fn endpoint_count(&self) -> usize {
-        self.registry.all_endpoint_count().await
+        match self.allowed_endpoints {
+            Some(allowed) => self.registry.endpoint_count_in(allowed).await,
+            None => self.registry.all_endpoint_count().await,
+        }
     }
 }
 
@@ -129,7 +162,24 @@ impl<'a> ServerTypeList<'a> {
 pub const INSTRUCTIONS_LEAD_IN: &str =
     "Endara Relay aggregates MCP servers behind a single endpoint.";
 
-/// Build the `InitializeResult.instructions` string.
+/// Shared body of [`instructions`] / [`instructions_for_profile`]. Takes a
+/// pre-bound [`ServerTypeList`] so the same render logic powers the global
+/// `/mcp` path and per-profile `/mcp/{profile}` advertising.
+async fn build_instructions(list: ServerTypeList<'_>) -> Option<String> {
+    let rendered = list.render().await;
+    let count = list.endpoint_count().await;
+    match (rendered, count) {
+        (Some(rendered), _) => Some(format!(
+            "{}\n\nConnected server types: {}",
+            INSTRUCTIONS_LEAD_IN, rendered
+        )),
+        (None, 0) => None,
+        (None, _) => Some(INSTRUCTIONS_LEAD_IN.to_string()),
+    }
+}
+
+/// Build the `InitializeResult.instructions` string for the global `/mcp`
+/// path (every registered adapter contributes).
 ///
 /// - Returns `Some("{LEAD_IN}\n\nConnected server types: {list}")` whenever
 ///   the rendered list is non-empty.
@@ -139,16 +189,20 @@ pub const INSTRUCTIONS_LEAD_IN: &str =
 /// - Returns `None` when the registry has zero registered adapters so the
 ///   field is omitted from the response.
 pub async fn instructions(registry: &AdapterRegistry) -> Option<String> {
-    let list = ServerTypeList::new(registry).render().await;
-    let count = registry.all_endpoint_count().await;
-    match (list, count) {
-        (Some(list), _) => Some(format!(
-            "{}\n\nConnected server types: {}",
-            INSTRUCTIONS_LEAD_IN, list
-        )),
-        (None, 0) => None,
-        (None, _) => Some(INSTRUCTIONS_LEAD_IN.to_string()),
-    }
+    build_instructions(ServerTypeList::new(registry)).await
+}
+
+/// Profile-scoped variant of [`instructions`]. Renders against the profile's
+/// allowed endpoint set so per-profile `InitializeResult.instructions` only
+/// advertises servers the profile is authorised to see — including the
+/// fallback lead-in / `None` shapes that the global helper uses for the
+/// zero-adapter case.
+pub async fn instructions_for_profile(view: &ProfileRegistryView) -> Option<String> {
+    build_instructions(ServerTypeList::for_profile(
+        view.inner(),
+        view.allowed_endpoints(),
+    ))
+    .await
 }
 
 /// Hint appended to the `search_tools` description when TOON output is
@@ -156,12 +210,14 @@ pub async fn instructions(registry: &AdapterRegistry) -> Option<String> {
 /// Object Notation) instead of JSON, so it doesn't try to `JSON.parse()` them.
 pub const TOON_OUTPUT_HINT: &str = "Tool responses are returned in TOON format (Token-Oriented Object Notation) for reduced token usage. TOON is a compact alternative to JSON — indentation-based, no braces, tabular arrays. Parse it like structured text.";
 
-/// Build the `search_tools` description. Appends `\n\nConnected server types: {list}`
-/// when at least one registered adapter has a rendered `server_type`, and
-/// the TOON hint when `toon_enabled` is true.
-pub async fn search_tools_description(registry: &AdapterRegistry, toon_enabled: bool) -> String {
-    let base = match ServerTypeList::new(registry).render().await {
-        Some(list) => format!("{}\n\nConnected server types: {}", SEARCH_TOOLS_BASE, list),
+/// Shared body of [`search_tools_description`] /
+/// [`search_tools_description_for_profile`].
+async fn build_search_tools_description(list: ServerTypeList<'_>, toon_enabled: bool) -> String {
+    let base = match list.render().await {
+        Some(rendered) => format!(
+            "{}\n\nConnected server types: {}",
+            SEARCH_TOOLS_BASE, rendered
+        ),
         None => SEARCH_TOOLS_BASE.to_string(),
     };
     if toon_enabled {
@@ -171,32 +227,74 @@ pub async fn search_tools_description(registry: &AdapterRegistry, toon_enabled: 
     }
 }
 
-/// Build the `list_tools` description. Appends `" {count} servers connected …"`
-/// when the registry has at least one registered adapter.
-pub async fn list_tools_description(registry: &AdapterRegistry) -> String {
-    let count = ServerTypeList::new(registry).endpoint_count().await;
+/// Build the `search_tools` description. Appends `\n\nConnected server types: {list}`
+/// when at least one registered adapter has a rendered `server_type`, and
+/// the TOON hint when `toon_enabled` is true.
+pub async fn search_tools_description(registry: &AdapterRegistry, toon_enabled: bool) -> String {
+    build_search_tools_description(ServerTypeList::new(registry), toon_enabled).await
+}
+
+/// Profile-scoped variant of [`search_tools_description`]. Only adapters in
+/// the profile's allowed endpoint set contribute to the appended
+/// `Connected server types:` line; the TOON hint follows the per-profile
+/// `toon_enabled`.
+pub async fn search_tools_description_for_profile(
+    view: &ProfileRegistryView,
+    toon_enabled: bool,
+) -> String {
+    build_search_tools_description(
+        ServerTypeList::for_profile(view.inner(), view.allowed_endpoints()),
+        toon_enabled,
+    )
+    .await
+}
+
+/// Shared body of [`list_tools_description`] /
+/// [`list_tools_description_for_profile`] and the matching `execute_tools`
+/// helpers — appends `" {count} servers connected …"` to `base` when the
+/// in-scope endpoint count is non-zero.
+async fn build_count_suffix_description(list: ServerTypeList<'_>, base: &str) -> String {
+    let count = list.endpoint_count().await;
     if count > 0 {
         format!(
             "{} {} servers connected via Endara Relay — use search_tools to discover tools.",
-            LIST_TOOLS_BASE, count
+            base, count
         )
     } else {
-        LIST_TOOLS_BASE.to_string()
+        base.to_string()
     }
+}
+
+/// Build the `list_tools` description. Appends `" {count} servers connected …"`
+/// when the registry has at least one registered adapter.
+pub async fn list_tools_description(registry: &AdapterRegistry) -> String {
+    build_count_suffix_description(ServerTypeList::new(registry), LIST_TOOLS_BASE).await
+}
+
+/// Profile-scoped variant of [`list_tools_description`] — the count reflects
+/// only adapters in the profile's allowed endpoint set.
+pub async fn list_tools_description_for_profile(view: &ProfileRegistryView) -> String {
+    build_count_suffix_description(
+        ServerTypeList::for_profile(view.inner(), view.allowed_endpoints()),
+        LIST_TOOLS_BASE,
+    )
+    .await
 }
 
 /// Build the `execute_tools` description. Same suffix as
 /// [`list_tools_description`], appended to the long base block.
 pub async fn execute_tools_description(registry: &AdapterRegistry) -> String {
-    let count = ServerTypeList::new(registry).endpoint_count().await;
-    if count > 0 {
-        format!(
-            "{} {} servers connected via Endara Relay — use search_tools to discover tools.",
-            EXECUTE_TOOLS_BASE, count
-        )
-    } else {
-        EXECUTE_TOOLS_BASE.to_string()
-    }
+    build_count_suffix_description(ServerTypeList::new(registry), EXECUTE_TOOLS_BASE).await
+}
+
+/// Profile-scoped variant of [`execute_tools_description`] — the count
+/// reflects only adapters in the profile's allowed endpoint set.
+pub async fn execute_tools_description_for_profile(view: &ProfileRegistryView) -> String {
+    build_count_suffix_description(
+        ServerTypeList::for_profile(view.inner(), view.allowed_endpoints()),
+        EXECUTE_TOOLS_BASE,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -573,6 +671,160 @@ mod tests {
             !list.ends_with(", \u{2026}"),
             "50 types should fit without truncation: {}",
             list
+        );
+    }
+
+    // ----------------------------------------------------------------------
+    // Profile-aware advertising (R3.C, matrix row #15).
+    //
+    // The `_for_profile` variants render the same shapes as the global
+    // builders but filter the server-type list and the endpoint count to
+    // adapters in `allowed_endpoints`. The tests below pin both halves of
+    // that contract: only the profile's types appear, the count reflects
+    // only the profile's endpoints, and the empty-profile / TOON-hint
+    // edge cases behave identically to the global helpers.
+    // ----------------------------------------------------------------------
+
+    /// Build a [`ProfileRegistryView`] scoped to `names` for the per-
+    /// profile advertising tests. Mirrors how [`crate::profile_registry::
+    /// ProfileRegistry::rebuild`] constructs views at runtime.
+    fn view_for(reg: &AdapterRegistry, names: &[&str]) -> ProfileRegistryView {
+        let allowed: HashSet<String> = names.iter().map(|s| (*s).to_string()).collect();
+        ProfileRegistryView::new(reg.clone(), allowed)
+    }
+
+    /// Matrix row #15 — happy path. `instructions_for_profile` only mentions
+    /// the profile's server types and uses the profile's endpoint count.
+    #[tokio::test]
+    async fn instructions_for_profile_filters_server_types_and_count() {
+        let reg = AdapterRegistry::new();
+        register(&reg, "gmail", MockAdapter::ready("gmail")).await;
+        register(&reg, "linear", MockAdapter::ready("linear")).await;
+        register(&reg, "todoist", MockAdapter::ready("todoist")).await;
+        register(&reg, "github", MockAdapter::ready("github")).await;
+
+        let view = view_for(&reg, &["gmail", "linear"]);
+        let s = instructions_for_profile(&view)
+            .await
+            .expect("instructions present");
+        assert_eq!(
+            s,
+            format!(
+                "{}\n\nConnected server types: gmail, linear",
+                INSTRUCTIONS_LEAD_IN
+            )
+        );
+        // The unrelated endpoints must not leak into the rendered list.
+        assert!(!s.contains("todoist"));
+        assert!(!s.contains("github"));
+    }
+
+    /// An empty profile (no overlap with any registered endpoint) returns
+    /// `None`, matching the global behaviour for an empty registry. This is
+    /// the "Connected server types: " line guard: a misconfigured profile
+    /// must not advertise the global server list.
+    #[tokio::test]
+    async fn instructions_for_profile_none_when_no_overlap() {
+        let reg = AdapterRegistry::new();
+        register(&reg, "gmail", MockAdapter::ready("gmail")).await;
+        register(&reg, "linear", MockAdapter::ready("linear")).await;
+        let view = view_for(&reg, &["does-not-exist"]);
+        assert!(instructions_for_profile(&view).await.is_none());
+    }
+
+    /// A profile whose endpoints are all registered but none have a rendered
+    /// `server_type` returns the lead-in only — same shape as the global
+    /// `instructions_lead_in_only_when_registered_but_no_types_render` test.
+    #[tokio::test]
+    async fn instructions_for_profile_lead_in_only_when_in_scope_but_no_types() {
+        let reg = AdapterRegistry::new();
+        register(&reg, "pending", MockAdapter::starting_no_type()).await;
+        let view = view_for(&reg, &["pending"]);
+        let s = instructions_for_profile(&view)
+            .await
+            .expect("instructions present");
+        assert_eq!(s, INSTRUCTIONS_LEAD_IN);
+        assert!(!s.contains("Connected server types:"));
+    }
+
+    /// Matrix #15 (description side) — `list_tools_description_for_profile`
+    /// uses the profile's endpoint count, not the registry-wide count.
+    #[tokio::test]
+    async fn list_tools_description_for_profile_counts_only_profile_endpoints() {
+        let reg = AdapterRegistry::new();
+        register(&reg, "gmail", MockAdapter::ready("gmail")).await;
+        register(&reg, "linear", MockAdapter::ready("linear")).await;
+        register(&reg, "todoist", MockAdapter::ready("todoist")).await;
+        let view = view_for(&reg, &["gmail", "linear"]);
+        let desc = list_tools_description_for_profile(&view).await;
+        assert!(desc.starts_with(LIST_TOOLS_BASE));
+        assert!(
+            desc.ends_with(" 2 servers connected via Endara Relay \u{2014} use search_tools to discover tools."),
+            "expected count = 2 for the 2-endpoint profile, got: {}",
+            desc
+        );
+    }
+
+    /// `search_tools_description_for_profile` filters the appended
+    /// `Connected server types:` line and respects the per-profile TOON
+    /// toggle exactly like the global helper.
+    #[tokio::test]
+    async fn search_tools_description_for_profile_filters_types_and_respects_toon() {
+        let reg = AdapterRegistry::new();
+        register(&reg, "gmail", MockAdapter::ready("gmail")).await;
+        register(&reg, "todoist", MockAdapter::ready("todoist")).await;
+        let view = view_for(&reg, &["gmail"]);
+
+        let no_toon = search_tools_description_for_profile(&view, false).await;
+        assert!(no_toon.starts_with(SEARCH_TOOLS_BASE));
+        assert!(no_toon.contains("Connected server types: gmail"));
+        assert!(!no_toon.contains("todoist"));
+        assert!(!no_toon.contains("TOON"));
+
+        let with_toon = search_tools_description_for_profile(&view, true).await;
+        assert!(with_toon.contains("Connected server types: gmail"));
+        assert!(!with_toon.contains("todoist"));
+        assert!(with_toon.ends_with(TOON_OUTPUT_HINT));
+    }
+
+    /// `execute_tools_description_for_profile` mirrors the list-tools
+    /// suffix on the profile's count.
+    #[tokio::test]
+    async fn execute_tools_description_for_profile_counts_only_profile_endpoints() {
+        let reg = AdapterRegistry::new();
+        register(&reg, "gmail", MockAdapter::ready("gmail")).await;
+        register(&reg, "linear", MockAdapter::ready("linear")).await;
+        register(&reg, "todoist", MockAdapter::ready("todoist")).await;
+        let view = view_for(&reg, &["gmail"]);
+        let desc = execute_tools_description_for_profile(&view).await;
+        assert!(desc.starts_with(EXECUTE_TOOLS_BASE));
+        assert!(
+            desc.ends_with(" 1 servers connected via Endara Relay \u{2014} use search_tools to discover tools."),
+            "expected count = 1 for the 1-endpoint profile, got tail: {}",
+            &desc[desc.len().saturating_sub(120)..]
+        );
+    }
+
+    /// Empty profile: descriptions fall back to the base text with no
+    /// appended suffix — same as the global helper when the registry is
+    /// empty. This is the regression guard against accidentally appending
+    /// "0 servers connected …" to misconfigured profiles.
+    #[tokio::test]
+    async fn description_for_profile_no_overlap_returns_base() {
+        let reg = AdapterRegistry::new();
+        register(&reg, "gmail", MockAdapter::ready("gmail")).await;
+        let view = view_for(&reg, &["nope"]);
+        assert_eq!(
+            list_tools_description_for_profile(&view).await,
+            LIST_TOOLS_BASE
+        );
+        assert_eq!(
+            execute_tools_description_for_profile(&view).await,
+            EXECUTE_TOOLS_BASE
+        );
+        assert_eq!(
+            search_tools_description_for_profile(&view, false).await,
+            SEARCH_TOOLS_BASE
         );
     }
 }
