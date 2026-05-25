@@ -615,6 +615,7 @@ async fn main() {
                 oauth_adapter_inners: Some(oauth_adapter_inners.clone()),
                 token_manager: Some(token_manager.clone()),
                 setup_manager: Some(setup_manager.clone()),
+                profile_registry: Some(profile_registry.clone()),
             };
             // Build the MCP (TCP) and management (UDS / Named Pipe) routers
             // separately. The management API carries credential-bearing routes

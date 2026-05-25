@@ -22,6 +22,7 @@ use crate::adapter::stdio::{StdioAdapter, StdioConfig};
 use crate::adapter::{FailedAdapter, HealthStatus, McpAdapter, StartingAdapter};
 use crate::config::Config;
 use crate::oauth::{OAuthFlowManager, OAuthSetupManager, PkceChallenge};
+use crate::profile_registry::ProfileRegistry;
 use crate::registry::AdapterRegistry;
 use crate::token_manager::{DcrCredentials, TokenManager};
 use crate::OAuthAdapterInners;
@@ -48,6 +49,13 @@ pub struct ManagementState {
     pub token_manager: Option<Arc<TokenManager>>,
     /// Transient OAuth setup session manager (preflight flow).
     pub setup_manager: Option<Arc<OAuthSetupManager>>,
+    /// Relay-wide profile registry. Profile CRUD handlers call
+    /// [`ProfileRegistry::rebuild`] directly after a successful TOML
+    /// writeback so the live `/mcp/{profile}` routes reflect the change
+    /// without waiting on `ConfigWatcher` (the watcher path is owned by
+    /// R4.B). `None` is permitted for legacy test fixtures that don't
+    /// exercise the profile routes.
+    pub profile_registry: Option<Arc<ProfileRegistry>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2299,6 +2307,458 @@ async fn oauth_setup_cancel(
 }
 
 // ---------------------------------------------------------------------------
+// Profile CRUD (R4.A)
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /api/profiles` and `PUT /api/profiles/{path}`.
+#[derive(Deserialize)]
+pub struct ProfileRequest {
+    pub name: String,
+    pub path: String,
+    #[serde(default)]
+    pub endpoints: Vec<String>,
+    #[serde(default)]
+    pub js_execution: Option<bool>,
+    #[serde(default)]
+    pub toon_output: Option<bool>,
+}
+
+/// Summary shape returned by `GET /api/profiles` and `POST /api/profiles`.
+/// Mirrors the JSON shape documented in Engineering Spec §8.2.
+#[derive(Serialize)]
+pub struct ProfileSummary {
+    pub name: String,
+    pub path: String,
+    pub endpoints: Vec<String>,
+    /// Resolved per-profile JS-execution flag (falls back to
+    /// `RelayConfig::local_js_execution` when the profile leaves it unset).
+    pub js_execution: bool,
+    /// Resolved per-profile TOON output flag (falls back to
+    /// `RelayConfig::toon_output`).
+    pub toon_output: bool,
+    pub endpoint_count: usize,
+    pub tool_count: usize,
+}
+
+/// Detail shape returned by `GET /api/profiles/{path}` — same fields as
+/// [`ProfileSummary`] plus the profile-scoped tool catalog.
+#[derive(Serialize)]
+pub struct ProfileDetail {
+    #[serde(flatten)]
+    pub summary: ProfileSummary,
+    pub tools: Vec<CatalogEntry>,
+}
+
+/// Resolve a request's `js_execution` / `toon_output` against the same
+/// fallbacks `ProfileRegistry::rebuild` uses, so the JSON shape matches what
+/// the live registry will report.
+fn resolve_profile_flags(profile: &crate::config::ProfileConfig, cfg: &Config) -> (bool, bool) {
+    let js = profile
+        .js_execution
+        .unwrap_or_else(|| cfg.relay.local_js_execution.unwrap_or(false));
+    let toon = profile
+        .toon_output
+        .unwrap_or_else(|| cfg.relay.toon_output.unwrap_or(true));
+    (js, toon)
+}
+
+/// Look up the live tool count for a profile (post-rebuild). Returns 0 when
+/// the registry isn't available (legacy test fixtures).
+async fn profile_tool_count(state: &ManagementState, path: &str) -> usize {
+    let Some(ref pr) = state.profile_registry else {
+        return 0;
+    };
+    match pr.get(path).await {
+        Some(ctx) => ctx.registry_view.merged_catalog().await.len(),
+        None => 0,
+    }
+}
+
+/// Build a [`ProfileSummary`] from a [`crate::config::ProfileConfig`].
+async fn build_profile_summary(
+    state: &ManagementState,
+    cfg: &Config,
+    profile: &crate::config::ProfileConfig,
+) -> ProfileSummary {
+    let (js, toon) = resolve_profile_flags(profile, cfg);
+    let tool_count = profile_tool_count(state, &profile.path).await;
+    ProfileSummary {
+        name: profile.name.clone(),
+        path: profile.path.clone(),
+        endpoints: profile.endpoints.clone(),
+        js_execution: js,
+        toon_output: toon,
+        endpoint_count: profile.endpoints.len(),
+        tool_count,
+    }
+}
+
+/// Validate a request body for create / update. Returns a 400 response on
+/// failure; on success returns the [`crate::config::ProfileConfig`] that
+/// would land in `config.toml`.
+fn validate_profile_request(
+    req: &ProfileRequest,
+    cfg: &Config,
+    existing_path_lower: Option<&str>,
+) -> Result<crate::config::ProfileConfig, Box<axum::http::Response<axum::body::Body>>> {
+    let bad_request = |err: &str, detail: String| -> Box<axum::http::Response<axum::body::Body>> {
+        Box::new(error_response(StatusCode::BAD_REQUEST, err, Some(&detail)).into_response())
+    };
+    let conflict = |err: &str, detail: String| -> Box<axum::http::Response<axum::body::Body>> {
+        Box::new(error_response(StatusCode::CONFLICT, err, Some(&detail)).into_response())
+    };
+
+    if req.name.trim().is_empty() {
+        return Err(bad_request(
+            "invalid profile",
+            "Profile name must not be empty".to_string(),
+        ));
+    }
+    if let Err(msg) = crate::config::validate_profile_path(&req.path) {
+        return Err(bad_request("invalid profile path", msg));
+    }
+    let new_path_lower = req.path.to_ascii_lowercase();
+    // Uniqueness: scan current profiles, ignoring the profile we're updating
+    // in place (matched by its current path, case-insensitive).
+    if let Some(profiles) = cfg.profiles.as_ref() {
+        for p in profiles {
+            let p_lower = p.path.to_ascii_lowercase();
+            if Some(p_lower.as_str()) == existing_path_lower {
+                continue;
+            }
+            if p_lower == new_path_lower {
+                return Err(conflict(
+                    "duplicate profile path",
+                    format!(
+                        "Profile path '{}' is already in use (paths are case-insensitive).",
+                        req.path
+                    ),
+                ));
+            }
+            if p.name == req.name && existing_path_lower != Some(p_lower.as_str()) {
+                return Err(conflict(
+                    "duplicate profile name",
+                    format!("Profile name '{}' is already in use.", req.name),
+                ));
+            }
+        }
+    }
+    let endpoint_names: std::collections::HashSet<&str> =
+        cfg.endpoints.iter().map(|e| e.name.as_str()).collect();
+    for ep in &req.endpoints {
+        if !endpoint_names.contains(ep.as_str()) {
+            return Err(bad_request(
+                "unknown endpoint",
+                format!(
+                    "Profile '{}' references unknown endpoint '{}'",
+                    req.name, ep
+                ),
+            ));
+        }
+    }
+    Ok(crate::config::ProfileConfig {
+        name: req.name.clone(),
+        path: req.path.clone(),
+        endpoints: req.endpoints.clone(),
+        js_execution: req.js_execution,
+        toon_output: req.toon_output,
+    })
+}
+
+/// Persist the updated profile list back to `config.toml`, preserving the
+/// rest of the document. Mirrors the targeted-edit pattern used by
+/// [`delete_endpoint`] / [`oauth_setup_commit`].
+fn write_profiles_to_disk(
+    config_path: &std::path::Path,
+    profiles: &[crate::config::ProfileConfig],
+) -> Result<(), (StatusCode, &'static str, String)> {
+    let contents = std::fs::read_to_string(config_path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to read config file",
+            e.to_string(),
+        )
+    })?;
+    let mut parsed: toml::Table = contents.parse().map_err(|e: toml::de::Error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to parse config file",
+            e.to_string(),
+        )
+    })?;
+
+    if profiles.is_empty() {
+        parsed.remove("profiles");
+    } else {
+        let arr: Vec<toml::Value> = profiles
+            .iter()
+            .map(|p| {
+                toml::Value::try_from(p)
+                    .expect("ProfileConfig is Serialize and round-trips through toml::Value")
+            })
+            .collect();
+        parsed.insert("profiles".into(), toml::Value::Array(arr));
+    }
+
+    let new_contents = toml::to_string_pretty(&parsed).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to serialize config",
+            e.to_string(),
+        )
+    })?;
+    crate::config::write_config_file(config_path, &new_contents).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to write config file",
+            e.to_string(),
+        )
+    })?;
+    Ok(())
+}
+
+/// Helper that writes `new_profiles` to disk, swaps them into the in-memory
+/// [`ManagementState::config`], and rebuilds the live [`ProfileRegistry`] so
+/// `/mcp/{profile}` reflects the change immediately. Returns the resolved
+/// config path on success.
+async fn apply_profiles_change(
+    state: &ManagementState,
+    new_profiles: Vec<crate::config::ProfileConfig>,
+) -> Result<(), Box<axum::http::Response<axum::body::Body>>> {
+    let Some(ref config_path) = state.config_path else {
+        return Err(Box::new(
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "config_path not configured",
+                Some("The management API was not initialised with a config file path."),
+            )
+            .into_response(),
+        ));
+    };
+    let resolved = crate::config::expand_tilde(config_path);
+    if let Err((status, err, detail)) = write_profiles_to_disk(&resolved, &new_profiles) {
+        return Err(Box::new(
+            error_response(status, err, Some(&detail)).into_response(),
+        ));
+    }
+    // Swap the in-memory config baseline and rebuild the live registry.
+    // R4.B will additionally rebuild on file-watcher events; for the
+    // self-written change we do it inline so the response reflects the
+    // post-write state without waiting on the watcher debounce.
+    let relay_clone = {
+        let mut cfg = state.config.write().await;
+        cfg.profiles = if new_profiles.is_empty() {
+            None
+        } else {
+            Some(new_profiles.clone())
+        };
+        cfg.relay.clone()
+    };
+    if let Some(ref pr) = state.profile_registry {
+        pr.rebuild(&new_profiles, &relay_clone).await;
+    }
+    Ok(())
+}
+
+/// GET /api/profiles — list all profiles with resolved flags + live tool count.
+async fn list_profiles(State(state): State<ManagementState>) -> impl IntoResponse {
+    let cfg = state.config.read().await;
+    let profiles = cfg.profiles.clone().unwrap_or_default();
+    let mut out: Vec<ProfileSummary> = Vec::with_capacity(profiles.len());
+    for p in &profiles {
+        out.push(build_profile_summary(&state, &cfg, p).await);
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Json(out).into_response()
+}
+
+/// POST /api/profiles — create a new profile.
+async fn create_profile(
+    State(state): State<ManagementState>,
+    Json(req): Json<ProfileRequest>,
+) -> impl IntoResponse {
+    let cfg_snapshot = state.config.read().await.clone();
+    let new_profile = match validate_profile_request(&req, &cfg_snapshot, None) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let mut profiles = cfg_snapshot.profiles.clone().unwrap_or_default();
+    profiles.push(new_profile.clone());
+    if let Err(resp) = apply_profiles_change(&state, profiles).await {
+        return *resp;
+    }
+    let cfg = state.config.read().await;
+    let summary = build_profile_summary(&state, &cfg, &new_profile).await;
+    (StatusCode::CREATED, Json(summary)).into_response()
+}
+
+/// GET /api/profiles/{path} — read one profile (with full scoped catalog).
+async fn get_profile(
+    State(state): State<ManagementState>,
+    Path(path): Path<String>,
+) -> impl IntoResponse {
+    let cfg = state.config.read().await;
+    let path_lower = path.to_ascii_lowercase();
+    let Some(profile) = cfg
+        .profiles
+        .as_ref()
+        .and_then(|ps| {
+            ps.iter()
+                .find(|p| p.path.to_ascii_lowercase() == path_lower)
+        })
+        .cloned()
+    else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "profile not found",
+            Some(&format!("No profile at path '{}'", path)),
+        )
+        .into_response();
+    };
+    let summary = build_profile_summary(&state, &cfg, &profile).await;
+    // Build a profile-scoped CatalogEntry list. When no profile_registry is
+    // wired (legacy test fixtures), the catalog is empty.
+    let tools: Vec<CatalogEntry> = if let Some(ref pr) = state.profile_registry {
+        match pr.get(&profile.path).await {
+            Some(ctx) => {
+                let (tools, lookup) = ctx.registry_view.merged_catalog_with_lookup().await;
+                let entries = state.registry.entries().read().await;
+                tools
+                    .into_iter()
+                    .map(|t| {
+                        let (endpoint_name, available) = match lookup.get(&t.name) {
+                            Some((ep, _raw)) => {
+                                let avail = entries
+                                    .get(ep.as_str())
+                                    .map(|e| {
+                                        !e.disabled
+                                            && matches!(
+                                                e.adapter.health(),
+                                                crate::adapter::HealthStatus::Healthy
+                                            )
+                                    })
+                                    .unwrap_or(false);
+                                (ep.clone(), avail)
+                            }
+                            None => ("unknown".to_string(), false),
+                        };
+                        CatalogEntry {
+                            name: t.name,
+                            description: t.description,
+                            input_schema: t.input_schema,
+                            annotations: t.annotations,
+                            endpoint: endpoint_name,
+                            available,
+                        }
+                    })
+                    .collect()
+            }
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    Json(ProfileDetail { summary, tools }).into_response()
+}
+
+/// PUT /api/profiles/{path} — update / rename a profile.
+async fn update_profile(
+    State(state): State<ManagementState>,
+    Path(path): Path<String>,
+    Json(req): Json<ProfileRequest>,
+) -> impl IntoResponse {
+    let cfg_snapshot = state.config.read().await.clone();
+    let path_lower = path.to_ascii_lowercase();
+    let exists = cfg_snapshot
+        .profiles
+        .as_ref()
+        .map(|ps| ps.iter().any(|p| p.path.to_ascii_lowercase() == path_lower))
+        .unwrap_or(false);
+    if !exists {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "profile not found",
+            Some(&format!("No profile at path '{}'", path)),
+        )
+        .into_response();
+    }
+    let updated = match validate_profile_request(&req, &cfg_snapshot, Some(&path_lower)) {
+        Ok(p) => p,
+        Err(resp) => return *resp,
+    };
+    let mut profiles = cfg_snapshot.profiles.clone().unwrap_or_default();
+    for p in profiles.iter_mut() {
+        if p.path.to_ascii_lowercase() == path_lower {
+            *p = updated.clone();
+            break;
+        }
+    }
+    if let Err(resp) = apply_profiles_change(&state, profiles).await {
+        return *resp;
+    }
+    let cfg = state.config.read().await;
+    let summary = build_profile_summary(&state, &cfg, &updated).await;
+    (StatusCode::OK, Json(summary)).into_response()
+}
+
+/// DELETE /api/profiles/{path} — remove a profile.
+async fn delete_profile(
+    State(state): State<ManagementState>,
+    Path(path): Path<String>,
+) -> impl IntoResponse {
+    let cfg_snapshot = state.config.read().await.clone();
+    let path_lower = path.to_ascii_lowercase();
+    let exists = cfg_snapshot
+        .profiles
+        .as_ref()
+        .map(|ps| ps.iter().any(|p| p.path.to_ascii_lowercase() == path_lower))
+        .unwrap_or(false);
+    if !exists {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "profile not found",
+            Some(&format!("No profile at path '{}'", path)),
+        )
+        .into_response();
+    }
+    let profiles: Vec<_> = cfg_snapshot
+        .profiles
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|p| p.path.to_ascii_lowercase() != path_lower)
+        .collect();
+    if let Err(resp) = apply_profiles_change(&state, profiles).await {
+        return *resp;
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// GET /api/endpoints/{name}/profiles — which profiles include this endpoint.
+async fn get_endpoint_profile_membership(
+    State(state): State<ManagementState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let cfg = state.config.read().await;
+    let endpoint_exists = cfg.endpoints.iter().any(|e| e.name == name);
+    if !endpoint_exists {
+        return endpoint_not_found(&name).into_response();
+    }
+    let mut paths: Vec<String> = cfg
+        .profiles
+        .as_ref()
+        .map(|ps| {
+            ps.iter()
+                .filter(|p| p.endpoints.iter().any(|ep| ep == &name))
+                .map(|p| p.path.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    paths.sort();
+    Json(serde_json::json!({ "profiles": paths })).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Router builder
 // ---------------------------------------------------------------------------
 
@@ -2348,6 +2808,17 @@ pub fn management_routes(state: ManagementState) -> Router {
         .route("/api/config", get(get_config))
         .route("/api/config/reload", post(reload_config))
         .route("/api/test-connection", post(test_connection))
+        // Profile CRUD (R4.A) — spec §8.1, §8.2.
+        .route("/api/profiles", get(list_profiles).post(create_profile))
+        .route(
+            "/api/profiles/{path}",
+            get(get_profile).put(update_profile).delete(delete_profile),
+        )
+        // Endpoint → profile membership (read-only, spec §8.3).
+        .route(
+            "/api/endpoints/{name}/profiles",
+            get(get_endpoint_profile_membership),
+        )
         // No CORS layer: this router is served exclusively over a Unix-domain
         // socket / Windows named pipe (see `management_listener`), which is not
         // reachable from a browser and has no cross-origin attack surface.
@@ -2716,6 +3187,7 @@ mod tests {
             oauth_adapter_inners: None,
             token_manager: None,
             setup_manager: None,
+            profile_registry: None,
         }
     }
 
@@ -2975,6 +3447,7 @@ mod tests {
             oauth_adapter_inners: None,
             token_manager: None,
             setup_manager: None,
+            profile_registry: None,
         };
         let app = management_routes(state);
 
@@ -3049,6 +3522,7 @@ mod tests {
             oauth_adapter_inners: None,
             token_manager: None,
             setup_manager: None,
+            profile_registry: None,
         };
         let registry_for_poll = state.registry.clone();
         let app = management_routes(state);
@@ -3182,6 +3656,7 @@ mod tests {
             oauth_adapter_inners: None,
             token_manager: None,
             setup_manager: None,
+            profile_registry: None,
         };
         let registry_for_poll = state.registry.clone();
         let app = management_routes(state);
@@ -3685,6 +4160,7 @@ command = "echo"
             oauth_adapter_inners: Some(oauth_inners),
             token_manager: Some(token_manager),
             setup_manager: None,
+            profile_registry: None,
         };
 
         (state, shared_inner)
@@ -3998,6 +4474,7 @@ command = "echo"
             oauth_adapter_inners: None,
             token_manager: None,
             setup_manager: Some(Arc::new(OAuthSetupManager::new())),
+            profile_registry: None,
         }
     }
 
@@ -4660,6 +5137,7 @@ command = "echo"
             oauth_adapter_inners: None,
             token_manager: Some(token_manager.clone()),
             setup_manager: None,
+            profile_registry: None,
         };
         (state, token_manager)
     }
@@ -4859,6 +5337,7 @@ command = "echo"
             oauth_adapter_inners: None,
             token_manager: None,
             setup_manager: None,
+            profile_registry: None,
         };
         (state, flow_mgr)
     }
@@ -5298,6 +5777,7 @@ command = "echo"
             oauth_adapter_inners: Some(oauth_inners.clone()),
             token_manager: Some(token_manager),
             setup_manager: None,
+            profile_registry: None,
         };
         let app = management_routes(state);
         let resp = app
@@ -5368,6 +5848,7 @@ client_id = "client123"
             oauth_adapter_inners: Some(oauth_inners.clone()),
             token_manager: Some(token_manager),
             setup_manager: None,
+            profile_registry: None,
         };
         let app = management_routes(state);
         let resp = app
@@ -5398,5 +5879,454 @@ client_id = "client123"
         crate::config::write_config_file(&path, "# placeholder").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "Expected 0600, got {:o}", mode & 0o777);
+    }
+
+    // ---------------------------------------------------------------------
+    // R4.A — Profile CRUD + endpoint membership (test matrix #21, #22)
+    // ---------------------------------------------------------------------
+
+    fn profiles_test_config(endpoint_names: &[&str]) -> Config {
+        Config {
+            relay: RelayConfig {
+                machine_name: "test".into(),
+                local_js_execution: None,
+                token_dir: None,
+                allow_insecure_oauth: None,
+                toon_output: None,
+                startup_init_timeout_secs: None,
+            },
+            endpoints: endpoint_names
+                .iter()
+                .map(|n| EndpointConfig {
+                    name: (*n).to_string(),
+                    description: None,
+                    tool_prefix: None,
+                    transport: Transport::Stdio,
+                    command: Some("echo".into()),
+                    args: None,
+                    url: None,
+                    env: None,
+                    headers: None,
+                    disabled: false,
+                    disabled_tools: Vec::new(),
+                    oauth_server_url: None,
+                    client_id: None,
+                    client_secret: None,
+                    scopes: None,
+                    token_endpoint: None,
+                    server_type_override: None,
+                })
+                .collect(),
+            profiles: None,
+        }
+    }
+
+    /// Build a `ManagementState` wired to a real on-disk `config.toml` and a
+    /// live `ProfileRegistry`, plus `endpoint_names` worth of registered
+    /// mock adapters. Returns the state and the path to the config file so
+    /// tests can assert TOML writeback.
+    async fn profiles_test_state(
+        endpoint_names: &[&str],
+        config_file: &std::path::Path,
+    ) -> ManagementState {
+        let registry = AdapterRegistry::new();
+        for name in endpoint_names {
+            registry
+                .register(
+                    (*name).to_string(),
+                    Box::new(MockAdapter::healthy_with_tools(vec![ToolInfo {
+                        name: format!("{}_tool", name),
+                        description: None,
+                        input_schema: serde_json::json!({}),
+                        annotations: None,
+                    }])),
+                    "stdio".to_string(),
+                    None,
+                    Some((*name).to_string()),
+                )
+                .await;
+        }
+        let registry_arc = Arc::new(registry);
+        let cfg = profiles_test_config(endpoint_names);
+        // Seed the on-disk file so writeback round-trips through a real
+        // TOML document and we can verify formatting.
+        let toml_str = toml::to_string_pretty(&cfg).unwrap();
+        std::fs::write(config_file, toml_str).unwrap();
+
+        let profile_registry = Arc::new(ProfileRegistry::new((*registry_arc).clone()));
+        profile_registry.rebuild(&[], &cfg.relay).await;
+
+        ManagementState {
+            registry: registry_arc,
+            config: Arc::new(RwLock::new(cfg)),
+            start_time: Instant::now(),
+            config_path: Some(config_file.to_path_buf()),
+            oauth_flow_manager: None,
+            relay_port: 9400,
+            oauth_adapter_inners: None,
+            token_manager: None,
+            setup_manager: None,
+            profile_registry: Some(profile_registry),
+        }
+    }
+
+    /// Matrix row #21 — Management API CRUD round trip.
+    ///
+    /// Create → list → get → update → delete, asserting status codes, JSON
+    /// shapes, TOML writeback, and that the live `ProfileRegistry`
+    /// reflects each mutation.
+    #[tokio::test]
+    async fn management_profiles_full_crud_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let state = profiles_test_state(&["gmail", "linear", "todoist"], &config_file).await;
+        let profile_registry = state.profile_registry.clone().unwrap();
+        let app = management_routes(state);
+
+        // ---- CREATE ----
+        let create_body = serde_json::json!({
+            "name": "Work",
+            "path": "work",
+            "endpoints": ["gmail", "linear"],
+            "js_execution": true,
+            "toon_output": true,
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/profiles")
+                    .header("content-type", "application/json")
+                    .body(Body::from(create_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp).await;
+        assert_eq!(body["name"], "Work");
+        assert_eq!(body["path"], "work");
+        assert_eq!(body["endpoint_count"], 2);
+        assert_eq!(body["tool_count"], 2); // gmail_tool + linear_tool
+        assert_eq!(body["js_execution"], true);
+        assert_eq!(body["toon_output"], true);
+        // Writeback: config.toml now contains the profile.
+        let on_disk = std::fs::read_to_string(&config_file).unwrap();
+        assert!(on_disk.contains("[[profiles]]"));
+        assert!(on_disk.contains("name = \"Work\""));
+        assert!(on_disk.contains("path = \"work\""));
+        // Live registry sees the new profile.
+        assert!(profile_registry.get("work").await.is_some());
+
+        // ---- LIST ----
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/api/profiles").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let arr = body.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["path"], "work");
+
+        // ---- GET (case-insensitive path lookup) ----
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/profiles/WORK")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["name"], "Work");
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2, "profile catalog must contain 2 tools");
+        let tool_names: std::collections::HashSet<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or(""))
+            .collect();
+        assert!(tool_names.contains("gmail__gmail_tool"));
+        assert!(tool_names.contains("linear__linear_tool"));
+
+        // ---- UPDATE (rename + change endpoints) ----
+        let update_body = serde_json::json!({
+            "name": "Daily",
+            "path": "daily",
+            "endpoints": ["gmail", "linear", "todoist"],
+            "js_execution": false,
+            "toon_output": false,
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::put("/api/profiles/work")
+                    .header("content-type", "application/json")
+                    .body(Body::from(update_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["name"], "Daily");
+        assert_eq!(body["path"], "daily");
+        assert_eq!(body["endpoint_count"], 3);
+        assert_eq!(body["js_execution"], false);
+        assert!(profile_registry.get("work").await.is_none());
+        assert!(profile_registry.get("daily").await.is_some());
+
+        // ---- DELETE ----
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::delete("/api/profiles/daily")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(profile_registry.get("daily").await.is_none());
+        let on_disk = std::fs::read_to_string(&config_file).unwrap();
+        assert!(
+            !on_disk.contains("[[profiles]]"),
+            "TOML must drop the [[profiles]] block when empty, got:\n{}",
+            on_disk
+        );
+
+        // ---- LIST is now empty ----
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/api/profiles").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert!(body.as_array().unwrap().is_empty());
+    }
+
+    /// Matrix row #22 — `GET /api/endpoints/{name}/profiles` returns the
+    /// list of profile paths containing the endpoint.
+    #[tokio::test]
+    async fn management_endpoint_profiles_membership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let state = profiles_test_state(&["gmail", "linear", "todoist"], &config_file).await;
+        let app = management_routes(state);
+
+        // Seed two profiles via the API: gmail is in both, todoist in none.
+        for (name, path, endpoints) in [
+            ("Work", "work", vec!["gmail", "linear"]),
+            ("Personal", "personal", vec!["gmail"]),
+        ] {
+            let body = serde_json::json!({
+                "name": name,
+                "path": path,
+                "endpoints": endpoints,
+                "js_execution": false,
+                "toon_output": true,
+            });
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/profiles")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+
+        // gmail → both profiles, sorted.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/endpoints/gmail/profiles")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let arr = body["profiles"].as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0], "personal");
+        assert_eq!(arr[1], "work");
+
+        // linear → only "work".
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/endpoints/linear/profiles")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert_eq!(body["profiles"].as_array().unwrap().len(), 1);
+        assert_eq!(body["profiles"][0], "work");
+
+        // todoist → no profiles.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/endpoints/todoist/profiles")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert!(body["profiles"].as_array().unwrap().is_empty());
+
+        // Unknown endpoint → 404.
+        let resp = app
+            .oneshot(
+                Request::get("/api/endpoints/missing/profiles")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Validation: `POST /api/profiles` rejects invalid paths (regex +
+    /// reserved-name list — spec §2.3) and unknown endpoint references with
+    /// 4xx responses, and never writes the bad payload to disk.
+    #[tokio::test]
+    async fn management_profiles_post_rejects_invalid_payloads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let state = profiles_test_state(&["gmail"], &config_file).await;
+        let app = management_routes(state);
+        let before = std::fs::read_to_string(&config_file).unwrap();
+
+        let cases: &[(&str, serde_json::Value, StatusCode)] = &[
+            (
+                "empty name",
+                serde_json::json!({ "name": "", "path": "work", "endpoints": [] }),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "reserved path",
+                serde_json::json!({ "name": "X", "path": "sse", "endpoints": [] }),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "invalid path characters",
+                serde_json::json!({ "name": "X", "path": "with space", "endpoints": [] }),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "unknown endpoint reference",
+                serde_json::json!({ "name": "X", "path": "x", "endpoints": ["nonexistent"] }),
+                StatusCode::BAD_REQUEST,
+            ),
+        ];
+        for (label, body, want_status) in cases {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/profiles")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                *want_status,
+                "case '{}' should reject with {}",
+                label,
+                want_status
+            );
+        }
+        // None of the rejected payloads should have touched the file.
+        let after = std::fs::read_to_string(&config_file).unwrap();
+        assert_eq!(
+            before, after,
+            "rejected POSTs must not write to config.toml"
+        );
+    }
+
+    /// `PUT /api/profiles/{path}` on a missing profile returns 404, and a
+    /// rename to a path that collides with another profile returns 409.
+    #[tokio::test]
+    async fn management_profiles_put_404_and_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let state = profiles_test_state(&["gmail"], &config_file).await;
+        let app = management_routes(state);
+
+        // 404 on update of nonexistent profile.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::put("/api/profiles/ghost")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "Ghost",
+                            "path": "ghost",
+                            "endpoints": [],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Seed two profiles, then try to rename one onto the other's path.
+        for (name, path) in [("A", "alpha"), ("B", "bravo")] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/profiles")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({
+                                "name": name,
+                                "path": path,
+                                "endpoints": [],
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::CREATED);
+        }
+        let resp = app
+            .oneshot(
+                Request::put("/api/profiles/bravo")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "B",
+                            "path": "ALPHA",
+                            "endpoints": [],
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::CONFLICT,
+            "rename onto existing path must 409 (case-insensitive)"
+        );
     }
 }
