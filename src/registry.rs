@@ -101,12 +101,13 @@ pub struct AdapterRegistry {
     catalog_generation: Arc<AtomicU64>,
     /// Relay-wide tools-changed broadcast. Fan-in for every per-endpoint
     /// `subscribe_tools_changed` tick observed by
-    /// [`AdapterRegistry::tools_changed_listener_loop`]. Downstream consumers
-    /// (e.g. the `/mcp/sse` handler) subscribe via
-    /// [`AdapterRegistry::subscribe_tools_changed`] to forward
-    /// `notifications/tools/list_changed` to connected MCP clients without
-    /// caring which upstream endpoint emitted the change.
-    tools_changed_tx: broadcast::Sender<()>,
+    /// [`AdapterRegistry::tools_changed_listener_loop`]. The payload is the
+    /// endpoint name that emitted the change, so downstream consumers can
+    /// filter by endpoint (e.g. per-profile SSE handlers that only forward
+    /// `notifications/tools/list_changed` when an endpoint inside their
+    /// profile changes). Consumers that don't care about origin (e.g. the
+    /// global `/mcp/sse` handler) forward unconditionally.
+    tools_changed_tx: broadcast::Sender<String>,
 }
 
 impl Default for AdapterRegistry {
@@ -128,21 +129,23 @@ impl AdapterRegistry {
     }
 
     /// Subscribe to the relay-wide tools-changed broadcast. Each `recv()`
-    /// represents at least one `notifications/tools/list_changed` tick from
-    /// some registered adapter since the previous receive. Mirrors the
-    /// per-adapter [`McpAdapter::subscribe_tools_changed`] policy: `Lagged`
-    /// is also surfaced as a tick by the fan-in loop, and `Closed` only
-    /// happens when the registry itself is dropped.
-    pub fn subscribe_tools_changed(&self) -> broadcast::Receiver<()> {
+    /// yields the endpoint name that emitted a
+    /// `notifications/tools/list_changed` tick since the previous receive.
+    /// Mirrors the per-adapter [`McpAdapter::subscribe_tools_changed`]
+    /// policy: `Lagged` is also surfaced as a tick (the endpoint name is
+    /// lost in that case — consumers should forward unconditionally), and
+    /// `Closed` only happens when the registry itself is dropped.
+    pub fn subscribe_tools_changed(&self) -> broadcast::Receiver<String> {
         self.tools_changed_tx.subscribe()
     }
 
-    /// Send a synthetic tools-changed tick on the relay-wide broadcast.
-    /// Test-only escape hatch so server-side handler tests can exercise the
-    /// fan-out path without standing up a real adapter and listener task.
+    /// Send a synthetic tools-changed tick on the relay-wide broadcast for
+    /// the given endpoint name. Test-only escape hatch so server-side
+    /// handler tests can exercise the fan-out path without standing up a
+    /// real adapter and listener task.
     #[cfg(test)]
-    pub(crate) fn tick_tools_changed_for_test(&self) {
-        let _ = self.tools_changed_tx.send(());
+    pub(crate) fn tick_tools_changed_for_test(&self, endpoint: &str) {
+        let _ = self.tools_changed_tx.send(endpoint.to_string());
     }
 
     /// Register an adapter under the given endpoint name.
@@ -213,9 +216,11 @@ impl AdapterRegistry {
     /// — as well as a `Lagged` error (treated as a missed-but-coalesced tick)
     /// — invalidates the per-endpoint tools cache followed by the merged
     /// catalog cache, then fans the tick into the relay-wide
-    /// `tools_changed_tx` so downstream consumers (e.g. the `/mcp/sse`
-    /// handler) can forward `notifications/tools/list_changed` to connected
-    /// MCP clients. A `Closed` receiver terminates the loop.
+    /// `tools_changed_tx` (carrying the endpoint name) so downstream
+    /// consumers (e.g. the `/mcp/sse` handler, or future per-profile SSE
+    /// handlers that filter by endpoint membership) can forward
+    /// `notifications/tools/list_changed` to connected MCP clients. A
+    /// `Closed` receiver terminates the loop.
     async fn tools_changed_listener_loop(
         registry: Self,
         endpoint: String,
@@ -226,7 +231,7 @@ impl AdapterRegistry {
                 Ok(()) => {
                     registry.invalidate_endpoint_tool_cache(&endpoint).await;
                     registry.invalidate_catalog_cache().await;
-                    let _ = registry.tools_changed_tx.send(());
+                    let _ = registry.tools_changed_tx.send(endpoint.clone());
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     debug!(
@@ -236,7 +241,7 @@ impl AdapterRegistry {
                     );
                     registry.invalidate_endpoint_tool_cache(&endpoint).await;
                     registry.invalidate_catalog_cache().await;
-                    let _ = registry.tools_changed_tx.send(());
+                    let _ = registry.tools_changed_tx.send(endpoint.clone());
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     debug!(endpoint = %endpoint, "tools-changed listener channel closed");
@@ -2001,7 +2006,8 @@ mod tests {
     /// A per-endpoint adapter tick must also fan into the relay-wide
     /// `subscribe_tools_changed` channel so server-side consumers (e.g. the
     /// `/mcp/sse` handler) can forward `notifications/tools/list_changed`
-    /// to MCP clients.
+    /// to MCP clients. The fanned-in payload carries the endpoint name so
+    /// per-profile SSE handlers can filter by endpoint membership.
     #[tokio::test]
     async fn test_tools_changed_tick_fans_in_to_relay_subscribers() {
         let registry = AdapterRegistry::new();
@@ -2018,13 +2024,16 @@ mod tests {
             .await;
 
         // Drive a per-endpoint tick; the listener loop should observe it and
-        // fan it into the relay-wide broadcast.
+        // fan it into the relay-wide broadcast with the endpoint name.
         tx.send(()).unwrap();
         let recv = tokio::time::timeout(std::time::Duration::from_secs(1), relay_rx.recv()).await;
-        assert!(
-            matches!(recv, Ok(Ok(()))),
-            "relay-wide tools-changed subscriber should receive the fanned-in tick (got {recv:?})"
-        );
+        match recv {
+            Ok(Ok(name)) => assert_eq!(name, "ep", "fanned-in payload should be the endpoint name"),
+            other => panic!(
+                "relay-wide tools-changed subscriber should receive the fanned-in tick \
+                 carrying the endpoint name (got {other:?})"
+            ),
+        }
     }
 
     #[tokio::test]

@@ -561,7 +561,12 @@ async fn mcp_sse(
         {
             return;
         }
-        while let Ok(()) | Err(RecvError::Lagged(_)) = tools_rx.recv().await {
+        // Global `/mcp/sse` forwards every tools-changed tick regardless of
+        // which endpoint emitted it. The payload (endpoint name) is unused
+        // here; per-profile SSE handlers use it to filter by endpoint
+        // membership. `Lagged` is also surfaced as a tick (endpoint name is
+        // lost in that case), so forward unconditionally on both arms.
+        while let Ok(_) | Err(RecvError::Lagged(_)) = tools_rx.recv().await {
             let frame = Event::default()
                 .data(r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#);
             if tx.send(Ok(frame)).await.is_err() {
@@ -2518,7 +2523,7 @@ mod tests {
         // races with the subscriber, so retry the tick until the frame lands.
         let driver = tokio::spawn(async move {
             for _ in 0..40 {
-                registry.tick_tools_changed_for_test();
+                registry.tick_tools_changed_for_test("test-endpoint");
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         });
