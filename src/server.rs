@@ -216,14 +216,25 @@ async fn meta_tool_definitions(
 /// `/mcp/{profile}` route so meta-tool descriptions advertise only the
 /// profile's server types. `None` for the global `/mcp` path. R3.A owns
 /// the catalog filtering itself (line 199 below).
+///
+/// Per-profile `js_execution` and `toon_output` (R3.B) override the global
+/// [`AppState::js_execution_mode`] and [`AppState::toon_enabled`] toggles
+/// whenever `profile_ctx` is `Some`. `ProfileContext` already pre-resolves
+/// the `Inherit | On | Off` semantics (`None` falls back to the global flag
+/// at rebuild time), so the gate sites just read the resolved `bool`.
 async fn mcp_tools_list(
     State(state): State<AppState>,
     Json(body): Json<JsonRpcBody>,
     profile_ctx: Option<&ProfileContext>,
 ) -> Json<Value> {
-    let js_mode = state.js_execution_mode.load(Ordering::Relaxed);
+    let js_mode = profile_ctx
+        .map(|c| c.js_execution)
+        .unwrap_or_else(|| state.js_execution_mode.load(Ordering::Relaxed));
+    let toon_enabled = profile_ctx
+        .map(|c| c.toon_output)
+        .unwrap_or(state.toon_enabled);
     let meta_tools =
-        meta_tool_definitions(js_mode, &state.registry, state.toon_enabled, profile_ctx).await;
+        meta_tool_definitions(js_mode, &state.registry, toon_enabled, profile_ctx).await;
 
     let tools: Vec<Value> = if js_mode {
         // JS execution mode: only the 3 meta-tools (incl. execute_tools)
@@ -262,9 +273,18 @@ async fn mcp_tools_list(
 }
 
 /// POST /mcp/tools/call
+///
+/// `profile_ctx` is `Some` for the wildcard `/mcp/{profile}` route and
+/// `None` for the global `/mcp` (and legacy `/mcp/tools/call`) path. When
+/// present, per-profile `js_execution` and `toon_output` (R3.B) override
+/// the global [`AppState::js_execution_mode`] / [`AppState::toon_enabled`]
+/// toggles, and the per-profile [`MetaToolHandler`] handles the meta-tool
+/// dispatch so list/search/execute see only the profile's allowed
+/// endpoints.
 async fn mcp_tools_call(
     State(state): State<AppState>,
     Json(body): Json<JsonRpcBody>,
+    profile_ctx: Option<&ProfileContext>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let params = body.params.unwrap_or(json!({}));
     let tool_name = params
@@ -273,7 +293,19 @@ async fn mcp_tools_call(
         .ok_or_else(|| jsonrpc_error(body.id.clone(), -32602, "missing 'name' in params"))?;
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-    let js_mode = state.js_execution_mode.load(Ordering::Relaxed);
+    let js_mode = profile_ctx
+        .map(|c| c.js_execution)
+        .unwrap_or_else(|| state.js_execution_mode.load(Ordering::Relaxed));
+    let toon_enabled = profile_ctx
+        .map(|c| c.toon_output)
+        .unwrap_or(state.toon_enabled);
+    // `ProfileContext::meta_tool_handler` is populated by `ProfileRegistry::rebuild`
+    // (R3.A) over the profile's [`ProfileRegistryView`] — using it here keeps
+    // list/search/execute scoped to the profile's allowed endpoints. The global
+    // handler is the fallback for `/mcp` and the legacy `/mcp/tools/call`.
+    let handler: &MetaToolHandler = profile_ctx
+        .and_then(|c| c.meta_tool_handler.as_deref())
+        .unwrap_or(&state.meta_tool_handler);
 
     // Check if this is a meta-tool call
     match tool_name {
@@ -286,11 +318,11 @@ async fn mcp_tools_call(
                 .get("offset")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize);
-            match state.meta_tool_handler.list_tools(limit, offset).await {
+            match handler.list_tools(limit, offset).await {
                 Ok(result) => {
                     return Ok(jsonrpc_response(
                         body.id,
-                        wrap_meta_tool_result(result, state.toon_enabled),
+                        wrap_meta_tool_result(result, toon_enabled),
                     ))
                 }
                 Err(e) => return Err(jsonrpc_error(body.id, -32603, &e.to_string())),
@@ -305,11 +337,11 @@ async fn mcp_tools_call(
                 .get("limit")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize);
-            match state.meta_tool_handler.search_tools(query, limit).await {
+            match handler.search_tools(query, limit).await {
                 Ok(result) => {
                     return Ok(jsonrpc_response(
                         body.id,
-                        wrap_meta_tool_result(result, state.toon_enabled),
+                        wrap_meta_tool_result(result, toon_enabled),
                     ))
                 }
                 Err(e) => return Err(jsonrpc_error(body.id, -32603, &e.to_string())),
@@ -331,11 +363,11 @@ async fn mcp_tools_call(
                 .get("script")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            match state.meta_tool_handler.execute_tools(script).await {
+            match handler.execute_tools(script).await {
                 Ok(result) => {
                     return Ok(jsonrpc_response(
                         body.id,
-                        wrap_meta_tool_result(result, state.toon_enabled),
+                        wrap_meta_tool_result(result, toon_enabled),
                     ))
                 }
                 Err(e) => return Err(jsonrpc_error(body.id, -32603, &e.to_string())),
@@ -353,9 +385,17 @@ async fn mcp_tools_call(
         ));
     }
 
-    match state.registry.route_tool_call(tool_name, arguments).await {
+    let route_result = match profile_ctx {
+        Some(ctx) => {
+            ctx.registry_view
+                .route_tool_call(tool_name, arguments)
+                .await
+        }
+        None => state.registry.route_tool_call(tool_name, arguments).await,
+    };
+    match route_result {
         Ok(result) => {
-            let result = if state.toon_enabled {
+            let result = if toon_enabled {
                 crate::toon_convert::toonify_call_result(result)
             } else {
                 result
@@ -426,7 +466,7 @@ async fn handle_single_message(
         let result: Result<Json<Value>, (StatusCode, Json<Value>)> = match method.as_str() {
             "initialize" => Ok(mcp_initialize(State(state.clone()), Json(body), profile_ctx).await),
             "tools/list" => Ok(mcp_tools_list(State(state.clone()), Json(body), profile_ctx).await),
-            "tools/call" => mcp_tools_call(State(state.clone()), Json(body)).await,
+            "tools/call" => mcp_tools_call(State(state.clone()), Json(body), profile_ctx).await,
             _ => Err(jsonrpc_error(
                 body.id,
                 -32601,
@@ -1085,7 +1125,7 @@ async fn mcp_tools_call_logged(
     async move {
         let start = Instant::now();
         let req_bytes = serde_json::to_string(&body.0).map(|s| s.len()).unwrap_or(0);
-        let result = mcp_tools_call(state, body).await;
+        let result = mcp_tools_call(state, body, None).await;
         let elapsed_ms = start.elapsed().as_millis() as u64;
         match &result {
             Ok(Json(resp)) => {
@@ -1645,7 +1685,7 @@ mod tests {
             params: Some(json!({"name": "list_tools", "arguments": {}})),
             id: Some(json!(1)),
         };
-        let result = mcp_tools_call(State(state.clone()), Json(body)).await;
+        let result = mcp_tools_call(State(state.clone()), Json(body), None).await;
         let Json(resp) = result.unwrap();
         let content = resp["result"]["content"]
             .as_array()
@@ -1663,7 +1703,7 @@ mod tests {
             params: Some(json!({"name": "search_tools", "arguments": {"query": "test"}})),
             id: Some(json!(2)),
         };
-        let result = mcp_tools_call(State(state.clone()), Json(body)).await;
+        let result = mcp_tools_call(State(state.clone()), Json(body), None).await;
         let Json(resp) = result.unwrap();
         let content = resp["result"]["content"]
             .as_array()
@@ -1679,7 +1719,7 @@ mod tests {
             params: Some(json!({"name": "execute_tools", "arguments": {"script": ""}})),
             id: Some(json!(3)),
         };
-        let result = mcp_tools_call(State(state), Json(body)).await;
+        let result = mcp_tools_call(State(state), Json(body), None).await;
         // execute_tools with empty script may error — either way, check the shape
         match result {
             Ok(Json(resp)) => {
@@ -1705,7 +1745,9 @@ mod tests {
             params: Some(json!({"name": "list_tools", "arguments": {}})),
             id: Some(json!(1)),
         };
-        let Json(resp) = mcp_tools_call(State(state), Json(body)).await.unwrap();
+        let Json(resp) = mcp_tools_call(State(state), Json(body), None)
+            .await
+            .unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         // TOON output for the `{ tools, total, limit, offset }` envelope is
         // never valid JSON — it starts with field declarations, not `{`.
@@ -1737,7 +1779,9 @@ mod tests {
             })),
             id: Some(json!(2)),
         };
-        let Json(resp) = mcp_tools_call(State(state), Json(body)).await.unwrap();
+        let Json(resp) = mcp_tools_call(State(state), Json(body), None)
+            .await
+            .unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
             serde_json::from_str::<Value>(text).is_err(),
@@ -1761,7 +1805,9 @@ mod tests {
             params: Some(json!({"name": "list_tools", "arguments": {}})),
             id: Some(json!(1)),
         };
-        let Json(resp) = mcp_tools_call(State(state), Json(body)).await.unwrap();
+        let Json(resp) = mcp_tools_call(State(state), Json(body), None)
+            .await
+            .unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).expect("JSON when toon disabled");
         assert!(parsed["tools"].is_array());
@@ -2793,20 +2839,37 @@ mod tests {
     /// `path` and whose endpoint set is `endpoints`. JS execution and TOON
     /// inherit from the relay defaults (off / on).
     async fn install_profile(state: &AppState, path: &str, endpoints: Vec<String>) {
+        install_profile_with_flags(state, path, endpoints, None, None, None, None).await;
+    }
+
+    /// Variant of [`install_profile`] that takes explicit `js_execution` /
+    /// `toon_output` overrides for both the relay defaults and the profile
+    /// itself. `None` on a profile field means "Inherit" — the resolved
+    /// `ProfileContext::js_execution` / `toon_output` then falls back to the
+    /// matching relay default (also passed in as `Option`).
+    async fn install_profile_with_flags(
+        state: &AppState,
+        path: &str,
+        endpoints: Vec<String>,
+        relay_js: Option<bool>,
+        relay_toon: Option<bool>,
+        profile_js: Option<bool>,
+        profile_toon: Option<bool>,
+    ) {
         let relay = crate::config::RelayConfig {
             machine_name: "test".into(),
-            local_js_execution: None,
+            local_js_execution: relay_js,
             token_dir: None,
             allow_insecure_oauth: None,
-            toon_output: None,
+            toon_output: relay_toon,
             startup_init_timeout_secs: None,
         };
         let profile = crate::config::ProfileConfig {
             name: path.to_string(),
             path: path.to_string(),
             endpoints,
-            js_execution: None,
-            toon_output: None,
+            js_execution: profile_js,
+            toon_output: profile_toon,
         };
         state.profile_registry.rebuild(&[profile], &relay).await;
     }
@@ -2989,7 +3052,20 @@ mod tests {
                 Some("github".into()),
             )
             .await;
-        install_profile(&state, "work", vec!["gmail".into()]).await;
+        // R3.B: `ProfileContext::js_execution` is resolved at rebuild time
+        // from the relay config, not from the runtime atomic. Set the
+        // relay default to `Some(true)` so the profile inherits JS-on and
+        // advertises `execute_tools` in the catalog.
+        install_profile_with_flags(
+            &state,
+            "work",
+            vec!["gmail".into()],
+            Some(true),
+            None,
+            None,
+            None,
+        )
+        .await;
         let profile_ctx = state.profile_registry.get("work").await.unwrap();
 
         let body = JsonRpcBody {
@@ -3019,6 +3095,146 @@ mod tests {
             exec_desc.ends_with(" 1 servers connected via Endara Relay \u{2014} use search_tools to discover tools."),
             "execute_tools description must reflect profile's 1 endpoint: {exec_desc}"
         );
+    }
+
+    // Test-matrix row #12 — per-profile `toon_output = true` produces a
+    // TOON-encoded `list_tools` response even when the relay default
+    // (`relay.toon_output`) is off. Exercises the profile override path in
+    // `mcp_tools_call`.
+    #[tokio::test]
+    async fn profile_toon_on_encodes_toon_when_global_off() {
+        let state = test_app_state();
+        assert!(
+            !state.toon_enabled,
+            "test relies on global toon default being off"
+        );
+        install_profile_with_flags(&state, "work", vec![], None, Some(false), None, Some(true))
+            .await;
+        let resp = send_profile_request(
+            state,
+            "POST",
+            "/mcp/work",
+            Some(&json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "list_tools", "arguments": {}},
+                "id": 1
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        // TOON output for the `{ tools, total, limit, offset }` envelope is
+        // never valid JSON — it starts with field declarations, not `{`.
+        assert!(
+            serde_json::from_str::<Value>(text).is_err(),
+            "profile toon=on must yield TOON text, got JSON-parseable: {text}"
+        );
+        assert!(
+            text.contains("total:"),
+            "expected TOON field syntax in: {text}"
+        );
+    }
+
+    // Test-matrix row #13 — per-profile `toon_output = false` keeps the
+    // `list_tools` response as raw JSON even when the relay default
+    // (`relay.toon_output`) is on. Mirror of #12 for the override-off path.
+    #[tokio::test]
+    async fn profile_toon_off_keeps_json_when_global_on() {
+        let state = test_app_state();
+        install_profile_with_flags(&state, "work", vec![], None, Some(true), None, Some(false))
+            .await;
+        // Sanity: the global default the profile is overriding is actually on.
+        let global_ctx = state.profile_registry.get("work").await.unwrap();
+        assert!(!global_ctx.toon_output, "profile override must be off");
+        let resp = send_profile_request(
+            state,
+            "POST",
+            "/mcp/work",
+            Some(&json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "list_tools", "arguments": {}},
+                "id": 1
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value =
+            serde_json::from_str(text).expect("profile toon=off must yield JSON text");
+        assert!(
+            parsed["tools"].is_array(),
+            "expected `tools` array in JSON: {text}"
+        );
+    }
+
+    // R3.B — per-profile `js_execution = true` enables `execute_tools` and
+    // gates direct tool calls even when the relay default
+    // (`relay.local_js_execution`) is off. The `tools/call` for an unknown
+    // direct tool must surface the JS-mode rejection error, not the
+    // generic "unknown tool" path.
+    #[tokio::test]
+    async fn profile_js_on_rejects_direct_tool_calls_when_global_off() {
+        let state = test_app_state();
+        assert!(
+            !state.js_execution_mode.load(Ordering::Relaxed),
+            "test relies on global JS default being off"
+        );
+        install_profile_with_flags(&state, "work", vec![], Some(false), None, Some(true), None)
+            .await;
+        let resp = send_profile_request(
+            state,
+            "POST",
+            "/mcp/work",
+            Some(&json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "anything", "arguments": {}},
+                "id": 1
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let msg = body["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("JS execution mode"),
+            "expected JS-mode rejection, got: {body}"
+        );
+    }
+
+    // R3.B — per-profile `js_execution = false` hides `execute_tools` from
+    // the catalog even when the relay default (`relay.local_js_execution`)
+    // is on. Symmetric to the override-on test above.
+    #[tokio::test]
+    async fn profile_js_off_hides_execute_tools_when_global_on() {
+        let state = test_app_state();
+        install_profile_with_flags(&state, "work", vec![], Some(true), None, Some(false), None)
+            .await;
+        let resp = send_profile_request(
+            state,
+            "POST",
+            "/mcp/work",
+            Some(&json!({
+                "jsonrpc": "2.0",
+                "method": "tools/list",
+                "id": 1
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let tools = body["result"]["tools"].as_array().unwrap();
+        assert!(
+            tools.iter().all(|t| t["name"] != "execute_tools"),
+            "execute_tools must be hidden when profile js=off, got: {tools:?}"
+        );
+        // The non-JS meta-tools are still advertised.
+        assert!(tools.iter().any(|t| t["name"] == "list_tools"));
+        assert!(tools.iter().any(|t| t["name"] == "search_tools"));
     }
 
     // Profile path lookup is case-insensitive (R2.A: registry lowercases keys).
