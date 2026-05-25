@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use endara_relay::adapter::stdio::{StdioAdapter, StdioConfig};
 use endara_relay::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use endara_relay::js_sandbox::MetaToolHandler;
+use endara_relay::profile_registry::ProfileRegistry;
 use endara_relay::registry::AdapterRegistry;
 use endara_relay::server::{build_router, start_server, AppState};
 use serde_json::{json, Value};
@@ -46,6 +47,7 @@ async fn setup_server() -> (SocketAddr, AdapterRegistry, tokio::task::JoinHandle
         registry: registry.clone(),
         js_execution_mode: Arc::new(AtomicBool::new(false)),
         meta_tool_handler: Arc::new(MetaToolHandler::new(registry_arc, Duration::from_secs(30))),
+        profile_registry: Arc::new(ProfileRegistry::new(registry.clone())),
         oauth_flow_manager: None,
         token_manager: None,
         oauth_adapter_inners: None,
@@ -228,10 +230,12 @@ async fn setup_native_toon_server(toon_enabled: bool) -> (SocketAddr, tokio::tas
         .await;
 
     let registry_arc = Arc::new(registry.clone());
+    let profile_registry = Arc::new(ProfileRegistry::new(registry.clone()));
     let state = AppState {
         registry,
         js_execution_mode: Arc::new(AtomicBool::new(false)),
         meta_tool_handler: Arc::new(MetaToolHandler::new(registry_arc, Duration::from_secs(30))),
+        profile_registry,
         oauth_flow_manager: None,
         token_manager: None,
         oauth_adapter_inners: None,

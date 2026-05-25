@@ -1,5 +1,6 @@
 use crate::js_sandbox::MetaToolHandler;
 use crate::oauth::{OAuthFlowManager, OAuthSetupManager};
+use crate::profile_registry::ProfileRegistry;
 use crate::registry::AdapterRegistry;
 use crate::token_manager::TokenManager;
 use crate::OAuthAdapterInners;
@@ -32,6 +33,10 @@ pub struct AppState {
     pub registry: AdapterRegistry,
     pub js_execution_mode: Arc<AtomicBool>,
     pub meta_tool_handler: Arc<MetaToolHandler>,
+    /// Relay-wide profile registry. R2.B/R3.A wire profile-scoped routes
+    /// that resolve the active [`ProfileContext`] from the request path.
+    #[allow(dead_code)]
+    pub profile_registry: Arc<ProfileRegistry>,
     /// OAuth flow manager (shared with management routes).
     pub oauth_flow_manager: Option<Arc<OAuthFlowManager>>,
     /// Token manager for persisting OAuth tokens.
@@ -1148,10 +1153,12 @@ mod tests {
             Arc::new(registry.clone()),
             Duration::from_secs(5),
         ));
+        let profile_registry = Arc::new(ProfileRegistry::new(registry.clone()));
         AppState {
             registry,
             js_execution_mode: Arc::new(AtomicBool::new(false)),
             meta_tool_handler,
+            profile_registry,
             oauth_flow_manager: None,
             token_manager: None,
             oauth_adapter_inners: None,

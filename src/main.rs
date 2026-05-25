@@ -10,6 +10,7 @@ mod adapter;
 mod advertise;
 mod jsonrpc;
 mod prefix;
+mod profile_registry;
 mod registry;
 mod server;
 mod shell_env;
@@ -20,6 +21,7 @@ use adapter::{FailedAdapter, McpAdapter, StartingAdapter};
 use clap::{Parser, Subcommand, ValueEnum};
 use js_sandbox::MetaToolHandler;
 use oauth::{OAuthFlowManager, OAuthSetupManager};
+use profile_registry::ProfileRegistry;
 use registry::AdapterRegistry;
 use server::{build_router, start_server, AppState};
 use std::collections::HashMap;
@@ -574,6 +576,13 @@ async fn main() {
                 registry.clone(),
                 Duration::from_secs(30),
             ));
+            // Build the relay-wide profile registry. R3.A will populate
+            // `ProfileContext::meta_tool_handler` per profile; for now the
+            // registry just exposes filtered views of `AdapterRegistry`.
+            let profile_registry = Arc::new(ProfileRegistry::new((*registry).clone()));
+            profile_registry
+                .rebuild(cfg.profiles.as_deref().unwrap_or(&[]), &cfg.relay)
+                .await;
             let setup_manager = Arc::new(OAuthSetupManager::new());
             // TOON output: CLI `--no-toon` forces off; otherwise honour
             // `relay.toon_output` from config.toml; default on when neither
@@ -588,6 +597,7 @@ async fn main() {
                 registry: (*registry).clone(),
                 js_execution_mode: js_execution_mode.clone(),
                 meta_tool_handler,
+                profile_registry: profile_registry.clone(),
                 oauth_flow_manager: Some(oauth_flow_manager.clone()),
                 token_manager: Some(token_manager.clone()),
                 oauth_adapter_inners: Some(oauth_adapter_inners.clone()),
