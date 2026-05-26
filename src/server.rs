@@ -2836,42 +2836,32 @@ mod tests {
     }
 
     /// Populate `state.profile_registry` with a single profile whose path is
-    /// `path` and whose endpoint set is `endpoints`. JS execution and TOON
-    /// inherit from the relay defaults (off / on).
+    /// `path` and whose endpoint set is `endpoints`. JS execution defaults
+    /// to off and TOON output to on — matching the historical "inherit from
+    /// relay defaults" resolution callers relied on.
     async fn install_profile(state: &AppState, path: &str, endpoints: Vec<String>) {
-        install_profile_with_flags(state, path, endpoints, None, None, None, None).await;
+        install_profile_with_flags(state, path, endpoints, false, true).await;
     }
 
     /// Variant of [`install_profile`] that takes explicit `js_execution` /
-    /// `toon_output` overrides for both the relay defaults and the profile
-    /// itself. `None` on a profile field means "Inherit" — the resolved
-    /// `ProfileContext::js_execution` / `toon_output` then falls back to the
-    /// matching relay default (also passed in as `Option`).
+    /// `toon_output` values for the installed profile. Both fields are
+    /// required on the profile config; callers pick concrete booleans for
+    /// whichever path the test wants to exercise.
     async fn install_profile_with_flags(
         state: &AppState,
         path: &str,
         endpoints: Vec<String>,
-        relay_js: Option<bool>,
-        relay_toon: Option<bool>,
-        profile_js: Option<bool>,
-        profile_toon: Option<bool>,
+        js_execution: bool,
+        toon_output: bool,
     ) {
-        let relay = crate::config::RelayConfig {
-            machine_name: "test".into(),
-            local_js_execution: relay_js,
-            token_dir: None,
-            allow_insecure_oauth: None,
-            toon_output: relay_toon,
-            startup_init_timeout_secs: None,
-        };
         let profile = crate::config::ProfileConfig {
             name: path.to_string(),
             path: path.to_string(),
             endpoints,
-            js_execution: profile_js,
-            toon_output: profile_toon,
+            js_execution,
+            toon_output,
         };
-        state.profile_registry.rebuild(&[profile], &relay).await;
+        state.profile_registry.rebuild(&[profile]).await;
     }
 
     // Test-matrix row #24 — unknown profile path → 404 with JSON body.
@@ -3052,20 +3042,11 @@ mod tests {
                 Some("github".into()),
             )
             .await;
-        // R3.B: `ProfileContext::js_execution` is resolved at rebuild time
-        // from the relay config, not from the runtime atomic. Set the
-        // relay default to `Some(true)` so the profile inherits JS-on and
-        // advertises `execute_tools` in the catalog.
-        install_profile_with_flags(
-            &state,
-            "work",
-            vec!["gmail".into()],
-            Some(true),
-            None,
-            None,
-            None,
-        )
-        .await;
+        // R3.B: `ProfileContext::js_execution` is read directly from the
+        // profile config at rebuild time, not from the runtime atomic. Set
+        // it to `true` so this profile advertises `execute_tools` in the
+        // catalog.
+        install_profile_with_flags(&state, "work", vec!["gmail".into()], true, true).await;
         let profile_ctx = state.profile_registry.get("work").await.unwrap();
 
         let body = JsonRpcBody {
@@ -3108,8 +3089,7 @@ mod tests {
             !state.toon_enabled,
             "test relies on global toon default being off"
         );
-        install_profile_with_flags(&state, "work", vec![], None, Some(false), None, Some(true))
-            .await;
+        install_profile_with_flags(&state, "work", vec![], false, true).await;
         let resp = send_profile_request(
             state,
             "POST",
@@ -3143,11 +3123,10 @@ mod tests {
     #[tokio::test]
     async fn profile_toon_off_keeps_json_when_global_on() {
         let state = test_app_state();
-        install_profile_with_flags(&state, "work", vec![], None, Some(true), None, Some(false))
-            .await;
-        // Sanity: the global default the profile is overriding is actually on.
+        install_profile_with_flags(&state, "work", vec![], false, false).await;
+        // Sanity: the profile's TOON flag is off.
         let global_ctx = state.profile_registry.get("work").await.unwrap();
-        assert!(!global_ctx.toon_output, "profile override must be off");
+        assert!(!global_ctx.toon_output, "profile toon must be off");
         let resp = send_profile_request(
             state,
             "POST",
@@ -3183,8 +3162,7 @@ mod tests {
             !state.js_execution_mode.load(Ordering::Relaxed),
             "test relies on global JS default being off"
         );
-        install_profile_with_flags(&state, "work", vec![], Some(false), None, Some(true), None)
-            .await;
+        install_profile_with_flags(&state, "work", vec![], true, true).await;
         let resp = send_profile_request(
             state,
             "POST",
@@ -3212,8 +3190,7 @@ mod tests {
     #[tokio::test]
     async fn profile_js_off_hides_execute_tools_when_global_on() {
         let state = test_app_state();
-        install_profile_with_flags(&state, "work", vec![], Some(true), None, Some(false), None)
-            .await;
+        install_profile_with_flags(&state, "work", vec![], false, true).await;
         let resp = send_profile_request(
             state,
             "POST",

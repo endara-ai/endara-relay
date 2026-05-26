@@ -28,37 +28,27 @@ use serde_json::Value;
 use tokio::sync::{broadcast, RwLock};
 
 use crate::adapter::{AdapterError, ToolInfo};
-use crate::config::{ProfileConfig, RelayConfig};
+use crate::config::ProfileConfig;
 use crate::js_sandbox::MetaToolHandler;
 use crate::registry::{AdapterRegistry, MetaToolRegistry};
-
-/// Effective default for [`RelayConfig::local_js_execution`] when the field
-/// is omitted from `config.toml`. Mirrors the main.rs startup default.
-const DEFAULT_LOCAL_JS_EXECUTION: bool = false;
-
-/// Effective default for [`RelayConfig::toon_output`] when neither
-/// `--no-toon` nor the config field is set. Mirrors the main.rs startup
-/// default.
-const DEFAULT_TOON_OUTPUT: bool = true;
 
 /// Runtime state for a single resolved profile.
 ///
 /// Constructed by [`ProfileRegistry::rebuild`] and handed (as `Arc`) to the
 /// profile-scoped request handlers landing in R2.B. Per-profile JS-execution
-/// and TOON-output flags are pre-resolved here so handlers don't have to
-/// reach back into [`RelayConfig`].
+/// and TOON-output flags are copied verbatim from the profile config — the
+/// loader requires concrete booleans per spec §2.4, so handlers don't fall
+/// back to relay-wide defaults.
 pub struct ProfileContext {
     /// The original profile configuration this context was built from.
     pub config: ProfileConfig,
     /// Filtered view over the global [`AdapterRegistry`].
     pub registry_view: ProfileRegistryView,
-    /// Resolved per-profile JS-execution flag (inherited from
-    /// `RelayConfig::local_js_execution` when [`ProfileConfig::js_execution`]
-    /// is `None`).
+    /// Per-profile JS-execution flag (mirror of
+    /// [`ProfileConfig::js_execution`]).
     pub js_execution: bool,
-    /// Resolved per-profile TOON-output flag (inherited from
-    /// `RelayConfig::toon_output` when [`ProfileConfig::toon_output`] is
-    /// `None`).
+    /// Per-profile TOON-output flag (mirror of
+    /// [`ProfileConfig::toon_output`]).
     pub toon_output: bool,
     /// Per-profile [`MetaToolHandler`]. Populated by R3.A once
     /// `MetaToolHandler` is parameterised over a `MetaToolRegistry` trait
@@ -234,15 +224,10 @@ impl ProfileRegistry {
     ///
     /// The swap is atomic from the perspective of [`Self::get`] / [`Self::list`]
     /// callers: a single write-lock acquisition replaces the entire map.
-    /// Resolves per-profile `js_execution` and `toon_output` against
-    /// `relay_config`, falling back to the same defaults `main.rs` uses at
-    /// startup (`local_js_execution = false`, `toon_output = true`).
-    pub async fn rebuild(&self, profiles: &[ProfileConfig], relay_config: &RelayConfig) {
-        let global_js = relay_config
-            .local_js_execution
-            .unwrap_or(DEFAULT_LOCAL_JS_EXECUTION);
-        let global_toon = relay_config.toon_output.unwrap_or(DEFAULT_TOON_OUTPUT);
-
+    /// Per-profile `js_execution` and `toon_output` are copied straight from
+    /// the profile config — the loader (`validate_profiles`) requires those
+    /// fields to be present, so there is no fallback to relay-wide defaults.
+    pub async fn rebuild(&self, profiles: &[ProfileConfig]) {
         let mut new_map: HashMap<String, Arc<ProfileContext>> = HashMap::new();
         for profile in profiles {
             let allowed: HashSet<String> = profile.endpoints.iter().cloned().collect();
@@ -255,8 +240,8 @@ impl ProfileRegistry {
             let ctx = ProfileContext {
                 config: profile.clone(),
                 registry_view: view,
-                js_execution: profile.js_execution.unwrap_or(global_js),
-                toon_output: profile.toon_output.unwrap_or(global_toon),
+                js_execution: profile.js_execution,
+                toon_output: profile.toon_output,
                 meta_tool_handler: Some(Arc::new(handler)),
             };
             new_map.insert(profile.path.to_ascii_lowercase(), Arc::new(ctx));
@@ -328,17 +313,6 @@ mod tests {
         }
     }
 
-    fn relay_cfg() -> RelayConfig {
-        RelayConfig {
-            machine_name: "test".into(),
-            local_js_execution: None,
-            token_dir: None,
-            allow_insecure_oauth: None,
-            toon_output: None,
-            startup_init_timeout_secs: None,
-        }
-    }
-
     async fn registry_with_four_endpoints() -> AdapterRegistry {
         let registry = AdapterRegistry::new();
         for (name, tool_name) in [
@@ -368,16 +342,13 @@ mod tests {
     async fn scoped_catalog_includes_only_profile_endpoints() {
         let registry = registry_with_four_endpoints().await;
         let pr = ProfileRegistry::new(registry);
-        pr.rebuild(
-            &[ProfileConfig {
-                name: "Work".into(),
-                path: "work".into(),
-                endpoints: vec!["gmail".into(), "linear".into()],
-                js_execution: None,
-                toon_output: None,
-            }],
-            &relay_cfg(),
-        )
+        pr.rebuild(&[ProfileConfig {
+            name: "Work".into(),
+            path: "work".into(),
+            endpoints: vec!["gmail".into(), "linear".into()],
+            js_execution: false,
+            toon_output: true,
+        }])
         .await;
 
         let ctx = pr.get("work").await.expect("profile should exist");
@@ -395,16 +366,13 @@ mod tests {
     async fn route_tool_call_rejects_out_of_profile_tool() {
         let registry = registry_with_four_endpoints().await;
         let pr = ProfileRegistry::new(registry);
-        pr.rebuild(
-            &[ProfileConfig {
-                name: "Work".into(),
-                path: "work".into(),
-                endpoints: vec!["gmail".into(), "linear".into()],
-                js_execution: None,
-                toon_output: None,
-            }],
-            &relay_cfg(),
-        )
+        pr.rebuild(&[ProfileConfig {
+            name: "Work".into(),
+            path: "work".into(),
+            endpoints: vec!["gmail".into(), "linear".into()],
+            js_execution: false,
+            toon_output: true,
+        }])
         .await;
 
         let ctx = pr.get("work").await.unwrap();
@@ -430,16 +398,13 @@ mod tests {
     async fn route_tool_call_succeeds_for_in_profile_tool() {
         let registry = registry_with_four_endpoints().await;
         let pr = ProfileRegistry::new(registry);
-        pr.rebuild(
-            &[ProfileConfig {
-                name: "Work".into(),
-                path: "work".into(),
-                endpoints: vec!["gmail".into(), "linear".into()],
-                js_execution: None,
-                toon_output: None,
-            }],
-            &relay_cfg(),
-        )
+        pr.rebuild(&[ProfileConfig {
+            name: "Work".into(),
+            path: "work".into(),
+            endpoints: vec!["gmail".into(), "linear".into()],
+            js_execution: false,
+            toon_output: true,
+        }])
         .await;
 
         let ctx = pr.get("work").await.unwrap();
@@ -455,16 +420,13 @@ mod tests {
     #[tokio::test]
     async fn get_is_case_insensitive() {
         let pr = ProfileRegistry::new(AdapterRegistry::new());
-        pr.rebuild(
-            &[ProfileConfig {
-                name: "Work".into(),
-                path: "Work-Stuff".into(),
-                endpoints: vec![],
-                js_execution: None,
-                toon_output: None,
-            }],
-            &relay_cfg(),
-        )
+        pr.rebuild(&[ProfileConfig {
+            name: "Work".into(),
+            path: "Work-Stuff".into(),
+            endpoints: vec![],
+            js_execution: false,
+            toon_output: true,
+        }])
         .await;
 
         assert!(pr.get("work-stuff").await.is_some());
@@ -476,29 +438,23 @@ mod tests {
     #[tokio::test]
     async fn rebuild_swaps_atomically() {
         let pr = ProfileRegistry::new(AdapterRegistry::new());
-        pr.rebuild(
-            &[ProfileConfig {
-                name: "A".into(),
-                path: "a".into(),
-                endpoints: vec![],
-                js_execution: None,
-                toon_output: None,
-            }],
-            &relay_cfg(),
-        )
+        pr.rebuild(&[ProfileConfig {
+            name: "A".into(),
+            path: "a".into(),
+            endpoints: vec![],
+            js_execution: false,
+            toon_output: true,
+        }])
         .await;
         assert!(pr.get("a").await.is_some());
 
-        pr.rebuild(
-            &[ProfileConfig {
-                name: "B".into(),
-                path: "b".into(),
-                endpoints: vec![],
-                js_execution: None,
-                toon_output: None,
-            }],
-            &relay_cfg(),
-        )
+        pr.rebuild(&[ProfileConfig {
+            name: "B".into(),
+            path: "b".into(),
+            endpoints: vec![],
+            js_execution: false,
+            toon_output: true,
+        }])
         .await;
         assert!(pr.get("a").await.is_none(), "old profile must be evicted");
         assert!(pr.get("b").await.is_some());
@@ -506,44 +462,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolves_js_and_toon_inheritance() {
+    async fn rebuild_copies_js_and_toon_from_profile() {
         let pr = ProfileRegistry::new(AdapterRegistry::new());
-        let relay = RelayConfig {
-            machine_name: "test".into(),
-            local_js_execution: Some(true),
-            token_dir: None,
-            allow_insecure_oauth: None,
-            toon_output: Some(false),
-            startup_init_timeout_secs: None,
-        };
-        pr.rebuild(
-            &[
-                ProfileConfig {
-                    name: "Inherit".into(),
-                    path: "inherit".into(),
-                    endpoints: vec![],
-                    js_execution: None,
-                    toon_output: None,
-                },
-                ProfileConfig {
-                    name: "Override".into(),
-                    path: "override".into(),
-                    endpoints: vec![],
-                    js_execution: Some(false),
-                    toon_output: Some(true),
-                },
-            ],
-            &relay,
-        )
+        pr.rebuild(&[
+            ProfileConfig {
+                name: "On".into(),
+                path: "on".into(),
+                endpoints: vec![],
+                js_execution: true,
+                toon_output: false,
+            },
+            ProfileConfig {
+                name: "Off".into(),
+                path: "off".into(),
+                endpoints: vec![],
+                js_execution: false,
+                toon_output: true,
+            },
+        ])
         .await;
 
-        let inherit = pr.get("inherit").await.unwrap();
-        assert!(inherit.js_execution, "should inherit relay's true");
-        assert!(!inherit.toon_output, "should inherit relay's false");
+        let on = pr.get("on").await.unwrap();
+        assert!(on.js_execution);
+        assert!(!on.toon_output);
 
-        let override_ctx = pr.get("override").await.unwrap();
-        assert!(!override_ctx.js_execution);
-        assert!(override_ctx.toon_output);
+        let off = pr.get("off").await.unwrap();
+        assert!(!off.js_execution);
+        assert!(off.toon_output);
     }
 
     /// R3.A: every profile gets its own [`MetaToolHandler`] at rebuild
@@ -552,16 +497,13 @@ mod tests {
     #[tokio::test]
     async fn rebuild_populates_per_profile_meta_tool_handler() {
         let pr = ProfileRegistry::new(AdapterRegistry::new());
-        pr.rebuild(
-            &[ProfileConfig {
-                name: "P".into(),
-                path: "p".into(),
-                endpoints: vec![],
-                js_execution: None,
-                toon_output: None,
-            }],
-            &relay_cfg(),
-        )
+        pr.rebuild(&[ProfileConfig {
+            name: "P".into(),
+            path: "p".into(),
+            endpoints: vec![],
+            js_execution: false,
+            toon_output: true,
+        }])
         .await;
         assert!(pr.get("p").await.unwrap().meta_tool_handler.is_some());
     }
@@ -572,16 +514,13 @@ mod tests {
     async fn per_profile_handler_scopes_list_tools() {
         let registry = registry_with_four_endpoints().await;
         let pr = ProfileRegistry::new(registry);
-        pr.rebuild(
-            &[ProfileConfig {
-                name: "Work".into(),
-                path: "work".into(),
-                endpoints: vec!["gmail".into(), "linear".into()],
-                js_execution: None,
-                toon_output: None,
-            }],
-            &relay_cfg(),
-        )
+        pr.rebuild(&[ProfileConfig {
+            name: "Work".into(),
+            path: "work".into(),
+            endpoints: vec!["gmail".into(), "linear".into()],
+            js_execution: false,
+            toon_output: true,
+        }])
         .await;
 
         let ctx = pr.get("work").await.unwrap();
@@ -619,16 +558,13 @@ mod tests {
     async fn per_profile_handler_scopes_search_tools() {
         let registry = registry_with_four_endpoints().await;
         let pr = ProfileRegistry::new(registry);
-        pr.rebuild(
-            &[ProfileConfig {
-                name: "Work".into(),
-                path: "work".into(),
-                endpoints: vec!["gmail".into(), "linear".into()],
-                js_execution: None,
-                toon_output: None,
-            }],
-            &relay_cfg(),
-        )
+        pr.rebuild(&[ProfileConfig {
+            name: "Work".into(),
+            path: "work".into(),
+            endpoints: vec!["gmail".into(), "linear".into()],
+            js_execution: false,
+            toon_output: true,
+        }])
         .await;
 
         let ctx = pr.get("work").await.unwrap();
@@ -693,16 +629,13 @@ mod tests {
     async fn per_profile_handler_execute_tools_rejects_out_of_profile_call() {
         let registry = registry_with_four_endpoints().await;
         let pr = ProfileRegistry::with_sandbox_timeout(registry, Duration::from_secs(5));
-        pr.rebuild(
-            &[ProfileConfig {
-                name: "Work".into(),
-                path: "work".into(),
-                endpoints: vec!["gmail".into(), "linear".into()],
-                js_execution: None,
-                toon_output: None,
-            }],
-            &relay_cfg(),
-        )
+        pr.rebuild(&[ProfileConfig {
+            name: "Work".into(),
+            path: "work".into(),
+            endpoints: vec!["gmail".into(), "linear".into()],
+            js_execution: false,
+            toon_output: true,
+        }])
         .await;
 
         let ctx = pr.get("work").await.unwrap();

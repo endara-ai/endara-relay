@@ -2311,16 +2311,18 @@ async fn oauth_setup_cancel(
 // ---------------------------------------------------------------------------
 
 /// Request body for `POST /api/profiles` and `PUT /api/profiles/{path}`.
+///
+/// `js_execution` and `toon_output` are required: requests that omit (or
+/// send `null` for) either field are rejected at deserialization time by
+/// the axum `Json` extractor.
 #[derive(Deserialize)]
 pub struct ProfileRequest {
     pub name: String,
     pub path: String,
     #[serde(default)]
     pub endpoints: Vec<String>,
-    #[serde(default)]
-    pub js_execution: Option<bool>,
-    #[serde(default)]
-    pub toon_output: Option<bool>,
+    pub js_execution: bool,
+    pub toon_output: bool,
 }
 
 /// Summary shape returned by `GET /api/profiles` and `POST /api/profiles`.
@@ -2330,11 +2332,11 @@ pub struct ProfileSummary {
     pub name: String,
     pub path: String,
     pub endpoints: Vec<String>,
-    /// Resolved per-profile JS-execution flag (falls back to
-    /// `RelayConfig::local_js_execution` when the profile leaves it unset).
+    /// Per-profile JS-execution flag (mirror of
+    /// [`crate::config::ProfileConfig::js_execution`]).
     pub js_execution: bool,
-    /// Resolved per-profile TOON output flag (falls back to
-    /// `RelayConfig::toon_output`).
+    /// Per-profile TOON output flag (mirror of
+    /// [`crate::config::ProfileConfig::toon_output`]).
     pub toon_output: bool,
     pub endpoint_count: usize,
     pub tool_count: usize,
@@ -2347,19 +2349,6 @@ pub struct ProfileDetail {
     #[serde(flatten)]
     pub summary: ProfileSummary,
     pub tools: Vec<CatalogEntry>,
-}
-
-/// Resolve a request's `js_execution` / `toon_output` against the same
-/// fallbacks `ProfileRegistry::rebuild` uses, so the JSON shape matches what
-/// the live registry will report.
-fn resolve_profile_flags(profile: &crate::config::ProfileConfig, cfg: &Config) -> (bool, bool) {
-    let js = profile
-        .js_execution
-        .unwrap_or_else(|| cfg.relay.local_js_execution.unwrap_or(false));
-    let toon = profile
-        .toon_output
-        .unwrap_or_else(|| cfg.relay.toon_output.unwrap_or(true));
-    (js, toon)
 }
 
 /// Look up the live tool count for a profile (post-rebuild). Returns 0 when
@@ -2377,17 +2366,15 @@ async fn profile_tool_count(state: &ManagementState, path: &str) -> usize {
 /// Build a [`ProfileSummary`] from a [`crate::config::ProfileConfig`].
 async fn build_profile_summary(
     state: &ManagementState,
-    cfg: &Config,
     profile: &crate::config::ProfileConfig,
 ) -> ProfileSummary {
-    let (js, toon) = resolve_profile_flags(profile, cfg);
     let tool_count = profile_tool_count(state, &profile.path).await;
     ProfileSummary {
         name: profile.name.clone(),
         path: profile.path.clone(),
         endpoints: profile.endpoints.clone(),
-        js_execution: js,
-        toon_output: toon,
+        js_execution: profile.js_execution,
+        toon_output: profile.toon_output,
         endpoint_count: profile.endpoints.len(),
         tool_count,
     }
@@ -2545,17 +2532,16 @@ async fn apply_profiles_change(
     // R4.B will additionally rebuild on file-watcher events; for the
     // self-written change we do it inline so the response reflects the
     // post-write state without waiting on the watcher debounce.
-    let relay_clone = {
+    {
         let mut cfg = state.config.write().await;
         cfg.profiles = if new_profiles.is_empty() {
             None
         } else {
             Some(new_profiles.clone())
         };
-        cfg.relay.clone()
-    };
+    }
     if let Some(ref pr) = state.profile_registry {
-        pr.rebuild(&new_profiles, &relay_clone).await;
+        pr.rebuild(&new_profiles).await;
     }
     Ok(())
 }
@@ -2564,9 +2550,10 @@ async fn apply_profiles_change(
 async fn list_profiles(State(state): State<ManagementState>) -> impl IntoResponse {
     let cfg = state.config.read().await;
     let profiles = cfg.profiles.clone().unwrap_or_default();
+    drop(cfg);
     let mut out: Vec<ProfileSummary> = Vec::with_capacity(profiles.len());
     for p in &profiles {
-        out.push(build_profile_summary(&state, &cfg, p).await);
+        out.push(build_profile_summary(&state, p).await);
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     Json(out).into_response()
@@ -2587,8 +2574,7 @@ async fn create_profile(
     if let Err(resp) = apply_profiles_change(&state, profiles).await {
         return *resp;
     }
-    let cfg = state.config.read().await;
-    let summary = build_profile_summary(&state, &cfg, &new_profile).await;
+    let summary = build_profile_summary(&state, &new_profile).await;
     (StatusCode::CREATED, Json(summary)).into_response()
 }
 
@@ -2615,7 +2601,8 @@ async fn get_profile(
         )
         .into_response();
     };
-    let summary = build_profile_summary(&state, &cfg, &profile).await;
+    drop(cfg);
+    let summary = build_profile_summary(&state, &profile).await;
     // Build a profile-scoped CatalogEntry list. When no profile_registry is
     // wired (legacy test fixtures), the catalog is empty.
     let tools: Vec<CatalogEntry> = if let Some(ref pr) = state.profile_registry {
@@ -2696,8 +2683,7 @@ async fn update_profile(
     if let Err(resp) = apply_profiles_change(&state, profiles).await {
         return *resp;
     }
-    let cfg = state.config.read().await;
-    let summary = build_profile_summary(&state, &cfg, &updated).await;
+    let summary = build_profile_summary(&state, &updated).await;
     (StatusCode::OK, Json(summary)).into_response()
 }
 
@@ -5954,7 +5940,7 @@ client_id = "client123"
         std::fs::write(config_file, toml_str).unwrap();
 
         let profile_registry = Arc::new(ProfileRegistry::new((*registry_arc).clone()));
-        profile_registry.rebuild(&[], &cfg.relay).await;
+        profile_registry.rebuild(&[]).await;
 
         ManagementState {
             registry: registry_arc,
@@ -6211,22 +6197,34 @@ client_id = "client123"
         let cases: &[(&str, serde_json::Value, StatusCode)] = &[
             (
                 "empty name",
-                serde_json::json!({ "name": "", "path": "work", "endpoints": [] }),
+                serde_json::json!({
+                    "name": "", "path": "work", "endpoints": [],
+                    "js_execution": false, "toon_output": true,
+                }),
                 StatusCode::BAD_REQUEST,
             ),
             (
                 "reserved path",
-                serde_json::json!({ "name": "X", "path": "sse", "endpoints": [] }),
+                serde_json::json!({
+                    "name": "X", "path": "sse", "endpoints": [],
+                    "js_execution": false, "toon_output": true,
+                }),
                 StatusCode::BAD_REQUEST,
             ),
             (
                 "invalid path characters",
-                serde_json::json!({ "name": "X", "path": "with space", "endpoints": [] }),
+                serde_json::json!({
+                    "name": "X", "path": "with space", "endpoints": [],
+                    "js_execution": false, "toon_output": true,
+                }),
                 StatusCode::BAD_REQUEST,
             ),
             (
                 "unknown endpoint reference",
-                serde_json::json!({ "name": "X", "path": "x", "endpoints": ["nonexistent"] }),
+                serde_json::json!({
+                    "name": "X", "path": "x", "endpoints": ["nonexistent"],
+                    "js_execution": false, "toon_output": true,
+                }),
                 StatusCode::BAD_REQUEST,
             ),
         ];
@@ -6277,6 +6275,8 @@ client_id = "client123"
                             "name": "Ghost",
                             "path": "ghost",
                             "endpoints": [],
+                            "js_execution": false,
+                            "toon_output": true,
                         })
                         .to_string(),
                     ))
@@ -6298,6 +6298,8 @@ client_id = "client123"
                                 "name": name,
                                 "path": path,
                                 "endpoints": [],
+                                "js_execution": false,
+                                "toon_output": true,
                             })
                             .to_string(),
                         ))
@@ -6316,6 +6318,8 @@ client_id = "client123"
                             "name": "B",
                             "path": "ALPHA",
                             "endpoints": [],
+                            "js_execution": false,
+                            "toon_output": true,
                         })
                         .to_string(),
                     ))
@@ -6327,6 +6331,73 @@ client_id = "client123"
             resp.status(),
             StatusCode::CONFLICT,
             "rename onto existing path must 409 (case-insensitive)"
+        );
+    }
+
+    /// `POST /api/profiles` with a body that omits (or nulls out)
+    /// `js_execution` / `toon_output` is rejected by the JSON extractor
+    /// with a 4xx, and never touches `config.toml` on disk.
+    #[tokio::test]
+    async fn management_profiles_post_rejects_missing_js_toon_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let state = profiles_test_state(&["gmail"], &config_file).await;
+        let app = management_routes(state);
+        let before = std::fs::read_to_string(&config_file).unwrap();
+
+        let cases: &[(&str, serde_json::Value)] = &[
+            (
+                "missing js_execution",
+                serde_json::json!({
+                    "name": "Work", "path": "work", "endpoints": [],
+                    "toon_output": true,
+                }),
+            ),
+            (
+                "missing toon_output",
+                serde_json::json!({
+                    "name": "Work", "path": "work", "endpoints": [],
+                    "js_execution": false,
+                }),
+            ),
+            (
+                "null js_execution",
+                serde_json::json!({
+                    "name": "Work", "path": "work", "endpoints": [],
+                    "js_execution": null, "toon_output": true,
+                }),
+            ),
+            (
+                "null toon_output",
+                serde_json::json!({
+                    "name": "Work", "path": "work", "endpoints": [],
+                    "js_execution": false, "toon_output": null,
+                }),
+            ),
+        ];
+        for (label, body) in cases {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/profiles")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let s = resp.status();
+            assert!(
+                s.is_client_error(),
+                "case '{}' should reject with a 4xx, got {}",
+                label,
+                s
+            );
+        }
+        let after = std::fs::read_to_string(&config_file).unwrap();
+        assert_eq!(
+            before, after,
+            "rejected POSTs must not write to config.toml"
         );
     }
 }

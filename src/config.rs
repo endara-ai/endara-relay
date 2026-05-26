@@ -90,17 +90,15 @@ pub struct ProfileConfig {
     /// registry layer.
     #[serde(default)]
     pub endpoints: Vec<String>,
-    /// Per-profile JS-execution mode. When `Some(true)`, this profile's
+    /// Per-profile JS-execution mode. When `true`, this profile's
     /// `/mcp/{path}` exposes the meta-tools (`list_tools`, `search_tools`,
-    /// `execute_tools`) and hides direct tool calls. When `None`, inherits
-    /// from [`RelayConfig::local_js_execution`].
-    #[serde(default)]
-    pub js_execution: Option<bool>,
-    /// Per-profile TOON output. When `Some(true)`, tool responses on this
-    /// profile are converted to TOON. When `None`, inherits from
-    /// [`RelayConfig::toon_output`].
-    #[serde(default)]
-    pub toon_output: Option<bool>,
+    /// `execute_tools`) and hides direct tool calls. Required: the loader
+    /// rejects configs whose profile block omits this field.
+    pub js_execution: bool,
+    /// Per-profile TOON output. When `true`, tool responses on this profile
+    /// are converted to TOON. Required: the loader rejects configs whose
+    /// profile block omits this field.
+    pub toon_output: bool,
 }
 
 /// Validate a profile path slug.
@@ -1331,6 +1329,8 @@ toon_output = true
 name = "Personal"
 path = "personal"
 endpoints = ["gmail"]
+js_execution = false
+toon_output = false
 "#;
         let config = parse_and_validate(toml_str).expect("config should parse");
         let profiles = config.profiles.expect("profiles should be present");
@@ -1338,10 +1338,10 @@ endpoints = ["gmail"]
         assert_eq!(profiles[0].name, "Work");
         assert_eq!(profiles[0].path, "work");
         assert_eq!(profiles[0].endpoints, vec!["gmail", "linear"]);
-        assert_eq!(profiles[0].js_execution, Some(true));
-        assert_eq!(profiles[0].toon_output, Some(true));
-        assert_eq!(profiles[1].js_execution, None);
-        assert_eq!(profiles[1].toon_output, None);
+        assert!(profiles[0].js_execution);
+        assert!(profiles[0].toon_output);
+        assert!(!profiles[1].js_execution);
+        assert!(!profiles[1].toon_output);
     }
 
     /// §11 row #5 — profile referencing a non-existent endpoint is a startup error.
@@ -1360,6 +1360,8 @@ command = "echo"
 name = "Work"
 path = "work"
 endpoints = ["gmail", "ghost"]
+js_execution = false
+toon_output = true
 "#;
         let err = parse_and_validate(toml_str).unwrap_err();
         match err {
@@ -1389,10 +1391,14 @@ machine_name = "test"
 [[profiles]]
 name = "Lower"
 path = "shared"
+js_execution = false
+toon_output = true
 
 [[profiles]]
 name = "Upper"
 path = "SHARED"
+js_execution = false
+toon_output = true
 "#;
         let err = parse_and_validate(toml_str).unwrap_err();
         match err {
@@ -1417,6 +1423,8 @@ machine_name = "test"
 [[profiles]]
 name = "Bad"
 path = "sse"
+js_execution = false
+toon_output = true
 "#;
         let err = parse_and_validate_graceful(toml_str).unwrap_err();
         match err {
@@ -1441,10 +1449,14 @@ machine_name = "test"
 [[profiles]]
 name = "Work"
 path = "work-a"
+js_execution = false
+toon_output = true
 
 [[profiles]]
 name = "Work"
 path = "work-b"
+js_execution = false
+toon_output = true
 "#;
         let err = parse_and_validate(toml_str).unwrap_err();
         match err {
@@ -1469,9 +1481,65 @@ machine_name = "test"
 [[profiles]]
 name = "Empty"
 path = "empty"
+js_execution = false
+toon_output = true
 "#;
         let config = parse_and_validate(toml_str).expect("empty profile should be valid");
         assert_eq!(config.profiles.as_ref().unwrap()[0].endpoints.len(), 0);
+    }
+
+    /// A profile block missing `js_execution` is rejected at parse time —
+    /// the loader treats the omission as a config error rather than silently
+    /// falling back to a default.
+    #[test]
+    fn profile_missing_js_execution_is_parse_error() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[profiles]]
+name = "Work"
+path = "work"
+toon_output = true
+"#;
+        let err = parse_and_validate(toml_str).unwrap_err();
+        match err {
+            ConfigError::ParseError(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("js_execution"),
+                    "parse error should mention js_execution: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected ParseError, got: {:?}", other),
+        }
+    }
+
+    /// A profile block missing `toon_output` is rejected at parse time.
+    #[test]
+    fn profile_missing_toon_output_is_parse_error() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[profiles]]
+name = "Work"
+path = "work"
+js_execution = false
+"#;
+        let err = parse_and_validate(toml_str).unwrap_err();
+        match err {
+            ConfigError::ParseError(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("toon_output"),
+                    "parse error should mention toon_output: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected ParseError, got: {:?}", other),
+        }
     }
 
     // --- Config diff tests ---

@@ -581,7 +581,7 @@ async fn main() {
             // registry just exposes filtered views of `AdapterRegistry`.
             let profile_registry = Arc::new(ProfileRegistry::new((*registry).clone()));
             profile_registry
-                .rebuild(cfg.profiles.as_deref().unwrap_or(&[]), &cfg.relay)
+                .rebuild(cfg.profiles.as_deref().unwrap_or(&[]))
                 .await;
             let setup_manager = Arc::new(OAuthSetupManager::new());
             // TOON output: CLI `--no-toon` forces off; otherwise honour

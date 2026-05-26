@@ -201,10 +201,7 @@ async fn reload_and_apply(
     // write-lock swap so requests in flight see either the old or the new
     // map atomically.
     profile_registry
-        .rebuild(
-            new_config.profiles.as_deref().unwrap_or(&[]),
-            &new_config.relay,
-        )
+        .rebuild(new_config.profiles.as_deref().unwrap_or(&[]))
         .await;
 
     // Update baseline.
@@ -1767,7 +1764,7 @@ mod tests {
                 // Mirror main.rs: rebuild once at startup against the initial
                 // config so the watcher's first reload sees a populated map.
                 profile_registry
-                    .rebuild(initial.profiles.as_deref().unwrap_or(&[]), &initial.relay)
+                    .rebuild(initial.profiles.as_deref().unwrap_or(&[]))
                     .await;
 
                 let current_config = Arc::new(Mutex::new(initial));
@@ -1808,6 +1805,8 @@ command = "/bin/true"
 name = "Work"
 path = "work"
 endpoints = ["ep1"]
+js_execution = false
+toon_output = true
 "#;
 
             /// Matrix #18: adding a `[[profiles]]` block to `config.toml`
@@ -1914,6 +1913,8 @@ command = "/bin/true"
 name = "Broken"
 path = "broken"
 endpoints = ["does-not-exist"]
+js_execution = false
+toon_output = true
 "#;
                 std::fs::write(&path, invalid).unwrap();
 
