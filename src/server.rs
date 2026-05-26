@@ -1,10 +1,11 @@
 use crate::js_sandbox::MetaToolHandler;
 use crate::oauth::{OAuthFlowManager, OAuthSetupManager};
+use crate::profile_registry::{ProfileContext, ProfileRegistry};
 use crate::registry::AdapterRegistry;
 use crate::token_manager::TokenManager;
 use crate::OAuthAdapterInners;
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{
         sse::{Event, KeepAlive},
@@ -32,6 +33,10 @@ pub struct AppState {
     pub registry: AdapterRegistry,
     pub js_execution_mode: Arc<AtomicBool>,
     pub meta_tool_handler: Arc<MetaToolHandler>,
+    /// Relay-wide profile registry. R2.B/R3.A wire profile-scoped routes
+    /// that resolve the active [`ProfileContext`] from the request path.
+    #[allow(dead_code)]
+    pub profile_registry: Arc<ProfileRegistry>,
     /// OAuth flow manager (shared with management routes).
     pub oauth_flow_manager: Option<Arc<OAuthFlowManager>>,
     /// Token manager for persisting OAuth tokens.
@@ -95,9 +100,15 @@ fn jsonrpc_error(id: Option<Value>, code: i64, message: &str) -> (StatusCode, Js
 }
 
 /// POST /mcp/initialize
+///
+/// `profile_ctx` is `Some` when the request arrived through a wildcard
+/// `/mcp/{profile}` route — `instructions` is then rendered against the
+/// profile's allowed endpoint set so only that profile's server types are
+/// advertised. `None` for the global `/mcp` path.
 async fn mcp_initialize(
     State(state): State<AppState>,
     Json(body): Json<JsonRpcBody>,
+    profile_ctx: Option<&ProfileContext>,
 ) -> Json<Value> {
     let mut result = json!({
         "protocolVersion": "2025-03-26",
@@ -109,7 +120,11 @@ async fn mcp_initialize(
             "version": env!("CARGO_PKG_VERSION")
         }
     });
-    if let Some(instructions) = crate::advertise::instructions(&state.registry).await {
+    let instructions = match profile_ctx {
+        Some(ctx) => crate::advertise::instructions_for_profile(&ctx.registry_view).await,
+        None => crate::advertise::instructions(&state.registry).await,
+    };
+    if let Some(instructions) = instructions {
         result["instructions"] = Value::String(instructions);
     }
     jsonrpc_response(body.id, result)
@@ -124,14 +139,29 @@ async fn mcp_initialize(
 ///
 /// The descriptions are built dynamically against the supplied [`AdapterRegistry`]
 /// so each `tools/list` response advertises the currently-Healthy server set
-/// (see `crate::advertise`).
+/// (see `crate::advertise`). When `profile_ctx` is `Some`, the `_for_profile`
+/// description builders are used so descriptions only mention server types
+/// inside the profile's allowed endpoint set.
 async fn meta_tool_definitions(
     js_mode: bool,
     registry: &AdapterRegistry,
     toon_enabled: bool,
+    profile_ctx: Option<&ProfileContext>,
 ) -> Vec<Value> {
-    let list_desc = crate::advertise::list_tools_description(registry).await;
-    let search_desc = crate::advertise::search_tools_description(registry, toon_enabled).await;
+    let (list_desc, search_desc) = match profile_ctx {
+        Some(ctx) => (
+            crate::advertise::list_tools_description_for_profile(&ctx.registry_view).await,
+            crate::advertise::search_tools_description_for_profile(
+                &ctx.registry_view,
+                toon_enabled,
+            )
+            .await,
+        ),
+        None => (
+            crate::advertise::list_tools_description(registry).await,
+            crate::advertise::search_tools_description(registry, toon_enabled).await,
+        ),
+    };
     let mut tools = vec![
         json!({
             "name": "list_tools",
@@ -160,7 +190,12 @@ async fn meta_tool_definitions(
     if !js_mode {
         return tools;
     }
-    let execute_desc = crate::advertise::execute_tools_description(registry).await;
+    let execute_desc = match profile_ctx {
+        Some(ctx) => {
+            crate::advertise::execute_tools_description_for_profile(&ctx.registry_view).await
+        }
+        None => crate::advertise::execute_tools_description(registry).await,
+    };
     tools.push(json!({
         "name": "execute_tools",
         "description": execute_desc,
@@ -176,12 +211,30 @@ async fn meta_tool_definitions(
 }
 
 /// POST /mcp/tools/list
+///
+/// `profile_ctx` threads the resolved [`ProfileContext`] from the wildcard
+/// `/mcp/{profile}` route so meta-tool descriptions advertise only the
+/// profile's server types. `None` for the global `/mcp` path. R3.A owns
+/// the catalog filtering itself (line 199 below).
+///
+/// Per-profile `js_execution` and `toon_output` (R3.B) override the global
+/// [`AppState::js_execution_mode`] and [`AppState::toon_enabled`] toggles
+/// whenever `profile_ctx` is `Some`. `ProfileContext` already pre-resolves
+/// the `Inherit | On | Off` semantics (`None` falls back to the global flag
+/// at rebuild time), so the gate sites just read the resolved `bool`.
 async fn mcp_tools_list(
     State(state): State<AppState>,
     Json(body): Json<JsonRpcBody>,
+    profile_ctx: Option<&ProfileContext>,
 ) -> Json<Value> {
-    let js_mode = state.js_execution_mode.load(Ordering::Relaxed);
-    let meta_tools = meta_tool_definitions(js_mode, &state.registry, state.toon_enabled).await;
+    let js_mode = profile_ctx
+        .map(|c| c.js_execution)
+        .unwrap_or_else(|| state.js_execution_mode.load(Ordering::Relaxed));
+    let toon_enabled = profile_ctx
+        .map(|c| c.toon_output)
+        .unwrap_or(state.toon_enabled);
+    let meta_tools =
+        meta_tool_definitions(js_mode, &state.registry, toon_enabled, profile_ctx).await;
 
     let tools: Vec<Value> = if js_mode {
         // JS execution mode: only the 3 meta-tools (incl. execute_tools)
@@ -220,9 +273,18 @@ async fn mcp_tools_list(
 }
 
 /// POST /mcp/tools/call
+///
+/// `profile_ctx` is `Some` for the wildcard `/mcp/{profile}` route and
+/// `None` for the global `/mcp` (and legacy `/mcp/tools/call`) path. When
+/// present, per-profile `js_execution` and `toon_output` (R3.B) override
+/// the global [`AppState::js_execution_mode`] / [`AppState::toon_enabled`]
+/// toggles, and the per-profile [`MetaToolHandler`] handles the meta-tool
+/// dispatch so list/search/execute see only the profile's allowed
+/// endpoints.
 async fn mcp_tools_call(
     State(state): State<AppState>,
     Json(body): Json<JsonRpcBody>,
+    profile_ctx: Option<&ProfileContext>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let params = body.params.unwrap_or(json!({}));
     let tool_name = params
@@ -231,7 +293,19 @@ async fn mcp_tools_call(
         .ok_or_else(|| jsonrpc_error(body.id.clone(), -32602, "missing 'name' in params"))?;
     let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
-    let js_mode = state.js_execution_mode.load(Ordering::Relaxed);
+    let js_mode = profile_ctx
+        .map(|c| c.js_execution)
+        .unwrap_or_else(|| state.js_execution_mode.load(Ordering::Relaxed));
+    let toon_enabled = profile_ctx
+        .map(|c| c.toon_output)
+        .unwrap_or(state.toon_enabled);
+    // `ProfileContext::meta_tool_handler` is populated by `ProfileRegistry::rebuild`
+    // (R3.A) over the profile's [`ProfileRegistryView`] — using it here keeps
+    // list/search/execute scoped to the profile's allowed endpoints. The global
+    // handler is the fallback for `/mcp` and the legacy `/mcp/tools/call`.
+    let handler: &MetaToolHandler = profile_ctx
+        .and_then(|c| c.meta_tool_handler.as_deref())
+        .unwrap_or(&state.meta_tool_handler);
 
     // Check if this is a meta-tool call
     match tool_name {
@@ -244,11 +318,11 @@ async fn mcp_tools_call(
                 .get("offset")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize);
-            match state.meta_tool_handler.list_tools(limit, offset).await {
+            match handler.list_tools(limit, offset).await {
                 Ok(result) => {
                     return Ok(jsonrpc_response(
                         body.id,
-                        wrap_meta_tool_result(result, state.toon_enabled),
+                        wrap_meta_tool_result(result, toon_enabled),
                     ))
                 }
                 Err(e) => return Err(jsonrpc_error(body.id, -32603, &e.to_string())),
@@ -263,11 +337,11 @@ async fn mcp_tools_call(
                 .get("limit")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as usize);
-            match state.meta_tool_handler.search_tools(query, limit).await {
+            match handler.search_tools(query, limit).await {
                 Ok(result) => {
                     return Ok(jsonrpc_response(
                         body.id,
-                        wrap_meta_tool_result(result, state.toon_enabled),
+                        wrap_meta_tool_result(result, toon_enabled),
                     ))
                 }
                 Err(e) => return Err(jsonrpc_error(body.id, -32603, &e.to_string())),
@@ -289,11 +363,11 @@ async fn mcp_tools_call(
                 .get("script")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            match state.meta_tool_handler.execute_tools(script).await {
+            match handler.execute_tools(script).await {
                 Ok(result) => {
                     return Ok(jsonrpc_response(
                         body.id,
-                        wrap_meta_tool_result(result, state.toon_enabled),
+                        wrap_meta_tool_result(result, toon_enabled),
                     ))
                 }
                 Err(e) => return Err(jsonrpc_error(body.id, -32603, &e.to_string())),
@@ -311,9 +385,17 @@ async fn mcp_tools_call(
         ));
     }
 
-    match state.registry.route_tool_call(tool_name, arguments).await {
+    let route_result = match profile_ctx {
+        Some(ctx) => {
+            ctx.registry_view
+                .route_tool_call(tool_name, arguments)
+                .await
+        }
+        None => state.registry.route_tool_call(tool_name, arguments).await,
+    };
+    match route_result {
         Ok(result) => {
-            let result = if state.toon_enabled {
+            let result = if toon_enabled {
                 crate::toon_convert::toonify_call_result(result)
             } else {
                 result
@@ -326,7 +408,19 @@ async fn mcp_tools_call(
 
 /// Handle a single JSON-RPC message object, returning `None` for notifications
 /// (which get 202 Accepted) or `Some(Value)` for requests that need a response.
-async fn handle_single_message(state: &AppState, msg: Value, headers_str: &str) -> Option<Value> {
+///
+/// `profile_ctx` is `Some` when the request arrived through a wildcard
+/// `/mcp/{profile}` route and identifies the resolved [`ProfileContext`]. It
+/// is `None` for the global `/mcp` endpoint. R3.C uses it to render
+/// profile-scoped `InitializeResult.instructions` and meta-tool
+/// descriptions; R3.A consumes it for per-profile catalog scoping and
+/// tools/call dispatch.
+async fn handle_single_message(
+    state: &AppState,
+    msg: Value,
+    headers_str: &str,
+    profile_ctx: Option<&ProfileContext>,
+) -> Option<Value> {
     let method = msg
         .get("method")
         .and_then(|v| v.as_str())
@@ -370,9 +464,9 @@ async fn handle_single_message(state: &AppState, msg: Value, headers_str: &str) 
         };
 
         let result: Result<Json<Value>, (StatusCode, Json<Value>)> = match method.as_str() {
-            "initialize" => Ok(mcp_initialize(State(state.clone()), Json(body)).await),
-            "tools/list" => Ok(mcp_tools_list(State(state.clone()), Json(body)).await),
-            "tools/call" => mcp_tools_call(State(state.clone()), Json(body)).await,
+            "initialize" => Ok(mcp_initialize(State(state.clone()), Json(body), profile_ctx).await),
+            "tools/list" => Ok(mcp_tools_list(State(state.clone()), Json(body), profile_ctx).await),
+            "tools/call" => mcp_tools_call(State(state.clone()), Json(body), profile_ctx).await,
             _ => Err(jsonrpc_error(
                 body.id,
                 -32601,
@@ -456,11 +550,57 @@ async fn mcp_unified(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
+    mcp_unified_impl(state, headers, body, None).await
+}
+
+/// POST `/mcp/{profile}` — profile-scoped variant of [`mcp_unified`].
+///
+/// Resolves the URL `{profile}` segment against
+/// [`AppState::profile_registry`] and 404s if unknown. On hit, delegates to
+/// [`mcp_unified_impl`] with the resolved [`ProfileContext`] so the global and
+/// profiled paths share a single dispatch implementation.
+///
+/// The catalog/tool-call scoping inside that shared implementation is wired
+/// in R3.A; for now the context is plumbed through but unused, and the
+/// dispatch behaviour matches the global `/mcp` endpoint.
+///
+/// The dispatch is wrapped in an `info_span!("mcp_request", profile = ...)`
+/// so every event emitted while handling the request — including the inner
+/// `request` span's `MCP request` / `MCP notification` lines and any
+/// adapter-side child spans — inherits the `profile` field. The field key
+/// `profile` is an immutable cross-stack contract with the desktop log
+/// parser (locked decision Cross-stack #1 / engineering-spec §7.1).
+async fn mcp_unified_profiled(
+    State(state): State<AppState>,
+    Path(profile_path): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let Some(profile_ctx) = state.profile_registry.get(&profile_path).await else {
+        return profile_not_found_response(&profile_path);
+    };
+    let span = tracing::info_span!("mcp_request", profile = %profile_path);
+    mcp_unified_impl(state, headers, body, Some(profile_ctx))
+        .instrument(span)
+        .await
+}
+
+/// Shared body of [`mcp_unified`] and [`mcp_unified_profiled`]. `profile_ctx`
+/// is `None` for the global `/mcp` route and `Some(...)` for
+/// `/mcp/{profile}`; see [`handle_single_message`] for how it is threaded
+/// through to per-message dispatch.
+async fn mcp_unified_impl(
+    state: AppState,
+    headers: HeaderMap,
+    body: Value,
+    profile_ctx: Option<Arc<ProfileContext>>,
+) -> Response {
     let headers_str: String = headers
         .iter()
         .map(|(k, v)| format!("{}={}", k, v.to_str().unwrap_or("")))
         .collect::<Vec<_>>()
         .join(" ");
+    let profile_ctx_ref = profile_ctx.as_deref();
 
     match body {
         Value::Array(messages) => {
@@ -482,7 +622,9 @@ async fn mcp_unified(
 
             let mut responses: Vec<Value> = Vec::new();
             for msg in messages {
-                if let Some(resp) = handle_single_message(&state, msg, &headers_str).await {
+                if let Some(resp) =
+                    handle_single_message(&state, msg, &headers_str, profile_ctx_ref).await
+                {
                     responses.push(resp);
                 }
             }
@@ -502,18 +644,20 @@ async fn mcp_unified(
                     .into_response()
             }
         }
-        Value::Object(_) => match handle_single_message(&state, body, &headers_str).await {
-            Some(resp) => (
-                StatusCode::OK,
-                [(
-                    axum::http::header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/json"),
-                )],
-                Json(resp),
-            )
-                .into_response(),
-            None => StatusCode::ACCEPTED.into_response(),
-        },
+        Value::Object(_) => {
+            match handle_single_message(&state, body, &headers_str, profile_ctx_ref).await {
+                Some(resp) => (
+                    StatusCode::OK,
+                    [(
+                        axum::http::header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    )],
+                    Json(resp),
+                )
+                    .into_response(),
+                None => StatusCode::ACCEPTED.into_response(),
+            }
+        }
         _ => (
             StatusCode::OK,
             [(
@@ -528,6 +672,30 @@ async fn mcp_unified(
         )
             .into_response(),
     }
+}
+
+/// JSON 404 body returned by profile-scoped routes when the URL `{profile}`
+/// segment does not resolve to a registered profile (test-matrix row #24).
+/// Shape mirrors the JSON-RPC error envelope used by [`mcp_unified`] for
+/// other invalid-request cases so generic JSON-RPC clients can surface a
+/// meaningful message.
+fn profile_not_found_response(profile_path: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        Json(json!({
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32004,
+                "message": format!("unknown profile '{}'", profile_path),
+            },
+            "id": null,
+        })),
+    )
+        .into_response()
 }
 
 /// GET /mcp/sse — basic SSE transport.
@@ -548,24 +716,97 @@ async fn mcp_unified(
 async fn mcp_sse(
     State(state): State<AppState>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
+    build_mcp_sse_stream(&state, "/mcp", None)
+}
+
+/// GET `/mcp/{profile}/sse` — profile-scoped SSE transport.
+///
+/// Resolves the URL `{profile}` segment against
+/// [`AppState::profile_registry`] and 404s if unknown. On hit, returns the
+/// same SSE stream shape as [`mcp_sse`], pointing the initial `endpoint`
+/// event at `/mcp/{profile}` so SSE-only clients POST follow-up JSON-RPC
+/// requests back to the same profile.
+///
+/// Per locked decision Relay #6 the per-tick filter loop in
+/// [`build_mcp_sse_stream`] mirrors the existing `mcp_sse` pattern (single
+/// `recv().await` per iteration). The profile's allowed-endpoints set is
+/// passed in so `notifications/tools/list_changed` is only forwarded when
+/// the changed endpoint is in-profile (`Lagged` always forwards
+/// unconditionally because the endpoint name is lost).
+async fn mcp_sse_profiled(
+    State(state): State<AppState>,
+    Path(profile_path): Path<String>,
+) -> Response {
+    let Some(profile_ctx) = state.profile_registry.get(&profile_path).await else {
+        return profile_not_found_response(&profile_path);
+    };
+    let endpoint_uri = format!("/mcp/{}", profile_path);
+    let allowed = Arc::new(profile_ctx.registry_view.allowed_endpoints().clone());
+    build_mcp_sse_stream(&state, &endpoint_uri, Some(allowed)).into_response()
+}
+
+/// Build the SSE stream backing both [`mcp_sse`] and [`mcp_sse_profiled`].
+///
+/// `endpoint_data` is the value emitted on the initial `endpoint` event so
+/// SSE-only clients learn where to POST follow-up JSON-RPC requests
+/// (`/mcp` for the global route, `/mcp/{profile}` for the profiled one).
+///
+/// `allowed_endpoints` filters which `tools/list_changed` ticks are
+/// forwarded: `None` (global `/mcp/sse`) forwards every tick;
+/// `Some(set)` (profile-scoped) forwards only when the tick's endpoint name
+/// is in `set`. `Lagged` is always forwarded unconditionally because the
+/// originating endpoint name is lost on lag (the client will re-fetch
+/// `tools/list` on receipt and re-discover any in-profile changes).
+fn build_mcp_sse_stream(
+    state: &AppState,
+    endpoint_data: &str,
+    allowed_endpoints: Option<Arc<std::collections::HashSet<String>>>,
+) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     use tokio::sync::broadcast::error::RecvError;
 
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let mut tools_rx = state.registry.subscribe_tools_changed();
+    let endpoint_data = endpoint_data.to_string();
 
     tokio::spawn(async move {
         if tx
-            .send(Ok(Event::default().event("endpoint").data("/mcp")))
+            .send(Ok(Event::default().event("endpoint").data(endpoint_data)))
             .await
             .is_err()
         {
             return;
         }
-        while let Ok(()) | Err(RecvError::Lagged(_)) = tools_rx.recv().await {
-            let frame = Event::default()
-                .data(r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#);
-            if tx.send(Ok(frame)).await.is_err() {
-                break;
+        // `Ok(name)` carries the endpoint that emitted the tick (registry
+        // fan-in at `registry.rs:234/244`); profile-scoped streams filter on
+        // membership while the global stream forwards every tick. `Lagged`
+        // loses the endpoint name, so we forward unconditionally on lag —
+        // any missed in-profile change is recovered when the client
+        // re-fetches `tools/list` after the notification. `Closed` only
+        // fires when the registry itself is dropped.
+        loop {
+            match tools_rx.recv().await {
+                Ok(name) => {
+                    let forward = match &allowed_endpoints {
+                        None => true,
+                        Some(set) => set.contains(&name),
+                    };
+                    if !forward {
+                        continue;
+                    }
+                    let frame = Event::default()
+                        .data(r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#);
+                    if tx.send(Ok(frame)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {
+                    let frame = Event::default()
+                        .data(r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#);
+                    if tx.send(Ok(frame)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(RecvError::Closed) => break,
             }
         }
     });
@@ -835,7 +1076,7 @@ async fn mcp_initialize_logged(state: State<AppState>, body: Json<JsonRpcBody>) 
     async move {
         let start = Instant::now();
         let req_bytes = serde_json::to_string(&body.0).map(|s| s.len()).unwrap_or(0);
-        let resp = mcp_initialize(state, body).await;
+        let resp = mcp_initialize(state, body, None).await;
         let elapsed_ms = start.elapsed().as_millis() as u64;
         let resp_bytes = serde_json::to_string(&resp.0).map(|s| s.len()).unwrap_or(0);
         info!(
@@ -858,7 +1099,7 @@ async fn mcp_tools_list_logged(state: State<AppState>, body: Json<JsonRpcBody>) 
     async move {
         let start = Instant::now();
         let req_bytes = serde_json::to_string(&body.0).map(|s| s.len()).unwrap_or(0);
-        let resp = mcp_tools_list(state, body).await;
+        let resp = mcp_tools_list(state, body, None).await;
         let elapsed_ms = start.elapsed().as_millis() as u64;
         let resp_bytes = serde_json::to_string(&resp.0).map(|s| s.len()).unwrap_or(0);
         info!(
@@ -884,7 +1125,7 @@ async fn mcp_tools_call_logged(
     async move {
         let start = Instant::now();
         let req_bytes = serde_json::to_string(&body.0).map(|s| s.len()).unwrap_or(0);
-        let result = mcp_tools_call(state, body).await;
+        let result = mcp_tools_call(state, body, None).await;
         let elapsed_ms = start.elapsed().as_millis() as u64;
         match &result {
             Ok(Json(resp)) => {
@@ -944,6 +1185,21 @@ async fn mcp_delete() -> Response {
     StatusCode::METHOD_NOT_ALLOWED.into_response()
 }
 
+/// Handler for `DELETE /mcp/{profile}` — profile-scoped variant of
+/// [`mcp_delete`]. Resolves the URL `{profile}` segment against
+/// [`AppState::profile_registry`] and returns 404 with a structured JSON
+/// body if unknown; on hit returns 405 to match the global `/mcp` route's
+/// opt-out from session termination.
+async fn mcp_delete_profiled(
+    State(state): State<AppState>,
+    Path(profile_path): Path<String>,
+) -> Response {
+    if state.profile_registry.get(&profile_path).await.is_none() {
+        return profile_not_found_response(&profile_path);
+    }
+    StatusCode::METHOD_NOT_ALLOWED.into_response()
+}
+
 /// Check whether an Origin header value is a localhost origin.
 /// Allows `http://localhost`, `http://127.0.0.1`, `http://[::1]` on any port.
 fn is_localhost_origin(origin: &str) -> bool {
@@ -1000,6 +1256,15 @@ pub fn build_router_with_origins(state: AppState, extra_origins: &[String]) -> R
         .route("/mcp/tools/list", post(mcp_tools_list_logged))
         .route("/mcp/tools/call", post(mcp_tools_call_logged))
         .route("/mcp/sse", get(mcp_sse))
+        // Profile-scoped variants. Per recon D7, axum 0.8 prefers the
+        // specific `/mcp/{initialize,tools,sse}` routes above over the
+        // `/mcp/{profile}` wildcard, and `RESERVED_PROFILE_PATHS` keeps
+        // profile names from colliding with the `/mcp/{profile}/sse` path.
+        .route(
+            "/mcp/{profile}",
+            post(mcp_unified_profiled).delete(mcp_delete_profiled),
+        )
+        .route("/mcp/{profile}/sse", get(mcp_sse_profiled))
         .route("/oauth/callback", get(oauth_callback))
         .layer(cors)
         .with_state(state)
@@ -1143,10 +1408,12 @@ mod tests {
             Arc::new(registry.clone()),
             Duration::from_secs(5),
         ));
+        let profile_registry = Arc::new(ProfileRegistry::new(registry.clone()));
         AppState {
             registry,
             js_execution_mode: Arc::new(AtomicBool::new(false)),
             meta_tool_handler,
+            profile_registry,
             oauth_flow_manager: None,
             token_manager: None,
             oauth_adapter_inners: None,
@@ -1196,7 +1463,7 @@ mod tests {
             params: None,
             id: Some(json!(1)),
         };
-        let Json(resp) = mcp_initialize(State(state), Json(body)).await;
+        let Json(resp) = mcp_initialize(State(state), Json(body), None).await;
 
         assert_eq!(resp["jsonrpc"], "2.0");
         assert_eq!(resp["id"], 1);
@@ -1215,7 +1482,7 @@ mod tests {
     #[tokio::test]
     async fn meta_tool_definitions_contains_expected_tools() {
         let registry = AdapterRegistry::new();
-        let defs = meta_tool_definitions(true, &registry, false).await;
+        let defs = meta_tool_definitions(true, &registry, false, None).await;
         assert_eq!(defs.len(), 3);
 
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
@@ -1235,7 +1502,7 @@ mod tests {
     #[tokio::test]
     async fn meta_tool_definitions_hides_execute_tools_when_js_off() {
         let registry = AdapterRegistry::new();
-        let defs = meta_tool_definitions(false, &registry, false).await;
+        let defs = meta_tool_definitions(false, &registry, false, None).await;
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"list_tools"));
         assert!(names.contains(&"search_tools"));
@@ -1248,7 +1515,7 @@ mod tests {
     #[tokio::test]
     async fn test_list_tools_description_documents_return_format() {
         let registry = AdapterRegistry::new();
-        let defs = meta_tool_definitions(true, &registry, false).await;
+        let defs = meta_tool_definitions(true, &registry, false, None).await;
         let list_desc = defs.iter().find(|d| d["name"] == "list_tools").unwrap()["description"]
             .as_str()
             .unwrap();
@@ -1277,7 +1544,7 @@ mod tests {
     #[tokio::test]
     async fn test_search_tools_description_documents_behavior() {
         let registry = AdapterRegistry::new();
-        let defs = meta_tool_definitions(true, &registry, false).await;
+        let defs = meta_tool_definitions(true, &registry, false, None).await;
         let search_desc = defs.iter().find(|d| d["name"] == "search_tools").unwrap()["description"]
             .as_str()
             .unwrap();
@@ -1300,7 +1567,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_tools_description_has_examples() {
         let registry = AdapterRegistry::new();
-        let defs = meta_tool_definitions(true, &registry, false).await;
+        let defs = meta_tool_definitions(true, &registry, false, None).await;
         let exec_desc = defs.iter().find(|d| d["name"] == "execute_tools").unwrap()["description"]
             .as_str()
             .unwrap();
@@ -1379,7 +1646,7 @@ mod tests {
             params: None,
             id: Some(json!(1)),
         };
-        let Json(resp) = mcp_tools_list(State(state), Json(body)).await;
+        let Json(resp) = mcp_tools_list(State(state), Json(body), None).await;
         let tools = resp["result"]["tools"].as_array().unwrap();
 
         // With no adapters registered and JS mode off, only list_tools and
@@ -1402,7 +1669,7 @@ mod tests {
             params: None,
             id: Some(json!(1)),
         };
-        let Json(resp) = mcp_tools_list(State(state), Json(body)).await;
+        let Json(resp) = mcp_tools_list(State(state), Json(body), None).await;
         let tools = resp["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 3);
     }
@@ -1418,7 +1685,7 @@ mod tests {
             params: Some(json!({"name": "list_tools", "arguments": {}})),
             id: Some(json!(1)),
         };
-        let result = mcp_tools_call(State(state.clone()), Json(body)).await;
+        let result = mcp_tools_call(State(state.clone()), Json(body), None).await;
         let Json(resp) = result.unwrap();
         let content = resp["result"]["content"]
             .as_array()
@@ -1436,7 +1703,7 @@ mod tests {
             params: Some(json!({"name": "search_tools", "arguments": {"query": "test"}})),
             id: Some(json!(2)),
         };
-        let result = mcp_tools_call(State(state.clone()), Json(body)).await;
+        let result = mcp_tools_call(State(state.clone()), Json(body), None).await;
         let Json(resp) = result.unwrap();
         let content = resp["result"]["content"]
             .as_array()
@@ -1452,7 +1719,7 @@ mod tests {
             params: Some(json!({"name": "execute_tools", "arguments": {"script": ""}})),
             id: Some(json!(3)),
         };
-        let result = mcp_tools_call(State(state), Json(body)).await;
+        let result = mcp_tools_call(State(state), Json(body), None).await;
         // execute_tools with empty script may error — either way, check the shape
         match result {
             Ok(Json(resp)) => {
@@ -1478,7 +1745,9 @@ mod tests {
             params: Some(json!({"name": "list_tools", "arguments": {}})),
             id: Some(json!(1)),
         };
-        let Json(resp) = mcp_tools_call(State(state), Json(body)).await.unwrap();
+        let Json(resp) = mcp_tools_call(State(state), Json(body), None)
+            .await
+            .unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         // TOON output for the `{ tools, total, limit, offset }` envelope is
         // never valid JSON — it starts with field declarations, not `{`.
@@ -1510,7 +1779,9 @@ mod tests {
             })),
             id: Some(json!(2)),
         };
-        let Json(resp) = mcp_tools_call(State(state), Json(body)).await.unwrap();
+        let Json(resp) = mcp_tools_call(State(state), Json(body), None)
+            .await
+            .unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         assert!(
             serde_json::from_str::<Value>(text).is_err(),
@@ -1534,7 +1805,9 @@ mod tests {
             params: Some(json!({"name": "list_tools", "arguments": {}})),
             id: Some(json!(1)),
         };
-        let Json(resp) = mcp_tools_call(State(state), Json(body)).await.unwrap();
+        let Json(resp) = mcp_tools_call(State(state), Json(body), None)
+            .await
+            .unwrap();
         let text = resp["result"]["content"][0]["text"].as_str().unwrap();
         let parsed: Value = serde_json::from_str(text).expect("JSON when toon disabled");
         assert!(parsed["tools"].is_array());
@@ -1545,7 +1818,7 @@ mod tests {
     #[tokio::test]
     async fn search_tools_advertising_includes_toon_hint_when_enabled() {
         let registry = AdapterRegistry::new();
-        let defs_on = meta_tool_definitions(true, &registry, true).await;
+        let defs_on = meta_tool_definitions(true, &registry, true, None).await;
         let search_desc = defs_on
             .iter()
             .find(|d| d["name"] == "search_tools")
@@ -1557,7 +1830,7 @@ mod tests {
             "expected TOON hint in: {search_desc}"
         );
 
-        let defs_off = meta_tool_definitions(true, &registry, false).await;
+        let defs_off = meta_tool_definitions(true, &registry, false, None).await;
         let search_desc_off = defs_off
             .iter()
             .find(|d| d["name"] == "search_tools")
@@ -2333,7 +2606,7 @@ mod tests {
             params: None,
             id: Some(json!(1)),
         };
-        let Json(resp) = mcp_tools_list(State(state), Json(body)).await;
+        let Json(resp) = mcp_tools_list(State(state), Json(body), None).await;
         let tools = resp["result"]["tools"].as_array().unwrap();
 
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -2358,7 +2631,7 @@ mod tests {
             params: None,
             id: Some(json!(1)),
         };
-        let Json(resp) = mcp_tools_list(State(state), Json(body)).await;
+        let Json(resp) = mcp_tools_list(State(state), Json(body), None).await;
         let tools = resp["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 3);
 
@@ -2434,7 +2707,7 @@ mod tests {
             params: None,
             id: Some(json!(7)),
         };
-        let Json(resp) = mcp_initialize(State(state), Json(body)).await;
+        let Json(resp) = mcp_initialize(State(state), Json(body), None).await;
         assert_eq!(
             resp["result"]["capabilities"]["tools"]["listChanged"], true,
             "initialize must advertise tools.listChanged: true (got {resp})"
@@ -2518,7 +2791,7 @@ mod tests {
         // races with the subscriber, so retry the tick until the frame lands.
         let driver = tokio::spawn(async move {
             for _ in 0..40 {
-                registry.tick_tools_changed_for_test();
+                registry.tick_tools_changed_for_test("test-endpoint");
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
         });
@@ -2535,5 +2808,763 @@ mod tests {
             text.contains("\"jsonrpc\":\"2.0\""),
             "frame should be a JSON-RPC notification (got: {text:?})"
         );
+    }
+
+    /// Helper: send `body` to a profile-scoped POST/DELETE/GET route via the
+    /// router and return the raw response. Mirrors [`post_mcp`] for the
+    /// `/mcp/{profile}` wildcard.
+    async fn send_profile_request(
+        state: AppState,
+        method: &str,
+        uri: &str,
+        body: Option<&Value>,
+    ) -> axum::response::Response {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let router = build_router(state);
+        let mut builder = axum::http::Request::builder().method(method).uri(uri);
+        let body_bytes = match body {
+            Some(v) => {
+                builder = builder.header("content-type", "application/json");
+                Body::from(serde_json::to_vec(v).unwrap())
+            }
+            None => Body::empty(),
+        };
+        let request = builder.body(body_bytes).unwrap();
+        router.oneshot(request).await.unwrap()
+    }
+
+    /// Populate `state.profile_registry` with a single profile whose path is
+    /// `path` and whose endpoint set is `endpoints`. JS execution defaults
+    /// to off and TOON output to on — matching the historical "inherit from
+    /// relay defaults" resolution callers relied on.
+    async fn install_profile(state: &AppState, path: &str, endpoints: Vec<String>) {
+        install_profile_with_flags(state, path, endpoints, false, true).await;
+    }
+
+    /// Variant of [`install_profile`] that takes explicit `js_execution` /
+    /// `toon_output` values for the installed profile. Both fields are
+    /// required on the profile config; callers pick concrete booleans for
+    /// whichever path the test wants to exercise.
+    async fn install_profile_with_flags(
+        state: &AppState,
+        path: &str,
+        endpoints: Vec<String>,
+        js_execution: bool,
+        toon_output: bool,
+    ) {
+        let profile = crate::config::ProfileConfig {
+            name: path.to_string(),
+            path: path.to_string(),
+            endpoints,
+            js_execution,
+            toon_output,
+        };
+        state.profile_registry.rebuild(&[profile]).await;
+    }
+
+    // Test-matrix row #24 — unknown profile path → 404 with JSON body.
+    #[tokio::test]
+    async fn mcp_unified_profiled_unknown_profile_returns_404_json() {
+        let state = test_app_state();
+        let resp = send_profile_request(
+            state,
+            "POST",
+            "/mcp/nonexistent",
+            Some(&json!({"jsonrpc":"2.0","method":"initialize","id":1})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json")
+        );
+        let body = body_json(resp).await;
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("nonexistent"));
+    }
+
+    // `DELETE /mcp/{unknown}` should also 404 with the same JSON shape, not
+    // 405 — the 405 contract is reserved for known profiles (mirroring the
+    // global `/mcp` opt-out from session termination).
+    #[tokio::test]
+    async fn mcp_delete_profiled_unknown_profile_returns_404_json() {
+        let state = test_app_state();
+        let resp = send_profile_request(state, "DELETE", "/mcp/nonexistent", None).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = body_json(resp).await;
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("nonexistent"));
+    }
+
+    // `GET /mcp/{unknown}/sse` should 404 with the same JSON shape.
+    #[tokio::test]
+    async fn mcp_sse_profiled_unknown_profile_returns_404_json() {
+        let state = test_app_state();
+        let resp = send_profile_request(state, "GET", "/mcp/nonexistent/sse", None).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let body = body_json(resp).await;
+        assert!(body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("nonexistent"));
+    }
+
+    // Known profile path → POST delegates to the shared `mcp_unified_impl`
+    // and returns a normal JSON-RPC response (R3.A wires per-profile catalog
+    // scoping; this slice only verifies the route reaches the handler).
+    #[tokio::test]
+    async fn mcp_unified_profiled_known_profile_dispatches_initialize() {
+        let state = test_app_state();
+        install_profile(&state, "work", vec![]).await;
+        let resp = send_profile_request(
+            state,
+            "POST",
+            "/mcp/work",
+            Some(&json!({"jsonrpc":"2.0","method":"initialize","id":7})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["id"], 7);
+        assert_eq!(body["result"]["serverInfo"]["name"], "Endara Relay");
+    }
+
+    // R3.C — profile-aware advertising wire-up.
+    //
+    // The matrix-row #15 contract is unit-tested in `crate::advertise` against
+    // the description builders directly. These integration tests verify that
+    // `mcp_initialize` and `mcp_tools_list` actually thread `profile_ctx`
+    // through and emit profile-scoped output, distinguishing the per-profile
+    // path from the global `/mcp` path. Endpoint count (not server_type) is
+    // used as the differentiator because the server.rs `MockAdapter` does
+    // not override `server_type()`.
+
+    // `mcp_initialize` with `Some(profile_ctx)` advertises a non-`None`
+    // `instructions` (lead-in only, since `MockAdapter` has no server_type)
+    // when the profile has overlapping endpoints. The global `/mcp` path
+    // sees the same registry so it also gets the lead-in — the differentiator
+    // is the profile-vs-global selection (per the `_for_profile` builder).
+    #[tokio::test]
+    async fn mcp_initialize_uses_profile_variant_when_ctx_present() {
+        let state = test_app_state();
+        // Register two endpoints in the relay-wide registry. Without
+        // server_type the lead-in renders without a `Connected server
+        // types:` line — which is exactly the shape we expect because
+        // `instructions_for_profile` should still emit the lead-in when
+        // the profile's allowed endpoints are registered.
+        state
+            .registry
+            .register(
+                "gmail".into(),
+                Box::new(MockAdapter::with_tools(&["send_email"])),
+                "stdio".into(),
+                None,
+                Some("gmail".into()),
+            )
+            .await;
+        state
+            .registry
+            .register(
+                "github".into(),
+                Box::new(MockAdapter::with_tools(&["list_issues"])),
+                "stdio".into(),
+                None,
+                Some("github".into()),
+            )
+            .await;
+        // Profile scoped to a non-overlapping endpoint → instructions must
+        // be `None` (the "no overlap" branch of `instructions_for_profile`).
+        install_profile(&state, "isolated", vec!["does-not-exist".into()]).await;
+        let profile_ctx = state.profile_registry.get("isolated").await.unwrap();
+
+        let body = JsonRpcBody {
+            jsonrpc: Some("2.0".into()),
+            method: Some("initialize".into()),
+            params: None,
+            id: Some(json!(1)),
+        };
+        let Json(resp) = mcp_initialize(State(state.clone()), Json(body), Some(&profile_ctx)).await;
+        assert!(
+            resp["result"].get("instructions").is_none(),
+            "profile with no in-scope endpoints must omit instructions, got: {resp}"
+        );
+
+        // Sanity check: the global path on the same state still includes
+        // instructions, proving the profile path took a different branch.
+        let body = JsonRpcBody {
+            jsonrpc: Some("2.0".into()),
+            method: Some("initialize".into()),
+            params: None,
+            id: Some(json!(2)),
+        };
+        let Json(global_resp) = mcp_initialize(State(state), Json(body), None).await;
+        assert!(
+            global_resp["result"]["instructions"].is_string(),
+            "global path must still advertise instructions, got: {global_resp}"
+        );
+    }
+
+    // `mcp_tools_list` with `Some(profile_ctx)` rebuilds the meta-tool
+    // descriptions against the profile view so the count suffix reflects
+    // only the profile's endpoints. Two endpoints registered globally, one
+    // in profile → list_tools description ends with "1 servers connected",
+    // not "2".
+    #[tokio::test]
+    async fn mcp_tools_list_meta_descriptions_are_profile_scoped() {
+        let state = test_app_state();
+        state.js_execution_mode.store(true, Ordering::Relaxed);
+        state
+            .registry
+            .register(
+                "gmail".into(),
+                Box::new(MockAdapter::with_tools(&["send_email"])),
+                "stdio".into(),
+                None,
+                Some("gmail".into()),
+            )
+            .await;
+        state
+            .registry
+            .register(
+                "github".into(),
+                Box::new(MockAdapter::with_tools(&["list_issues"])),
+                "stdio".into(),
+                None,
+                Some("github".into()),
+            )
+            .await;
+        // R3.B: `ProfileContext::js_execution` is read directly from the
+        // profile config at rebuild time, not from the runtime atomic. Set
+        // it to `true` so this profile advertises `execute_tools` in the
+        // catalog.
+        install_profile_with_flags(&state, "work", vec!["gmail".into()], true, true).await;
+        let profile_ctx = state.profile_registry.get("work").await.unwrap();
+
+        let body = JsonRpcBody {
+            jsonrpc: Some("2.0".into()),
+            method: Some("tools/list".into()),
+            params: None,
+            id: Some(json!(1)),
+        };
+        let Json(resp) = mcp_tools_list(State(state), Json(body), Some(&profile_ctx)).await;
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let list_tools = tools
+            .iter()
+            .find(|t| t["name"] == "list_tools")
+            .expect("list_tools meta-tool present");
+        let desc = list_tools["description"].as_str().unwrap();
+        assert!(
+            desc.ends_with(" 1 servers connected via Endara Relay \u{2014} use search_tools to discover tools."),
+            "list_tools description must reflect profile's 1 endpoint, not the registry's 2: {desc}"
+        );
+        // `execute_tools` is advertised in JS mode → same profile-scoped suffix.
+        let execute_tools = tools
+            .iter()
+            .find(|t| t["name"] == "execute_tools")
+            .expect("execute_tools meta-tool present in JS mode");
+        let exec_desc = execute_tools["description"].as_str().unwrap();
+        assert!(
+            exec_desc.ends_with(" 1 servers connected via Endara Relay \u{2014} use search_tools to discover tools."),
+            "execute_tools description must reflect profile's 1 endpoint: {exec_desc}"
+        );
+    }
+
+    // Test-matrix row #12 — per-profile `toon_output = true` produces a
+    // TOON-encoded `list_tools` response even when the relay default
+    // (`relay.toon_output`) is off. Exercises the profile override path in
+    // `mcp_tools_call`.
+    #[tokio::test]
+    async fn profile_toon_on_encodes_toon_when_global_off() {
+        let state = test_app_state();
+        assert!(
+            !state.toon_enabled,
+            "test relies on global toon default being off"
+        );
+        install_profile_with_flags(&state, "work", vec![], false, true).await;
+        let resp = send_profile_request(
+            state,
+            "POST",
+            "/mcp/work",
+            Some(&json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "list_tools", "arguments": {}},
+                "id": 1
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        // TOON output for the `{ tools, total, limit, offset }` envelope is
+        // never valid JSON — it starts with field declarations, not `{`.
+        assert!(
+            serde_json::from_str::<Value>(text).is_err(),
+            "profile toon=on must yield TOON text, got JSON-parseable: {text}"
+        );
+        assert!(
+            text.contains("total:"),
+            "expected TOON field syntax in: {text}"
+        );
+    }
+
+    // Test-matrix row #13 — per-profile `toon_output = false` keeps the
+    // `list_tools` response as raw JSON even when the relay default
+    // (`relay.toon_output`) is on. Mirror of #12 for the override-off path.
+    #[tokio::test]
+    async fn profile_toon_off_keeps_json_when_global_on() {
+        let state = test_app_state();
+        install_profile_with_flags(&state, "work", vec![], false, false).await;
+        // Sanity: the profile's TOON flag is off.
+        let global_ctx = state.profile_registry.get("work").await.unwrap();
+        assert!(!global_ctx.toon_output, "profile toon must be off");
+        let resp = send_profile_request(
+            state,
+            "POST",
+            "/mcp/work",
+            Some(&json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "list_tools", "arguments": {}},
+                "id": 1
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        let parsed: Value =
+            serde_json::from_str(text).expect("profile toon=off must yield JSON text");
+        assert!(
+            parsed["tools"].is_array(),
+            "expected `tools` array in JSON: {text}"
+        );
+    }
+
+    // R3.B — per-profile `js_execution = true` enables `execute_tools` and
+    // gates direct tool calls even when the relay default
+    // (`relay.local_js_execution`) is off. The `tools/call` for an unknown
+    // direct tool must surface the JS-mode rejection error, not the
+    // generic "unknown tool" path.
+    #[tokio::test]
+    async fn profile_js_on_rejects_direct_tool_calls_when_global_off() {
+        let state = test_app_state();
+        assert!(
+            !state.js_execution_mode.load(Ordering::Relaxed),
+            "test relies on global JS default being off"
+        );
+        install_profile_with_flags(&state, "work", vec![], true, true).await;
+        let resp = send_profile_request(
+            state,
+            "POST",
+            "/mcp/work",
+            Some(&json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "anything", "arguments": {}},
+                "id": 1
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let msg = body["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            msg.contains("JS execution mode"),
+            "expected JS-mode rejection, got: {body}"
+        );
+    }
+
+    // R3.B — per-profile `js_execution = false` hides `execute_tools` from
+    // the catalog even when the relay default (`relay.local_js_execution`)
+    // is on. Symmetric to the override-on test above.
+    #[tokio::test]
+    async fn profile_js_off_hides_execute_tools_when_global_on() {
+        let state = test_app_state();
+        install_profile_with_flags(&state, "work", vec![], false, true).await;
+        let resp = send_profile_request(
+            state,
+            "POST",
+            "/mcp/work",
+            Some(&json!({
+                "jsonrpc": "2.0",
+                "method": "tools/list",
+                "id": 1
+            })),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let tools = body["result"]["tools"].as_array().unwrap();
+        assert!(
+            tools.iter().all(|t| t["name"] != "execute_tools"),
+            "execute_tools must be hidden when profile js=off, got: {tools:?}"
+        );
+        // The non-JS meta-tools are still advertised.
+        assert!(tools.iter().any(|t| t["name"] == "list_tools"));
+        assert!(tools.iter().any(|t| t["name"] == "search_tools"));
+    }
+
+    // Profile path lookup is case-insensitive (R2.A: registry lowercases keys).
+    #[tokio::test]
+    async fn mcp_unified_profiled_lookup_is_case_insensitive() {
+        let state = test_app_state();
+        install_profile(&state, "work", vec![]).await;
+        let resp = send_profile_request(
+            state,
+            "POST",
+            "/mcp/WORK",
+            Some(&json!({"jsonrpc":"2.0","method":"initialize","id":1})),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    // Known profile + DELETE → 405 (matches the global `/mcp` route).
+    #[tokio::test]
+    async fn mcp_delete_profiled_known_profile_returns_405() {
+        let state = test_app_state();
+        install_profile(&state, "work", vec![]).await;
+        let resp = send_profile_request(state, "DELETE", "/mcp/work", None).await;
+        assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    // Known profile + GET SSE → 200 + initial `endpoint` event points at the
+    // profile's URL so SSE-only clients POST follow-ups to `/mcp/{profile}`.
+    #[tokio::test]
+    async fn mcp_sse_profiled_known_profile_emits_endpoint_event() {
+        let state = test_app_state();
+        install_profile(&state, "work", vec![]).await;
+        let resp = send_profile_request(state, "GET", "/mcp/work/sse", None).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = read_sse_until(resp, Duration::from_secs(2), |s| {
+            s.contains("event: endpoint") && s.contains("data: /mcp/work")
+        })
+        .await;
+        assert!(
+            text.contains("event: endpoint") && text.contains("data: /mcp/work"),
+            "first SSE frame should be the endpoint event for /mcp/work (got: {text:?})"
+        );
+    }
+
+    // Sanity: legacy `/mcp/initialize`, `/mcp/tools/list`, `/mcp/sse` are
+    // still reachable after the wildcard `/mcp/{profile}` was added (recon
+    // D7 — axum 0.8 prefers specific routes over `{profile}` wildcards).
+    #[tokio::test]
+    async fn legacy_specific_mcp_routes_still_match_after_wildcard() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+        let state = test_app_state();
+        let router = build_router(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp/initialize")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({"jsonrpc":"2.0","method":"initialize","id":1})).unwrap(),
+            ))
+            .unwrap();
+        let resp = router.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["result"]["serverInfo"]["name"], "Endara Relay");
+
+        let req = axum::http::Request::builder()
+            .method("GET")
+            .uri("/mcp/sse")
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Helper: open a profile-scoped SSE stream and return the response.
+    /// Mirrors the per-test boilerplate in [`mcp_sse_profiled_known_profile_emits_endpoint_event`].
+    async fn open_profile_sse(state: AppState, profile_path: &str) -> axum::response::Response {
+        use axum::body::Body;
+        use tower::ServiceExt;
+        let router = build_router(state);
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri(format!("/mcp/{}/sse", profile_path))
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+        router.oneshot(request).await.unwrap()
+    }
+
+    /// Drive `endpoint_name` tools-changed ticks on the registry until the
+    /// `deadline` elapses. Mirrors the retry-tick pattern used by the
+    /// existing `mcp_sse_forwards_tools_changed_notification` test: each
+    /// `subscribe_tools_changed()` call races with the in-handler subscriber
+    /// being installed, so a single send is unreliable.
+    async fn drive_ticks_until(
+        registry: AdapterRegistry,
+        endpoint_name: &str,
+        deadline: tokio::time::Instant,
+    ) {
+        let name = endpoint_name.to_string();
+        while tokio::time::Instant::now() < deadline {
+            registry.tick_tools_changed_for_test(&name);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    // Test-matrix row #16 — in-profile endpoint change is forwarded on
+    // `/mcp/{profile}/sse`. The profile contains "gmail"; ticking "gmail"
+    // produces a `notifications/tools/list_changed` SSE frame.
+    #[tokio::test]
+    async fn mcp_sse_profiled_forwards_in_profile_tools_changed() {
+        let state = test_app_state();
+        install_profile(&state, "work", vec!["gmail".into(), "linear".into()]).await;
+        let registry = state.registry.clone();
+        let resp = open_profile_sse(state, "work").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let driver = tokio::spawn(async move {
+            drive_ticks_until(registry, "gmail", deadline).await;
+        });
+        let text = read_sse_until(resp, Duration::from_secs(2), |s| {
+            s.contains("notifications/tools/list_changed")
+        })
+        .await;
+        driver.abort();
+        assert!(
+            text.contains("notifications/tools/list_changed"),
+            "expected in-profile tools/list_changed frame (got: {text:?})"
+        );
+    }
+
+    // Test-matrix row #17 — out-of-profile endpoint change is suppressed on
+    // `/mcp/{profile}/sse`. Ticking "todoist" (not in the profile) for the
+    // full window must not produce a `notifications/tools/list_changed`
+    // frame; only the initial `endpoint` event should be visible.
+    #[tokio::test]
+    async fn mcp_sse_profiled_suppresses_out_of_profile_tools_changed() {
+        let state = test_app_state();
+        install_profile(&state, "work", vec!["gmail".into(), "linear".into()]).await;
+        let registry = state.registry.clone();
+        let resp = open_profile_sse(state, "work").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+        let driver = tokio::spawn(async move {
+            drive_ticks_until(registry, "todoist", deadline).await;
+        });
+        let text = read_sse_until(resp, Duration::from_secs(1), |s| {
+            s.contains("notifications/tools/list_changed")
+        })
+        .await;
+        driver.abort();
+        assert!(
+            !text.contains("notifications/tools/list_changed"),
+            "out-of-profile tick must not be forwarded (got: {text:?})"
+        );
+        assert!(
+            text.contains("event: endpoint") && text.contains("data: /mcp/work"),
+            "initial endpoint frame should still be emitted (got: {text:?})"
+        );
+    }
+
+    // Mixed traffic: ticks alternate between in-profile and out-of-profile
+    // endpoints; only the in-profile tick must surface. Guards against an
+    // implementation that filters incorrectly (e.g. forwards everything or
+    // nothing).
+    #[tokio::test]
+    async fn mcp_sse_profiled_only_forwards_in_profile_when_mixed() {
+        let state = test_app_state();
+        install_profile(&state, "work", vec!["gmail".into()]).await;
+        let registry = state.registry.clone();
+        let resp = open_profile_sse(state, "work").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let driver = tokio::spawn(async move {
+            while tokio::time::Instant::now() < deadline {
+                registry.tick_tools_changed_for_test("todoist");
+                registry.tick_tools_changed_for_test("gmail");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+        let text = read_sse_until(resp, Duration::from_secs(2), |s| {
+            s.contains("notifications/tools/list_changed")
+        })
+        .await;
+        driver.abort();
+        assert!(
+            text.contains("notifications/tools/list_changed"),
+            "expected at least one in-profile frame from mixed traffic (got: {text:?})"
+        );
+    }
+
+    // Sanity: the global `/mcp/sse` stream is unchanged by R3.D — it still
+    // forwards every tick regardless of the originating endpoint (the
+    // `None`-filter branch of `build_mcp_sse_stream`).
+    #[tokio::test]
+    async fn mcp_sse_global_forwards_every_endpoint_after_r3d() {
+        let state = test_app_state();
+        // No profile installed; the global handler ignores the profile
+        // registry entirely.
+        let registry = state.registry.clone();
+        let resp = open_profile_sse_via_global(state).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let driver = tokio::spawn(async move {
+            drive_ticks_until(registry, "anything", deadline).await;
+        });
+        let text = read_sse_until(resp, Duration::from_secs(2), |s| {
+            s.contains("notifications/tools/list_changed")
+        })
+        .await;
+        driver.abort();
+        assert!(
+            text.contains("notifications/tools/list_changed"),
+            "global /mcp/sse must forward every tick regardless of endpoint (got: {text:?})"
+        );
+    }
+
+    /// Helper: open the global `/mcp/sse` stream. Kept separate from
+    /// [`open_profile_sse`] so the global regression test reads explicitly.
+    async fn open_profile_sse_via_global(state: AppState) -> axum::response::Response {
+        use axum::body::Body;
+        use tower::ServiceExt;
+        let router = build_router(state);
+        let request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/mcp/sse")
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+        router.oneshot(request).await.unwrap()
+    }
+
+    // R3.E — `profile` field in tracing spans. Nested under `tracing::profile`
+    // so `cargo test tracing::profile` (the verification command on the task
+    // note) selects exactly these cases. The inner module names intentionally
+    // shadow the `tracing` extern crate within this scope; tests reference it
+    // via the absolute path `::tracing::` to disambiguate.
+    mod tracing {
+        mod profile {
+            use super::super::*;
+            use ::tracing_subscriber::fmt::MakeWriter;
+            use std::io;
+            use std::sync::{Arc, Mutex};
+
+            /// In-memory `MakeWriter` so the test can read back every byte the
+            /// `fmt` subscriber emitted. Mirrors the buffered-writer pattern
+            /// already used in `watcher.rs::adapter_init_warns_...`.
+            #[derive(Clone, Default)]
+            struct BufWriter(Arc<Mutex<Vec<u8>>>);
+            impl io::Write for BufWriter {
+                fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                    self.0.lock().unwrap().extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> io::Result<()> {
+                    Ok(())
+                }
+            }
+            impl<'a> MakeWriter<'a> for BufWriter {
+                type Writer = BufWriter;
+                fn make_writer(&'a self) -> Self::Writer {
+                    self.clone()
+                }
+            }
+
+            /// Drain the buffer into a UTF-8 string.
+            fn captured(buf: &BufWriter) -> String {
+                String::from_utf8(buf.0.lock().unwrap().clone()).unwrap()
+            }
+
+            // Matrix #22 — profile-scoped POST emits at least one log line
+            // bearing `profile=<path>`. The `MCP request` line lives inside
+            // `handle_single_message`'s `request` span, which is itself a
+            // child of `mcp_request{profile=...}` thanks to the `.instrument`
+            // wrap on `mcp_unified_profiled`. With span-field propagation the
+            // child event's formatted output carries the parent's `profile`
+            // field.
+            #[tokio::test(flavor = "current_thread")]
+            async fn field_present_on_profiled_request() {
+                let buf = BufWriter::default();
+                let subscriber = ::tracing_subscriber::fmt()
+                    .with_writer(buf.clone())
+                    .with_max_level(::tracing::Level::INFO)
+                    .with_ansi(false)
+                    .finish();
+                let _guard = ::tracing::subscriber::set_default(subscriber);
+
+                let state = test_app_state();
+                install_profile(&state, "work", vec!["gmail".into()]).await;
+                let resp = send_profile_request(
+                    state,
+                    "POST",
+                    "/mcp/work",
+                    Some(&json!({"jsonrpc":"2.0","method":"initialize","id":1})),
+                )
+                .await;
+                assert_eq!(resp.status(), StatusCode::OK);
+                // Drain the body so the handler future fully completes before
+                // we read the captured logs.
+                let _ = body_json(resp).await;
+
+                let text = captured(&buf);
+                assert!(
+                    text.contains("profile=work"),
+                    "expected `profile=work` in tracing output for /mcp/work; got: {text:?}"
+                );
+                assert!(
+                    text.contains("MCP request"),
+                    "expected the inner `MCP request` log line to appear; got: {text:?}"
+                );
+            }
+
+            // Counterpart to the matrix #22 row: the global `/mcp` route MUST
+            // NOT add a `profile` field. Locked decision Cross-stack #1 makes
+            // the field key `profile=` an immutable contract, so any
+            // accidental insertion (e.g. a stray default span) would break
+            // the desktop log filter's per-profile dropdown.
+            #[tokio::test(flavor = "current_thread")]
+            async fn field_absent_on_global_request() {
+                let buf = BufWriter::default();
+                let subscriber = ::tracing_subscriber::fmt()
+                    .with_writer(buf.clone())
+                    .with_max_level(::tracing::Level::INFO)
+                    .with_ansi(false)
+                    .finish();
+                let _guard = ::tracing::subscriber::set_default(subscriber);
+
+                let state = test_app_state();
+                let resp = post_mcp(
+                    state,
+                    &json!({"jsonrpc":"2.0","method":"initialize","id":1}),
+                )
+                .await;
+                assert_eq!(resp.status(), StatusCode::OK);
+                let _ = body_json(resp).await;
+
+                let text = captured(&buf);
+                assert!(
+                    text.contains("MCP request"),
+                    "expected the global `MCP request` log line to appear; got: {text:?}"
+                );
+                assert!(
+                    !text.contains("profile="),
+                    "global /mcp must not introduce a `profile` field; got: {text:?}"
+                );
+            }
+        }
     }
 }

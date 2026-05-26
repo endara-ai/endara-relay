@@ -14,7 +14,7 @@ use serde_json::Value;
 use tokio::sync::RwLock;
 
 use crate::adapter::{AdapterError, ToolInfo};
-use crate::registry::AdapterRegistry;
+use crate::registry::MetaToolRegistry;
 
 // ---------------------------------------------------------------------------
 // Retry tuning (Wave 3)
@@ -73,7 +73,12 @@ pub enum JsSandboxError {
 // ---------------------------------------------------------------------------
 
 struct SandboxState {
-    registry: Arc<AdapterRegistry>,
+    /// Catalog/routing source for the running script. Per locked decision
+    /// Relay #2 this is `Arc<dyn MetaToolRegistry>` so the sandbox sees the
+    /// same scoped view as its enclosing [`MetaToolHandler`] — global
+    /// (`AdapterRegistry`) for `/mcp` or filtered
+    /// (`ProfileRegistryView`) for `/mcp/{profile}`.
+    registry: Arc<dyn MetaToolRegistry>,
     handle: tokio::runtime::Handle,
     /// Wall-clock deadline for the running script (`now + sandbox_timeout`,
     /// captured when `execute_in_sandbox` enters). The retry loop checks this
@@ -98,7 +103,11 @@ thread_local! {
 
 /// A sandboxed JavaScript execution environment.
 pub struct JsSandbox {
-    registry: Arc<AdapterRegistry>,
+    /// Catalog/routing source the sandbox sees. Held as
+    /// `Arc<dyn MetaToolRegistry>` (locked decision Relay #2) so a profile
+    /// view filters which tools `tools.call()` can reach without changing
+    /// the sandbox's wiring.
+    registry: Arc<dyn MetaToolRegistry>,
     timeout: Duration,
     /// Test-only override that opts a single sandbox into the real backoff
     /// schedule. Production callers leave this at `false` because production
@@ -107,8 +116,30 @@ pub struct JsSandbox {
 }
 
 impl JsSandbox {
-    /// Create a new sandbox backed by the given registry.
-    pub fn new(registry: Arc<AdapterRegistry>, timeout: Duration) -> Self {
+    /// Create a new sandbox backed by the given registry. Accepts any
+    /// `Arc<R>` where `R: MetaToolRegistry + 'static`, so callers can pass
+    /// either `Arc<AdapterRegistry>` (global) or
+    /// `Arc<ProfileRegistryView>` (per-profile) without explicit
+    /// `as Arc<dyn ...>` casting — the trait-object coercion fires at the
+    /// `from_dyn` call site below.
+    ///
+    /// `allow(dead_code)`: production callers reach the sandbox through
+    /// [`MetaToolHandler::execute_tools`], which uses [`Self::from_dyn`]
+    /// directly. This generic convenience constructor is exercised by
+    /// the unit tests in this module and by external lib consumers.
+    #[allow(dead_code)]
+    pub fn new<R>(registry: Arc<R>, timeout: Duration) -> Self
+    where
+        R: MetaToolRegistry + 'static,
+    {
+        Self::from_dyn(registry, timeout)
+    }
+
+    /// Construct directly from an already-typed `Arc<dyn MetaToolRegistry>`.
+    /// Used by `MetaToolHandler::execute_tools`, which holds the trait
+    /// object and forwards it into the sandbox without naming the concrete
+    /// type.
+    pub fn from_dyn(registry: Arc<dyn MetaToolRegistry>, timeout: Duration) -> Self {
         Self {
             registry,
             timeout,
@@ -164,7 +195,7 @@ impl JsSandbox {
 fn execute_in_sandbox(
     script: &str,
     catalog: &[ToolInfo],
-    registry: &Arc<AdapterRegistry>,
+    registry: &Arc<dyn MetaToolRegistry>,
     handle: &tokio::runtime::Handle,
     sandbox_timeout: Duration,
     use_real_backoff: bool,
@@ -404,7 +435,7 @@ fn call_tool_with_retry_native(
         let res = state
             .handle
             .block_on(call_tool_with_retry_loop(
-                &registry,
+                registry.as_ref(),
                 &tool_name,
                 arguments,
                 max_retries,
@@ -440,7 +471,7 @@ fn call_tool_with_retry_native(
 /// the real schedule outside `cfg(test)`. Tests pass `true` to opt back into
 /// real sleeps.
 async fn call_tool_with_retry_loop(
-    registry: &AdapterRegistry,
+    registry: &dyn MetaToolRegistry,
     tool_name: &str,
     arguments: Value,
     max_retries: usize,
@@ -1044,7 +1075,11 @@ impl From<&ToolInfo> for ToolInfoSlim {
 
 /// Handles the three meta-tools: list_tools, search_tools, execute_tools.
 pub struct MetaToolHandler {
-    registry: Arc<AdapterRegistry>,
+    /// Catalog/routing source for the three meta-tools. Held as
+    /// `Arc<dyn MetaToolRegistry>` (locked decision Relay #2) so a profile
+    /// view filters which tools `list_tools`/`search_tools` see and which
+    /// tools `execute_tools` can reach via the JS sandbox.
+    registry: Arc<dyn MetaToolRegistry>,
     sandbox_timeout: Duration,
     /// Memoized per-tool search index reused across `search_tools` calls.
     /// Holds `(generation, docs)` where `generation` is the registry's
@@ -1061,7 +1096,30 @@ pub struct MetaToolHandler {
 }
 
 impl MetaToolHandler {
-    pub fn new(registry: Arc<AdapterRegistry>, sandbox_timeout: Duration) -> Self {
+    /// Build a handler backed by the given registry. Accepts any `Arc<R>`
+    /// where `R: MetaToolRegistry + 'static`, so callers can pass either
+    /// `Arc<AdapterRegistry>` (global `/mcp`) or
+    /// `Arc<ProfileRegistryView>` (per-profile `/mcp/{profile}`) without
+    /// explicit `as Arc<dyn ...>` casting at call sites — the trait-object
+    /// coercion fires at the [`Self::from_dyn`] call site.
+    ///
+    /// `allow(dead_code)`: production code paths build per-profile
+    /// handlers via `MetaToolHandler::new(Arc::new(view.clone()), ...)`
+    /// in `ProfileRegistry::rebuild`, which goes through this generic
+    /// constructor; the bin compilation unit (which doesn't see the
+    /// rebuild path) still flags it without this.
+    #[allow(dead_code)]
+    pub fn new<R>(registry: Arc<R>, sandbox_timeout: Duration) -> Self
+    where
+        R: MetaToolRegistry + 'static,
+    {
+        Self::from_dyn(registry, sandbox_timeout)
+    }
+
+    /// Construct directly from an already-typed `Arc<dyn MetaToolRegistry>`.
+    /// Used internally and by callers that hold the trait object without
+    /// the concrete type in scope.
+    pub fn from_dyn(registry: Arc<dyn MetaToolRegistry>, sandbox_timeout: Duration) -> Self {
         Self {
             registry,
             sandbox_timeout,
@@ -1200,9 +1258,11 @@ impl MetaToolHandler {
         serde_json::to_value(&matches).map_err(|e| JsSandboxError::Internal(e.to_string()))
     }
 
-    /// `execute_tools` — run JS in sandbox.
+    /// `execute_tools` — run JS in sandbox. The sandbox inherits the
+    /// handler's [`MetaToolRegistry`] backing, so a per-profile handler
+    /// gives the script a profile-filtered `tools.call()`.
     pub async fn execute_tools(&self, script: &str) -> Result<Value, JsSandboxError> {
-        let sandbox = JsSandbox::new(self.registry.clone(), self.sandbox_timeout);
+        let sandbox = JsSandbox::from_dyn(self.registry.clone(), self.sandbox_timeout);
         sandbox.execute(script).await
     }
 }
@@ -1215,6 +1275,7 @@ impl MetaToolHandler {
 mod tests {
     use super::*;
     use crate::adapter::{AdapterError, HealthStatus, McpAdapter};
+    use crate::registry::AdapterRegistry;
     use async_trait::async_trait;
     use serde_json::json;
 

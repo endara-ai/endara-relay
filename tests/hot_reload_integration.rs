@@ -82,6 +82,7 @@ async fn test_config_diff_add_endpoint() {
             token_endpoint: None,
             server_type_override: None,
         }],
+        profiles: None,
     };
 
     let new_config = config::Config {
@@ -133,6 +134,7 @@ async fn test_config_diff_add_endpoint() {
                 server_type_override: None,
             },
         ],
+        profiles: None,
     };
 
     let diff = config::diff_configs(&old_config, &new_config);
@@ -262,6 +264,7 @@ async fn test_config_diff_remove_endpoint() {
                 server_type_override: None,
             },
         ],
+        profiles: None,
     };
 
     let new_config = config::Config {
@@ -292,6 +295,7 @@ async fn test_config_diff_remove_endpoint() {
             token_endpoint: None,
             server_type_override: None,
         }],
+        profiles: None,
     };
 
     let diff = config::diff_configs(&old_config, &new_config);

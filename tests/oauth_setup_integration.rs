@@ -47,6 +47,7 @@ fn empty_config() -> Config {
             token_endpoint: None,
             server_type_override: None,
         }],
+        profiles: None,
     }
 }
 
@@ -62,6 +63,7 @@ async fn start_setup_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         oauth_adapter_inners: None,
         token_manager: None,
         setup_manager: Some(Arc::new(OAuthSetupManager::new())),
+        profile_registry: None,
     };
 
     let app = management_routes(state);

@@ -106,6 +106,7 @@ fn test_config() -> Config {
             token_endpoint: None,
             server_type_override: None,
         }],
+        profiles: None,
     }
 }
 
@@ -135,6 +136,7 @@ async fn start_management_server(
         oauth_adapter_inners: None,
         token_manager: None,
         setup_manager: None,
+        profile_registry: None,
     };
 
     let app = management_routes(state);
@@ -323,6 +325,7 @@ async fn start_management_server_with_config(
         oauth_adapter_inners: None,
         token_manager: None,
         setup_manager: None,
+        profile_registry: None,
     };
 
     let app = management_routes(state);

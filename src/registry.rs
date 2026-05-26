@@ -1,5 +1,7 @@
 use crate::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::prefix;
+use async_trait::async_trait;
+use serde_json::Value;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -101,12 +103,13 @@ pub struct AdapterRegistry {
     catalog_generation: Arc<AtomicU64>,
     /// Relay-wide tools-changed broadcast. Fan-in for every per-endpoint
     /// `subscribe_tools_changed` tick observed by
-    /// [`AdapterRegistry::tools_changed_listener_loop`]. Downstream consumers
-    /// (e.g. the `/mcp/sse` handler) subscribe via
-    /// [`AdapterRegistry::subscribe_tools_changed`] to forward
-    /// `notifications/tools/list_changed` to connected MCP clients without
-    /// caring which upstream endpoint emitted the change.
-    tools_changed_tx: broadcast::Sender<()>,
+    /// [`AdapterRegistry::tools_changed_listener_loop`]. The payload is the
+    /// endpoint name that emitted the change, so downstream consumers can
+    /// filter by endpoint (e.g. per-profile SSE handlers that only forward
+    /// `notifications/tools/list_changed` when an endpoint inside their
+    /// profile changes). Consumers that don't care about origin (e.g. the
+    /// global `/mcp/sse` handler) forward unconditionally.
+    tools_changed_tx: broadcast::Sender<String>,
 }
 
 impl Default for AdapterRegistry {
@@ -128,21 +131,23 @@ impl AdapterRegistry {
     }
 
     /// Subscribe to the relay-wide tools-changed broadcast. Each `recv()`
-    /// represents at least one `notifications/tools/list_changed` tick from
-    /// some registered adapter since the previous receive. Mirrors the
-    /// per-adapter [`McpAdapter::subscribe_tools_changed`] policy: `Lagged`
-    /// is also surfaced as a tick by the fan-in loop, and `Closed` only
-    /// happens when the registry itself is dropped.
-    pub fn subscribe_tools_changed(&self) -> broadcast::Receiver<()> {
+    /// yields the endpoint name that emitted a
+    /// `notifications/tools/list_changed` tick since the previous receive.
+    /// Mirrors the per-adapter [`McpAdapter::subscribe_tools_changed`]
+    /// policy: `Lagged` is also surfaced as a tick (the endpoint name is
+    /// lost in that case — consumers should forward unconditionally), and
+    /// `Closed` only happens when the registry itself is dropped.
+    pub fn subscribe_tools_changed(&self) -> broadcast::Receiver<String> {
         self.tools_changed_tx.subscribe()
     }
 
-    /// Send a synthetic tools-changed tick on the relay-wide broadcast.
-    /// Test-only escape hatch so server-side handler tests can exercise the
-    /// fan-out path without standing up a real adapter and listener task.
+    /// Send a synthetic tools-changed tick on the relay-wide broadcast for
+    /// the given endpoint name. Test-only escape hatch so server-side
+    /// handler tests can exercise the fan-out path without standing up a
+    /// real adapter and listener task.
     #[cfg(test)]
-    pub(crate) fn tick_tools_changed_for_test(&self) {
-        let _ = self.tools_changed_tx.send(());
+    pub(crate) fn tick_tools_changed_for_test(&self, endpoint: &str) {
+        let _ = self.tools_changed_tx.send(endpoint.to_string());
     }
 
     /// Register an adapter under the given endpoint name.
@@ -213,9 +218,11 @@ impl AdapterRegistry {
     /// — as well as a `Lagged` error (treated as a missed-but-coalesced tick)
     /// — invalidates the per-endpoint tools cache followed by the merged
     /// catalog cache, then fans the tick into the relay-wide
-    /// `tools_changed_tx` so downstream consumers (e.g. the `/mcp/sse`
-    /// handler) can forward `notifications/tools/list_changed` to connected
-    /// MCP clients. A `Closed` receiver terminates the loop.
+    /// `tools_changed_tx` (carrying the endpoint name) so downstream
+    /// consumers (e.g. the `/mcp/sse` handler, or future per-profile SSE
+    /// handlers that filter by endpoint membership) can forward
+    /// `notifications/tools/list_changed` to connected MCP clients. A
+    /// `Closed` receiver terminates the loop.
     async fn tools_changed_listener_loop(
         registry: Self,
         endpoint: String,
@@ -226,7 +233,7 @@ impl AdapterRegistry {
                 Ok(()) => {
                     registry.invalidate_endpoint_tool_cache(&endpoint).await;
                     registry.invalidate_catalog_cache().await;
-                    let _ = registry.tools_changed_tx.send(());
+                    let _ = registry.tools_changed_tx.send(endpoint.clone());
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     debug!(
@@ -236,7 +243,7 @@ impl AdapterRegistry {
                     );
                     registry.invalidate_endpoint_tool_cache(&endpoint).await;
                     registry.invalidate_catalog_cache().await;
-                    let _ = registry.tools_changed_tx.send(());
+                    let _ = registry.tools_changed_tx.send(endpoint.clone());
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     debug!(endpoint = %endpoint, "tools-changed listener channel closed");
@@ -381,6 +388,35 @@ impl AdapterRegistry {
     pub async fn all_endpoint_count(&self) -> usize {
         let adapters = self.adapters.read().await;
         adapters.len()
+    }
+
+    /// Profile-scoped variant of [`Self::all_server_types`] — only adapters
+    /// whose endpoint name is in `allowed_endpoints` contribute. Used by the
+    /// `_for_profile` advertising builders so per-profile `instructions` and
+    /// meta-tool descriptions list only the profile's server types.
+    pub async fn server_types_in(&self, allowed_endpoints: &HashSet<String>) -> BTreeSet<String> {
+        let adapters = self.adapters.read().await;
+        adapters
+            .iter()
+            .filter(|(name, _)| allowed_endpoints.contains(*name))
+            .filter_map(|(_, entry)| {
+                entry
+                    .adapter
+                    .server_type()
+                    .or_else(|| entry.adapter.configured_server_type())
+            })
+            .map(|s| s.to_lowercase())
+            .collect()
+    }
+
+    /// Profile-scoped variant of [`Self::all_endpoint_count`] — counts only
+    /// adapters whose endpoint name is in `allowed_endpoints`.
+    pub async fn endpoint_count_in(&self, allowed_endpoints: &HashSet<String>) -> usize {
+        let adapters = self.adapters.read().await;
+        adapters
+            .keys()
+            .filter(|name| allowed_endpoints.contains(*name))
+            .count()
     }
 
     /// Access the underlying adapters map (for management API use).
@@ -560,6 +596,89 @@ impl AdapterRegistry {
             "Routing tool call"
         );
         entry.adapter.call_tool(tool, arguments).await
+    }
+}
+
+/// Abstraction over the catalog/routing surface used by [`MetaToolHandler`]
+/// and the JS sandbox, so they can operate on either the global
+/// [`AdapterRegistry`] or a per-profile filtered view
+/// (`profile_registry::ProfileRegistryView`).
+///
+/// Per locked decision Relay #2 the surface is intentionally narrow:
+/// `merged_catalog`, `merged_catalog_with_lookup`, `route_tool_call`, and
+/// `subscribe_tools_changed`. `catalog_generation` is also included because
+/// `MetaToolHandler::search_tools` uses it as a cache invalidation key — a
+/// per-profile view delegates to the underlying registry's counter so
+/// catalog mutations correctly invalidate per-profile caches too.
+#[async_trait]
+pub trait MetaToolRegistry: Send + Sync {
+    /// Build (or fetch the cached) merged tool catalog visible to this
+    /// scope. Names are prefixed per the adapter's `tool_prefix` (see
+    /// [`AdapterRegistry::merged_catalog`]); profile-scoped impls filter to
+    /// tools owned by in-profile endpoints.
+    async fn merged_catalog(&self) -> Vec<ToolInfo>;
+
+    /// Variant of [`Self::merged_catalog`] that also returns the
+    /// `prefixed_name → (endpoint, raw_name)` reverse lookup map, filtered
+    /// to the same scope as the catalog.
+    ///
+    /// `allow(dead_code)`: callers in the bin compilation unit reach
+    /// this method through `MetaToolHandler` which is built only by
+    /// `ProfileRegistry::rebuild` and `main.rs` — the bin's dead-code
+    /// pass doesn't see those call sites uniformly, so this and
+    /// [`Self::subscribe_tools_changed`] are annotated explicitly.
+    #[allow(dead_code)]
+    async fn merged_catalog_with_lookup(
+        &self,
+    ) -> (Vec<ToolInfo>, HashMap<String, (String, String)>);
+
+    /// Route a prefixed tool call. Profile-scoped impls reject tools whose
+    /// owning endpoint is not in the profile.
+    async fn route_tool_call(
+        &self,
+        prefixed_name: &str,
+        arguments: Value,
+    ) -> Result<Value, AdapterError>;
+
+    /// Current catalog generation. Monotonically increases on every
+    /// catalog-affecting mutation; profile-scoped impls delegate to the
+    /// underlying registry's counter.
+    fn catalog_generation(&self) -> u64;
+
+    /// Subscribe to the relay-wide tools-changed broadcast. Each tick
+    /// yields the endpoint name that emitted the change. Profile-scoped
+    /// impls delegate to the underlying registry — consumers (e.g. the
+    /// SSE handler in R3.D) filter on endpoint membership.
+    #[allow(dead_code)]
+    fn subscribe_tools_changed(&self) -> broadcast::Receiver<String>;
+}
+
+#[async_trait]
+impl MetaToolRegistry for AdapterRegistry {
+    async fn merged_catalog(&self) -> Vec<ToolInfo> {
+        AdapterRegistry::merged_catalog(self).await
+    }
+
+    async fn merged_catalog_with_lookup(
+        &self,
+    ) -> (Vec<ToolInfo>, HashMap<String, (String, String)>) {
+        AdapterRegistry::merged_catalog_with_lookup(self).await
+    }
+
+    async fn route_tool_call(
+        &self,
+        prefixed_name: &str,
+        arguments: Value,
+    ) -> Result<Value, AdapterError> {
+        AdapterRegistry::route_tool_call(self, prefixed_name, arguments).await
+    }
+
+    fn catalog_generation(&self) -> u64 {
+        AdapterRegistry::catalog_generation(self)
+    }
+
+    fn subscribe_tools_changed(&self) -> broadcast::Receiver<String> {
+        AdapterRegistry::subscribe_tools_changed(self)
     }
 }
 
@@ -2001,7 +2120,8 @@ mod tests {
     /// A per-endpoint adapter tick must also fan into the relay-wide
     /// `subscribe_tools_changed` channel so server-side consumers (e.g. the
     /// `/mcp/sse` handler) can forward `notifications/tools/list_changed`
-    /// to MCP clients.
+    /// to MCP clients. The fanned-in payload carries the endpoint name so
+    /// per-profile SSE handlers can filter by endpoint membership.
     #[tokio::test]
     async fn test_tools_changed_tick_fans_in_to_relay_subscribers() {
         let registry = AdapterRegistry::new();
@@ -2018,13 +2138,16 @@ mod tests {
             .await;
 
         // Drive a per-endpoint tick; the listener loop should observe it and
-        // fan it into the relay-wide broadcast.
+        // fan it into the relay-wide broadcast with the endpoint name.
         tx.send(()).unwrap();
         let recv = tokio::time::timeout(std::time::Duration::from_secs(1), relay_rx.recv()).await;
-        assert!(
-            matches!(recv, Ok(Ok(()))),
-            "relay-wide tools-changed subscriber should receive the fanned-in tick (got {recv:?})"
-        );
+        match recv {
+            Ok(Ok(name)) => assert_eq!(name, "ep", "fanned-in payload should be the endpoint name"),
+            other => panic!(
+                "relay-wide tools-changed subscriber should receive the fanned-in tick \
+                 carrying the endpoint name (got {other:?})"
+            ),
+        }
     }
 
     #[tokio::test]

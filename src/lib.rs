@@ -7,6 +7,7 @@ pub mod management;
 pub mod management_listener;
 pub mod oauth;
 pub mod prefix;
+pub mod profile_registry;
 pub mod registry;
 pub mod server;
 pub mod shell_env;

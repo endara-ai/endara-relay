@@ -5,6 +5,7 @@
 //! `uptime_secs` fields, and that the `Content-Type` is JSON.
 
 use endara_relay::js_sandbox::MetaToolHandler;
+use endara_relay::profile_registry::ProfileRegistry;
 use endara_relay::registry::AdapterRegistry;
 use endara_relay::server::{build_router, start_server, AppState};
 use std::net::SocketAddr;
@@ -19,6 +20,7 @@ async fn setup_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         registry: registry.clone(),
         js_execution_mode: Arc::new(AtomicBool::new(false)),
         meta_tool_handler: Arc::new(MetaToolHandler::new(registry_arc, Duration::from_secs(30))),
+        profile_registry: Arc::new(ProfileRegistry::new(registry.clone())),
         oauth_flow_manager: None,
         token_manager: None,
         oauth_adapter_inners: None,
