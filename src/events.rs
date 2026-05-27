@@ -151,6 +151,7 @@ impl ToolCallEventBus {
     }
 
     /// Current subscriber count (used by tests).
+    #[cfg(test)]
     pub fn receiver_count(&self) -> usize {
         self.tx.receiver_count()
     }
