@@ -41,6 +41,24 @@ pub struct ToolInfo {
     pub annotations: Option<Value>,
 }
 
+/// Max character count retained from `HttpError.body` when formatting an
+/// `AdapterError` for display. Upstream MCP servers occasionally return
+/// multi-KB HTML error pages or stack traces; including those verbatim
+/// in `Failed` events would leak noise into the management UI / logs.
+pub const HTTP_ERROR_BODY_MAX_CHARS: usize = 200;
+
+/// Return at most `max_chars` characters from `s`, appending `"…"` if the
+/// input was longer. Counts by `char` (not byte) so the result is always a
+/// valid UTF-8 boundary even for multi-byte input.
+pub fn truncate_for_display(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max_chars).collect();
+        format!("{head}…")
+    }
+}
+
 /// Errors that can occur in adapter operations.
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterError {
@@ -69,7 +87,10 @@ pub enum AdapterError {
     #[error("connection failed: {0}")]
     ConnectionFailed(String),
 
-    #[error("HTTP error {status}: {body}")]
+    #[error(
+        "HTTP error {status}: {}",
+        truncate_for_display(body, HTTP_ERROR_BODY_MAX_CHARS)
+    )]
     HttpError { status: u16, body: String },
 
     #[error("Authentication required for endpoint '{endpoint}': {message}")]
@@ -301,5 +322,57 @@ mod tests {
     fn failed_adapter_without_override_returns_none() {
         let adapter = FailedAdapter::new("validation failed".to_string());
         assert_eq!(adapter.configured_server_type(), None);
+    }
+
+    #[test]
+    fn truncate_for_display_passes_short_input_unchanged() {
+        assert_eq!(truncate_for_display("short body", 200), "short body");
+        let exact: String = "a".repeat(200);
+        assert_eq!(truncate_for_display(&exact, 200), exact);
+    }
+
+    #[test]
+    fn truncate_for_display_truncates_long_input_with_ellipsis() {
+        let body: String = "a".repeat(500);
+        let out = truncate_for_display(&body, 200);
+        assert!(
+            out.ends_with('…'),
+            "expected trailing ellipsis, got {out:?}"
+        );
+        let n_chars = out.chars().count();
+        assert_eq!(n_chars, 201, "expected 200 chars + ellipsis, got {n_chars}");
+    }
+
+    #[test]
+    fn truncate_for_display_respects_char_boundaries_for_multibyte() {
+        // A 300-char string of multi-byte chars must truncate on a char
+        // boundary (no UTF-8 panic) and stay within max_chars + 1.
+        let body: String = "✓".repeat(300);
+        let out = truncate_for_display(&body, 200);
+        assert!(out.ends_with('…'));
+        assert_eq!(out.chars().count(), 201);
+    }
+
+    #[test]
+    fn http_error_display_truncates_oversized_body() {
+        let body: String = "x".repeat(1024);
+        let err = AdapterError::HttpError {
+            status: 500,
+            body: body.clone(),
+        };
+        let rendered = err.to_string();
+        assert!(rendered.starts_with("HTTP error 500: "));
+        assert!(rendered.ends_with('…'));
+        // "HTTP error 500: " (16 chars) + 200 chars + "…" (1 char) = 217.
+        assert_eq!(rendered.chars().count(), 16 + HTTP_ERROR_BODY_MAX_CHARS + 1);
+    }
+
+    #[test]
+    fn http_error_display_preserves_short_body_verbatim() {
+        let err = AdapterError::HttpError {
+            status: 404,
+            body: "not found".to_string(),
+        };
+        assert_eq!(err.to_string(), "HTTP error 404: not found");
     }
 }
