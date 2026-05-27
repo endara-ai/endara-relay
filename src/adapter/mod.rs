@@ -161,6 +161,17 @@ pub trait McpAdapter: Send + Sync {
     fn subscribe_tools_changed(&self) -> Option<tokio::sync::broadcast::Receiver<()>> {
         None
     }
+
+    /// Wire a shared [`crate::events::ToolCallEventBus`] into the adapter so
+    /// `call_tool` can publish typed `started` / `completed` / `failed`
+    /// events for the desktop overlay's SSE stream.
+    ///
+    /// Default impl is a no-op so placeholder adapters
+    /// ([`FailedAdapter`], [`StartingAdapter`]) and any future read-only
+    /// adapters don't need to participate. Concrete transports (STDIO, SSE,
+    /// HTTP, OAuth) override this and stash the bus for use during
+    /// `call_tool`.
+    fn set_event_bus(&self, _bus: crate::events::ToolCallEventBus) {}
 }
 
 /// A placeholder adapter registered when the real adapter fails to initialize.

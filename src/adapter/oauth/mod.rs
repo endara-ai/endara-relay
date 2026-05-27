@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -156,6 +156,11 @@ pub struct OAuthAdapterInner {
     /// `endpoint`/`transport="oauth"` (and `server_type` once the inner MCP
     /// handshake completes).
     pub span: tracing::Span,
+    /// Shared `OnceLock` cell for the desktop overlay's event bus. Owned at
+    /// the OAuth layer so that every inner HTTP adapter rebuilt during a
+    /// token swap shares the same slot — the outer `set_event_bus` call
+    /// thus reaches both the current inner adapter and any future one.
+    event_bus: Arc<OnceLock<crate::events::ToolCallEventBus>>,
 }
 
 impl OAuthAdapterInner {
@@ -581,6 +586,11 @@ impl OAuthAdapterInner {
             self.config.server_type_override.clone(),
             self.config.endpoint_name.clone(),
         );
+        // Share the OAuth adapter's event-bus OnceLock with the new inner so
+        // overlay events fire from the inner's `call_tool` once the bus is
+        // wired, even across token swaps. The outer `set_event_bus` writes
+        // through this same cell.
+        adapter.set_event_bus_handle(self.event_bus.clone());
         match adapter.initialize().await {
             Ok(()) => {
                 // Mirror the stdio/sse/http adapters: once the inner MCP
@@ -860,6 +870,7 @@ impl OAuthAdapter {
                 outer_tools_changed_tx,
                 inner_forwarder_handle: Mutex::new(None),
                 span,
+                event_bus: Arc::new(OnceLock::new()),
             }),
         }
     }
@@ -1120,6 +1131,14 @@ impl McpAdapter for OAuthAdapter {
             Some(adapter) => adapter.activity_log().await,
             None => vec![],
         }
+    }
+
+    fn set_event_bus(&self, bus: crate::events::ToolCallEventBus) {
+        // Writes through the shared `OnceLock` cell. Every inner HTTP
+        // adapter built (now or after a token swap) shares this cell via
+        // [`HttpAdapter::set_event_bus_handle`], so the bus reaches both
+        // the current inner adapter and any future one.
+        let _ = self.inner.event_bus.set(bus);
     }
 }
 

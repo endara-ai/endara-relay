@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod advertise;
 pub mod config;
+pub mod events;
 pub mod js_sandbox;
 pub mod jsonrpc;
 pub mod management;

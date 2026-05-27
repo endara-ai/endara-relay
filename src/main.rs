@@ -1,4 +1,5 @@
 mod config;
+mod events;
 mod js_sandbox;
 mod management;
 mod management_listener;
@@ -19,6 +20,7 @@ mod toon_convert;
 use adapter::oauth::{OAuthAdapter, OAuthAdapterConfig, OAuthAdapterInner};
 use adapter::{FailedAdapter, McpAdapter, StartingAdapter};
 use clap::{Parser, Subcommand, ValueEnum};
+use events::ToolCallEventBus;
 use js_sandbox::MetaToolHandler;
 use oauth::{OAuthFlowManager, OAuthSetupManager};
 use profile_registry::ProfileRegistry;
@@ -304,6 +306,13 @@ async fn main() {
             // Create adapter registry
             let registry = AdapterRegistry::new();
 
+            // Typed tool-call event bus consumed by the desktop overlay's
+            // SSE stream (`GET /api/events/tool-calls`). One bus per relay
+            // process; cloned cheaply into each adapter's setter and into
+            // ManagementState. See [`events`] module docs for ring-buffer
+            // semantics.
+            let event_bus = ToolCallEventBus::with_default_capacity();
+
             // Track duplicate endpoint names: first occurrence wins
             let mut registered_names = std::collections::HashSet::new();
 
@@ -416,6 +425,11 @@ async fn main() {
                     };
 
                     let adapter = OAuthAdapter::new(oauth_config, token_manager.clone());
+                    // Wire the overlay event bus before initialize() so the
+                    // inner HTTP adapter built during the first apply_tokens
+                    // round (which can race the management socket binding)
+                    // already publishes call_tool events.
+                    adapter.set_event_bus(event_bus.clone());
                     let shared_inner = adapter.shared_inner();
                     oauth_adapter_inners
                         .write()
@@ -487,9 +501,11 @@ async fn main() {
                 let tm = token_manager.clone();
                 let oai = oauth_adapter_inners.clone();
                 let settled = settled_inits.clone();
+                let bus = event_bus.clone();
                 let handle = tokio::spawn(async move {
                     let adapter =
-                        watcher::create_adapter(&ep, &tm, &oai, allow_insecure_oauth).await;
+                        watcher::create_adapter(&ep, &tm, &oai, allow_insecure_oauth, Some(&bus))
+                            .await;
                     let mut entries = reg.entries().write().await;
                     if let Some(entry) = entries.get_mut(ep.name.as_str()) {
                         entry.adapter = adapter;
@@ -621,6 +637,7 @@ async fn main() {
                 token_manager: Some(token_manager.clone()),
                 setup_manager: Some(setup_manager.clone()),
                 profile_registry: Some(profile_registry.clone()),
+                event_bus: Some(event_bus.clone()),
             };
             // Build the MCP (TCP) and management (UDS / Named Pipe) routers
             // separately. The management API carries credential-bearing routes
@@ -756,6 +773,7 @@ async fn main() {
                         oauth_flow_manager.clone(),
                         oauth_adapter_inners.clone(),
                         shared_config.clone(),
+                        Some(event_bus.clone()),
                     );
 
                     handle.await.ok();

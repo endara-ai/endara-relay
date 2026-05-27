@@ -4,6 +4,7 @@ use crate::adapter::sse::{SseAdapter, SseConfig};
 use crate::adapter::stdio::{StdioAdapter, StdioConfig};
 use crate::adapter::{FailedAdapter, McpAdapter, StartingAdapter};
 use crate::config::{self, Config, ConfigDiff, EndpointConfig, Transport};
+use crate::events::ToolCallEventBus;
 use crate::oauth::OAuthFlowManager;
 use crate::profile_registry::ProfileRegistry;
 use crate::registry::AdapterRegistry;
@@ -41,6 +42,7 @@ impl ConfigWatcher {
         _oauth_flow_manager: Arc<OAuthFlowManager>,
         oauth_adapter_inners: OAuthAdapterInners,
         shared_config: Arc<RwLock<Config>>,
+        event_bus: Option<ToolCallEventBus>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             if let Err(e) = watch_loop(
@@ -52,6 +54,7 @@ impl ConfigWatcher {
                 token_manager,
                 oauth_adapter_inners,
                 shared_config,
+                event_bus,
             )
             .await
             {
@@ -71,6 +74,7 @@ async fn watch_loop(
     token_manager: Arc<TokenManager>,
     oauth_adapter_inners: OAuthAdapterInners,
     shared_config: Arc<RwLock<Config>>,
+    event_bus: Option<ToolCallEventBus>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
@@ -125,6 +129,7 @@ async fn watch_loop(
             &profile_registry,
             &token_manager,
             &oauth_adapter_inners,
+            event_bus.as_ref(),
         )
         .await;
     }
@@ -145,6 +150,7 @@ async fn watch_loop(
 /// Returns `Ok(())` when the reload was applied (including warning-only
 /// reloads); returns `Err(ConfigError)` when nothing was applied because the
 /// new config could not be parsed or its profile block was invalid.
+#[allow(clippy::too_many_arguments)]
 async fn reload_and_apply(
     config_path: &Path,
     shared_config: &Arc<RwLock<Config>>,
@@ -153,6 +159,7 @@ async fn reload_and_apply(
     profile_registry: &Arc<ProfileRegistry>,
     token_manager: &Arc<TokenManager>,
     oauth_adapter_inners: &OAuthAdapterInners,
+    event_bus: Option<&ToolCallEventBus>,
 ) -> Result<(), config::ConfigError> {
     // Parse new config gracefully. Fatal errors (parse failure or
     // fail-fast profile-validation failure) bail out without touching the
@@ -187,6 +194,7 @@ async fn reload_and_apply(
         token_manager,
         oauth_adapter_inners,
         new_config.relay.allow_insecure_oauth.unwrap_or(false),
+        event_bus,
     )
     .await;
 
@@ -217,12 +225,14 @@ async fn reload_and_apply(
 ///
 /// This is public so it can also be called from a manual reload endpoint.
 #[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_diff(
     diff: &ConfigDiff,
     registry: &AdapterRegistry,
     token_manager: &Arc<TokenManager>,
     oauth_adapter_inners: &OAuthAdapterInners,
     allow_insecure_oauth: bool,
+    event_bus: Option<&ToolCallEventBus>,
 ) {
     // Remove endpoints
     for name in &diff.removed {
@@ -278,8 +288,10 @@ pub async fn apply_diff(
         let name_clone = name.clone();
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
+        let bus = event_bus.cloned();
         tokio::spawn(async move {
-            let adapter = create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth).await;
+            let adapter =
+                create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth, bus.as_ref()).await;
             let mut entries = reg.entries().write().await;
             if let Some(entry) = entries.get_mut(name_clone.as_str()) {
                 entry.adapter = adapter;
@@ -321,8 +333,10 @@ pub async fn apply_diff(
         let ep_clone = ep.clone();
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
+        let bus = event_bus.cloned();
         tokio::spawn(async move {
-            let adapter = create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth).await;
+            let adapter =
+                create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth, bus.as_ref()).await;
             let mut entries = reg.entries().write().await;
             if let Some(entry) = entries.get_mut(ep_clone.name.as_str()) {
                 entry.adapter = adapter;
@@ -347,6 +361,7 @@ pub async fn apply_diff(
 ///
 /// Endpoints whose names appear in `warned_names` are registered as `FailedAdapter`
 /// with the warning message instead of attempting initialization.
+#[allow(clippy::too_many_arguments)]
 pub async fn apply_diff_graceful(
     diff: &ConfigDiff,
     registry: &AdapterRegistry,
@@ -355,6 +370,7 @@ pub async fn apply_diff_graceful(
     token_manager: &Arc<TokenManager>,
     oauth_adapter_inners: &OAuthAdapterInners,
     allow_insecure_oauth: bool,
+    event_bus: Option<&ToolCallEventBus>,
 ) {
     // Build warning message map
     let warning_messages: std::collections::HashMap<String, String> = {
@@ -449,8 +465,10 @@ pub async fn apply_diff_graceful(
         let name_clone = name.clone();
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
+        let bus = event_bus.cloned();
         tokio::spawn(async move {
-            let adapter = create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth).await;
+            let adapter =
+                create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth, bus.as_ref()).await;
             let mut entries = reg.entries().write().await;
             if let Some(entry) = entries.get_mut(name_clone.as_str()) {
                 entry.adapter = adapter;
@@ -519,8 +537,10 @@ pub async fn apply_diff_graceful(
         let ep_clone = ep.clone();
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
+        let bus = event_bus.cloned();
         tokio::spawn(async move {
-            let adapter = create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth).await;
+            let adapter =
+                create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth, bus.as_ref()).await;
             let mut entries = reg.entries().write().await;
             if let Some(entry) = entries.get_mut(ep_clone.name.as_str()) {
                 entry.adapter = adapter;
@@ -658,6 +678,7 @@ pub(crate) async fn create_adapter(
     token_manager: &Arc<TokenManager>,
     oauth_adapter_inners: &OAuthAdapterInners,
     allow_insecure_oauth: bool,
+    event_bus: Option<&ToolCallEventBus>,
 ) -> Box<dyn McpAdapter> {
     match ep.transport {
         Transport::Stdio => {
@@ -669,6 +690,9 @@ pub(crate) async fn create_adapter(
                 endpoint_name: ep.name.clone(),
             };
             let mut adapter = StdioAdapter::new(stdio_config);
+            if let Some(bus) = event_bus {
+                adapter.set_event_bus(bus.clone());
+            }
             match adapter.initialize().await {
                 Ok(()) => Box::new(adapter),
                 Err(e) => {
@@ -687,6 +711,9 @@ pub(crate) async fn create_adapter(
             sse_config.server_type_override = ep.server_type_override.clone();
             sse_config.endpoint_name = ep.name.clone();
             let mut adapter = SseAdapter::new(sse_config);
+            if let Some(bus) = event_bus {
+                adapter.set_event_bus(bus.clone());
+            }
             match adapter.initialize().await {
                 Ok(()) => Box::new(adapter),
                 Err(e) => {
@@ -705,6 +732,9 @@ pub(crate) async fn create_adapter(
             http_config.server_type_override = ep.server_type_override.clone();
             http_config.endpoint_name = ep.name.clone();
             let mut adapter = HttpAdapter::new(http_config);
+            if let Some(bus) = event_bus {
+                adapter.set_event_bus(bus.clone());
+            }
             match adapter.initialize().await {
                 Ok(()) => Box::new(adapter),
                 Err(e) => {
@@ -734,6 +764,9 @@ pub(crate) async fn create_adapter(
             };
 
             let mut adapter = OAuthAdapter::new(oauth_config, token_manager.clone());
+            if let Some(bus) = event_bus {
+                adapter.set_event_bus(bus.clone());
+            }
             let shared_inner = adapter.shared_inner();
             oauth_adapter_inners
                 .write()
@@ -905,7 +938,7 @@ mod tests {
             )
             .await;
 
-        apply_diff(&empty_diff(), &registry, &tm, &inners, false).await;
+        apply_diff(&empty_diff(), &registry, &tm, &inners, false, None).await;
 
         // Existing adapter should still be there, not shut down
         assert!(!shutdown.load(std::sync::atomic::Ordering::SeqCst));
@@ -932,7 +965,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners, false).await;
+        apply_diff(&diff, &registry, &tm, &inners, false, None).await;
 
         assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
         assert!(registry.merged_catalog().await.is_empty());
@@ -948,7 +981,7 @@ mod tests {
         };
 
         // Should not panic
-        apply_diff(&diff, &registry, &tm, &inners, false).await;
+        apply_diff(&diff, &registry, &tm, &inners, false, None).await;
     }
 
     #[tokio::test]
@@ -992,7 +1025,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners, false).await;
+        apply_diff(&diff, &registry, &tm, &inners, false, None).await;
 
         // Old adapter should have been shut down
         assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
@@ -1027,7 +1060,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners, false).await;
+        apply_diff(&diff, &registry, &tm, &inners, false, None).await;
 
         // Wait for background initialization to complete
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1079,7 +1112,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners, false).await;
+        apply_diff(&diff, &registry, &tm, &inners, false, None).await;
 
         // "keep" should still be alive
         assert!(!shutdown_keep.load(std::sync::atomic::Ordering::SeqCst));
@@ -1120,7 +1153,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners, false).await;
+        apply_diff(&diff, &registry, &tm, &inners, false, None).await;
 
         // Wait for background initialization to complete
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1189,7 +1222,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners, true).await;
+        apply_diff(&diff, &registry, &tm, &inners, true, None).await;
 
         // Wait for background initialization to register the OAuth adapter inner.
         let stop = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1236,6 +1269,7 @@ mod tests {
             &tm,
             &inners,
             false,
+            None,
         )
         .await;
 
@@ -1282,7 +1316,10 @@ mod tests {
         let warned: std::collections::HashSet<String> =
             warnings.iter().map(|w| w.endpoint_name.clone()).collect();
 
-        apply_diff_graceful(&diff, &registry, &warnings, &warned, &tm, &inners, false).await;
+        apply_diff_graceful(
+            &diff, &registry, &warnings, &warned, &tm, &inners, false, None,
+        )
+        .await;
 
         // No background spawn for warned endpoints — entry is final immediately.
         let entries = registry.entries().read().await;
@@ -1332,7 +1369,10 @@ mod tests {
         }];
         let warned: std::collections::HashSet<String> = ["ep".to_string()].into_iter().collect();
 
-        apply_diff_graceful(&diff, &registry, &warnings, &warned, &tm, &inners, false).await;
+        apply_diff_graceful(
+            &diff, &registry, &warnings, &warned, &tm, &inners, false, None,
+        )
+        .await;
 
         // Old adapter shut down synchronously.
         assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
@@ -1382,7 +1422,10 @@ mod tests {
         let warnings: Vec<config::EndpointValidationWarning> = vec![];
         let warned: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        apply_diff_graceful(&diff, &registry, &warnings, &warned, &tm, &inners, true).await;
+        apply_diff_graceful(
+            &diff, &registry, &warnings, &warned, &tm, &inners, true, None,
+        )
+        .await;
 
         // Wait for background initialization to register the OAuth adapter inner.
         let stop = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1831,6 +1874,7 @@ toon_output = true
                     &profile_registry,
                     &tm,
                     &inners,
+                    None,
                 )
                 .await
                 .expect("reload should succeed");
@@ -1873,6 +1917,7 @@ toon_output = true
                     &profile_registry,
                     &tm,
                     &inners,
+                    None,
                 )
                 .await
                 .expect("reload should succeed");
@@ -1930,6 +1975,7 @@ toon_output = true
                     &profile_registry,
                     &tm,
                     &inners,
+                    None,
                 )
                 .await
                 .expect_err("invalid profile config must be rejected");
@@ -2123,6 +2169,7 @@ command = "/bin/true"
                     &profile_registry,
                     &tm,
                     &inners,
+                    None,
                 )
                 .await
                 .expect("reload should succeed");
@@ -2223,6 +2270,7 @@ command = "/bin/true"
                     token_manager: Some(token_manager.clone()),
                     setup_manager: None,
                     profile_registry: Some(profile_registry.clone()),
+                    event_bus: None,
                 };
                 let app = management_routes(state);
 
@@ -2257,6 +2305,7 @@ command = "/bin/true"
                     &profile_registry,
                     &token_manager,
                     &inners,
+                    None,
                 )
                 .await
                 .expect("reload of valid config must succeed");
