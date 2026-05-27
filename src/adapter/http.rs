@@ -2,7 +2,9 @@ use super::server_name::{sanitize_server_name, ServerNameError};
 use super::server_type_resolution::{effective_server_type, strip_mcp_server_suffix};
 use super::stdio::{iso8601_now, RingBuffer};
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
-use crate::events::{annotations_from_value, ToolCallEvent, ToolCallEventBus};
+use crate::events::{
+    annotations_from_value, current_request_context, ToolCallEvent, ToolCallEventBus,
+};
 use crate::jsonrpc::{self, JsonRpcResponse};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -695,6 +697,13 @@ impl McpAdapter for HttpAdapter {
     }
 
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
+        // Capture caller span context BEFORE `.instrument(self.span)` re-enters
+        // the adapter's own `endpoint` span — endpoint is constructed at
+        // adapter init time with no parent linkage to per-request spans, so
+        // reading the context from inside the instrumented body would lose
+        // the `request{id}` / `mcp_request{profile}` scope.
+        // See `events::SpanFieldCaptureLayer`.
+        let span_ctx = current_request_context();
         async {
             let request_id = uuid::Uuid::new_v4().to_string();
             if let Some(bus) = self.event_bus.get() {
@@ -706,12 +715,13 @@ impl McpAdapter for HttpAdapter {
                     .and_then(|v| v.as_ref().and_then(annotations_from_value));
                 bus.send(ToolCallEvent::Started {
                     request_id: request_id.clone(),
+                    jsonrpc_id: span_ctx.jsonrpc_id.clone(),
                     ts: iso8601_now(),
                     endpoint: self.config.endpoint_name.clone(),
                     transport: "http".into(),
                     server_type: self.server_type.read().await.clone(),
                     server_name: self.upstream_server_name.read().await.clone(),
-                    profile: None,
+                    profile: span_ctx.profile.clone(),
                     tool: name.to_string(),
                     annotations,
                 });
@@ -758,12 +768,14 @@ impl McpAdapter for HttpAdapter {
                 match &result {
                     Ok(_) => bus.send(ToolCallEvent::Completed {
                         request_id,
+                        jsonrpc_id: span_ctx.jsonrpc_id.clone(),
                         ts,
                         duration_ms: duration_ms_u64,
                         status: "ok".into(),
                     }),
                     Err(e) => bus.send(ToolCallEvent::Failed {
                         request_id,
+                        jsonrpc_id: span_ctx.jsonrpc_id.clone(),
                         ts,
                         duration_ms: duration_ms_u64,
                         status: "error".into(),

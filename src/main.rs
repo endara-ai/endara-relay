@@ -155,7 +155,13 @@ fn init_tracing(
             .boxed(),
     };
 
+    // SpanFieldCaptureLayer captures the JSON-RPC id (from `request` spans)
+    // and profile (from `mcp_request` spans) into per-span extensions so
+    // adapters can populate `jsonrpc_id` / `profile` on every
+    // `ToolCallEvent` without a breaking `McpAdapter::call_tool` signature
+    // change. Cheap: only allocates for the two named spans.
     tracing_subscriber::registry()
+        .with(events::SpanFieldCaptureLayer)
         .with(stdout_layer)
         .with(file_layer)
         .init();

@@ -7725,6 +7725,7 @@ client_id = "client123"
         assert!(bus.receiver_count() > 0, "SSE handler should subscribe");
         bus.send(crate::events::ToolCallEvent::Completed {
             request_id: "rid-1".into(),
+            jsonrpc_id: Some("42".into()),
             ts: "2026-05-27T00:00:00.000Z".into(),
             duration_ms: 5,
             status: "ok".into(),
@@ -7756,6 +7757,11 @@ client_id = "client123"
         assert!(
             text.contains("\"request_id\":\"rid-1\""),
             "expected request_id in SSE body, got: {}",
+            text
+        );
+        assert!(
+            text.contains("\"jsonrpc_id\":\"42\""),
+            "expected jsonrpc_id in SSE body, got: {}",
             text
         );
     }
