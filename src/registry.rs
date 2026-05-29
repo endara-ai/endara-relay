@@ -1,4 +1,6 @@
+use crate::adapter::stdio::iso8601_now;
 use crate::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
+use crate::events::{current_request_context, ToolCallEvent, ToolCallEventBus};
 use crate::prefix;
 use async_trait::async_trait;
 use serde_json::Value;
@@ -110,6 +112,16 @@ pub struct AdapterRegistry {
     /// profile changes). Consumers that don't care about origin (e.g. the
     /// global `/mcp/sse` handler) forward unconditionally.
     tools_changed_tx: broadcast::Sender<String>,
+    /// Optional shared [`ToolCallEventBus`] used by [`Self::route_tool_call`]
+    /// to publish `started` + `failed` pairs for early-rejection branches
+    /// that short-circuit before reaching an adapter's `call_tool` (unknown
+    /// prefix, missing adapter, disabled endpoint, unhealthy endpoint,
+    /// disabled tool). `None` by default so the many test-only call sites
+    /// that construct a bare registry without a bus keep compiling; wired in
+    /// by `main.rs` via [`Self::with_event_bus`] so the overlay still gets
+    /// the same `Started` → `Failed` transition adapters produce for calls
+    /// that do reach the network.
+    event_bus: Option<ToolCallEventBus>,
 }
 
 impl Default for AdapterRegistry {
@@ -127,7 +139,21 @@ impl AdapterRegistry {
             catalog_cache: Arc::new(RwLock::new(None)),
             catalog_generation: Arc::new(AtomicU64::new(0)),
             tools_changed_tx,
+            event_bus: None,
         }
+    }
+
+    /// Attach a shared [`ToolCallEventBus`] so [`Self::route_tool_call`]
+    /// publishes a `Started` + `Failed` pair for every early-rejection
+    /// branch (unknown prefix, missing/disabled/unhealthy endpoint,
+    /// disabled tool). The same bus instance must be wired into adapters
+    /// via [`McpAdapter::set_event_bus`] so the overlay sees a single
+    /// fan-out for both pre-adapter and adapter-side failures. Builder
+    /// style so the existing many-call-sites `AdapterRegistry::new()`
+    /// continues to compile unchanged.
+    pub fn with_event_bus(mut self, bus: ToolCallEventBus) -> Self {
+        self.event_bus = Some(bus);
+        self
     }
 
     /// Subscribe to the relay-wide tools-changed broadcast. Each `recv()`
@@ -560,7 +586,13 @@ impl AdapterRegistry {
     /// Route a prefixed tool call to the correct adapter.
     ///
     /// Rebuilds the reverse-lookup map from the current catalog to find the
-    /// target endpoint and raw tool name for the given prefixed name.
+    /// target endpoint and raw tool name for the given prefixed name. Every
+    /// early-rejection branch (unknown prefix, missing adapter, disabled
+    /// endpoint, unhealthy endpoint, disabled tool) emits a
+    /// [`ToolCallEvent::Started`] + [`ToolCallEvent::Failed`] pair on the
+    /// shared [`ToolCallEventBus`] (when wired via [`Self::with_event_bus`])
+    /// so the desktop overlay shows the same brief in-flight → failed card
+    /// it would render for an adapter-side failure.
     pub async fn route_tool_call(
         &self,
         prefixed_name: &str,
@@ -568,37 +600,81 @@ impl AdapterRegistry {
     ) -> Result<serde_json::Value, AdapterError> {
         let (_, lookup) = self.merged_catalog_with_lookup().await;
 
-        let (endpoint, tool) = lookup.get(prefixed_name).ok_or_else(|| {
-            AdapterError::ProtocolError(format!(
-                "no tool found for prefixed name '{}'",
-                prefixed_name
-            ))
-        })?;
+        let (endpoint, tool) = match lookup.get(prefixed_name) {
+            Some(v) => v,
+            None => {
+                // Branch 1: unknown prefixed name. We have no endpoint or
+                // adapter to consult, so server_type/server_name are omitted
+                // and transport falls back to the "unknown" sentinel.
+                return Err(self.publish_early_rejection(
+                    prefixed_name.to_string(),
+                    "unknown".to_string(),
+                    "unknown".to_string(),
+                    None,
+                    None,
+                    format!("no tool found for prefixed name '{}'", prefixed_name),
+                ));
+            }
+        };
 
         let adapters = self.adapters.read().await;
-        let entry = adapters.get(endpoint).ok_or_else(|| {
-            AdapterError::ProtocolError(format!("no adapter found for endpoint '{}'", endpoint))
-        })?;
+        let entry = match adapters.get(endpoint) {
+            Some(e) => e,
+            None => {
+                // Branch 2: lookup pointed at an endpoint the registry no
+                // longer has an adapter for (e.g. catalog cached across a
+                // remove). transport/server_type/server_name unknown.
+                return Err(self.publish_early_rejection(
+                    tool.clone(),
+                    endpoint.clone(),
+                    "unknown".to_string(),
+                    None,
+                    None,
+                    format!("no adapter found for endpoint '{}'", endpoint),
+                ));
+            }
+        };
 
         if entry.disabled {
-            return Err(AdapterError::ProtocolError(format!(
-                "endpoint '{}' is disabled",
-                endpoint
-            )));
+            // Branch 3: endpoint is administratively disabled.
+            return Err(self.publish_early_rejection(
+                tool.clone(),
+                endpoint.clone(),
+                entry.transport.clone(),
+                entry.adapter.server_type(),
+                entry.adapter.upstream_server_name(),
+                format!("endpoint '{}' is disabled", endpoint),
+            ));
         }
 
         if !matches!(entry.adapter.health(), HealthStatus::Healthy) {
-            return Err(AdapterError::ProtocolError(format!(
-                "tool '{}' is currently unavailable: endpoint '{}' is not healthy",
-                tool, endpoint
-            )));
+            // Branch 4: endpoint is registered + enabled but not Healthy.
+            return Err(self.publish_early_rejection(
+                tool.clone(),
+                endpoint.clone(),
+                entry.transport.clone(),
+                entry.adapter.server_type(),
+                entry.adapter.upstream_server_name(),
+                format!(
+                    "tool '{}' is currently unavailable: endpoint '{}' is not healthy",
+                    tool, endpoint
+                ),
+            ));
         }
 
         if entry.disabled_tools.contains(tool) {
-            return Err(AdapterError::ProtocolError(format!(
-                "tool '{}' is disabled on endpoint '{}'",
-                tool, endpoint
-            )));
+            // Branch 5: tool is disabled on this endpoint. Normally
+            // `merged_catalog_with_lookup` filters disabled tools so this
+            // branch is only reachable when the lookup was cached before
+            // the tool was added to `disabled_tools`.
+            return Err(self.publish_early_rejection(
+                tool.clone(),
+                endpoint.clone(),
+                entry.transport.clone(),
+                entry.adapter.server_type(),
+                entry.adapter.upstream_server_name(),
+                format!("tool '{}' is disabled on endpoint '{}'", tool, endpoint),
+            ));
         }
 
         info!(
@@ -608,6 +684,59 @@ impl AdapterRegistry {
             "Routing tool call"
         );
         entry.adapter.call_tool(tool, arguments).await
+    }
+
+    /// Publish a `Started` + `Failed` pair on the shared
+    /// [`ToolCallEventBus`] (when wired) for an early-rejection branch of
+    /// [`Self::route_tool_call`], then return the matching
+    /// [`AdapterError::ProtocolError`]. Kept in lockstep with the
+    /// per-adapter `call_tool` emission pattern in
+    /// `adapter/stdio.rs::call_tool` so the overlay sees a uniform
+    /// `Started` → `Failed` transition regardless of whether the call was
+    /// rejected pre-adapter or returned an error from the upstream MCP
+    /// server. The error text returned here MUST match the pre-event
+    /// strings (`no tool found for prefixed name`,
+    /// `no adapter found for endpoint`, `endpoint '{}' is disabled`,
+    /// `tool '{}' is currently unavailable: endpoint '{}' is not healthy`,
+    /// `tool '{}' is disabled on endpoint '{}'`) — external log scrapers
+    /// may depend on the exact wording.
+    fn publish_early_rejection(
+        &self,
+        tool: String,
+        endpoint: String,
+        transport: String,
+        server_type: Option<String>,
+        server_name: Option<String>,
+        error_message: String,
+    ) -> AdapterError {
+        if let Some(bus) = &self.event_bus {
+            let span_ctx = current_request_context();
+            let request_id = uuid::Uuid::new_v4().to_string();
+            // Emit `Started` first so the overlay can spawn an in-flight
+            // card before it sees `Failed`, matching the
+            // adapter-side ordering.
+            bus.send(ToolCallEvent::Started {
+                request_id: request_id.clone(),
+                jsonrpc_id: span_ctx.jsonrpc_id.clone(),
+                ts: iso8601_now(),
+                endpoint,
+                transport,
+                server_type,
+                server_name,
+                profile: span_ctx.profile.clone(),
+                tool,
+                annotations: None,
+            });
+            bus.send(ToolCallEvent::Failed {
+                request_id,
+                jsonrpc_id: span_ctx.jsonrpc_id,
+                ts: iso8601_now(),
+                duration_ms: 0,
+                status: "error".to_string(),
+                error_message: error_message.clone(),
+            });
+        }
+        AdapterError::ProtocolError(error_message)
     }
 }
 
@@ -2571,6 +2700,256 @@ mod tests {
             1,
             "expected exactly one underlying list_tools call; the second \
              caller must observe the populated cache after the populate lock"
+        );
+    }
+
+    // --- Early-rejection event emission (route_tool_call) ---
+    //
+    // Each of the 5 early-rejection branches in `route_tool_call` must
+    // publish a `Started` + `Failed` pair on the wired
+    // `ToolCallEventBus` before returning the underlying
+    // `AdapterError::ProtocolError`. The error string must match the
+    // pre-event wording exactly (log scrapers depend on it).
+
+    /// Drain the next two events from `rx` and assert they form a matched
+    /// `Started` + `Failed` pair carrying the expected tool name and error
+    /// message. Returns the request_id so the caller can assert nothing
+    /// else followed.
+    async fn assert_started_then_failed(
+        rx: &mut tokio::sync::broadcast::Receiver<ToolCallEvent>,
+        expected_tool: &str,
+        expected_endpoint: Option<&str>,
+        expected_error: &str,
+    ) -> String {
+        let started = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("started event arrived")
+            .expect("started recv ok");
+        let (sid, sendpoint) = match started {
+            ToolCallEvent::Started {
+                request_id,
+                tool,
+                endpoint,
+                ..
+            } => {
+                assert_eq!(tool, expected_tool, "Started.tool");
+                if let Some(exp) = expected_endpoint {
+                    assert_eq!(endpoint, exp, "Started.endpoint");
+                }
+                (request_id, endpoint)
+            }
+            other => panic!("expected Started, got {:?}", other),
+        };
+        let _ = sendpoint;
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("failed event arrived")
+            .expect("failed recv ok");
+        match failed {
+            ToolCallEvent::Failed {
+                request_id,
+                status,
+                error_message,
+                ..
+            } => {
+                assert_eq!(request_id, sid, "Failed.request_id matches Started");
+                assert_eq!(status, "error");
+                assert_eq!(error_message, expected_error);
+            }
+            other => panic!("expected Failed, got {:?}", other),
+        }
+        sid
+    }
+
+    #[tokio::test]
+    async fn route_unknown_prefix_emits_started_and_failed() {
+        let bus = ToolCallEventBus::with_default_capacity();
+        let mut rx = bus.subscribe();
+        let registry = AdapterRegistry::new().with_event_bus(bus);
+
+        let err = registry
+            .route_tool_call("ghost_tool", json!({}))
+            .await
+            .expect_err("unknown prefix should reject");
+        let expected = "no tool found for prefixed name 'ghost_tool'";
+        match &err {
+            AdapterError::ProtocolError(msg) => assert_eq!(msg, expected),
+            other => panic!("expected ProtocolError, got {:?}", other),
+        }
+        assert_started_then_failed(&mut rx, "ghost_tool", Some("unknown"), expected).await;
+    }
+
+    #[tokio::test]
+    async fn route_missing_adapter_emits_started_and_failed() {
+        // Build a lookup pointing at endpoint `ep` then remove the
+        // adapter without invalidating the cached lookup so route hits
+        // the "no adapter found" branch.
+        let bus = ToolCallEventBus::with_default_capacity();
+        let mut rx = bus.subscribe();
+        let registry = AdapterRegistry::new().with_event_bus(bus);
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("read")])),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+        // Warm the cached lookup so the subsequent removal keeps the
+        // (prefixed_name -> ("ep", "read")) mapping in `catalog_cache`.
+        let _ = registry.merged_catalog_with_lookup().await;
+        // Bypass `remove()` (which invalidates the catalog) by yanking
+        // the adapter directly out of the inner map.
+        registry.adapters.write().await.remove("ep");
+
+        let err = registry
+            .route_tool_call("read", json!({}))
+            .await
+            .expect_err("missing adapter should reject");
+        let expected = "no adapter found for endpoint 'ep'";
+        match &err {
+            AdapterError::ProtocolError(msg) => assert_eq!(msg, expected),
+            other => panic!("expected ProtocolError, got {:?}", other),
+        }
+        assert_started_then_failed(&mut rx, "read", Some("ep"), expected).await;
+    }
+
+    #[tokio::test]
+    async fn route_disabled_endpoint_emits_started_and_failed() {
+        let bus = ToolCallEventBus::with_default_capacity();
+        let mut rx = bus.subscribe();
+        let registry = AdapterRegistry::new().with_event_bus(bus);
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("read")])),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+        // Warm the lookup, then disable the endpoint without
+        // invalidating so the branch is reachable.
+        let _ = registry.merged_catalog_with_lookup().await;
+        registry
+            .adapters
+            .write()
+            .await
+            .get_mut("ep")
+            .unwrap()
+            .disabled = true;
+
+        let err = registry
+            .route_tool_call("read", json!({}))
+            .await
+            .expect_err("disabled endpoint should reject");
+        let expected = "endpoint 'ep' is disabled";
+        match &err {
+            AdapterError::ProtocolError(msg) => assert_eq!(msg, expected),
+            other => panic!("expected ProtocolError, got {:?}", other),
+        }
+        assert_started_then_failed(&mut rx, "read", Some("ep"), expected).await;
+    }
+
+    #[tokio::test]
+    async fn route_unhealthy_endpoint_emits_started_and_failed() {
+        let bus = ToolCallEventBus::with_default_capacity();
+        let mut rx = bus.subscribe();
+        let registry = AdapterRegistry::new().with_event_bus(bus);
+        // Register an unhealthy adapter that still publishes a tool so
+        // the lookup contains it (the catalog includes unhealthy tools
+        // marked `[⚠️ UNAVAILABLE]`).
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::unhealthy_with_tools(vec![make_tool("read")])),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        let err = registry
+            .route_tool_call("read", json!({}))
+            .await
+            .expect_err("unhealthy endpoint should reject");
+        let expected = "tool 'read' is currently unavailable: endpoint 'ep' is not healthy";
+        match &err {
+            AdapterError::ProtocolError(msg) => assert_eq!(msg, expected),
+            other => panic!("expected ProtocolError, got {:?}", other),
+        }
+        assert_started_then_failed(&mut rx, "read", Some("ep"), expected).await;
+    }
+
+    #[tokio::test]
+    async fn route_disabled_tool_emits_started_and_failed() {
+        let bus = ToolCallEventBus::with_default_capacity();
+        let mut rx = bus.subscribe();
+        let registry = AdapterRegistry::new().with_event_bus(bus);
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("read")])),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+        // Warm the lookup so the disabled-tool branch becomes reachable
+        // (merged_catalog_with_lookup filters disabled tools, so a
+        // post-disable lookup rebuild would route the call through the
+        // unknown-prefix branch instead).
+        let _ = registry.merged_catalog_with_lookup().await;
+        registry
+            .adapters
+            .write()
+            .await
+            .get_mut("ep")
+            .unwrap()
+            .disabled_tools
+            .insert("read".into());
+
+        let err = registry
+            .route_tool_call("read", json!({}))
+            .await
+            .expect_err("disabled tool should reject");
+        let expected = "tool 'read' is disabled on endpoint 'ep'";
+        match &err {
+            AdapterError::ProtocolError(msg) => assert_eq!(msg, expected),
+            other => panic!("expected ProtocolError, got {:?}", other),
+        }
+        assert_started_then_failed(&mut rx, "read", Some("ep"), expected).await;
+    }
+
+    #[tokio::test]
+    async fn route_success_does_not_emit_registry_events() {
+        // Sanity check: when the call reaches the adapter (and the mock
+        // adapter does not publish events), the registry must not emit
+        // a stray `Started`/`Failed` pair.
+        let bus = ToolCallEventBus::with_default_capacity();
+        let mut rx = bus.subscribe();
+        let registry = AdapterRegistry::new().with_event_bus(bus);
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("read")])),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        let result = registry.route_tool_call("read", json!({})).await.unwrap();
+        assert_eq!(result["called"], "read");
+        let try_recv = rx.try_recv();
+        assert!(
+            matches!(
+                try_recv,
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "registry must not publish events on the happy path; got {:?}",
+            try_recv
         );
     }
 }

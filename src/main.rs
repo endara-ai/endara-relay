@@ -309,15 +309,19 @@ async fn main() {
             let oauth_flow_manager = Arc::new(OAuthFlowManager::new());
             let oauth_adapter_inners: OAuthAdapterInners = Arc::new(RwLock::new(HashMap::new()));
 
-            // Create adapter registry
-            let registry = AdapterRegistry::new();
-
             // Typed tool-call event bus consumed by the desktop overlay's
             // SSE stream (`GET /api/events/tool-calls`). One bus per relay
             // process; cloned cheaply into each adapter's setter and into
             // ManagementState. See [`events`] module docs for ring-buffer
             // semantics.
             let event_bus = ToolCallEventBus::with_default_capacity();
+
+            // Create adapter registry. Wire the same bus into the
+            // registry so its early-rejection branches in
+            // `route_tool_call` (unknown prefix, missing/disabled/unhealthy
+            // endpoint, disabled tool) emit `Started` + `Failed` pairs
+            // alongside the per-adapter emissions.
+            let registry = AdapterRegistry::new().with_event_bus(event_bus.clone());
 
             // Track duplicate endpoint names: first occurrence wins
             let mut registered_names = std::collections::HashSet::new();
