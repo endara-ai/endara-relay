@@ -1962,6 +1962,196 @@ toon_output = true
             }
         }
 
+        // ---- R3.D: tools_changed broadcast coverage from reload_and_apply ----
+        //
+        // Acceptance #4 in the R3.D spec: a single `reload_and_apply` that
+        // adds one endpoint, removes another, and leaves a third unchanged
+        // must emit exactly one `tools_changed` tick for the added endpoint,
+        // exactly one for the removed endpoint, and zero for the unchanged
+        // one. All add/remove paths in `apply_diff_graceful` flow through
+        // `AdapterRegistry::register` / `remove`, which already tick once
+        // per call (registry.rs:195 and :206); this test pins that wiring
+        // end-to-end so future watcher refactors can't silently break it.
+        mod tools_changed {
+            use super::super::*;
+            use crate::config::Config;
+            use crate::profile_registry::ProfileRegistry;
+            use std::collections::HashMap;
+            use std::path::PathBuf;
+            use std::sync::atomic::AtomicBool;
+            use std::sync::Arc;
+            use tokio::sync::RwLock;
+
+            /// Initial config: `keep` (unchanged across reload) + `remove_me`
+            /// (removed on reload).
+            const CONFIG_BEFORE: &str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "keep"
+transport = "stdio"
+command = "/bin/true"
+
+[[endpoints]]
+name = "remove_me"
+transport = "stdio"
+command = "/bin/true"
+"#;
+
+            /// New config: `keep` (unchanged) + `add_me` (newly added).
+            const CONFIG_AFTER: &str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "keep"
+transport = "stdio"
+command = "/bin/true"
+
+[[endpoints]]
+name = "add_me"
+transport = "stdio"
+command = "/bin/true"
+"#;
+
+            /// Build the in-memory state matching what main.rs would have
+            /// after loading `CONFIG_BEFORE` at startup, with `keep` and
+            /// `remove_me` pre-registered in the adapter registry so the
+            /// reload's `removed` branch actually has something to remove
+            /// (and therefore actually ticks).
+            async fn setup_with_endpoints() -> (
+                tempfile::TempDir,
+                PathBuf,
+                Arc<RwLock<Config>>,
+                Arc<AdapterRegistry>,
+                Arc<ProfileRegistry>,
+                Arc<AtomicBool>,
+                Arc<TokenManager>,
+                OAuthAdapterInners,
+            ) {
+                let tmp = tempfile::tempdir().unwrap();
+                let path = tmp.path().join("config.toml");
+                std::fs::write(&path, CONFIG_BEFORE).unwrap();
+                let (initial, _warnings) = config::load_config_graceful(&path).unwrap();
+
+                let registry = Arc::new(AdapterRegistry::new());
+                // Pre-register the two initial endpoints as MockAdapters so
+                // the reload's `remove("remove_me")` call actually finds and
+                // removes an entry (and therefore ticks). `keep` is also
+                // registered so its presence in the unchanged branch
+                // exercises the "no-op for unchanged" path realistically.
+                let dummy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                for name in ["keep", "remove_me"] {
+                    registry
+                        .register(
+                            name.into(),
+                            Box::new(MockAdapter::healthy(vec![make_tool("t")], dummy.clone())),
+                            "stdio".into(),
+                            None,
+                            Some(name.into()),
+                        )
+                        .await;
+                }
+
+                let profile_registry = Arc::new(ProfileRegistry::new((*registry).clone()));
+                profile_registry
+                    .rebuild(initial.profiles.as_deref().unwrap_or(&[]))
+                    .await;
+
+                let current_config = Arc::new(RwLock::new(initial));
+                let js_mode = Arc::new(AtomicBool::new(false));
+                let (token_manager, inners) = test_oauth_infra();
+                (
+                    tmp,
+                    path,
+                    current_config,
+                    registry,
+                    profile_registry,
+                    js_mode,
+                    token_manager,
+                    inners,
+                )
+            }
+
+            /// Drain every tick the subscriber sees within `budget`, returning
+            /// a per-endpoint count map. Uses a per-recv timeout (instead of
+            /// `try_recv`) so the test stays robust against background-task
+            /// scheduling jitter — the budget is generous enough to absorb
+            /// any synchronously-emitted tick from `reload_and_apply` while
+            /// still being short on test wall-clock.
+            async fn drain_ticks(
+                rx: &mut tokio::sync::broadcast::Receiver<String>,
+                budget: std::time::Duration,
+            ) -> HashMap<String, usize> {
+                let deadline = std::time::Instant::now() + budget;
+                let mut counts: HashMap<String, usize> = HashMap::new();
+                loop {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let remaining = deadline - now;
+                    match tokio::time::timeout(remaining, rx.recv()).await {
+                        Ok(Ok(name)) => *counts.entry(name).or_insert(0) += 1,
+                        Ok(Err(_)) => break, // Lagged or Closed — stop draining.
+                        Err(_) => break,     // Timeout — no more ticks.
+                    }
+                }
+                counts
+            }
+
+            /// Spec R3.D acceptance #4: a reload that adds one endpoint,
+            /// removes another, and leaves a third unchanged must produce
+            /// exactly one `tools_changed` tick for the added endpoint, one
+            /// for the removed endpoint, and zero for the unchanged one.
+            #[tokio::test]
+            async fn reload_and_apply_ticks_added_and_removed_not_unchanged() {
+                let (_tmp, path, current_config, registry, profile_registry, js_mode, tm, inners) =
+                    setup_with_endpoints().await;
+
+                // Subscribe AFTER the initial pre-registration so we only
+                // observe the ticks driven by `reload_and_apply` itself.
+                let mut rx = registry.subscribe_tools_changed();
+
+                std::fs::write(&path, CONFIG_AFTER).unwrap();
+                reload_and_apply(
+                    &path,
+                    &current_config,
+                    &registry,
+                    &js_mode,
+                    &profile_registry,
+                    &tm,
+                    &inners,
+                )
+                .await
+                .expect("reload should succeed");
+
+                let counts = drain_ticks(&mut rx, std::time::Duration::from_millis(150)).await;
+
+                assert_eq!(
+                    counts.get("add_me").copied().unwrap_or(0),
+                    1,
+                    "added endpoint must emit exactly one tick (counts={counts:?})"
+                );
+                assert_eq!(
+                    counts.get("remove_me").copied().unwrap_or(0),
+                    1,
+                    "removed endpoint must emit exactly one tick (counts={counts:?})"
+                );
+                assert_eq!(
+                    counts.get("keep").copied().unwrap_or(0),
+                    0,
+                    "unchanged endpoint must emit zero ticks (counts={counts:?})"
+                );
+                assert_eq!(
+                    counts.values().sum::<usize>(),
+                    2,
+                    "reload should emit exactly 2 ticks total (counts={counts:?})"
+                );
+            }
+        }
+
         /// Regression coverage for the desktop "Failed to load profiles"
         /// bug: after a new endpoint lands on disk via the same code path
         /// `oauth_setup_commit` uses (TOML writeback → watcher reload), the
