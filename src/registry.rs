@@ -141,13 +141,22 @@ impl AdapterRegistry {
         self.tools_changed_tx.subscribe()
     }
 
+    /// Emit a synthetic tools-changed tick for `endpoint` on the relay-wide
+    /// broadcast. Used by management mutations (e.g. enable/disable an
+    /// endpoint or per-endpoint tool) that change the advertised catalog
+    /// without a real `notifications/tools/list_changed` event from the
+    /// underlying adapter. Sending on a closed broadcast is ignored.
+    pub(crate) fn tick_tools_changed(&self, endpoint: &str) {
+        let _ = self.tools_changed_tx.send(endpoint.to_string());
+    }
+
     /// Send a synthetic tools-changed tick on the relay-wide broadcast for
     /// the given endpoint name. Test-only escape hatch so server-side
     /// handler tests can exercise the fan-out path without standing up a
     /// real adapter and listener task.
     #[cfg(test)]
     pub(crate) fn tick_tools_changed_for_test(&self, endpoint: &str) {
-        let _ = self.tools_changed_tx.send(endpoint.to_string());
+        self.tick_tools_changed(endpoint);
     }
 
     /// Register an adapter under the given endpoint name.
@@ -161,6 +170,7 @@ impl AdapterRegistry {
     ) {
         debug!(endpoint = %name, ?tool_prefix, "Registering adapter");
         let listener_handle = self.spawn_tools_changed_listener(&name, adapter.as_ref());
+        let endpoint_for_tick = name.clone();
         let previous = self.adapters.write().await.insert(
             name,
             RegisteredAdapter {
@@ -182,6 +192,7 @@ impl AdapterRegistry {
             }
         }
         self.invalidate_catalog_cache().await;
+        let _ = self.tools_changed_tx.send(endpoint_for_tick);
     }
 
     /// Remove an adapter by endpoint name.
@@ -192,6 +203,7 @@ impl AdapterRegistry {
                 handle.abort();
             }
             self.invalidate_catalog_cache().await;
+            let _ = self.tools_changed_tx.send(name.to_string());
         }
         result
     }
@@ -2137,6 +2149,10 @@ mod tests {
             )
             .await;
 
+        // Drain the tick emitted by `register` itself so the next recv
+        // observes only the fanned-in per-endpoint tick.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), relay_rx.recv()).await;
+
         // Drive a per-endpoint tick; the listener loop should observe it and
         // fan it into the relay-wide broadcast with the endpoint name.
         tx.send(()).unwrap();
@@ -2148,6 +2164,125 @@ mod tests {
                  carrying the endpoint name (got {other:?})"
             ),
         }
+    }
+
+    /// `register` must emit exactly one relay-wide tools-changed tick
+    /// carrying the endpoint name, after caches are invalidated.
+    #[tokio::test]
+    async fn test_register_emits_single_tools_changed_tick() {
+        let registry = AdapterRegistry::new();
+        let mut rx = registry.subscribe_tools_changed();
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("a")])),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("register tick must fire within 1s")
+            .expect("broadcast must still be open");
+        assert_eq!(first, "ep");
+
+        // Exactly one tick — a second recv must time out.
+        let second = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            second.is_err(),
+            "register must emit exactly one tick (got extra: {second:?})"
+        );
+    }
+
+    /// `remove` on an existing endpoint must emit exactly one tick
+    /// carrying the endpoint name.
+    #[tokio::test]
+    async fn test_remove_emits_single_tools_changed_tick() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("a")])),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        // Subscribe AFTER register so we only observe the remove tick.
+        let mut rx = registry.subscribe_tools_changed();
+        let removed = registry.remove("ep").await;
+        assert!(removed.is_some(), "endpoint should have been removed");
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("remove tick must fire within 1s")
+            .expect("broadcast must still be open");
+        assert_eq!(first, "ep");
+
+        let second = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            second.is_err(),
+            "remove must emit exactly one tick (got extra: {second:?})"
+        );
+    }
+
+    /// `remove` of a non-existent endpoint must NOT emit a tick.
+    #[tokio::test]
+    async fn test_remove_noop_emits_no_tools_changed_tick() {
+        let registry = AdapterRegistry::new();
+        let mut rx = registry.subscribe_tools_changed();
+        let removed = registry.remove("does-not-exist").await;
+        assert!(removed.is_none(), "no-op remove must return None");
+
+        let any = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            any.is_err(),
+            "no-op remove must not emit any tick (got: {any:?})"
+        );
+    }
+
+    /// Re-registering an endpoint (overwriting an existing entry) must
+    /// emit exactly one tick per register call — not two.
+    #[tokio::test]
+    async fn test_reregister_emits_single_tools_changed_tick() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("v1")])),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        // Subscribe AFTER the first register so we only observe the
+        // overwrite tick.
+        let mut rx = registry.subscribe_tools_changed();
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("v2")])),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("overwrite register tick must fire within 1s")
+            .expect("broadcast must still be open");
+        assert_eq!(first, "ep");
+
+        let second = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+        assert!(
+            second.is_err(),
+            "overwrite register must emit exactly one tick (got extra: {second:?})"
+        );
     }
 
     #[tokio::test]
