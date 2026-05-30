@@ -111,7 +111,6 @@ non-goals for the Endara Relay process.
 
 ## Reporting a vulnerability
 
-See `SECURITY.md` (TODO) for the responsible-disclosure process. In the interim,
-file a private security advisory via GitHub at
-`https://github.com/endara-ai/endara-relay/security/advisories/new`.
+See [`SECURITY.md`](SECURITY.md) for the responsible-disclosure process and what
+to expect after you report.
 
