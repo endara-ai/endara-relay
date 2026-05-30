@@ -605,9 +605,14 @@ async fn main() {
                 started_at: std::time::Instant::now(),
                 toon_enabled,
             };
+            // Shared config handle: a single `Arc<RwLock<Config>>` that both
+            // `ManagementState` (read by `/api/*` handlers) and `ConfigWatcher`
+            // (writes through on each reload) point at, so a file-watcher
+            // reconciliation is immediately visible to the management API.
+            let shared_config = Arc::new(tokio::sync::RwLock::new(cfg.clone()));
             let mgmt_state = management::ManagementState {
                 registry: registry.clone(),
-                config: Arc::new(tokio::sync::RwLock::new(cfg.clone())),
+                config: shared_config.clone(),
                 start_time: std::time::Instant::now(),
                 config_path: Some(config_path.clone()),
                 oauth_flow_manager: Some(oauth_flow_manager.clone()),
@@ -750,6 +755,7 @@ async fn main() {
                         token_manager.clone(),
                         oauth_flow_manager.clone(),
                         oauth_adapter_inners.clone(),
+                        shared_config.clone(),
                     );
 
                     handle.await.ok();

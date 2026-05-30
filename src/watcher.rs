@@ -14,7 +14,7 @@ use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
 use tracing::{error, info, warn};
@@ -40,6 +40,7 @@ impl ConfigWatcher {
         token_manager: Arc<TokenManager>,
         _oauth_flow_manager: Arc<OAuthFlowManager>,
         oauth_adapter_inners: OAuthAdapterInners,
+        shared_config: Arc<RwLock<Config>>,
     ) -> JoinHandle<()> {
         tokio::spawn(async move {
             if let Err(e) = watch_loop(
@@ -50,6 +51,7 @@ impl ConfigWatcher {
                 profile_registry,
                 token_manager,
                 oauth_adapter_inners,
+                shared_config,
             )
             .await
             {
@@ -59,6 +61,7 @@ impl ConfigWatcher {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn watch_loop(
     config_path: PathBuf,
     registry: Arc<AdapterRegistry>,
@@ -67,6 +70,7 @@ async fn watch_loop(
     profile_registry: Arc<ProfileRegistry>,
     token_manager: Arc<TokenManager>,
     oauth_adapter_inners: OAuthAdapterInners,
+    shared_config: Arc<RwLock<Config>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
@@ -90,14 +94,10 @@ async fn watch_loop(
 
     info!(path = %config_path.display(), "Config watcher started");
 
-    // Load initial config as baseline (use graceful — fatal errors still propagate)
-    let (initial_config, initial_warnings) = config::load_config_graceful(&config_path)?;
-    if !initial_warnings.is_empty() {
-        for w in &initial_warnings {
-            warn!("{}", w);
-        }
-    }
-    let current_config = Arc::new(Mutex::new(initial_config));
+    // Baseline lives in `shared_config`, populated at startup by `main.rs`
+    // (and re-populated by every successful `reload_and_apply` below). No
+    // separate initial parse here — that would race with main.rs's load and
+    // produce two distinct in-memory copies of the same TOML.
 
     loop {
         // Wait for a filesystem event
@@ -119,7 +119,7 @@ async fn watch_loop(
 
         let _ = reload_and_apply(
             &config_path,
-            &current_config,
+            &shared_config,
             &registry,
             &js_execution_mode,
             &profile_registry,
@@ -147,7 +147,7 @@ async fn watch_loop(
 /// new config could not be parsed or its profile block was invalid.
 async fn reload_and_apply(
     config_path: &Path,
-    current_config: &Arc<Mutex<Config>>,
+    shared_config: &Arc<RwLock<Config>>,
     registry: &Arc<AdapterRegistry>,
     js_execution_mode: &Arc<AtomicBool>,
     profile_registry: &Arc<ProfileRegistry>,
@@ -156,7 +156,8 @@ async fn reload_and_apply(
 ) -> Result<(), config::ConfigError> {
     // Parse new config gracefully. Fatal errors (parse failure or
     // fail-fast profile-validation failure) bail out without touching the
-    // running registry — that is the keep-last-good guarantee.
+    // running registry — that is the keep-last-good guarantee. `shared_config`
+    // (also read by `ManagementState`) is left untouched on this path.
     let (new_config, warnings) = match config::load_config_graceful(config_path) {
         Ok(result) => result,
         Err(e) => {
@@ -171,8 +172,10 @@ async fn reload_and_apply(
 
     let warned_names = config::warned_endpoint_names(&warnings);
 
-    // Diff and apply endpoint changes.
-    let old_config = current_config.lock().await;
+    // Snapshot the previous config for diffing. Cloning lets us drop the
+    // read lock before the (potentially slow) `apply_diff_graceful` spawns
+    // run, so management API readers are never blocked on adapter init.
+    let old_config = shared_config.read().await.clone();
     let diff = config::diff_configs(&old_config, &new_config);
     drop(old_config);
 
@@ -204,8 +207,9 @@ async fn reload_and_apply(
         .rebuild(new_config.profiles.as_deref().unwrap_or(&[]))
         .await;
 
-    // Update baseline.
-    *current_config.lock().await = new_config;
+    // Publish the new baseline to the shared handle so the next
+    // management-API read sees it (and the next diff is taken against it).
+    *shared_config.write().await = new_config;
     Ok(())
 }
 
@@ -1738,7 +1742,7 @@ mod tests {
             use std::path::PathBuf;
             use std::sync::atomic::AtomicBool;
             use std::sync::Arc;
-            use tokio::sync::Mutex;
+            use tokio::sync::RwLock;
 
             /// Build the initial in-memory state the watcher would have after
             /// loading `config.toml` for the first time at startup.
@@ -1747,7 +1751,7 @@ mod tests {
             ) -> (
                 tempfile::TempDir,
                 PathBuf,
-                Arc<Mutex<Config>>,
+                Arc<RwLock<Config>>,
                 Arc<AdapterRegistry>,
                 Arc<ProfileRegistry>,
                 Arc<AtomicBool>,
@@ -1767,7 +1771,7 @@ mod tests {
                     .rebuild(initial.profiles.as_deref().unwrap_or(&[]))
                     .await;
 
-                let current_config = Arc::new(Mutex::new(initial));
+                let current_config = Arc::new(RwLock::new(initial));
                 let js_mode = Arc::new(AtomicBool::new(false));
                 let (token_manager, inners) = test_oauth_infra();
                 (
@@ -1839,7 +1843,7 @@ toon_output = true
                 assert_eq!(ctx.config.endpoints, vec!["ep1".to_string()]);
                 assert_eq!(
                     current_config
-                        .lock()
+                        .read()
                         .await
                         .profiles
                         .as_deref()
@@ -1946,7 +1950,7 @@ toon_output = true
                     profile_registry.get("broken").await.is_none(),
                     "broken profile must never be installed"
                 );
-                let baseline = current_config.lock().await;
+                let baseline = current_config.read().await;
                 let baseline_names: Vec<String> = baseline
                     .profiles
                     .as_deref()
@@ -1955,6 +1959,141 @@ toon_output = true
                     .map(|p| p.name.clone())
                     .collect();
                 assert_eq!(baseline_names, vec!["Work".to_string()]);
+            }
+        }
+
+        /// Regression coverage for the desktop "Failed to load profiles"
+        /// bug: after a new endpoint lands on disk via the same code path
+        /// `oauth_setup_commit` uses (TOML writeback → watcher reload), the
+        /// management API's `GET /api/endpoints/{name}/profiles` route must
+        /// switch from 404 to 200. The bug was that the watcher updated its
+        /// own internal `current_config` and the adapter registry, but the
+        /// `ManagementState::config` Arc it pulled from at request time
+        /// stayed stale — so the Profiles tab opened on a freshly-added
+        /// OAuth MCP server surfaced "Failed to load profiles" forever.
+        ///
+        /// The fix wires the same `Arc<RwLock<Config>>` through both
+        /// `ManagementState` and `reload_and_apply`, which this test
+        /// asserts by driving the reload helper directly and oneshot-ing
+        /// the membership route against the shared state.
+        mod endpoint_membership {
+            use super::super::*;
+            use crate::management::{management_routes, ManagementState};
+            use crate::profile_registry::ProfileRegistry;
+            use axum::body::Body;
+            use axum::http::{Request, StatusCode};
+            use std::sync::atomic::AtomicBool;
+            use std::sync::Arc;
+            use std::time::Instant;
+            use tokio::sync::RwLock;
+            use tower::ServiceExt;
+
+            const CONFIG_EMPTY: &str = r#"
+[relay]
+machine_name = "test"
+"#;
+
+            const CONFIG_WITH_NEW_ENDPOINT: &str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "newserver"
+transport = "stdio"
+command = "/bin/true"
+"#;
+
+            #[tokio::test]
+            async fn endpoint_profile_membership_visible_after_watcher_reload() {
+                let tmp = tempfile::tempdir().unwrap();
+                let path = tmp.path().join("config.toml");
+                std::fs::write(&path, CONFIG_EMPTY).unwrap();
+                let (initial, _warnings) = config::load_config_graceful(&path).unwrap();
+
+                let registry = Arc::new(AdapterRegistry::new());
+                let profile_registry = Arc::new(ProfileRegistry::new((*registry).clone()));
+                profile_registry
+                    .rebuild(initial.profiles.as_deref().unwrap_or(&[]))
+                    .await;
+                let shared_config = Arc::new(RwLock::new(initial));
+                let js_mode = Arc::new(AtomicBool::new(false));
+                let (token_manager, inners) = test_oauth_infra();
+
+                // Same Arc on both sides — this is the wiring the bug
+                // regressed: before the fix the watcher swapped a private
+                // copy and `ManagementState` held a separate stale Arc.
+                let state = ManagementState {
+                    registry: registry.clone(),
+                    config: shared_config.clone(),
+                    start_time: Instant::now(),
+                    config_path: Some(path.clone()),
+                    oauth_flow_manager: None,
+                    relay_port: 0,
+                    oauth_adapter_inners: Some(inners.clone()),
+                    token_manager: Some(token_manager.clone()),
+                    setup_manager: None,
+                    profile_registry: Some(profile_registry.clone()),
+                };
+                let app = management_routes(state);
+
+                // Fixture sanity: the endpoint doesn't exist yet, so the
+                // membership route must 404 — confirms the assertion
+                // pivots on the reload, not on the route always returning
+                // 200.
+                let resp = app
+                    .clone()
+                    .oneshot(
+                        Request::get("/api/endpoints/newserver/profiles")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::NOT_FOUND,
+                    "fixture sanity: 'newserver' must not exist before reload"
+                );
+
+                // Same code path `oauth_setup_commit` exercises: edit the
+                // TOML file and let the watcher's reload helper reconcile
+                // both the registry and the shared config snapshot.
+                std::fs::write(&path, CONFIG_WITH_NEW_ENDPOINT).unwrap();
+                reload_and_apply(
+                    &path,
+                    &shared_config,
+                    &registry,
+                    &js_mode,
+                    &profile_registry,
+                    &token_manager,
+                    &inners,
+                )
+                .await
+                .expect("reload of valid config must succeed");
+
+                let resp = app
+                    .oneshot(
+                        Request::get("/api/endpoints/newserver/profiles")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::OK,
+                    "after reload, membership route must see the new endpoint \
+                     via the shared ManagementState::config Arc"
+                );
+                let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    body,
+                    serde_json::json!({ "profiles": [] }),
+                    "brand-new endpoint with no profiles should report an empty list"
+                );
             }
         }
     }
