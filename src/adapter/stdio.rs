@@ -402,11 +402,46 @@ impl StdioAdapter {
             .ok_or_else(|| AdapterError::ProtocolError("response has no result".into()))
     }
 
+    /// Send a JSON-RPC notification (no id, no response expected).
+    ///
+    /// Writes a single newline-terminated frame to the child's stdin. Unlike
+    /// [`Self::send_request`], this does not allocate a request id, does not
+    /// register a pending entry, and does not wait for a response.
+    async fn send_notification(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<(), AdapterError> {
+        let notification = jsonrpc::new_notification(method, params);
+        let mut line = serde_json::to_string(&notification)?;
+        line.push('\n');
+
+        let mut writer_guard = self.stdin_writer.lock().await;
+        let writer = writer_guard.as_mut().ok_or(AdapterError::NotInitialized)?;
+        if let Err(e) = writer.write_all(line.as_bytes()).await {
+            return Err(AdapterError::ProcessCrashed(format!(
+                "stdin write failed: {}",
+                e
+            )));
+        }
+        if let Err(e) = writer.flush().await {
+            return Err(AdapterError::ProcessCrashed(format!(
+                "stdin flush failed: {}",
+                e
+            )));
+        }
+        Ok(())
+    }
+
     /// Perform the MCP initialize handshake.
     ///
     /// This method enforces that the server MUST provide a valid `serverInfo.name`
     /// in the initialize response. If the name is missing, empty, or reduces to
     /// empty after sanitization, the handshake fails with a ProtocolError.
+    ///
+    /// On success, a `notifications/initialized` notification is sent to the
+    /// server (per the MCP spec) before returning. A failure to send that
+    /// notification is logged at `warn!` level but does not fail the handshake.
     async fn mcp_initialize(&self) -> Result<(), AdapterError> {
         let params = json!({
             "protocolVersion": "2024-11-05",
@@ -461,6 +496,16 @@ impl StdioAdapter {
         }
         *self.server_type.write().await = effective;
         *self.upstream_server_name.write().await = Some(upstream_stripped);
+
+        // Per the MCP spec the client MUST send a notifications/initialized
+        // notification after a successful initialize exchange. Strict servers
+        // refuse all subsequent requests until they observe it.
+        if let Err(e) = self
+            .send_notification("notifications/initialized", None)
+            .await
+        {
+            warn!(error = %e, "failed to send notifications/initialized");
+        }
 
         info!("MCP initialize handshake complete");
         Ok(())
@@ -1140,5 +1185,109 @@ for line in sys.stdin:
         }
 
         adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stdio_sends_initialized_notification_after_handshake() {
+        // Python script that records every received stdin line to a file
+        // (path passed via the RECORD_PATH env var) and responds to the
+        // initialize and tools/list requests with minimal valid results.
+        let script = r#"
+import sys, json, os
+record_path = os.environ["RECORD_PATH"]
+with open(record_path, "w") as rec:
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        rec.write(line + "\n")
+        rec.flush()
+        try:
+            req = json.loads(line)
+        except Exception:
+            continue
+        method = req.get("method")
+        req_id = req.get("id")
+        if req_id is None:
+            # Notifications get no response.
+            continue
+        if method == "initialize":
+            resp = {
+                "jsonrpc": "2.0",
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "serverInfo": {"name": "test", "version": "0.1"},
+                },
+                "id": req_id,
+            }
+        elif method == "tools/list":
+            resp = {"jsonrpc": "2.0", "result": {"tools": []}, "id": req_id}
+        else:
+            resp = {"jsonrpc": "2.0", "result": {}, "id": req_id}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+        let record_path = std::env::temp_dir().join(format!(
+            "endara-stdio-init-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut env = HashMap::new();
+        env.insert(
+            "RECORD_PATH".to_string(),
+            record_path.to_string_lossy().into_owned(),
+        );
+        let mut adapter = StdioAdapter::new(StdioConfig {
+            command: "python3".to_string(),
+            args: vec!["-u".to_string(), "-c".to_string(), script.to_string()],
+            env,
+            ..Default::default()
+        });
+
+        (&mut adapter as &mut dyn McpAdapter)
+            .initialize()
+            .await
+            .unwrap();
+        let _ = adapter.list_tools().await.unwrap();
+
+        // Give the Python script a moment to flush before we read the file.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        adapter.shutdown().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let recorded = std::fs::read_to_string(&record_path)
+            .expect("record file should exist after handshake + list_tools");
+        let _ = std::fs::remove_file(&record_path);
+        let frames: Vec<Value> = recorded
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("each recorded line is valid JSON"))
+            .collect();
+
+        assert!(
+            frames.len() >= 3,
+            "expected at least 3 frames, got {}: {:?}",
+            frames.len(),
+            frames
+        );
+        assert_eq!(frames[0]["method"].as_str(), Some("initialize"));
+        assert!(
+            frames[0].get("id").and_then(|v| v.as_u64()).is_some(),
+            "initialize frame must carry a numeric id"
+        );
+        assert_eq!(
+            frames[1]["method"].as_str(),
+            Some("notifications/initialized")
+        );
+        assert!(
+            frames[1].get("id").is_none(),
+            "notifications/initialized frame must not have an id field, got: {:?}",
+            frames[1]
+        );
+        assert_eq!(frames[2]["method"].as_str(), Some("tools/list"));
     }
 }

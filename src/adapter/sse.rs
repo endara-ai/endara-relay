@@ -440,6 +440,61 @@ impl SseAdapter {
         }
     }
 
+    /// Send a JSON-RPC notification via POST to the endpoint. Notifications
+    /// have no `id` and do not produce a response — we only inspect the HTTP
+    /// status. Used for `notifications/initialized` after the handshake.
+    async fn send_notification(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<(), AdapterError> {
+        let endpoint = {
+            let guard = self.post_endpoint.read().await;
+            guard.clone().ok_or(AdapterError::NotInitialized)?
+        };
+
+        let mut request = json!({
+            "jsonrpc": "2.0",
+            "method": method,
+        });
+        if let Some(p) = params {
+            request["params"] = p;
+        }
+
+        debug!(method = method, endpoint = %endpoint, "sending SSE JSON-RPC notification");
+
+        let resp = self
+            .client
+            .post(&endpoint)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| {
+                if e.is_timeout() {
+                    AdapterError::Timeout(self.config.timeout_secs)
+                } else if e.is_connect() {
+                    AdapterError::ConnectionFailed(format!("{}: {}", endpoint, e))
+                } else {
+                    AdapterError::HttpError {
+                        status: 0,
+                        body: e.to_string(),
+                    }
+                }
+            })?;
+
+        let status = resp.status();
+        if status.is_success() {
+            debug!(method = method, status = %status, "notification accepted");
+            Ok(())
+        } else {
+            let body = resp.text().await.unwrap_or_default();
+            Err(AdapterError::HttpError {
+                status: status.as_u16(),
+                body,
+            })
+        }
+    }
+
     /// Send a JSON-RPC request via POST to the endpoint and wait for the response via SSE.
     async fn send_request(
         &self,
@@ -580,6 +635,17 @@ impl SseAdapter {
         }
         *self.server_type.write().await = effective;
         *self.upstream_server_name.write().await = Some(upstream_stripped);
+
+        // Per the MCP spec the client MUST send a notifications/initialized
+        // notification after a successful initialize exchange. Failure is
+        // non-fatal — log and continue, matching the STDIO/HTTP adapters.
+        if let Err(e) = self
+            .send_notification("notifications/initialized", None)
+            .await
+        {
+            warn!(url = %self.config.url, error = %e, "failed to send notifications/initialized");
+        }
+
         *self.health.write().await = HealthStatus::Healthy;
         self.crash_tracker.lock().await.reset();
         // Emit a tick after every successful (re)connect + handshake so any
@@ -913,6 +979,8 @@ mod tests {
             /// When true, /message does NOT broadcast `tools/call` responses
             /// (used to test pending-request error propagation).
             silent_on_tools_call: AtomicBool,
+            /// Bodies of every POST /message received, in arrival order.
+            posts: std::sync::Mutex<Vec<Value>>,
         }
 
         /// Handle for a running test server; aborts on drop.
@@ -993,8 +1061,16 @@ mod tests {
         async fn handle_message(
             State(app): State<AppState>,
             Json(body): Json<Value>,
-        ) -> Json<Value> {
+        ) -> axum::response::Response {
+            app.fake.posts.lock().unwrap().push(body.clone());
+
             let method = body["method"].as_str().unwrap_or("").to_string();
+
+            // Notifications have no `id` and produce no response body.
+            if body.get("id").is_none() {
+                return (StatusCode::ACCEPTED, "").into_response();
+            }
+
             let id = body["id"].as_u64().unwrap_or(0);
             let response = match method.as_str() {
                 "initialize" => json!({
@@ -1021,7 +1097,7 @@ mod tests {
             if is_tools_call && app.fake.close_on_tools_call.load(Ordering::SeqCst) {
                 let _ = app.close_tx.send(());
             }
-            Json(response)
+            Json(response).into_response()
         }
 
         async fn start_test_server() -> FakeServer {
@@ -1081,6 +1157,58 @@ mod tests {
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
+        }
+
+        #[tokio::test]
+        async fn test_sse_sends_initialized_notification_after_handshake() {
+            let server = start_test_server().await;
+            let mut adapter = build_adapter(&server.url, 5).await;
+
+            adapter.initialize().await.unwrap();
+
+            let posts = server.state.posts.lock().unwrap().clone();
+            assert!(
+                posts.len() >= 2,
+                "expected at least 2 POSTs (initialize + notifications/initialized), got {}: {:?}",
+                posts.len(),
+                posts
+            );
+
+            let init_idx = posts
+                .iter()
+                .position(|b| b.get("method").and_then(|m| m.as_str()) == Some("initialize"))
+                .expect("initialize POST should be recorded");
+            let notif_idx = posts
+                .iter()
+                .position(|b| {
+                    b.get("method").and_then(|m| m.as_str()) == Some("notifications/initialized")
+                })
+                .expect("notifications/initialized POST should be recorded");
+            assert!(
+                notif_idx > init_idx,
+                "notifications/initialized must come after initialize; init_idx={}, notif_idx={}",
+                init_idx,
+                notif_idx
+            );
+
+            let notif = &posts[notif_idx];
+            assert!(
+                notif.get("id").is_none(),
+                "notifications/initialized must not carry an id field, got {:?}",
+                notif
+            );
+            // No other request methods should have been POSTed between
+            // initialize and notifications/initialized.
+            for (i, b) in posts.iter().enumerate() {
+                if i > init_idx && i < notif_idx {
+                    panic!(
+                        "unexpected POST between initialize and notifications/initialized: {:?}",
+                        b
+                    );
+                }
+            }
+
+            adapter.shutdown().await.unwrap();
         }
 
         #[tokio::test]
