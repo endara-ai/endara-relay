@@ -319,7 +319,7 @@ Prefer a UI to running a binary from a terminal? [Endara Desktop](https://github
 
 ## Security
 
-The relay's threat model — including its trust boundaries, the management API's UDS/Named-Pipe isolation, and the OAuth callback's localhost-only CSRF protections — is documented in [`THREAT_MODEL.md`](THREAT_MODEL.md). Report security issues by opening a private security advisory on GitHub.
+The relay's threat model — including its trust boundaries, the management API's UDS/Named-Pipe isolation, and the OAuth callback's localhost-only CSRF protections — is documented in [`THREAT_MODEL.md`](THREAT_MODEL.md). See [`SECURITY.md`](SECURITY.md) for the responsible-disclosure process and response-time expectations.
 
 ---
 
