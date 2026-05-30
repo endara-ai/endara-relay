@@ -11,6 +11,15 @@ pub struct JsonRpcRequest {
     pub id: u64,
 }
 
+/// JSON-RPC 2.0 notification (request without an `id`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JsonRpcNotification {
+    pub jsonrpc: String,
+    pub method: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+}
+
 /// JSON-RPC 2.0 response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JsonRpcResponse {
@@ -38,6 +47,15 @@ pub fn new_request(method: &str, params: Option<Value>, id: u64) -> JsonRpcReque
         method: method.to_string(),
         params,
         id,
+    }
+}
+
+/// Create a new JSON-RPC 2.0 notification (no `id` field).
+pub fn new_notification(method: &str, params: Option<Value>) -> JsonRpcNotification {
+    JsonRpcNotification {
+        jsonrpc: "2.0".to_string(),
+        method: method.to_string(),
+        params,
     }
 }
 
