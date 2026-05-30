@@ -310,6 +310,17 @@ fn categorize_error(reason: &str) -> String {
 /// in a background task that swaps the freshly-built adapter back into the
 /// registry on completion. Failures leave the registry entry as a
 /// `FailedAdapter` so the standard health channel surfaces the error.
+///
+/// Emits `tools_changed_tx` ticks on both the foreground placeholder swap
+/// (catalog briefly loses the endpoint's tools while `StartingAdapter` is in
+/// place) and the background re-init swap completion (catalog regains the
+/// rebuilt adapter's tools). Both ticks mirror what subscribers reading the
+/// catalog would actually observe at each phase; emitting only the second
+/// would hide the transient "tools gone" state. This is independent of any
+/// tick the rebuilt adapter's upstream may later emit via
+/// `rewire_tools_changed_listener` — that path handles real upstream
+/// `tools/list_changed` events, while these two ticks reflect the relay-side
+/// swap itself.
 async fn restart_endpoint(
     State(state): State<ManagementState>,
     Path(name): Path<String>,
@@ -324,6 +335,10 @@ async fn restart_endpoint(
         std::mem::replace(&mut entry.adapter, Box::new(StartingAdapter))
     };
     state.registry.invalidate_catalog_cache().await;
+    // Foreground tick: the catalog has just lost the endpoint's tools. Send
+    // after `invalidate_catalog_cache` so subscribers re-reading the catalog
+    // on receipt see the placeholder state.
+    state.registry.tick_tools_changed(&name);
 
     // Arc-clone everything the background task needs so it owns its captures.
     let registry = state.registry.clone();
@@ -401,6 +416,12 @@ async fn restart_endpoint(
         registry.rewire_tools_changed_listener(&task_name).await;
         registry.invalidate_endpoint_tool_cache(&task_name).await;
         registry.invalidate_catalog_cache().await;
+        // Background tick: the catalog has just regained the endpoint's
+        // tools via the rebuilt adapter. Sent after cache invalidation so
+        // subscribers re-reading the catalog see the post-swap state. This
+        // is distinct from any future tick emitted by the rewired listener
+        // when the upstream server itself sends `tools/list_changed`.
+        registry.tick_tools_changed(&task_name);
 
         tracing::info!(endpoint = %task_name, "Restart: background task complete");
     });
@@ -2901,7 +2922,7 @@ async fn disable_endpoint(
     State(state): State<ManagementState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    {
+    let flipped = {
         let mut entries = state.registry.entries().write().await;
         let Some(entry) = entries.get_mut(&name) else {
             return endpoint_not_found(&name).into_response();
@@ -2914,10 +2935,15 @@ async fn disable_endpoint(
             )
             .into_response();
         }
+        let was_enabled = !entry.disabled;
         entry.disabled = true;
-    }
+        was_enabled
+    };
     state.registry.invalidate_catalog_cache().await;
     persist_disabled_state(&state).await;
+    if flipped {
+        state.registry.tick_tools_changed(&name);
+    }
     Json(ActionResponse {
         ok: true,
         message: format!("Endpoint '{}' disabled", name),
@@ -2930,16 +2956,20 @@ async fn enable_endpoint(
     State(state): State<ManagementState>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let result = {
+    let (flipped, result) = {
         let mut entries = state.registry.entries().write().await;
         let Some(entry) = entries.get_mut(&name) else {
             return endpoint_not_found(&name).into_response();
         };
+        let was_disabled = entry.disabled;
         entry.disabled = false;
-        entry.adapter.initialize().await
+        (was_disabled, entry.adapter.initialize().await)
     };
     state.registry.invalidate_catalog_cache().await;
     persist_disabled_state(&state).await;
+    if flipped {
+        state.registry.tick_tools_changed(&name);
+    }
     match result {
         Ok(()) => Json(ActionResponse {
             ok: true,
@@ -2960,15 +2990,18 @@ async fn disable_tool(
     State(state): State<ManagementState>,
     Path((name, tool_name)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    {
+    let flipped = {
         let mut entries = state.registry.entries().write().await;
         let Some(entry) = entries.get_mut(&name) else {
             return endpoint_not_found(&name).into_response();
         };
-        entry.disabled_tools.insert(tool_name.clone());
-    }
+        entry.disabled_tools.insert(tool_name.clone())
+    };
     state.registry.invalidate_catalog_cache().await;
     persist_disabled_state(&state).await;
+    if flipped {
+        state.registry.tick_tools_changed(&name);
+    }
     Json(ActionResponse {
         ok: true,
         message: format!("Tool '{}' disabled on '{}'", tool_name, name),
@@ -2981,15 +3014,18 @@ async fn enable_tool(
     State(state): State<ManagementState>,
     Path((name, tool_name)): Path<(String, String)>,
 ) -> impl IntoResponse {
-    {
+    let flipped = {
         let mut entries = state.registry.entries().write().await;
         let Some(entry) = entries.get_mut(&name) else {
             return endpoint_not_found(&name).into_response();
         };
-        entry.disabled_tools.remove(&tool_name);
-    }
+        entry.disabled_tools.remove(&tool_name)
+    };
     state.registry.invalidate_catalog_cache().await;
     persist_disabled_state(&state).await;
+    if flipped {
+        state.registry.tick_tools_changed(&name);
+    }
     Json(ActionResponse {
         ok: true,
         message: format!("Tool '{}' enabled on '{}'", tool_name, name),
@@ -3724,6 +3760,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_endpoint_emits_foreground_and_background_ticks() {
+        use std::time::Duration;
+
+        // Use a SlowShutdownAdapter so the foreground placeholder swap is
+        // observable as a distinct event from the background re-init swap.
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "echo".to_string(),
+                Box::new(SlowShutdownAdapter::new(Duration::from_millis(150))),
+                "stdio".to_string(),
+                None,
+                Some("echo".to_string()),
+            )
+            .await;
+        let state = ManagementState {
+            registry: Arc::new(registry),
+            config: Arc::new(RwLock::new(test_config())),
+            start_time: Instant::now(),
+            config_path: None,
+            oauth_flow_manager: None,
+            relay_port: 9400,
+            oauth_adapter_inners: None,
+            token_manager: None,
+            setup_manager: None,
+            profile_registry: None,
+        };
+
+        // Subscribe BEFORE issuing the restart so we don't race the
+        // foreground tick. The relay-wide channel carries the endpoint name
+        // as its payload.
+        let mut rx = state.registry.subscribe_tools_changed();
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/echo/restart")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // First tick: foreground swap to StartingAdapter. It should arrive
+        // essentially immediately (well within the shutdown delay).
+        let first = tokio::time::timeout(Duration::from_millis(500), rx.recv())
+            .await
+            .expect("foreground tick did not arrive within 500ms")
+            .expect("foreground tick channel closed");
+        assert_eq!(first, "echo", "foreground tick should carry endpoint name");
+
+        // Second tick: background re-init swap completion. Allow extra time
+        // because the slow shutdown must finish before the new adapter is
+        // swapped in.
+        let second = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("background tick did not arrive within 5s")
+            .expect("background tick channel closed");
+        assert_eq!(second, "echo", "background tick should carry endpoint name");
+    }
+
+    #[tokio::test]
     async fn management_delete_endpoint_success() {
         // Write a temp config file with two endpoints
         let dir = std::env::temp_dir().join(format!("relay-test-delete-{}", std::process::id()));
@@ -4039,6 +4138,149 @@ command = "echo"
         let arr = body.as_array().unwrap();
         let read_tool = arr.iter().find(|t| t["name"] == "read").unwrap();
         assert_eq!(read_tool["disabled"], false);
+    }
+
+    // ---- tools_changed_tx tick coverage (one tick per real flip; zero on no-op)
+    //
+    // These tests subscribe to the relay-wide `tools_changed_tx` broadcast
+    // BEFORE issuing the management call and assert exactly one tick lands on
+    // a real state flip and zero ticks on a repeat (no-op) call. The payload
+    // is the endpoint name. Settling delays use a short sleep because
+    // `tools_changed_tx.send` is synchronous from the broadcast's standpoint
+    // but the management handler performs cache invalidation and disk
+    // persistence between the state mutation and the tick.
+
+    async fn post_ok(app: axum::Router, path: &str) {
+        let resp = app
+            .oneshot(Request::post(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "POST {} expected 200", path);
+    }
+
+    fn try_recv_tick(rx: &mut tokio::sync::broadcast::Receiver<String>) -> Option<String> {
+        match rx.try_recv() {
+            Ok(s) => Some(s),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => None,
+            Err(e) => panic!("unexpected broadcast recv error: {e:?}"),
+        }
+    }
+
+    async fn assert_one_tick(rx: &mut tokio::sync::broadcast::Receiver<String>, endpoint: &str) {
+        let tick = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("expected one tools_changed_tx tick within 1s")
+            .expect("broadcast recv must succeed");
+        assert_eq!(tick, endpoint, "tick payload must be the endpoint name");
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            try_recv_tick(rx).is_none(),
+            "exactly one tick expected; got a second"
+        );
+    }
+
+    async fn assert_no_tick(rx: &mut tokio::sync::broadcast::Receiver<String>) {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            try_recv_tick(rx).is_none(),
+            "no-op mutation must not emit a tools_changed_tx tick"
+        );
+    }
+
+    #[tokio::test]
+    async fn disable_endpoint_ticks_once_on_flip_and_not_on_noop() {
+        let tools = vec![ToolInfo {
+            name: "t1".into(),
+            description: None,
+            input_schema: serde_json::json!({}),
+            annotations: None,
+        }];
+        let state = test_state(vec![("echo", MockAdapter::healthy_with_tools(tools))]).await;
+        // Hold the registry Arc so the broadcast sender outlives the router.
+        let registry = state.registry.clone();
+        let mut rx = registry.subscribe_tools_changed();
+        let app = management_routes(state);
+
+        // First disable — real flip, expect exactly one tick.
+        post_ok(app.clone(), "/api/endpoints/echo/disable").await;
+        assert_one_tick(&mut rx, "echo").await;
+
+        // Second disable — already disabled, expect zero ticks.
+        post_ok(app, "/api/endpoints/echo/disable").await;
+        assert_no_tick(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn enable_endpoint_ticks_once_on_flip_and_not_on_noop() {
+        let tools = vec![ToolInfo {
+            name: "t1".into(),
+            description: None,
+            input_schema: serde_json::json!({}),
+            annotations: None,
+        }];
+        let state = test_state(vec![("echo", MockAdapter::healthy_with_tools(tools))]).await;
+        let app = management_routes(state.clone());
+
+        // Pre-condition: disable so the next enable is a real flip. Subscribe
+        // AFTER this so the disable tick doesn't pollute the receiver.
+        post_ok(app.clone(), "/api/endpoints/echo/disable").await;
+        let mut rx = state.registry.subscribe_tools_changed();
+
+        // Enable — real flip, expect exactly one tick.
+        post_ok(app.clone(), "/api/endpoints/echo/enable").await;
+        assert_one_tick(&mut rx, "echo").await;
+
+        // Enable again — already enabled, expect zero ticks.
+        post_ok(app, "/api/endpoints/echo/enable").await;
+        assert_no_tick(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn disable_tool_ticks_once_on_flip_and_not_on_noop() {
+        let tools = vec![ToolInfo {
+            name: "read".into(),
+            description: Some("Read".into()),
+            input_schema: serde_json::json!({"type": "object"}),
+            annotations: None,
+        }];
+        let state = test_state(vec![("fs", MockAdapter::healthy_with_tools(tools))]).await;
+        // Hold the registry Arc so the broadcast sender outlives the router.
+        let registry = state.registry.clone();
+        let mut rx = registry.subscribe_tools_changed();
+        let app = management_routes(state);
+
+        // First disable — newly inserted, expect exactly one tick.
+        post_ok(app.clone(), "/api/endpoints/fs/tools/read/disable").await;
+        assert_one_tick(&mut rx, "fs").await;
+
+        // Second disable — already in disabled_tools, expect zero ticks.
+        post_ok(app, "/api/endpoints/fs/tools/read/disable").await;
+        assert_no_tick(&mut rx).await;
+    }
+
+    #[tokio::test]
+    async fn enable_tool_ticks_once_on_flip_and_not_on_noop() {
+        let tools = vec![ToolInfo {
+            name: "read".into(),
+            description: Some("Read".into()),
+            input_schema: serde_json::json!({"type": "object"}),
+            annotations: None,
+        }];
+        let state = test_state(vec![("fs", MockAdapter::healthy_with_tools(tools))]).await;
+        let app = management_routes(state.clone());
+
+        // Pre-condition: disable so the next enable is a real flip. Subscribe
+        // AFTER this so the disable tick doesn't pollute the receiver.
+        post_ok(app.clone(), "/api/endpoints/fs/tools/read/disable").await;
+        let mut rx = state.registry.subscribe_tools_changed();
+
+        // Enable — actually removed, expect exactly one tick.
+        post_ok(app.clone(), "/api/endpoints/fs/tools/read/enable").await;
+        assert_one_tick(&mut rx, "fs").await;
+
+        // Enable again — not in disabled_tools, expect zero ticks.
+        post_ok(app, "/api/endpoints/fs/tools/read/enable").await;
+        assert_no_tick(&mut rx).await;
     }
 
     #[tokio::test]
