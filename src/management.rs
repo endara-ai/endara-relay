@@ -2766,6 +2766,559 @@ async fn get_endpoint_profile_membership(
 }
 
 // ---------------------------------------------------------------------------
+// Endpoint CRUD (issue #82) — POST /api/endpoints, PUT /api/endpoints/{name}
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /api/endpoints` and `PUT /api/endpoints/{name}`.
+///
+/// Mirrors the TOML fields the desktop's `add_endpoint` Tauri command writes
+/// today. `client_secret` is deliberately accepted at the deserialization
+/// layer so we can reject it with a clear 400 pointing at
+/// `/api/endpoints/{name}/credentials`. `disabled` and `disabled_tools` are
+/// rejected for the same reason — they have dedicated routes
+/// (`/api/endpoints/{name}/{enable,disable}` and per-tool toggles).
+#[derive(Deserialize)]
+pub struct EndpointRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    pub transport: crate::config::Transport,
+    #[serde(default)]
+    pub tool_prefix: Option<String>,
+    #[serde(default)]
+    pub command: Option<String>,
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub env: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub headers: Option<HashMap<String, String>>,
+    #[serde(default)]
+    pub oauth_server_url: Option<String>,
+    #[serde(default)]
+    pub client_id: Option<String>,
+    /// Space-separated string, matching the existing desktop `add_endpoint`
+    /// Tauri shape (and `oauth_setup_commit`). Split on whitespace into a
+    /// TOML array when persisted.
+    #[serde(default)]
+    pub scopes: Option<String>,
+    #[serde(default)]
+    pub token_endpoint: Option<String>,
+    #[serde(default)]
+    pub server_type_override: Option<String>,
+    // Forbidden fields — present so we can return a precise 400 instead of
+    // silently dropping the value when a client mistakenly includes them.
+    #[serde(default)]
+    pub client_secret: Option<serde_json::Value>,
+    #[serde(default)]
+    pub disabled: Option<serde_json::Value>,
+    #[serde(default)]
+    pub disabled_tools: Option<serde_json::Value>,
+}
+
+/// Sanitized summary returned by `POST /api/endpoints` and
+/// `PUT /api/endpoints/{name}`. Never contains a `client_secret` — that
+/// value is write-only via `/api/endpoints/{name}/credentials`.
+#[derive(Serialize)]
+pub struct EndpointSummary {
+    pub name: String,
+    pub transport: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_prefix: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub headers: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oauth_server_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub scopes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub server_type_override: Option<String>,
+}
+
+fn endpoint_summary_from(ep: &crate::config::EndpointConfig) -> EndpointSummary {
+    EndpointSummary {
+        name: ep.name.clone(),
+        transport: ep.transport.to_string(),
+        description: ep.description.clone(),
+        tool_prefix: ep.tool_prefix.clone(),
+        command: ep.command.clone(),
+        args: ep.args.clone(),
+        url: ep.url.clone(),
+        env: ep.env.clone(),
+        headers: ep.headers.clone(),
+        oauth_server_url: ep.oauth_server_url.clone(),
+        client_id: ep.client_id.clone(),
+        scopes: ep.scopes.clone().unwrap_or_default(),
+        token_endpoint: ep.token_endpoint.clone(),
+        server_type_override: ep.server_type_override.clone(),
+    }
+}
+
+/// Validate an [`EndpointRequest`] against the same rules the config loader
+/// enforces at startup (transport-specific required fields, tool_prefix
+/// validity, name uniqueness, `server_type_override` sanitization), plus the
+/// extra "forbidden-field" rejections specific to the management API. On
+/// success returns the [`crate::config::EndpointConfig`] that will land in
+/// `config.toml`.
+///
+/// `original_name` is `None` for create and `Some(orig)` for update — the
+/// caller's original path-param name. When supplied, uniqueness scans skip
+/// the entry currently identified by that name so renames work.
+fn validate_endpoint_request(
+    req: &EndpointRequest,
+    cfg: &Config,
+    original_name: Option<&str>,
+) -> Result<crate::config::EndpointConfig, Box<axum::http::Response<axum::body::Body>>> {
+    let bad_request = |err: &str, detail: String| -> Box<axum::http::Response<axum::body::Body>> {
+        Box::new(error_response(StatusCode::BAD_REQUEST, err, Some(&detail)).into_response())
+    };
+    let conflict = |err: &str, detail: String| -> Box<axum::http::Response<axum::body::Body>> {
+        Box::new(error_response(StatusCode::CONFLICT, err, Some(&detail)).into_response())
+    };
+
+    // Forbidden fields — `client_secret` belongs in the DCR file; disabled
+    // state has dedicated routes.
+    if req.client_secret.is_some() {
+        return Err(bad_request(
+            "client_secret not allowed",
+            "POST the client_secret to /api/endpoints/{name}/credentials instead — it is persisted via TokenManager (DCR file, chmod 0600) rather than config.toml.".to_string(),
+        ));
+    }
+    if req.disabled.is_some() {
+        return Err(bad_request(
+            "disabled not allowed",
+            "Use POST /api/endpoints/{name}/disable or /enable instead.".to_string(),
+        ));
+    }
+    if req.disabled_tools.is_some() {
+        return Err(bad_request(
+            "disabled_tools not allowed",
+            "Use POST /api/endpoints/{name}/tools/{tool}/disable or /enable instead.".to_string(),
+        ));
+    }
+
+    if req.name.trim().is_empty() {
+        return Err(bad_request(
+            "invalid endpoint",
+            "Endpoint name must not be empty".to_string(),
+        ));
+    }
+
+    // Transport-specific required fields (mirror Config::validate).
+    match req.transport {
+        crate::config::Transport::Stdio => {
+            if req.command.as_deref().unwrap_or("").is_empty() {
+                return Err(bad_request(
+                    "invalid endpoint",
+                    format!(
+                        "Endpoint '{}': stdio transport requires a 'command' field",
+                        req.name
+                    ),
+                ));
+            }
+        }
+        crate::config::Transport::Sse
+        | crate::config::Transport::Http
+        | crate::config::Transport::Oauth => {
+            if req.url.as_deref().unwrap_or("").is_empty() {
+                return Err(bad_request(
+                    "invalid endpoint",
+                    format!(
+                        "Endpoint '{}': {} transport requires a 'url' field",
+                        req.name, req.transport
+                    ),
+                ));
+            }
+        }
+    }
+
+    // server_type_override — sanitize through the same rules adapters use
+    // when reading the field at startup.
+    let server_type_override = match req.server_type_override.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => {
+            if let Err(e) = crate::adapter::server_name::sanitize_server_name(s) {
+                return Err(bad_request(
+                    "invalid server_type_override",
+                    format!("Endpoint '{}': {}", req.name, e),
+                ));
+            }
+            Some(s.to_string())
+        }
+        _ => None,
+    };
+
+    // Uniqueness (case-sensitive exact match, matching delete_endpoint and
+    // today's desktop add_endpoint Tauri behaviour). For update, skip the
+    // entry currently identified by `original_name`.
+    for ep in &cfg.endpoints {
+        if Some(ep.name.as_str()) == original_name {
+            continue;
+        }
+        if ep.name == req.name {
+            return Err(conflict(
+                "duplicate endpoint name",
+                format!("Endpoint name '{}' is already in use.", req.name),
+            ));
+        }
+    }
+
+    // Scopes: space-separated string → Vec<String>. Empty becomes None.
+    let scopes_vec: Option<Vec<String>> = req.scopes.as_deref().and_then(|s| {
+        let v: Vec<String> = s.split_whitespace().map(|s| s.to_string()).collect();
+        if v.is_empty() {
+            None
+        } else {
+            Some(v)
+        }
+    });
+
+    let new_ep = crate::config::EndpointConfig {
+        name: req.name.clone(),
+        description: req.description.clone(),
+        tool_prefix: req.tool_prefix.clone(),
+        transport: req.transport.clone(),
+        command: req.command.clone(),
+        args: req.args.clone(),
+        url: req.url.clone(),
+        env: req.env.clone(),
+        headers: req.headers.clone(),
+        disabled: false,
+        disabled_tools: Vec::new(),
+        oauth_server_url: req.oauth_server_url.clone(),
+        client_id: req.client_id.clone(),
+        client_secret: None,
+        scopes: scopes_vec,
+        token_endpoint: req.token_endpoint.clone(),
+        server_type_override,
+    };
+
+    Ok(new_ep)
+}
+
+/// Serialize an [`crate::config::EndpointConfig`] into a `toml::Table` with
+/// a stable key order that mirrors today's `add_endpoint` Tauri command,
+/// omitting empty / `None` fields. Disabled state and legacy `client_secret`
+/// are intentionally NOT written here — the caller preserves them from the
+/// existing TOML entry on update.
+fn endpoint_to_toml_table(
+    ep: &crate::config::EndpointConfig,
+) -> toml::map::Map<String, toml::Value> {
+    let mut t = toml::map::Map::new();
+    t.insert("name".into(), toml::Value::String(ep.name.clone()));
+    t.insert(
+        "transport".into(),
+        toml::Value::String(ep.transport.to_string()),
+    );
+    if let Some(ref tp) = ep.tool_prefix {
+        t.insert("tool_prefix".into(), toml::Value::String(tp.clone()));
+    }
+    if let Some(ref cmd) = ep.command {
+        t.insert("command".into(), toml::Value::String(cmd.clone()));
+    }
+    if let Some(ref args) = ep.args {
+        let arr: Vec<toml::Value> = args
+            .iter()
+            .map(|a| toml::Value::String(a.clone()))
+            .collect();
+        t.insert("args".into(), toml::Value::Array(arr));
+    }
+    if let Some(ref url) = ep.url {
+        t.insert("url".into(), toml::Value::String(url.clone()));
+    }
+    if let Some(ref desc) = ep.description {
+        t.insert("description".into(), toml::Value::String(desc.clone()));
+    }
+    if let Some(ref env) = ep.env {
+        if !env.is_empty() {
+            let mut env_table = toml::map::Map::new();
+            for (k, v) in env {
+                env_table.insert(k.clone(), toml::Value::String(v.clone()));
+            }
+            t.insert("env".into(), toml::Value::Table(env_table));
+        }
+    }
+    if let Some(ref headers) = ep.headers {
+        if !headers.is_empty() {
+            let mut headers_table = toml::map::Map::new();
+            for (k, v) in headers {
+                headers_table.insert(k.clone(), toml::Value::String(v.clone()));
+            }
+            t.insert("headers".into(), toml::Value::Table(headers_table));
+        }
+    }
+    if let Some(ref os) = ep.oauth_server_url {
+        t.insert("oauth_server_url".into(), toml::Value::String(os.clone()));
+    }
+    if let Some(ref cid) = ep.client_id {
+        t.insert("client_id".into(), toml::Value::String(cid.clone()));
+    }
+    if let Some(ref scopes) = ep.scopes {
+        if !scopes.is_empty() {
+            let arr: Vec<toml::Value> = scopes
+                .iter()
+                .map(|s| toml::Value::String(s.clone()))
+                .collect();
+            t.insert("scopes".into(), toml::Value::Array(arr));
+        }
+    }
+    if let Some(ref te) = ep.token_endpoint {
+        t.insert("token_endpoint".into(), toml::Value::String(te.clone()));
+    }
+    if let Some(ref sto) = ep.server_type_override {
+        t.insert(
+            "server_type_override".into(),
+            toml::Value::String(sto.clone()),
+        );
+    }
+    t
+}
+
+/// Targeted edit of the on-disk `config.toml`: read, parse, replace
+/// (update) or append (create) the matching `[[endpoints]]` entry,
+/// serialize, and write back. Mirrors the pattern used by
+/// [`delete_endpoint`] and [`oauth_setup_commit`] so unrelated TOML keys
+/// and per-entry key order on other endpoints are preserved verbatim.
+///
+/// On update (`original_name = Some(orig)`), the existing entry's
+/// `disabled`, `disabled_tools`, and legacy `client_secret` keys are
+/// preserved — those are managed via dedicated routes / the credentials
+/// endpoint, not the create/update body.
+fn write_endpoint_to_disk(
+    config_path: &std::path::Path,
+    new_ep: &crate::config::EndpointConfig,
+    original_name: Option<&str>,
+) -> Result<(), (StatusCode, &'static str, String)> {
+    let contents = std::fs::read_to_string(config_path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to read config file",
+            e.to_string(),
+        )
+    })?;
+    let mut parsed: toml::Table = contents.parse().map_err(|e: toml::de::Error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to parse config file",
+            e.to_string(),
+        )
+    })?;
+
+    let endpoints_val = parsed
+        .entry("endpoints")
+        .or_insert_with(|| toml::Value::Array(Vec::new()));
+    let arr = endpoints_val.as_array_mut().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to parse config file",
+            "[[endpoints]] section is not an array".to_string(),
+        )
+    })?;
+
+    let mut new_table = endpoint_to_toml_table(new_ep);
+
+    match original_name {
+        None => {
+            arr.push(toml::Value::Table(new_table));
+        }
+        Some(orig) => {
+            let idx = arr
+                .iter()
+                .position(|v| v.get("name").and_then(|n| n.as_str()) == Some(orig));
+            let Some(idx) = idx else {
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    "endpoint not found",
+                    format!("No endpoint named '{}'", orig),
+                ));
+            };
+            if let Some(existing) = arr[idx].as_table() {
+                for key in ["disabled", "disabled_tools", "client_secret"] {
+                    if let Some(v) = existing.get(key) {
+                        new_table.insert(key.into(), v.clone());
+                    }
+                }
+            }
+            arr[idx] = toml::Value::Table(new_table);
+        }
+    }
+
+    let new_contents = toml::to_string_pretty(&parsed).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to serialize config",
+            e.to_string(),
+        )
+    })?;
+    crate::config::write_config_file(config_path, &new_contents).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to write config file",
+            e.to_string(),
+        )
+    })?;
+    Ok(())
+}
+
+/// Persist `new_ep` to disk, swap the in-memory `ManagementState::config`
+/// endpoints list, and rebuild the affected adapter inline so the response
+/// reflects the post-write state without waiting on the file watcher.
+/// Mirrors [`apply_profiles_change`] for the profile CRUD flow.
+///
+/// `original_name` is `None` for create and `Some(orig)` for update.
+async fn apply_endpoint_change(
+    state: &ManagementState,
+    new_ep: crate::config::EndpointConfig,
+    original_name: Option<&str>,
+) -> Result<(), Box<axum::http::Response<axum::body::Body>>> {
+    let Some(ref config_path) = state.config_path else {
+        return Err(Box::new(
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "config_path not configured",
+                Some("The management API was not initialised with a config file path."),
+            )
+            .into_response(),
+        ));
+    };
+    let resolved = crate::config::expand_tilde(config_path);
+    if let Err((status, err, detail)) = write_endpoint_to_disk(&resolved, &new_ep, original_name) {
+        return Err(Box::new(
+            error_response(status, err, Some(&detail)).into_response(),
+        ));
+    }
+
+    // Build the new in-memory endpoints vec by replacing-or-appending and
+    // preserving the existing entry's disabled / disabled_tools / legacy
+    // client_secret on update so we match what we just wrote to disk.
+    let old_cfg = state.config.read().await.clone();
+    let mut new_endpoints = old_cfg.endpoints.clone();
+    let preserved: Option<(bool, Vec<String>, Option<String>)> = match original_name {
+        Some(orig) => {
+            let idx = new_endpoints.iter().position(|e| e.name == orig);
+            idx.map(|i| {
+                let existing = &new_endpoints[i];
+                (
+                    existing.disabled,
+                    existing.disabled_tools.clone(),
+                    existing.client_secret.clone(),
+                )
+            })
+        }
+        None => None,
+    };
+    let mut effective = new_ep.clone();
+    if let Some((dis, dis_tools, legacy_secret)) = preserved {
+        effective.disabled = dis;
+        effective.disabled_tools = dis_tools;
+        effective.client_secret = legacy_secret;
+    }
+    match original_name {
+        Some(orig) => {
+            if let Some(slot) = new_endpoints.iter_mut().find(|e| e.name == orig) {
+                *slot = effective.clone();
+            } else {
+                new_endpoints.push(effective.clone());
+            }
+        }
+        None => {
+            new_endpoints.push(effective.clone());
+        }
+    }
+
+    // Build the new Config (preserves relay + profiles untouched), diff
+    // against the old one, and feed it through the same `apply_diff_graceful`
+    // path the file watcher / reload_config use. This restarts only the
+    // affected adapter when fields it cares about changed.
+    let new_cfg = Config {
+        relay: old_cfg.relay.clone(),
+        endpoints: new_endpoints.clone(),
+        profiles: old_cfg.profiles.clone(),
+    };
+    let diff = crate::config::diff_configs(&old_cfg, &new_cfg);
+    let token_manager = state.token_manager.clone().unwrap_or_else(|| {
+        Arc::new(crate::token_manager::TokenManager::new(
+            std::path::PathBuf::from("/tmp"),
+        ))
+    });
+    let oauth_adapter_inners = state
+        .oauth_adapter_inners
+        .clone()
+        .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())));
+    crate::watcher::apply_diff_graceful(
+        &diff,
+        &state.registry,
+        &[],
+        &std::collections::HashSet::new(),
+        &token_manager,
+        &oauth_adapter_inners,
+        new_cfg.relay.allow_insecure_oauth.unwrap_or(false),
+    )
+    .await;
+
+    *state.config.write().await = new_cfg;
+    Ok(())
+}
+
+/// POST /api/endpoints — create a new endpoint.
+async fn create_endpoint(
+    State(state): State<ManagementState>,
+    Json(req): Json<EndpointRequest>,
+) -> impl IntoResponse {
+    let cfg_snapshot = state.config.read().await.clone();
+    let new_ep = match validate_endpoint_request(&req, &cfg_snapshot, None) {
+        Ok(ep) => ep,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = apply_endpoint_change(&state, new_ep.clone(), None).await {
+        return *resp;
+    }
+    (StatusCode::CREATED, Json(endpoint_summary_from(&new_ep))).into_response()
+}
+
+/// PUT /api/endpoints/{name} — update (and optionally rename) an endpoint.
+///
+/// The path parameter identifies the existing endpoint; the body's `name`
+/// becomes the new name (which may equal the path param for a no-op rename).
+/// `disabled` / `disabled_tools` / `client_secret` are rejected in the body
+/// — those have dedicated routes — and the existing entry's values for
+/// those fields are preserved across the update.
+async fn update_endpoint(
+    State(state): State<ManagementState>,
+    Path(name): Path<String>,
+    Json(req): Json<EndpointRequest>,
+) -> impl IntoResponse {
+    let cfg_snapshot = state.config.read().await.clone();
+    let exists = cfg_snapshot.endpoints.iter().any(|e| e.name == name);
+    if !exists {
+        return endpoint_not_found(&name).into_response();
+    }
+    let new_ep = match validate_endpoint_request(&req, &cfg_snapshot, Some(&name)) {
+        Ok(ep) => ep,
+        Err(resp) => return *resp,
+    };
+    if let Err(resp) = apply_endpoint_change(&state, new_ep.clone(), Some(&name)).await {
+        return *resp;
+    }
+    (StatusCode::OK, Json(endpoint_summary_from(&new_ep))).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Router builder
 // ---------------------------------------------------------------------------
 
@@ -2773,8 +3326,11 @@ async fn get_endpoint_profile_membership(
 pub fn management_routes(state: ManagementState) -> Router {
     Router::new()
         .route("/api/status", get(get_status))
-        .route("/api/endpoints", get(get_endpoints))
-        .route("/api/endpoints/{name}", delete(delete_endpoint))
+        .route("/api/endpoints", get(get_endpoints).post(create_endpoint))
+        .route(
+            "/api/endpoints/{name}",
+            delete(delete_endpoint).put(update_endpoint),
+        )
         .route("/api/endpoints/{name}/tools", get(get_endpoint_tools))
         .route("/api/endpoints/{name}/restart", post(restart_endpoint))
         .route("/api/endpoints/{name}/refresh", post(refresh_endpoint))
@@ -6640,6 +7196,379 @@ client_id = "client123"
         assert_eq!(
             before, after,
             "rejected POSTs must not write to config.toml"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Endpoint CRUD (issue #82) — POST /api/endpoints, PUT /api/endpoints/{name}
+    // ---------------------------------------------------------------------
+
+    /// Build a `ManagementState` wired to a real on-disk `config.toml`.
+    /// Unlike `profiles_test_state` this seeds the registry with *no*
+    /// adapters so we can assert that `POST /api/endpoints` registers a
+    /// new one inline (without waiting on the file watcher). The seeded
+    /// TOML contains a single stdio endpoint so update tests have
+    /// something to mutate.
+    async fn endpoints_test_state(config_file: &std::path::Path) -> ManagementState {
+        let registry = AdapterRegistry::new();
+        // Seed an "existing" entry the on-disk TOML will also reflect so
+        // update / rename tests work against a real adapter.
+        registry
+            .register(
+                "existing".to_string(),
+                Box::new(MockAdapter::healthy_with_tools(vec![])),
+                "stdio".to_string(),
+                None,
+                Some("existing".to_string()),
+            )
+            .await;
+        let registry_arc = Arc::new(registry);
+        let cfg = Config {
+            relay: RelayConfig {
+                machine_name: "test".into(),
+                local_js_execution: None,
+                token_dir: None,
+                allow_insecure_oauth: None,
+                toon_output: None,
+                startup_init_timeout_secs: None,
+            },
+            endpoints: vec![EndpointConfig {
+                name: "existing".to_string(),
+                description: None,
+                tool_prefix: None,
+                transport: Transport::Stdio,
+                command: Some("echo".into()),
+                args: None,
+                url: None,
+                env: None,
+                headers: None,
+                disabled: false,
+                disabled_tools: Vec::new(),
+                oauth_server_url: None,
+                client_id: None,
+                client_secret: None,
+                scopes: None,
+                token_endpoint: None,
+                server_type_override: None,
+            }],
+            profiles: None,
+        };
+        let toml_str = toml::to_string_pretty(&cfg).unwrap();
+        std::fs::write(config_file, toml_str).unwrap();
+        ManagementState {
+            registry: registry_arc,
+            config: Arc::new(RwLock::new(cfg)),
+            start_time: Instant::now(),
+            config_path: Some(config_file.to_path_buf()),
+            oauth_flow_manager: None,
+            relay_port: 9400,
+            oauth_adapter_inners: None,
+            token_manager: None,
+            setup_manager: None,
+            profile_registry: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn endpoint_create_happy_path_and_visible_in_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let state = endpoints_test_state(&config_file).await;
+        let app = management_routes(state);
+
+        let body = serde_json::json!({
+            "name": "newstdio",
+            "transport": "stdio",
+            "command": "echo",
+            "args": ["hi"],
+            "description": "a new endpoint",
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/endpoints")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let summary = body_json(resp).await;
+        assert_eq!(summary["name"], "newstdio");
+        assert_eq!(summary["transport"], "stdio");
+        assert_eq!(summary["command"], "echo");
+        assert!(summary.get("client_secret").is_none());
+
+        // TOML writeback contains the new entry.
+        let on_disk = std::fs::read_to_string(&config_file).unwrap();
+        assert!(on_disk.contains("name = \"newstdio\""));
+        assert!(on_disk.contains("command = \"echo\""));
+
+        // The new endpoint is visible in GET /api/endpoints without a
+        // separate /api/config/reload call.
+        let resp = app
+            .clone()
+            .oneshot(Request::get("/api/endpoints").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let list = body_json(resp).await;
+        let names: std::collections::HashSet<&str> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap_or(""))
+            .collect();
+        assert!(
+            names.contains("newstdio"),
+            "newly-created endpoint must appear in GET /api/endpoints, got {:?}",
+            names
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_create_rejects_duplicate_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let state = endpoints_test_state(&config_file).await;
+        let before = std::fs::read_to_string(&config_file).unwrap();
+        let app = management_routes(state);
+
+        let body = serde_json::json!({
+            "name": "existing",
+            "transport": "stdio",
+            "command": "echo",
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let after = std::fs::read_to_string(&config_file).unwrap();
+        assert_eq!(
+            before, after,
+            "rejected create must not write to config.toml"
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_create_rejects_forbidden_and_missing_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let state = endpoints_test_state(&config_file).await;
+        let before = std::fs::read_to_string(&config_file).unwrap();
+        let app = management_routes(state);
+
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "client_secret rejected (use /credentials)",
+                serde_json::json!({
+                    "name": "rej1",
+                    "transport": "stdio",
+                    "command": "echo",
+                    "client_secret": "shh",
+                }),
+            ),
+            (
+                "disabled rejected (use /disable)",
+                serde_json::json!({
+                    "name": "rej2",
+                    "transport": "stdio",
+                    "command": "echo",
+                    "disabled": true,
+                }),
+            ),
+            (
+                "disabled_tools rejected (use per-tool route)",
+                serde_json::json!({
+                    "name": "rej3",
+                    "transport": "stdio",
+                    "command": "echo",
+                    "disabled_tools": ["foo"],
+                }),
+            ),
+            (
+                "stdio without command",
+                serde_json::json!({ "name": "rej4", "transport": "stdio" }),
+            ),
+            (
+                "http without url",
+                serde_json::json!({ "name": "rej5", "transport": "http" }),
+            ),
+            (
+                "sse without url",
+                serde_json::json!({ "name": "rej6", "transport": "sse" }),
+            ),
+            (
+                "empty name",
+                serde_json::json!({ "name": "", "transport": "stdio", "command": "echo" }),
+            ),
+        ];
+
+        for (label, body) in cases {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/endpoints")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let s = resp.status();
+            assert!(
+                s.is_client_error(),
+                "case '{}' should reject with a 4xx, got {}",
+                label,
+                s
+            );
+        }
+        let after = std::fs::read_to_string(&config_file).unwrap();
+        assert_eq!(
+            before, after,
+            "rejected creates must not write to config.toml"
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_update_happy_path_with_rename_preserves_disabled_tools() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let state = endpoints_test_state(&config_file).await;
+        // Mark the existing endpoint disabled with a disabled tool so we
+        // can assert the update path preserves both across rename.
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].disabled = true;
+            cfg.endpoints[0].disabled_tools = vec!["bad_tool".to_string()];
+            let toml_str = toml::to_string_pretty(&*cfg).unwrap();
+            std::fs::write(&config_file, toml_str).unwrap();
+        }
+        let app = management_routes(state.clone());
+
+        let body = serde_json::json!({
+            "name": "renamed",
+            "transport": "stdio",
+            "command": "echo",
+            "args": ["after-rename"],
+            "description": "updated",
+        });
+        let resp = app
+            .oneshot(
+                Request::put("/api/endpoints/existing")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let summary = body_json(resp).await;
+        assert_eq!(summary["name"], "renamed");
+        assert_eq!(summary["args"][0], "after-rename");
+
+        let on_disk = std::fs::read_to_string(&config_file).unwrap();
+        assert!(on_disk.contains("name = \"renamed\""));
+        assert!(!on_disk.contains("name = \"existing\""));
+        assert!(
+            on_disk.contains("disabled = true"),
+            "update must preserve disabled=true: {}",
+            on_disk
+        );
+        assert!(
+            on_disk.contains("bad_tool"),
+            "update must preserve disabled_tools: {}",
+            on_disk
+        );
+
+        let cfg = state.config.read().await;
+        assert!(cfg.endpoints.iter().any(|e| e.name == "renamed"));
+        assert!(!cfg.endpoints.iter().any(|e| e.name == "existing"));
+    }
+
+    #[tokio::test]
+    async fn endpoint_update_unknown_name_returns_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let state = endpoints_test_state(&config_file).await;
+        let app = management_routes(state);
+
+        let body = serde_json::json!({
+            "name": "nope",
+            "transport": "stdio",
+            "command": "echo",
+        });
+        let resp = app
+            .oneshot(
+                Request::put("/api/endpoints/nope")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn endpoint_update_rename_conflicts_with_existing_other_endpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let state = endpoints_test_state(&config_file).await;
+        // Add a second endpoint we can collide with on rename.
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints.push(EndpointConfig {
+                name: "other".to_string(),
+                description: None,
+                tool_prefix: None,
+                transport: Transport::Stdio,
+                command: Some("echo".into()),
+                args: None,
+                url: None,
+                env: None,
+                headers: None,
+                disabled: false,
+                disabled_tools: Vec::new(),
+                oauth_server_url: None,
+                client_id: None,
+                client_secret: None,
+                scopes: None,
+                token_endpoint: None,
+                server_type_override: None,
+            });
+            let toml_str = toml::to_string_pretty(&*cfg).unwrap();
+            std::fs::write(&config_file, toml_str).unwrap();
+        }
+        let before = std::fs::read_to_string(&config_file).unwrap();
+        let app = management_routes(state);
+
+        let body = serde_json::json!({
+            "name": "other",
+            "transport": "stdio",
+            "command": "echo",
+        });
+        let resp = app
+            .oneshot(
+                Request::put("/api/endpoints/existing")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let after = std::fs::read_to_string(&config_file).unwrap();
+        assert_eq!(
+            before, after,
+            "rejected rename must not write to config.toml"
         );
     }
 }
