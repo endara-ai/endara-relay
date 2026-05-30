@@ -206,9 +206,9 @@ pub async fn instructions_for_profile(view: &ProfileRegistryView) -> Option<Stri
 }
 
 /// Hint appended to the `search_tools` description when TOON output is
-/// enabled. Tells the model that tool responses arrive in TOON (Token-Oriented
-/// Object Notation) instead of JSON, so it doesn't try to `JSON.parse()` them.
-pub const TOON_OUTPUT_HINT: &str = "Tool responses are returned in TOON format (Token-Oriented Object Notation) for reduced token usage. TOON is a compact alternative to JSON — indentation-based, no braces, tabular arrays. Parse it like structured text.";
+/// enabled. Tells the model that tool responses arrive in TOON instead of
+/// JSON and points at the `toon` CLI for filtering large saved responses.
+pub const TOON_OUTPUT_HINT: &str = "Tool responses are returned in TOON format (Token-Oriented Object Notation) for reduced token usage. TOON is a compact alternative to JSON — indentation-based, no braces, tabular arrays. Parse it like structured text. For large responses saved to disk, the `toon` CLI can filter and query TOON data (like jq for JSON). Use `toon --to-json` to convert back to JSON if needed. See https://toonformat.dev/cli/";
 
 /// Shared body of [`search_tools_description`] /
 /// [`search_tools_description_for_profile`].
