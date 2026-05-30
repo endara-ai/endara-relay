@@ -727,22 +727,42 @@ async fn mcp_sse(
 /// event at `/mcp/{profile}` so SSE-only clients POST follow-up JSON-RPC
 /// requests back to the same profile.
 ///
-/// Per locked decision Relay #6 the per-tick filter loop in
-/// [`build_mcp_sse_stream`] mirrors the existing `mcp_sse` pattern (single
-/// `recv().await` per iteration). The profile's allowed-endpoints set is
-/// passed in so `notifications/tools/list_changed` is only forwarded when
-/// the changed endpoint is in-profile (`Lagged` always forwards
-/// unconditionally because the endpoint name is lost).
+/// The profile filter passed into [`build_mcp_sse_stream`] re-reads the
+/// allowed-endpoints set from [`AppState::profile_registry`] on every
+/// per-endpoint tick so mid-stream profile-membership changes (via
+/// `update_profile` or the config watcher) take effect without
+/// reconnecting. Profile-level mutations (membership change, `js_execution`
+/// toggle, profile add/remove) arrive on the parallel
+/// [`ProfileRegistry::subscribe_profiles_changed`] channel.
 async fn mcp_sse_profiled(
     State(state): State<AppState>,
     Path(profile_path): Path<String>,
 ) -> Response {
-    let Some(profile_ctx) = state.profile_registry.get(&profile_path).await else {
+    if state.profile_registry.get(&profile_path).await.is_none() {
         return profile_not_found_response(&profile_path);
-    };
+    }
     let endpoint_uri = format!("/mcp/{}", profile_path);
-    let allowed = Arc::new(profile_ctx.registry_view.allowed_endpoints().clone());
-    build_mcp_sse_stream(&state, &endpoint_uri, Some(allowed)).into_response()
+    let filter = ProfileSseFilter {
+        path: profile_path.to_ascii_lowercase(),
+        registry: state.profile_registry.clone(),
+    };
+    build_mcp_sse_stream(&state, &endpoint_uri, Some(filter)).into_response()
+}
+
+/// Profile-scoped filter handed to [`build_mcp_sse_stream`].
+///
+/// The static `HashSet<String>` allowed-endpoints snapshot used pre-R3.D is
+/// replaced by a `(path, registry)` pair so the stream can resolve the
+/// *current* allowed set each tick. That way an `update_profile` that adds
+/// an endpoint surfaces on already-open SSE streams without forcing the
+/// client to reconnect (spec acceptance #2).
+struct ProfileSseFilter {
+    /// Lowercased profile path — keys the [`ProfileRegistry`] lookup and
+    /// matches against
+    /// [`ProfileRegistry::subscribe_profiles_changed`] payloads.
+    path: String,
+    /// Shared handle to the live profile registry.
+    registry: Arc<ProfileRegistry>,
 }
 
 /// Build the SSE stream backing both [`mcp_sse`] and [`mcp_sse_profiled`].
@@ -751,24 +771,51 @@ async fn mcp_sse_profiled(
 /// SSE-only clients learn where to POST follow-up JSON-RPC requests
 /// (`/mcp` for the global route, `/mcp/{profile}` for the profiled one).
 ///
-/// `allowed_endpoints` filters which `tools/list_changed` ticks are
-/// forwarded: `None` (global `/mcp/sse`) forwards every tick;
-/// `Some(set)` (profile-scoped) forwards only when the tick's endpoint name
-/// is in `set`. `Lagged` is always forwarded unconditionally because the
-/// originating endpoint name is lost on lag (the client will re-fetch
-/// `tools/list` on receipt and re-discover any in-profile changes).
+/// `profile_filter` controls which `tools/list_changed` ticks are
+/// forwarded:
+/// - `None` (global `/mcp/sse`) forwards every per-endpoint tick from
+///   [`AdapterRegistry::subscribe_tools_changed`] and ignores the profile
+///   channel entirely — behaviour unchanged from pre-R3.D.
+/// - `Some(filter)` (profile-scoped) forwards per-endpoint ticks only when
+///   the changed endpoint is in the profile's *current* allowed set
+///   (re-resolved against `filter.registry` each tick, so mid-stream
+///   membership changes take effect), AND forwards profile-channel ticks
+///   when the payload path matches `filter.path` (membership change, JS
+///   toggle, profile add/remove).
+///
+/// Both channels treat `Lagged` as an unconditional forward — the client
+/// re-fetches `tools/list` on receipt and re-discovers any missed change.
 fn build_mcp_sse_stream(
     state: &AppState,
     endpoint_data: &str,
-    allowed_endpoints: Option<Arc<std::collections::HashSet<String>>>,
+    profile_filter: Option<ProfileSseFilter>,
 ) -> Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>> {
     use tokio::sync::broadcast::error::RecvError;
 
     let (tx, rx) = tokio::sync::mpsc::channel(16);
     let mut tools_rx = state.registry.subscribe_tools_changed();
+    // Subscribe to the profile channel even for the global stream so the
+    // two `select!` branches are uniform; the `None` filter just drops the
+    // payloads on the floor. Keeping the subscription means a slow profile
+    // rebuild can't back-pressure the global stream into `Lagged`.
+    let mut profiles_rx = state.profile_registry.subscribe_profiles_changed();
+    // Keep-alive Arc clones moved into the spawn so the broadcast `Sender`s
+    // outlive the request scope. Without these, test harnesses that consume
+    // `AppState` into a one-shot router (e.g. `tower::ServiceExt::oneshot`)
+    // drop the underlying registries as soon as the response is built,
+    // closing both broadcast channels and tripping the `Closed` arms below
+    // before any tick can be evaluated. Production paths keep `AppState`
+    // alive for the lifetime of the server, so this is purely defensive for
+    // short-lived state scopes.
+    let registry_keepalive = state.registry.clone();
+    let profile_registry_keepalive = state.profile_registry.clone();
     let endpoint_data = endpoint_data.to_string();
 
     tokio::spawn(async move {
+        // Bind the keep-alives so the borrow checker keeps them in scope
+        // until the spawn exits.
+        let _registry_keepalive = registry_keepalive;
+        let _profile_registry_keepalive = profile_registry_keepalive;
         if tx
             .send(Ok(Event::default().event("endpoint").data(endpoint_data)))
             .await
@@ -776,37 +823,87 @@ fn build_mcp_sse_stream(
         {
             return;
         }
-        // `Ok(name)` carries the endpoint that emitted the tick (registry
-        // fan-in at `registry.rs:234/244`); profile-scoped streams filter on
-        // membership while the global stream forwards every tick. `Lagged`
-        // loses the endpoint name, so we forward unconditionally on lag —
-        // any missed in-profile change is recovered when the client
-        // re-fetches `tools/list` after the notification. `Closed` only
-        // fires when the registry itself is dropped.
+        // Re-usable JSON-RPC notification frame body. Defined once so both
+        // branches of the `select!` and the `Lagged` arms emit byte-for-byte
+        // identical SSE frames.
+        const FRAME_BODY: &str = r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#;
         loop {
-            match tools_rx.recv().await {
-                Ok(name) => {
-                    let forward = match &allowed_endpoints {
-                        None => true,
-                        Some(set) => set.contains(&name),
-                    };
-                    if !forward {
-                        continue;
-                    }
-                    let frame = Event::default()
-                        .data(r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#);
-                    if tx.send(Ok(frame)).await.is_err() {
-                        break;
+            tokio::select! {
+                ep_tick = tools_rx.recv() => {
+                    match ep_tick {
+                        Ok(name) => {
+                            // Resolve the live allowed-endpoints set per-tick
+                            // so membership changes published since stream
+                            // open take effect without reconnection.
+                            let forward = match &profile_filter {
+                                None => true,
+                                Some(f) => match f.registry.get(&f.path).await {
+                                    Some(ctx) => {
+                                        ctx.registry_view.allowed_endpoints().contains(&name)
+                                    }
+                                    // Profile deleted mid-stream: suppress
+                                    // per-endpoint ticks. The matching
+                                    // profile-channel tick (emitted by
+                                    // `rebuild`) will still flow through the
+                                    // other branch and deliver one final
+                                    // frame to the client.
+                                    None => false,
+                                },
+                            };
+                            if !forward {
+                                continue;
+                            }
+                            if tx.send(Ok(Event::default().data(FRAME_BODY))).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(RecvError::Lagged(_)) => {
+                            if tx.send(Ok(Event::default().data(FRAME_BODY))).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(RecvError::Closed) => break,
                     }
                 }
-                Err(RecvError::Lagged(_)) => {
-                    let frame = Event::default()
-                        .data(r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#);
-                    if tx.send(Ok(frame)).await.is_err() {
-                        break;
+                prof_tick = profiles_rx.recv() => {
+                    match prof_tick {
+                        Ok(path) => {
+                            // Profile-channel ticks only matter for
+                            // profile-scoped streams; the global stream
+                            // ignores them entirely (its tool surface is
+                            // governed by per-endpoint ticks).
+                            let forward = match &profile_filter {
+                                None => false,
+                                Some(f) => path == f.path,
+                            };
+                            if !forward {
+                                continue;
+                            }
+                            if tx.send(Ok(Event::default().data(FRAME_BODY))).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(RecvError::Lagged(_)) => {
+                            // Same policy as the per-endpoint channel: on
+                            // lag the originating path is lost, so forward
+                            // unconditionally for profile-scoped streams and
+                            // suppress for the global stream (which doesn't
+                            // care about profile ticks at all).
+                            if profile_filter.is_some()
+                                && tx.send(Ok(Event::default().data(FRAME_BODY))).await.is_err()
+                            {
+                                break;
+                            }
+                        }
+                        Err(RecvError::Closed) => {
+                            // The profile registry only drops when the
+                            // process exits; treat the same as the
+                            // per-endpoint `Closed` and bail out so we don't
+                            // spin on a dead channel.
+                            break;
+                        }
                     }
                 }
-                Err(RecvError::Closed) => break,
             }
         }
     });
@@ -2810,6 +2907,152 @@ mod tests {
         );
     }
 
+    /// End-to-end SSE smoke test covering the path the user originally cared
+    /// about: an MCP client subscribed to `/mcp/sse` is notified when a new
+    /// endpoint is registered, and a subsequent `tools/list` reflects both
+    /// the new tool and the `advertise.rs`-generated `Connected server
+    /// types: …` line on `search_tools`.
+    #[tokio::test]
+    async fn mcp_sse_e2e_new_endpoint_notifies_and_updates_descriptions() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        // Local mock that surfaces a `server_type()` so the advertised
+        // description in `search_tools` picks up a `Connected server types:`
+        // suffix. Kept inline to avoid touching the shared `MockAdapter`
+        // used by other tests.
+        struct TypedMockAdapter {
+            tools: Vec<ToolInfo>,
+            server_type_val: String,
+        }
+        #[async_trait]
+        impl McpAdapter for TypedMockAdapter {
+            async fn initialize(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+                Ok(self.tools.clone())
+            }
+            async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
+                Ok(json!({ "called": name, "args": arguments }))
+            }
+            fn health(&self) -> HealthStatus {
+                HealthStatus::Healthy
+            }
+            fn server_type(&self) -> Option<String> {
+                Some(self.server_type_val.clone())
+            }
+            async fn shutdown(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+        }
+
+        let state = test_app_state();
+        let registry = state.registry.clone();
+        let router = build_router(state.clone());
+
+        // Step 1: open `/mcp/sse`. `build_mcp_sse_stream` subscribes to
+        // `tools_changed_tx` synchronously before returning, so any tick
+        // emitted after this point is guaranteed to be received.
+        let sse_request = axum::http::Request::builder()
+            .method("GET")
+            .uri("/mcp/sse")
+            .header("accept", "text/event-stream")
+            .body(Body::empty())
+            .unwrap();
+        let sse_resp = router.clone().oneshot(sse_request).await.unwrap();
+        assert_eq!(sse_resp.status(), StatusCode::OK);
+
+        // Step 2: register a new endpoint advertising a tool + a new
+        // server type. `register` emits a per-endpoint tick on
+        // `tools_changed_tx` (registry.rs:195).
+        let driver = tokio::spawn(async move {
+            // A small initial yield lets the spawned SSE writer task make
+            // forward progress past the `endpoint` event before the tick
+            // arrives. Without this the test still passes (the broadcast
+            // queues), but yielding makes the timing match what a real
+            // MCP client sees.
+            tokio::task::yield_now().await;
+            registry
+                .register(
+                    "smoke-ep".into(),
+                    Box::new(TypedMockAdapter {
+                        tools: vec![ToolInfo {
+                            name: "smoke_tool".into(),
+                            description: Some("smoke tool".into()),
+                            input_schema: json!({"type": "object"}),
+                            annotations: None,
+                        }],
+                        server_type_val: "smoke-server".into(),
+                    }),
+                    "stdio".into(),
+                    None,
+                    Some("smoke-ep".into()),
+                )
+                .await;
+        });
+
+        // Step 3: assert a `notifications/tools/list_changed` frame
+        // arrives within 1s. `read_sse_until` accumulates all bytes so
+        // the assertion below can also verify the initial endpoint
+        // event was delivered on the same stream.
+        let text = read_sse_until(sse_resp, Duration::from_secs(1), |s| {
+            s.contains("notifications/tools/list_changed")
+        })
+        .await;
+        driver.await.expect("registration driver task panicked");
+
+        assert!(
+            text.contains("event: endpoint") && text.contains("data: /mcp"),
+            "SSE stream should have delivered the initial endpoint event before the tools-changed frame (got: {text:?})"
+        );
+        assert!(
+            text.contains("notifications/tools/list_changed"),
+            "FRAME_MISSING: SSE stream did not deliver a notifications/tools/list_changed frame within 1s of registering a new endpoint (got: {text:?})"
+        );
+        assert!(
+            text.contains("\"jsonrpc\":\"2.0\""),
+            "FRAME_MISSING: tools/list_changed frame should be a JSON-RPC notification (got: {text:?})"
+        );
+
+        // Step 4: issue `tools/list` and verify the new endpoint's tool
+        // is present, and that `search_tools`'s description now includes
+        // the new server type via `Connected server types: …`.
+        let resp = post_mcp(
+            state.clone(),
+            &json!({"jsonrpc":"2.0","method":"tools/list","id":1}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let tools = body["result"]["tools"]
+            .as_array()
+            .expect("tools/list result must have a tools array");
+
+        let tool_names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or(""))
+            .collect();
+        assert!(
+            tool_names.contains(&"smoke_tool"),
+            "CATALOG_ENTRY_MISSING: tools/list should include the newly registered endpoint's tool 'smoke_tool' (got names: {tool_names:?})"
+        );
+
+        let search_tools = tools
+            .iter()
+            .find(|t| t["name"] == "search_tools")
+            .expect("CATALOG_ENTRY_MISSING: tools/list must include the search_tools meta-tool");
+        let search_desc = search_tools["description"].as_str().unwrap_or("");
+        assert!(
+            search_desc.contains("Connected server types:"),
+            "DESCRIPTION_NOT_UPDATED: search_tools description should contain a 'Connected server types:' line now that an endpoint with a server_type is registered (got: {search_desc:?})"
+        );
+        assert!(
+            search_desc.contains("smoke-server"),
+            "DESCRIPTION_NOT_UPDATED: search_tools description should mention the new server type 'smoke-server' (got: {search_desc:?})"
+        );
+    }
+
     /// Helper: send `body` to a profile-scoped POST/DELETE/GET route via the
     /// router and return the raw response. Mirrors [`post_mcp`] for the
     /// `/mcp/{profile}` wildcard.
@@ -3449,6 +3692,289 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         router.oneshot(request).await.unwrap()
+    }
+
+    // -- Profile-channel propagation matrix ----------------------------------
+    //
+    // The rows below back acceptance #2 of the spec: profile-scoped
+    // `/mcp/{profile}/sse` must receive a frame on profile-membership /
+    // toggle changes affecting it, and must re-read the live allowed-set
+    // when forwarding per-endpoint ticks so mid-stream membership changes
+    // take effect without reconnection. Each test mirrors the retry-tick
+    // pattern of the existing R3.D matrix (the in-handler subscriber races
+    // with the broadcast send, so single sends are unreliable).
+
+    /// Drive profile-changed ticks on `state.profile_registry` until
+    /// `deadline`. Mirrors [`drive_ticks_until`] but exercises the parallel
+    /// profile-channel installed alongside `AdapterRegistry`'s per-endpoint
+    /// channel.
+    async fn drive_profile_ticks_until(
+        state: AppState,
+        profile_path: &str,
+        deadline: tokio::time::Instant,
+    ) {
+        let path = profile_path.to_string();
+        while tokio::time::Instant::now() < deadline {
+            state.profile_registry.tick_profile_changed_for_test(&path);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    // Matrix row A — profile-channel tick whose payload matches the
+    // stream's profile path is forwarded as a tools/list_changed frame.
+    // Backs spec acceptance #2: membership change emits a frame.
+    #[tokio::test]
+    async fn mcp_sse_profiled_forwards_profile_channel_tick() {
+        let state = test_app_state();
+        install_profile(&state, "work", vec!["gmail".into()]).await;
+        let resp = open_profile_sse(state.clone(), "work").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let driver_state = state.clone();
+        let driver = tokio::spawn(async move {
+            drive_profile_ticks_until(driver_state, "work", deadline).await;
+        });
+        let text = read_sse_until(resp, Duration::from_secs(2), |s| {
+            s.contains("notifications/tools/list_changed")
+        })
+        .await;
+        driver.abort();
+        assert!(
+            text.contains("notifications/tools/list_changed"),
+            "expected profile-channel tick to be forwarded (got: {text:?})"
+        );
+    }
+
+    // Matrix row B — profile-channel tick for a *different* profile path
+    // is suppressed on this stream. Guards against the filter being too
+    // permissive (e.g. forwarding every profile tick).
+    #[tokio::test]
+    async fn mcp_sse_profiled_suppresses_other_profile_channel_tick() {
+        let state = test_app_state();
+        // Install both profiles so `mcp_sse_profiled` opens cleanly on `work`
+        // and the "personal" path is a legitimate payload value.
+        let profiles = vec![
+            crate::config::ProfileConfig {
+                name: "work".into(),
+                path: "work".into(),
+                endpoints: vec!["gmail".into()],
+                js_execution: false,
+                toon_output: true,
+            },
+            crate::config::ProfileConfig {
+                name: "personal".into(),
+                path: "personal".into(),
+                endpoints: vec!["todoist".into()],
+                js_execution: false,
+                toon_output: true,
+            },
+        ];
+        state.profile_registry.rebuild(&profiles).await;
+
+        let resp = open_profile_sse(state.clone(), "work").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+        let driver_state = state.clone();
+        let driver = tokio::spawn(async move {
+            drive_profile_ticks_until(driver_state, "personal", deadline).await;
+        });
+        let text = read_sse_until(resp, Duration::from_secs(1), |s| {
+            s.contains("notifications/tools/list_changed")
+        })
+        .await;
+        driver.abort();
+        assert!(
+            !text.contains("notifications/tools/list_changed"),
+            "other-profile tick must not be forwarded (got: {text:?})"
+        );
+        assert!(
+            text.contains("event: endpoint") && text.contains("data: /mcp/work"),
+            "initial endpoint frame should still be emitted (got: {text:?})"
+        );
+    }
+
+    // Matrix row C — a `rebuild` that adds an endpoint to the profile must
+    // emit one profile-channel tick (consumed by the open stream) and the
+    // *next* per-endpoint tick for the newly-added endpoint must be
+    // forwarded because the stream re-reads the allowed set live. Pre-R3.D
+    // the stream captured a static snapshot, so this test would have
+    // suppressed the post-rebuild "gmail" tick.
+    #[tokio::test]
+    async fn mcp_sse_profiled_picks_up_new_membership_live() {
+        let state = test_app_state();
+        // Start with an empty profile; "gmail" is initially out-of-profile.
+        install_profile(&state, "work", vec![]).await;
+        let resp = open_profile_sse(state.clone(), "work").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Rebuild to include "gmail". This emits a profile-channel tick.
+        install_profile(&state, "work", vec!["gmail".into()]).await;
+
+        // After the rebuild, per-endpoint ticks for "gmail" should now be
+        // forwarded. Drive ticks until the frame lands.
+        let registry = state.registry.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let driver = tokio::spawn(async move {
+            drive_ticks_until(registry, "gmail", deadline).await;
+        });
+        let text = read_sse_until(resp, Duration::from_secs(2), |s| {
+            s.contains("notifications/tools/list_changed")
+        })
+        .await;
+        driver.abort();
+        assert!(
+            text.contains("notifications/tools/list_changed"),
+            "expected post-rebuild in-profile tick to be forwarded (got: {text:?})"
+        );
+    }
+
+    // Matrix row D — converse of row C: a `rebuild` that *removes* an
+    // endpoint from the profile must cause subsequent per-endpoint ticks
+    // for that endpoint to be suppressed. The lone frame the stream is
+    // allowed to surface is the one fired by the rebuild itself (profile
+    // channel); after that, ticks against the removed endpoint must not
+    // appear.
+    #[tokio::test]
+    async fn mcp_sse_profiled_drops_removed_membership_live() {
+        let state = test_app_state();
+        install_profile(&state, "work", vec!["gmail".into()]).await;
+        let resp = open_profile_sse(state.clone(), "work").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Drain the initial `endpoint` event and the rebuild's profile
+        // tick, then prove the next "gmail" per-endpoint tick is dropped.
+        install_profile(&state, "work", vec![]).await;
+        // Give the spawned forwarder a beat to consume the profile-channel
+        // tick before we start driving per-endpoint ticks.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Now drive "gmail" per-endpoint ticks for a bounded window. The
+        // stream should swallow them all because "gmail" is no longer in
+        // the live allowed set.
+        let registry = state.registry.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+        let driver = tokio::spawn(async move {
+            drive_ticks_until(registry, "gmail", deadline).await;
+        });
+        // Read for slightly longer than the deadline to confirm no extra
+        // frames arrive after the rebuild's bookkeeping tick.
+        let text = read_sse_until(resp, Duration::from_secs(1), |s| {
+            // Two frames would indicate the per-endpoint forwarding still
+            // sees "gmail" as in-profile.
+            s.matches("notifications/tools/list_changed").count() >= 2
+        })
+        .await;
+        driver.abort();
+        let frame_count = text.matches("notifications/tools/list_changed").count();
+        assert!(
+            frame_count <= 1,
+            "post-removal per-endpoint ticks for 'gmail' must be suppressed; \
+             got {frame_count} frames: {text:?}"
+        );
+    }
+
+    // Matrix row E — the global `/mcp/sse` stream ignores profile-channel
+    // ticks entirely. Without this, profile-membership churn (which is
+    // unrelated to the global tool surface) would spam every connected
+    // global client with redundant notifications.
+    #[tokio::test]
+    async fn mcp_sse_global_ignores_profile_channel_ticks() {
+        let state = test_app_state();
+        install_profile(&state, "work", vec!["gmail".into()]).await;
+        let resp = open_profile_sse_via_global(state.clone()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+        let driver_state = state.clone();
+        let driver = tokio::spawn(async move {
+            drive_profile_ticks_until(driver_state, "work", deadline).await;
+        });
+        let text = read_sse_until(resp, Duration::from_secs(1), |s| {
+            s.contains("notifications/tools/list_changed")
+        })
+        .await;
+        driver.abort();
+        assert!(
+            !text.contains("notifications/tools/list_changed"),
+            "global /mcp/sse must ignore profile-channel ticks (got: {text:?})"
+        );
+    }
+
+    // Matrix row F — a no-op `rebuild` (same configs) MUST NOT emit a
+    // profile-channel tick. Backs spec acceptance #5 for profile streams.
+    #[tokio::test]
+    async fn rebuild_with_identical_config_emits_no_profile_tick() {
+        let state = test_app_state();
+        install_profile(&state, "work", vec!["gmail".into()]).await;
+        // Subscribe AFTER the initial rebuild so we only observe ticks from
+        // the second (no-op) rebuild.
+        let mut rx = state.profile_registry.subscribe_profiles_changed();
+        install_profile(&state, "work", vec!["gmail".into()]).await;
+        // Give the broadcast a beat to deliver, then assert nothing landed.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        match rx.try_recv() {
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+            other => panic!("no-op rebuild must not emit a profile tick (got: {other:?})"),
+        }
+    }
+
+    // Matrix row G — toggling `js_execution` on an otherwise-identical
+    // profile flips `execute_tools` in/out of the advertised catalog, so
+    // the rebuild must emit a profile-channel tick. Backs spec acceptance
+    // #2 ("profile sandbox/toggle changes that affect advertised tools").
+    #[tokio::test]
+    async fn rebuild_js_execution_toggle_emits_profile_tick() {
+        let state = test_app_state();
+        install_profile_with_flags(&state, "work", vec!["gmail".into()], false, true).await;
+        let mut rx = state.profile_registry.subscribe_profiles_changed();
+        install_profile_with_flags(&state, "work", vec!["gmail".into()], true, true).await;
+        let tick = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("profile-channel tick must arrive within 1s")
+            .expect("profile-channel recv must not error");
+        assert_eq!(
+            tick, "work",
+            "js_execution toggle on 'work' must tick the 'work' path"
+        );
+    }
+
+    // Matrix row H — toggling only `toon_output` does NOT change the
+    // advertised tool list (it only affects response serialization), so no
+    // profile-channel tick is emitted. Backs spec acceptance #5 (no frame
+    // on toggles that don't affect the advertised catalog).
+    #[tokio::test]
+    async fn rebuild_toon_only_toggle_emits_no_profile_tick() {
+        let state = test_app_state();
+        install_profile_with_flags(&state, "work", vec!["gmail".into()], false, true).await;
+        let mut rx = state.profile_registry.subscribe_profiles_changed();
+        install_profile_with_flags(&state, "work", vec!["gmail".into()], false, false).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        match rx.try_recv() {
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+            other => {
+                panic!("toon_output-only toggle must not emit a profile tick (got: {other:?})")
+            }
+        }
+    }
+
+    // Matrix row I — removing a profile via `rebuild(&[])` must emit a
+    // final profile-channel tick for the now-deleted path so any open
+    // `/mcp/{path}/sse` stream gets one last `notifications/tools/list_changed`
+    // frame before its per-endpoint forwarding goes silent (because
+    // `ProfileRegistry::get` will return `None` from then on).
+    #[tokio::test]
+    async fn rebuild_emits_tick_for_removed_profile() {
+        let state = test_app_state();
+        install_profile(&state, "work", vec!["gmail".into()]).await;
+        let mut rx = state.profile_registry.subscribe_profiles_changed();
+        state.profile_registry.rebuild(&[]).await;
+        let tick = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("removal must tick within 1s")
+            .expect("profile-channel recv must not error");
+        assert_eq!(tick, "work", "removed profile path must be broadcast");
     }
 
     // R3.E — `profile` field in tracing spans. Nested under `tracing::profile`

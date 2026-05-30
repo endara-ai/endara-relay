@@ -192,6 +192,20 @@ pub struct ProfileRegistry {
     /// each [`ProfileContext`]) so it stays in lockstep with the global
     /// handler's value and is reapplied on every hot reload.
     sandbox_timeout: Duration,
+    /// Profile-membership broadcast — fan-out for
+    /// `notifications/tools/list_changed` on `/mcp/{profile}/sse` streams
+    /// when the *profile itself* changes (endpoint added/removed from the
+    /// profile, profile created/deleted, or `js_execution` toggled, which
+    /// flips whether `execute_tools` is advertised). Payload is the
+    /// lowercased profile path; per-profile SSE handlers filter on it.
+    ///
+    /// This sits alongside [`AdapterRegistry`]'s per-endpoint
+    /// `tools_changed_tx` broadcast rather than replacing it: per-endpoint
+    /// ticks are still the right signal for profile streams when an
+    /// endpoint *inside* the profile mutates, and keeping the two channels
+    /// separate avoids reshaping every existing consumer of the relay-wide
+    /// channel.
+    profiles_changed_tx: broadcast::Sender<String>,
 }
 
 impl ProfileRegistry {
@@ -213,11 +227,33 @@ impl ProfileRegistry {
         adapter_registry: AdapterRegistry,
         sandbox_timeout: Duration,
     ) -> Self {
+        let (profiles_changed_tx, _) = broadcast::channel(16);
         Self {
             profiles: Arc::new(RwLock::new(HashMap::new())),
             adapter_registry,
             sandbox_timeout,
+            profiles_changed_tx,
         }
+    }
+
+    /// Subscribe to the profile-membership broadcast. Each `recv()` yields
+    /// the lowercased profile path whose allowed-endpoints set or advertised
+    /// tool surface (e.g. `js_execution` toggle) changed since the previous
+    /// receive. `Lagged` is surfaced as a tick like the per-endpoint
+    /// `subscribe_tools_changed` — consumers should forward unconditionally
+    /// on lag.
+    pub fn subscribe_profiles_changed(&self) -> broadcast::Receiver<String> {
+        self.profiles_changed_tx.subscribe()
+    }
+
+    /// Send a synthetic profile-changed tick for the given profile path.
+    /// Test-only escape hatch mirroring
+    /// [`AdapterRegistry::tick_tools_changed_for_test`].
+    #[cfg(test)]
+    pub(crate) fn tick_profile_changed_for_test(&self, profile_path: &str) {
+        let _ = self
+            .profiles_changed_tx
+            .send(profile_path.to_ascii_lowercase());
     }
 
     /// Replace the current profile set with one built from `profiles`.
@@ -227,6 +263,17 @@ impl ProfileRegistry {
     /// Per-profile `js_execution` and `toon_output` are copied straight from
     /// the profile config — the loader (`validate_profiles`) requires those
     /// fields to be present, so there is no fallback to relay-wide defaults.
+    ///
+    /// After the swap, emits one
+    /// [`subscribe_profiles_changed`](Self::subscribe_profiles_changed) tick
+    /// per profile path whose membership or advertised-tool surface changed
+    /// — added profiles, removed profiles, profiles whose allowed-endpoint
+    /// set differs, and profiles whose `js_execution` toggle flipped (which
+    /// adds/removes `execute_tools` from the advertised catalog). A pure
+    /// `toon_output` flip is NOT signalled because it only affects response
+    /// serialization, not the advertised tool list. No-op rebuilds (same
+    /// configs in same order) emit nothing — satisfying spec acceptance #5
+    /// for profile-scoped streams.
     pub async fn rebuild(&self, profiles: &[ProfileConfig]) {
         let mut new_map: HashMap<String, Arc<ProfileContext>> = HashMap::new();
         for profile in profiles {
@@ -247,7 +294,40 @@ impl ProfileRegistry {
             new_map.insert(profile.path.to_ascii_lowercase(), Arc::new(ctx));
         }
 
-        *self.profiles.write().await = new_map;
+        // Diff old vs new under the write lock so the membership ticks we
+        // emit accurately describe the post-swap state. Collect the set of
+        // changed paths first, then drop the lock before broadcasting so a
+        // slow subscriber can't stall the swap.
+        let changed: Vec<String> = {
+            let mut guard = self.profiles.write().await;
+            let mut changed = Vec::new();
+            // Added or mutated profiles.
+            for (path, new_ctx) in new_map.iter() {
+                let dirty = match guard.get(path) {
+                    None => true,
+                    Some(old_ctx) => {
+                        old_ctx.registry_view.allowed_endpoints()
+                            != new_ctx.registry_view.allowed_endpoints()
+                            || old_ctx.js_execution != new_ctx.js_execution
+                    }
+                };
+                if dirty {
+                    changed.push(path.clone());
+                }
+            }
+            // Removed profiles.
+            for path in guard.keys() {
+                if !new_map.contains_key(path) {
+                    changed.push(path.clone());
+                }
+            }
+            *guard = new_map;
+            changed
+        };
+
+        for path in changed {
+            let _ = self.profiles_changed_tx.send(path);
+        }
     }
 
     /// Look up a profile by URL path (case-insensitive).
