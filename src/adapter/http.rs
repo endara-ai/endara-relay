@@ -101,7 +101,21 @@ pub struct HttpAdapter {
     /// `call_tool` can attach hint metadata to the overlay's `started`
     /// event without a second round-trip.
     tool_annotations_cache: Arc<RwLock<HashMap<String, Option<Value>>>>,
+    /// Current `Mcp-Session-Id` (per the Streamable HTTP transport spec).
+    /// Populated by [`HttpAdapter::initialize`] from the initialize response
+    /// header (if the upstream sent one) and echoed back on every subsequent
+    /// POST and on the long-lived `GET <url>` listener. Stays `None` for
+    /// upstreams that don't issue a session ID — those servers continue to
+    /// work without the header.
+    session_id: Arc<RwLock<Option<String>>>,
 }
+
+/// HTTP header name reqwest reads/writes for the MCP session ID. Reqwest's
+/// `HeaderMap` stores names lowercase internally, so reading and writing both
+/// go through this constant. The wire-level spelling stays `Mcp-Session-Id`
+/// per the spec; HTTP header names are case-insensitive on transmit.
+const MCP_SESSION_ID_HEADER: reqwest::header::HeaderName =
+    reqwest::header::HeaderName::from_static("mcp-session-id");
 
 impl HttpAdapter {
     /// Create a new HttpAdapter with the given configuration.
@@ -161,6 +175,7 @@ impl HttpAdapter {
             shutdown_notify: Arc::new(Notify::new()),
             event_bus: Arc::new(OnceLock::new()),
             tool_annotations_cache: Arc::new(RwLock::new(HashMap::new())),
+            session_id: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -206,6 +221,7 @@ impl HttpAdapter {
             shutdown_notify: Arc::new(Notify::new()),
             event_bus: Arc::new(OnceLock::new()),
             tool_annotations_cache: Arc::new(RwLock::new(HashMap::new())),
+            session_id: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -323,24 +339,24 @@ impl HttpAdapter {
 
         trace!(method = method, url = %self.config.url, "sending HTTP JSON-RPC notification");
 
-        let resp = self
-            .client
-            .post(&self.config.url)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    AdapterError::Timeout(self.config.timeout_secs)
-                } else if e.is_connect() {
-                    AdapterError::ConnectionFailed(format!("{}: {}", self.config.url, e))
-                } else {
-                    AdapterError::HttpError {
-                        status: 0,
-                        body: e.to_string(),
-                    }
+        let mut builder = self.client.post(&self.config.url).json(&request);
+        if let Some(ref id) = *self.session_id.read().await {
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(id) {
+                builder = builder.header(MCP_SESSION_ID_HEADER.clone(), val);
+            }
+        }
+        let resp = builder.send().await.map_err(|e| {
+            if e.is_timeout() {
+                AdapterError::Timeout(self.config.timeout_secs)
+            } else if e.is_connect() {
+                AdapterError::ConnectionFailed(format!("{}: {}", self.config.url, e))
+            } else {
+                AdapterError::HttpError {
+                    status: 0,
+                    body: e.to_string(),
                 }
-            })?;
+            }
+        })?;
 
         let status = resp.status();
         // 202 Accepted is the expected response for notifications.
@@ -368,24 +384,24 @@ impl HttpAdapter {
 
         trace!(method = method, id = id, url = %self.config.url, "sending HTTP JSON-RPC request");
 
-        let resp = self
-            .client
-            .post(&self.config.url)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    AdapterError::Timeout(self.config.timeout_secs)
-                } else if e.is_connect() {
-                    AdapterError::ConnectionFailed(format!("{}: {}", self.config.url, e))
-                } else {
-                    AdapterError::HttpError {
-                        status: 0,
-                        body: e.to_string(),
-                    }
+        let mut builder = self.client.post(&self.config.url).json(&request);
+        if let Some(ref sid) = *self.session_id.read().await {
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(sid) {
+                builder = builder.header(MCP_SESSION_ID_HEADER.clone(), val);
+            }
+        }
+        let resp = builder.send().await.map_err(|e| {
+            if e.is_timeout() {
+                AdapterError::Timeout(self.config.timeout_secs)
+            } else if e.is_connect() {
+                AdapterError::ConnectionFailed(format!("{}: {}", self.config.url, e))
+            } else {
+                AdapterError::HttpError {
+                    status: 0,
+                    body: e.to_string(),
                 }
-            })?;
+            }
+        })?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -445,6 +461,7 @@ impl HttpAdapter {
     async fn run_get_listener(
         url: String,
         headers: HashMap<String, String>,
+        session_id: Option<String>,
         tools_changed_tx: broadcast::Sender<()>,
         shutdown: Arc<Notify>,
     ) {
@@ -464,6 +481,11 @@ impl HttpAdapter {
                 reqwest::header::HeaderValue::from_str(value),
             ) {
                 default_headers.insert(name, val);
+            }
+        }
+        if let Some(ref sid) = session_id {
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(sid) {
+                default_headers.insert(MCP_SESSION_ID_HEADER.clone(), val);
             }
         }
         let client = match Client::builder().default_headers(default_headers).build() {
@@ -582,13 +604,146 @@ impl McpAdapter for HttpAdapter {
                 }
             });
 
-            let result = match self.send_request("initialize", Some(params)).await {
-                Ok(r) => r,
-                Err(e) => {
+            // Inline POST for the initialize handshake so we can capture the
+            // `Mcp-Session-Id` response header BEFORE the body is consumed.
+            // Per the Streamable HTTP transport spec the upstream returns the
+            // session ID once on the initialize response, and the client MUST
+            // echo it back on every subsequent POST and on the long-lived
+            // `GET <url>` listener — otherwise the server returns 400.
+            //
+            // Mirror `send_request`'s flow (JSON vs SSE content-type, error
+            // mapping) so behaviour stays consistent with the rest of the
+            // adapter's call sites.
+            let result: Value = {
+                let id = self.next_id();
+                let request = jsonrpc::new_request("initialize", Some(params), id);
+                trace!(method = "initialize", id = id, url = %self.config.url, "sending HTTP JSON-RPC request");
+                let send_result = self
+                    .client
+                    .post(&self.config.url)
+                    .json(&request)
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        if e.is_timeout() {
+                            AdapterError::Timeout(self.config.timeout_secs)
+                        } else if e.is_connect() {
+                            AdapterError::ConnectionFailed(format!("{}: {}", self.config.url, e))
+                        } else {
+                            AdapterError::HttpError {
+                                status: 0,
+                                body: e.to_string(),
+                            }
+                        }
+                    });
+                let resp = match send_result {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let msg = e.to_string();
+                        *self.health.write().await = HealthStatus::Unhealthy(msg);
+                        error!(url = %self.config.url, error = %e, "HTTP MCP adapter initialization failed");
+                        return Err(e);
+                    }
+                };
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    let e = AdapterError::HttpError {
+                        status: status.as_u16(),
+                        body,
+                    };
                     let msg = e.to_string();
                     *self.health.write().await = HealthStatus::Unhealthy(msg);
                     error!(url = %self.config.url, error = %e, "HTTP MCP adapter initialization failed");
                     return Err(e);
+                }
+
+                // Capture `Mcp-Session-Id` from the initialize response BEFORE
+                // we consume the body. Reqwest's `HeaderMap` lookups are
+                // case-insensitive, so this matches whatever spelling the
+                // upstream sends (Mcp-Session-Id, mcp-session-id, etc.).
+                if let Some(sid_val) = resp.headers().get(&MCP_SESSION_ID_HEADER) {
+                    if let Ok(sid_str) = sid_val.to_str() {
+                        let sid_str = sid_str.trim();
+                        if !sid_str.is_empty() {
+                            debug!(
+                                session_id = %sid_str,
+                                "captured Mcp-Session-Id from initialize response"
+                            );
+                            *self.session_id.write().await = Some(sid_str.to_string());
+                        }
+                    }
+                }
+
+                let content_type = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+
+                let response: JsonRpcResponse = if content_type.contains("text/event-stream") {
+                    trace!(id = id, "response is SSE (text/event-stream), parsing events");
+                    let body = match resp.text().await {
+                        Ok(b) => b,
+                        Err(e) => {
+                            let err = AdapterError::ProtocolError(format!(
+                                "failed to read SSE body: {}",
+                                e
+                            ));
+                            let msg = err.to_string();
+                            *self.health.write().await = HealthStatus::Unhealthy(msg);
+                            error!(url = %self.config.url, error = %err, "HTTP MCP adapter initialization failed");
+                            return Err(err);
+                        }
+                    };
+                    match Self::parse_sse_response(&body, id, Some(&self.tools_changed_tx)) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let msg = e.to_string();
+                            *self.health.write().await = HealthStatus::Unhealthy(msg);
+                            error!(url = %self.config.url, error = %e, "HTTP MCP adapter initialization failed");
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    match resp.json().await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let err = AdapterError::ProtocolError(format!(
+                                "invalid JSON-RPC response: {}",
+                                e
+                            ));
+                            let msg = err.to_string();
+                            *self.health.write().await = HealthStatus::Unhealthy(msg);
+                            error!(url = %self.config.url, error = %err, "HTTP MCP adapter initialization failed");
+                            return Err(err);
+                        }
+                    }
+                };
+
+                if let Some(err) = response.error {
+                    let e = AdapterError::JsonRpcError {
+                        code: err.code,
+                        message: err.message,
+                        data: err.data,
+                    };
+                    let msg = e.to_string();
+                    *self.health.write().await = HealthStatus::Unhealthy(msg);
+                    error!(url = %self.config.url, error = %e, "HTTP MCP adapter initialization failed");
+                    return Err(e);
+                }
+
+                match response.result {
+                    Some(v) => v,
+                    None => {
+                        let err =
+                            AdapterError::ProtocolError("response has no result".into());
+                        let msg = err.to_string();
+                        *self.health.write().await = HealthStatus::Unhealthy(msg);
+                        error!(url = %self.config.url, error = %err, "HTTP MCP adapter initialization failed");
+                        return Err(err);
+                    }
                 }
             };
 
@@ -657,12 +812,15 @@ impl McpAdapter for HttpAdapter {
             // via `parse_sse_response`.
             let url = self.config.url.clone();
             let headers = self.config.headers.clone();
+            // Snapshot the session ID at spawn time so the listener doesn't
+            // need to re-read adapter state. Matches how `headers` is passed.
+            let session_id = self.session_id.read().await.clone();
             let tx = self.tools_changed_tx.clone();
             let shutdown = self.shutdown_notify.clone();
             let listener_span = self.span.clone();
             let handle = tokio::spawn(
                 async move {
-                    Self::run_get_listener(url, headers, tx, shutdown).await;
+                    Self::run_get_listener(url, headers, session_id, tx, shutdown).await;
                 }
                 .instrument(listener_span),
             );
@@ -1199,12 +1357,22 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio::sync::mpsc;
 
+    /// Session-ID value the fake server returns on the initialize response
+    /// when `require_session_id` is enabled.
+    const FAKE_SESSION_ID: &str = "test-session-abc";
+
     #[derive(Clone)]
     struct GetListenerAppState {
         /// When true, GET /mcp returns 405. When false, GET /mcp returns an
         /// SSE stream that emits a single `notifications/tools/list_changed`
         /// event after a short delay and keeps the connection open.
         get_returns_405: Arc<AtomicBool>,
+        /// When true, the initialize POST response carries
+        /// `Mcp-Session-Id: test-session-abc` and every subsequent POST that
+        /// arrives without a matching `Mcp-Session-Id` request header is
+        /// rejected with 400 (mirroring the upstream Atlassian behaviour).
+        /// Defaults to false so existing GET-listener tests stay unaffected.
+        require_session_id: Arc<AtomicBool>,
     }
 
     async fn handle_get_listener(
@@ -1230,11 +1398,20 @@ mod tests {
             .into_response()
     }
 
-    async fn handle_post_initialize(Json(body): Json<Value>) -> impl IntoResponse {
+    /// Build a POST response.
+    ///
+    /// `session_header` is the value of the inbound `Mcp-Session-Id` request
+    /// header (if any); the handler uses it to enforce the Streamable HTTP
+    /// session-ID contract when `require_session_id` is true.
+    fn build_post_response(
+        body: Value,
+        require_session_id: bool,
+        session_header: Option<String>,
+    ) -> axum::response::Response {
         let id = body["id"].as_u64().unwrap_or(0);
         let method = body["method"].as_str().unwrap_or("");
         if method == "initialize" {
-            Json(json!({
+            let mut resp = Json(json!({
                 "jsonrpc": "2.0",
                 "result": {
                     "protocolVersion": "2025-03-26",
@@ -1243,8 +1420,40 @@ mod tests {
                 },
                 "id": id,
             }))
-            .into_response()
-        } else if body.get("id").is_none() {
+            .into_response();
+            if require_session_id {
+                resp.headers_mut().insert(
+                    MCP_SESSION_ID_HEADER.clone(),
+                    reqwest::header::HeaderValue::from_static(FAKE_SESSION_ID),
+                );
+            }
+            return resp;
+        }
+
+        // For every non-initialize POST: when the server requires a session
+        // ID, missing/mismatched headers get 400 with the exact spec-defined
+        // error body (this is the behaviour Atlassian's MCP returns).
+        if require_session_id {
+            let matches = session_header
+                .as_deref()
+                .map(|v| v == FAKE_SESSION_ID)
+                .unwrap_or(false);
+            if !matches {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "error": {
+                            "code": -32600,
+                            "message": "Request must be an initialize request if no session ID is provided."
+                        }
+                    })),
+                )
+                    .into_response();
+            }
+        }
+
+        if body.get("id").is_none() {
             // notifications/initialized and other JSON-RPC notifications
             (StatusCode::ACCEPTED, "").into_response()
         } else {
@@ -1257,11 +1466,21 @@ mod tests {
         }
     }
 
+    /// Existing helper kept as a thin wrapper so the two pre-existing
+    /// GET-listener tests stay unchanged.
     async fn start_fake_http_server(
         get_returns_405: bool,
     ) -> (String, tokio::task::JoinHandle<()>) {
+        start_fake_http_server_with_options(get_returns_405, false).await
+    }
+
+    async fn start_fake_http_server_with_options(
+        get_returns_405: bool,
+        require_session_id: bool,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         let state = GetListenerAppState {
             get_returns_405: Arc::new(AtomicBool::new(get_returns_405)),
+            require_session_id: Arc::new(AtomicBool::new(require_session_id)),
         };
         let app = Router::new()
             .route("/mcp", any(get_handler_dispatch))
@@ -1282,6 +1501,15 @@ mod tests {
         if req.method() == axum::http::Method::GET {
             handle_get_listener(State(app)).await
         } else if req.method() == axum::http::Method::POST {
+            // Extract the inbound `Mcp-Session-Id` request header (axum's
+            // `HeaderMap` lookups are case-insensitive) BEFORE consuming the
+            // body so the validation branch can compare against it.
+            let session_header = req
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
+            let require_session_id = app.require_session_id.load(Ordering::SeqCst);
             let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
                 Ok(b) => b,
                 Err(_) => return (StatusCode::BAD_REQUEST, "bad body").into_response(),
@@ -1290,7 +1518,7 @@ mod tests {
                 Ok(v) => v,
                 Err(_) => return (StatusCode::BAD_REQUEST, "bad json").into_response(),
             };
-            handle_post_initialize(Json(value)).await.into_response()
+            build_post_response(value, require_session_id, session_header)
         } else {
             (StatusCode::METHOD_NOT_ALLOWED, "").into_response()
         }
@@ -1364,6 +1592,68 @@ mod tests {
             .send_request("tools/call", Some(json!({"name": "x"})))
             .await
             .expect("POST send_request still works after GET 405");
+        assert_eq!(result["ok"], true);
+
+        server.abort();
+    }
+
+    /// Session-ID capture + replay: server returns `Mcp-Session-Id` on
+    /// initialize and rejects every subsequent POST that arrives without it
+    /// with 400. The adapter must capture the header from the initialize
+    /// response BEFORE consuming the body and echo it back on the
+    /// `notifications/initialized` POST and on the follow-up `send_request`.
+    #[tokio::test]
+    async fn test_session_id_captured_and_replayed_on_subsequent_requests() {
+        // require_session_id = true → initialize sets Mcp-Session-Id and any
+        // follow-up POST without the header gets a 400. GET listener returns
+        // 405 so the test doesn't depend on the SSE channel.
+        let (url, server) = start_fake_http_server_with_options(true, true).await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter
+            .initialize()
+            .await
+            .expect("initialize succeeds and captures Mcp-Session-Id");
+
+        // Field populated from the response header.
+        assert_eq!(
+            *adapter.session_id.read().await,
+            Some(FAKE_SESSION_ID.to_string()),
+            "session_id should be captured from initialize response header"
+        );
+
+        // Follow-up POST works only because the adapter replays the header.
+        let result = adapter
+            .send_request("tools/call", Some(json!({"name": "x"})))
+            .await
+            .expect("send_request must replay Mcp-Session-Id on subsequent POSTs");
+        assert_eq!(result["ok"], true);
+
+        server.abort();
+    }
+
+    /// Backward-compat: server does NOT send `Mcp-Session-Id` on initialize
+    /// (e.g. the in-tree fake or any non-session upstream). The adapter must
+    /// leave its session_id slot `None` and continue to function without
+    /// adding the header on subsequent requests.
+    #[tokio::test]
+    async fn test_initialize_without_session_id_header_is_backward_compatible() {
+        // require_session_id = false → initialize handler omits the header.
+        let (url, server) = start_fake_http_server_with_options(true, false).await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter
+            .initialize()
+            .await
+            .expect("initialize succeeds even without Mcp-Session-Id");
+
+        assert!(
+            adapter.session_id.read().await.is_none(),
+            "session_id should remain None when upstream omits the header"
+        );
+
+        let result = adapter
+            .send_request("tools/call", Some(json!({"name": "x"})))
+            .await
+            .expect("send_request succeeds without a session header");
         assert_eq!(result["ok"], true);
 
         server.abort();
