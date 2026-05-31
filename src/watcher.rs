@@ -18,7 +18,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tokio::time::{Duration, Instant};
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, Instrument};
 
 /// Watches a config file for changes and applies diffs to the adapter registry.
 pub struct ConfigWatcher;
@@ -236,17 +236,21 @@ pub async fn apply_diff(
 ) {
     // Remove endpoints
     for name in &diff.removed {
-        info!(endpoint = %name, "Removing endpoint");
+        let span = tracing::info_span!("endpoint", endpoint = %name);
+        let _g = span.enter();
+        info!("Removing endpoint");
         if let Some(mut entry) = registry.remove(name).await {
             if let Err(e) = entry.adapter.shutdown().await {
-                warn!(endpoint = %name, error = %e, "Error shutting down removed adapter");
+                warn!(error = %e, "Error shutting down removed adapter");
             }
         }
     }
 
     // Changed endpoints: shutdown old, register as Starting, init in background
     for (name, new_ep) in &diff.changed {
-        info!(endpoint = %name, "Restarting changed endpoint");
+        let span = tracing::info_span!("endpoint", endpoint = %name);
+        let _g = span.enter();
+        info!("Restarting changed endpoint");
         let (was_disabled, old_disabled_tools) = {
             let entries = registry.entries().read().await;
             if let Some(entry) = entries.get(name.as_str()) {
@@ -260,7 +264,7 @@ pub async fn apply_diff(
         };
         if let Some(mut entry) = registry.remove(name).await {
             if let Err(e) = entry.adapter.shutdown().await {
-                warn!(endpoint = %name, error = %e, "Error shutting down old adapter");
+                warn!(error = %e, "Error shutting down old adapter");
             }
         }
 
@@ -289,26 +293,32 @@ pub async fn apply_diff(
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
         let bus = event_bus.cloned();
-        tokio::spawn(async move {
-            let adapter =
-                create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth, bus.as_ref()).await;
-            let mut entries = reg.entries().write().await;
-            if let Some(entry) = entries.get_mut(name_clone.as_str()) {
-                entry.adapter = adapter;
-                if was_disabled {
-                    let _ = entry.adapter.shutdown().await;
+        let init_span = tracing::info_span!("endpoint", endpoint = %name_clone);
+        tokio::spawn(
+            async move {
+                let adapter =
+                    create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth, bus.as_ref()).await;
+                let mut entries = reg.entries().write().await;
+                if let Some(entry) = entries.get_mut(name_clone.as_str()) {
+                    entry.adapter = adapter;
+                    if was_disabled {
+                        let _ = entry.adapter.shutdown().await;
+                    }
                 }
+                drop(entries);
+                reg.rewire_tools_changed_listener(&name_clone).await;
+                reg.invalidate_endpoint_tool_cache(&name_clone).await;
+                info!("Changed endpoint initialized");
             }
-            drop(entries);
-            reg.rewire_tools_changed_listener(&name_clone).await;
-            reg.invalidate_endpoint_tool_cache(&name_clone).await;
-            info!(endpoint = %name_clone, "Changed endpoint initialized");
-        });
+            .instrument(init_span),
+        );
     }
 
     // Added endpoints
     for ep in &diff.added {
-        info!(endpoint = %ep.name, transport = %ep.transport, "Adding new endpoint");
+        let span = tracing::info_span!("endpoint", endpoint = %ep.name);
+        let _g = span.enter();
+        info!(transport = %ep.transport, "Adding new endpoint");
 
         // Register immediately with Starting status
         registry
@@ -334,26 +344,32 @@ pub async fn apply_diff(
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
         let bus = event_bus.cloned();
-        tokio::spawn(async move {
-            let adapter =
-                create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth, bus.as_ref()).await;
-            let mut entries = reg.entries().write().await;
-            if let Some(entry) = entries.get_mut(ep_clone.name.as_str()) {
-                entry.adapter = adapter;
-                if ep_clone.disabled {
-                    let _ = entry.adapter.shutdown().await;
+        let init_span = tracing::info_span!("endpoint", endpoint = %ep_clone.name);
+        tokio::spawn(
+            async move {
+                let adapter =
+                    create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth, bus.as_ref()).await;
+                let mut entries = reg.entries().write().await;
+                if let Some(entry) = entries.get_mut(ep_clone.name.as_str()) {
+                    entry.adapter = adapter;
+                    if ep_clone.disabled {
+                        let _ = entry.adapter.shutdown().await;
+                    }
                 }
+                drop(entries);
+                reg.rewire_tools_changed_listener(&ep_clone.name).await;
+                reg.invalidate_endpoint_tool_cache(&ep_clone.name).await;
+                info!("New endpoint initialized");
             }
-            drop(entries);
-            reg.rewire_tools_changed_listener(&ep_clone.name).await;
-            reg.invalidate_endpoint_tool_cache(&ep_clone.name).await;
-            info!(endpoint = %ep_clone.name, "New endpoint initialized");
-        });
+            .instrument(init_span),
+        );
     }
 
     // Log unchanged
     for name in &diff.unchanged {
-        info!(endpoint = %name, "Endpoint unchanged, keeping running");
+        let span = tracing::info_span!("endpoint", endpoint = %name);
+        let _g = span.enter();
+        info!("Endpoint unchanged, keeping running");
     }
 }
 
@@ -388,17 +404,21 @@ pub async fn apply_diff_graceful(
 
     // Remove endpoints
     for name in &diff.removed {
-        info!(endpoint = %name, "Removing endpoint");
+        let span = tracing::info_span!("endpoint", endpoint = %name);
+        let _g = span.enter();
+        info!("Removing endpoint");
         if let Some(mut entry) = registry.remove(name).await {
             if let Err(e) = entry.adapter.shutdown().await {
-                warn!(endpoint = %name, error = %e, "Error shutting down removed adapter");
+                warn!(error = %e, "Error shutting down removed adapter");
             }
         }
     }
 
     // Changed endpoints: shutdown old, register as Starting, init in background
     for (name, new_ep) in &diff.changed {
-        info!(endpoint = %name, "Restarting changed endpoint");
+        let span = tracing::info_span!("endpoint", endpoint = %name);
+        let _g = span.enter();
+        info!("Restarting changed endpoint");
         let (was_disabled, old_disabled_tools) = {
             let entries = registry.entries().read().await;
             if let Some(entry) = entries.get(name.as_str()) {
@@ -412,14 +432,14 @@ pub async fn apply_diff_graceful(
         };
         if let Some(mut entry) = registry.remove(name).await {
             if let Err(e) = entry.adapter.shutdown().await {
-                warn!(endpoint = %name, error = %e, "Error shutting down old adapter");
+                warn!(error = %e, "Error shutting down old adapter");
             }
         }
 
         // Warned endpoints get FailedAdapter immediately (no background init)
         if warned_names.contains(name) {
             let msg = warning_messages.get(name).cloned().unwrap_or_default();
-            warn!(endpoint = %name, "Registering as failed due to validation error: {}", msg);
+            warn!("Registering as failed due to validation error: {}", msg);
             registry
                 .register(
                     name.clone(),
@@ -437,7 +457,7 @@ pub async fn apply_diff_graceful(
                 entry.disabled = was_disabled;
                 entry.disabled_tools = old_disabled_tools;
             }
-            info!(endpoint = %name, "Changed endpoint re-registered (failed)");
+            info!("Changed endpoint re-registered (failed)");
             continue;
         }
 
@@ -466,31 +486,37 @@ pub async fn apply_diff_graceful(
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
         let bus = event_bus.cloned();
-        tokio::spawn(async move {
-            let adapter =
-                create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth, bus.as_ref()).await;
-            let mut entries = reg.entries().write().await;
-            if let Some(entry) = entries.get_mut(name_clone.as_str()) {
-                entry.adapter = adapter;
-                if was_disabled {
-                    let _ = entry.adapter.shutdown().await;
+        let init_span = tracing::info_span!("endpoint", endpoint = %name_clone);
+        tokio::spawn(
+            async move {
+                let adapter =
+                    create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth, bus.as_ref()).await;
+                let mut entries = reg.entries().write().await;
+                if let Some(entry) = entries.get_mut(name_clone.as_str()) {
+                    entry.adapter = adapter;
+                    if was_disabled {
+                        let _ = entry.adapter.shutdown().await;
+                    }
                 }
+                drop(entries);
+                reg.rewire_tools_changed_listener(&name_clone).await;
+                reg.invalidate_endpoint_tool_cache(&name_clone).await;
+                info!("Changed endpoint initialized");
             }
-            drop(entries);
-            reg.rewire_tools_changed_listener(&name_clone).await;
-            reg.invalidate_endpoint_tool_cache(&name_clone).await;
-            info!(endpoint = %name_clone, "Changed endpoint initialized");
-        });
+            .instrument(init_span),
+        );
     }
 
     // Added endpoints
     for ep in &diff.added {
-        info!(endpoint = %ep.name, transport = %ep.transport, "Adding new endpoint");
+        let span = tracing::info_span!("endpoint", endpoint = %ep.name);
+        let _g = span.enter();
+        info!(transport = %ep.transport, "Adding new endpoint");
 
         // Warned endpoints get FailedAdapter immediately
         if warned_names.contains(&ep.name) {
             let msg = warning_messages.get(&ep.name).cloned().unwrap_or_default();
-            warn!(endpoint = %ep.name, "Registering as failed due to validation error: {}", msg);
+            warn!("Registering as failed due to validation error: {}", msg);
             registry
                 .register(
                     ep.name.clone(),
@@ -510,7 +536,7 @@ pub async fn apply_diff_graceful(
                     entry.disabled_tools = ep.disabled_tools.iter().cloned().collect();
                 }
             }
-            info!(endpoint = %ep.name, "New endpoint registered (failed)");
+            info!("New endpoint registered (failed)");
             continue;
         }
 
@@ -538,26 +564,32 @@ pub async fn apply_diff_graceful(
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
         let bus = event_bus.cloned();
-        tokio::spawn(async move {
-            let adapter =
-                create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth, bus.as_ref()).await;
-            let mut entries = reg.entries().write().await;
-            if let Some(entry) = entries.get_mut(ep_clone.name.as_str()) {
-                entry.adapter = adapter;
-                if ep_clone.disabled {
-                    let _ = entry.adapter.shutdown().await;
+        let init_span = tracing::info_span!("endpoint", endpoint = %ep_clone.name);
+        tokio::spawn(
+            async move {
+                let adapter =
+                    create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth, bus.as_ref()).await;
+                let mut entries = reg.entries().write().await;
+                if let Some(entry) = entries.get_mut(ep_clone.name.as_str()) {
+                    entry.adapter = adapter;
+                    if ep_clone.disabled {
+                        let _ = entry.adapter.shutdown().await;
+                    }
                 }
+                drop(entries);
+                reg.rewire_tools_changed_listener(&ep_clone.name).await;
+                reg.invalidate_endpoint_tool_cache(&ep_clone.name).await;
+                info!("New endpoint initialized");
             }
-            drop(entries);
-            reg.rewire_tools_changed_listener(&ep_clone.name).await;
-            reg.invalidate_endpoint_tool_cache(&ep_clone.name).await;
-            info!(endpoint = %ep_clone.name, "New endpoint initialized");
-        });
+            .instrument(init_span),
+        );
     }
 
     // Log unchanged
     for name in &diff.unchanged {
-        info!(endpoint = %name, "Endpoint unchanged, keeping running");
+        let span = tracing::info_span!("endpoint", endpoint = %name);
+        let _g = span.enter();
+        info!("Endpoint unchanged, keeping running");
     }
 }
 
