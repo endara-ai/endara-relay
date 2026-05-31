@@ -64,6 +64,7 @@ async fn start_setup_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
         token_manager: None,
         setup_manager: Some(Arc::new(OAuthSetupManager::new())),
         profile_registry: None,
+        event_bus: None,
     };
 
     let app = management_routes(state);

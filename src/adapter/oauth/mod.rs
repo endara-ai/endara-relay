@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::task::{AbortHandle, JoinHandle};
@@ -156,6 +156,11 @@ pub struct OAuthAdapterInner {
     /// `endpoint`/`transport="oauth"` (and `server_type` once the inner MCP
     /// handshake completes).
     pub span: tracing::Span,
+    /// Shared `OnceLock` cell for the desktop overlay's event bus. Owned at
+    /// the OAuth layer so that every inner HTTP adapter rebuilt during a
+    /// token swap shares the same slot — the outer `set_event_bus` call
+    /// thus reaches both the current inner adapter and any future one.
+    event_bus: Arc<OnceLock<crate::events::ToolCallEventBus>>,
 }
 
 impl OAuthAdapterInner {
@@ -581,6 +586,11 @@ impl OAuthAdapterInner {
             self.config.server_type_override.clone(),
             self.config.endpoint_name.clone(),
         );
+        // Share the OAuth adapter's event-bus OnceLock with the new inner so
+        // overlay events fire from the inner's `call_tool` once the bus is
+        // wired, even across token swaps. The outer `set_event_bus` writes
+        // through this same cell.
+        adapter.set_event_bus_handle(self.event_bus.clone());
         match adapter.initialize().await {
             Ok(()) => {
                 // Mirror the stdio/sse/http adapters: once the inner MCP
@@ -860,6 +870,7 @@ impl OAuthAdapter {
                 outer_tools_changed_tx,
                 inner_forwarder_handle: Mutex::new(None),
                 span,
+                event_bus: Arc::new(OnceLock::new()),
             }),
         }
     }
@@ -988,38 +999,55 @@ impl McpAdapter for OAuthAdapter {
     }
 
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
-        async {
-            let guard = self.inner.inner_adapter.read().await;
-            let adapter = match guard.as_ref() {
-                Some(a) => a,
-                None => {
-                    return Err(AdapterError::ConnectionFailed(
-                        "not authenticated — complete OAuth login first".to_string(),
-                    ));
-                }
-            };
+        // NB: do NOT wrap the inner adapter's `call_tool` invocations in
+        // `.instrument(self.inner.span)`. The inner `HttpAdapter::call_tool`
+        // captures the caller's per-request span context (`request{id}`,
+        // `mcp_request{profile}`) BEFORE entering its own span so it can
+        // attach `jsonrpc_id`/`profile` to the published `ToolCallEvent`s.
+        // OAuth's `inner.span` is the persistent endpoint span built at init
+        // time with no parent linkage to per-request spans, so wrapping the
+        // inner call here would zero out those fields on every OAuth-routed
+        // tool call. The OAuth endpoint span is still applied around the
+        // refresh / state-transition branches below where it actually adds
+        // useful context.
+        let guard = self.inner.inner_adapter.read().await;
+        let adapter = match guard.as_ref() {
+            Some(a) => a,
+            None => {
+                return Err(AdapterError::ConnectionFailed(
+                    "not authenticated — complete OAuth login first".to_string(),
+                ));
+            }
+        };
 
-            match adapter.call_tool(name, arguments.clone()).await {
-                Ok(result) => Ok(result),
-                Err(AdapterError::HttpError { status: 401, .. }) => {
-                    // Drop the read lock before refreshing
-                    drop(guard);
+        match adapter.call_tool(name, arguments.clone()).await {
+            Ok(result) => Ok(result),
+            Err(AdapterError::HttpError { status: 401, .. }) => {
+                // Drop the read lock before refreshing
+                drop(guard);
 
+                let refresh_result = async {
                     info!("Got 401, attempting token refresh");
+                    self.inner.do_token_refresh().await
+                }
+                .instrument(self.inner.span.clone())
+                .await;
 
-                    match self.inner.do_token_refresh().await {
-                        Ok(new_tokens) => {
-                            self.inner.apply_tokens(new_tokens).await;
-                            // Retry with new token
-                            let guard = self.inner.inner_adapter.read().await;
-                            let adapter = guard.as_ref().ok_or_else(|| {
-                                AdapterError::ConnectionFailed(
-                                    "Adapter lost during refresh".to_string(),
-                                )
-                            })?;
-                            adapter.call_tool(name, arguments).await
-                        }
-                        Err(e) => {
+                match refresh_result {
+                    Ok(new_tokens) => {
+                        self.inner.apply_tokens(new_tokens).await;
+                        // Retry with new token — again in caller's span so
+                        // the inner adapter sees the per-request scope.
+                        let guard = self.inner.inner_adapter.read().await;
+                        let adapter = guard.as_ref().ok_or_else(|| {
+                            AdapterError::ConnectionFailed(
+                                "Adapter lost during refresh".to_string(),
+                            )
+                        })?;
+                        adapter.call_tool(name, arguments).await
+                    }
+                    Err(e) => {
+                        async {
                             warn!(
                                 error = %e,
                                 "Token refresh after 401 failed"
@@ -1030,18 +1058,18 @@ impl McpAdapter for OAuthAdapter {
                                     "401 on call_tool, refresh failed",
                                 )
                                 .await;
-                            Err(AdapterError::AuthenticationRequired {
-                                endpoint: self.inner.config.endpoint_name.clone(),
-                                message: "Token expired and refresh failed. Re-authenticate in Endara Desktop.".to_string(),
-                            })
                         }
+                        .instrument(self.inner.span.clone())
+                        .await;
+                        Err(AdapterError::AuthenticationRequired {
+                            endpoint: self.inner.config.endpoint_name.clone(),
+                            message: "Token expired and refresh failed. Re-authenticate in Endara Desktop.".to_string(),
+                        })
                     }
                 }
-                Err(other) => Err(other),
             }
+            Err(other) => Err(other),
         }
-        .instrument(self.inner.span.clone())
-        .await
     }
 
     fn server_type(&self) -> Option<String> {
@@ -1120,6 +1148,14 @@ impl McpAdapter for OAuthAdapter {
             Some(adapter) => adapter.activity_log().await,
             None => vec![],
         }
+    }
+
+    fn set_event_bus(&self, bus: crate::events::ToolCallEventBus) {
+        // Writes through the shared `OnceLock` cell. Every inner HTTP
+        // adapter built (now or after a token swap) shares this cell via
+        // [`HttpAdapter::set_event_bus_handle`], so the bus reaches both
+        // the current inner adapter and any future one.
+        let _ = self.inner.event_bus.set(bus);
     }
 }
 
@@ -2709,5 +2745,99 @@ mod tests {
         assert_eq!(state, OAuthState::AuthRequired);
 
         server.abort();
+    }
+
+    /// Regression: a `call_tool` routed through `OAuthAdapter` (which wraps an
+    /// inner `HttpAdapter`) must publish a [`ToolCallEvent::Started`] whose
+    /// `jsonrpc_id` and `profile` fields are populated from the caller's
+    /// per-request span scope (`mcp_request{profile}` > `request{id}`).
+    ///
+    /// Before the fix, `OAuthAdapter::call_tool` wrapped the inner-adapter
+    /// invocation in `.instrument(self.inner.span)` — the OAuth endpoint span
+    /// has no parent linkage to the per-request spans, so the inner
+    /// `HttpAdapter::call_tool`'s `current_request_context()` walk found
+    /// neither field and emitted `jsonrpc_id: None` / `profile: None` for
+    /// every OAuth-authenticated endpoint.
+    ///
+    /// `#[test]` (not `#[tokio::test]`) because we install the capture layer
+    /// via `with_default(...)` and drive an inner current-thread runtime so
+    /// the dispatcher stays attached across `tokio::spawn`'d tasks.
+    #[test]
+    fn call_tool_publishes_jsonrpc_id_and_profile_from_request_span() {
+        use crate::events::{SpanFieldCaptureLayer, ToolCallEvent, ToolCallEventBus};
+        use tracing::Instrument;
+        use tracing_subscriber::prelude::*;
+
+        let subscriber = tracing_subscriber::registry().with(SpanFieldCaptureLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (url, server) = spawn_minimal_mcp_server().await;
+                let mut config = make_config();
+                config.url = url;
+                let adapter = make_adapter(config);
+
+                // Wire the event bus before applying tokens so the rebuilt
+                // inner HttpAdapter sees the shared OnceLock immediately.
+                let bus = ToolCallEventBus::with_default_capacity();
+                adapter.set_event_bus(bus.clone());
+                let mut rx = bus.subscribe();
+
+                adapter
+                    .inner
+                    .apply_tokens(TokenSet {
+                        access_token: "test-access".to_string(),
+                        refresh_token: None,
+                        expires_at: None,
+                        token_type: "Bearer".to_string(),
+                        scope: None,
+                        issued_at: None,
+                    })
+                    .await;
+
+                let id_str = "42".to_string();
+                let profile_str = "test".to_string();
+                let mcp_span = tracing::info_span!(
+                    "mcp_request",
+                    profile = %profile_str,
+                );
+                let req_span =
+                    tracing::info_span!(parent: &mcp_span, "request", method = "tools/call", id = %id_str);
+
+                let result =
+                    async { adapter.call_tool("ping", serde_json::json!({})).await }
+                        .instrument(req_span)
+                        .await;
+                assert!(result.is_ok(), "expected Ok from minimal MCP server, got {result:?}");
+
+                let started = rx.try_recv().expect("started event must be buffered");
+                match started {
+                    ToolCallEvent::Started {
+                        jsonrpc_id,
+                        profile,
+                        transport,
+                        ..
+                    } => {
+                        assert_eq!(jsonrpc_id.as_deref(), Some("42"));
+                        assert_eq!(profile.as_deref(), Some("test"));
+                        // Inner is HttpAdapter, so transport should be "http".
+                        assert_eq!(transport, "http");
+                    }
+                    other => panic!("expected Started event, got {other:?}"),
+                }
+                let completed = rx.try_recv().expect("completed event must be buffered");
+                match completed {
+                    ToolCallEvent::Completed { jsonrpc_id, .. } => {
+                        assert_eq!(jsonrpc_id.as_deref(), Some("42"));
+                    }
+                    other => panic!("expected Completed event, got {other:?}"),
+                }
+
+                server.abort();
+            });
+        });
     }
 }

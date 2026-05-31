@@ -1,14 +1,17 @@
 use super::server_name::{sanitize_server_name, ServerNameError};
 use super::server_type_resolution::{effective_server_type, strip_mcp_server_suffix};
-use super::stdio::RingBuffer;
+use super::stdio::{iso8601_now, RingBuffer};
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
+use crate::events::{
+    annotations_from_value, current_request_context, ToolCallEvent, ToolCallEventBus,
+};
 use crate::jsonrpc::{self, JsonRpcResponse};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, Notify, RwLock};
 use tokio::task::JoinHandle;
@@ -91,6 +94,13 @@ pub struct HttpAdapter {
     /// listener loop exits cleanly between SSE reads and reconnect backoffs
     /// instead of waiting out the current sleep / network read.
     shutdown_notify: Arc<Notify>,
+    /// Shared typed event bus for the desktop overlay's SSE stream. See the
+    /// matching field on [`super::stdio::StdioAdapter`].
+    event_bus: Arc<OnceLock<ToolCallEventBus>>,
+    /// Per-tool annotation cache populated from `list_tools()` responses so
+    /// `call_tool` can attach hint metadata to the overlay's `started`
+    /// event without a second round-trip.
+    tool_annotations_cache: Arc<RwLock<HashMap<String, Option<Value>>>>,
 }
 
 impl HttpAdapter {
@@ -149,6 +159,8 @@ impl HttpAdapter {
             tools_changed_tx,
             listener_handle: Arc::new(Mutex::new(None)),
             shutdown_notify: Arc::new(Notify::new()),
+            event_bus: Arc::new(OnceLock::new()),
+            tool_annotations_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -192,7 +204,17 @@ impl HttpAdapter {
             tools_changed_tx,
             listener_handle: Arc::new(Mutex::new(None)),
             shutdown_notify: Arc::new(Notify::new()),
+            event_bus: Arc::new(OnceLock::new()),
+            tool_annotations_cache: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// Install the given event-bus handle (Arc-cloned) on this adapter,
+    /// replacing the slot reserved by the constructor. Used by
+    /// [`crate::adapter::oauth::OAuthAdapter`] to share a single
+    /// `OnceLock` cell across every inner adapter it rebuilds.
+    pub(crate) fn set_event_bus_handle(&mut self, handle: Arc<OnceLock<ToolCallEventBus>>) {
+        self.event_bus = handle;
     }
 
     fn next_id(&self) -> u64 {
@@ -661,6 +683,13 @@ impl McpAdapter for HttpAdapter {
                 .get("tools")
                 .ok_or_else(|| AdapterError::ProtocolError("missing 'tools' field".into()))?;
             let tools: Vec<ToolInfo> = serde_json::from_value(tools_value.clone())?;
+            // Refresh the per-tool annotations cache for overlay events.
+            let mut cache = self.tool_annotations_cache.write().await;
+            cache.clear();
+            for tool in &tools {
+                cache.insert(tool.name.clone(), tool.annotations.clone());
+            }
+            drop(cache);
             Ok(tools)
         }
         .instrument(self.span.clone())
@@ -668,7 +697,35 @@ impl McpAdapter for HttpAdapter {
     }
 
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
+        // Capture caller span context BEFORE `.instrument(self.span)` re-enters
+        // the adapter's own `endpoint` span — endpoint is constructed at
+        // adapter init time with no parent linkage to per-request spans, so
+        // reading the context from inside the instrumented body would lose
+        // the `request{id}` / `mcp_request{profile}` scope.
+        // See `events::SpanFieldCaptureLayer`.
+        let span_ctx = current_request_context();
         async {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            if let Some(bus) = self.event_bus.get() {
+                let annotations = self
+                    .tool_annotations_cache
+                    .read()
+                    .await
+                    .get(name)
+                    .and_then(|v| v.as_ref().and_then(annotations_from_value));
+                bus.send(ToolCallEvent::Started {
+                    request_id: request_id.clone(),
+                    jsonrpc_id: span_ctx.jsonrpc_id.clone(),
+                    ts: iso8601_now(),
+                    endpoint: self.config.endpoint_name.clone(),
+                    transport: "http".into(),
+                    server_type: self.server_type.read().await.clone(),
+                    server_name: self.upstream_server_name.read().await.clone(),
+                    profile: span_ctx.profile.clone(),
+                    tool: name.to_string(),
+                    annotations,
+                });
+            }
             let params = json!({
                 "name": name,
                 "arguments": arguments,
@@ -705,10 +762,35 @@ impl McpAdapter for HttpAdapter {
                     "Tool call failed"
                 ),
             }
+            if let Some(bus) = self.event_bus.get() {
+                let duration_ms_u64 = duration_ms as u64;
+                let ts = iso8601_now();
+                match &result {
+                    Ok(_) => bus.send(ToolCallEvent::Completed {
+                        request_id,
+                        jsonrpc_id: span_ctx.jsonrpc_id.clone(),
+                        ts,
+                        duration_ms: duration_ms_u64,
+                        status: "ok".into(),
+                    }),
+                    Err(e) => bus.send(ToolCallEvent::Failed {
+                        request_id,
+                        jsonrpc_id: span_ctx.jsonrpc_id.clone(),
+                        ts,
+                        duration_ms: duration_ms_u64,
+                        status: "error".into(),
+                        error_message: e.to_string(),
+                    }),
+                }
+            }
             result
         }
         .instrument(self.span.clone())
         .await
+    }
+
+    fn set_event_bus(&self, bus: ToolCallEventBus) {
+        let _ = self.event_bus.set(bus);
     }
 
     fn health(&self) -> HealthStatus {

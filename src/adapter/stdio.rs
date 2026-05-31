@@ -1,6 +1,9 @@
 use super::server_name::{sanitize_server_name, ServerNameError};
 use super::server_type_resolution::{effective_server_type, strip_mcp_server_suffix};
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
+use crate::events::{
+    annotations_from_value, current_request_context, ToolCallEvent, ToolCallEventBus,
+};
 use crate::jsonrpc::{self, JsonRpcResponse};
 use crate::shell_env;
 use async_trait::async_trait;
@@ -8,7 +11,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -134,6 +137,16 @@ impl CrashTracker {
     }
 }
 
+/// Format the current UTC time as an RFC-3339 / ISO-8601 string with
+/// millisecond precision (e.g. `2026-05-27T04:36:29.710Z`). Shared by all
+/// three adapters' `call_tool` event timestamps so the overlay sees a
+/// consistent format regardless of transport.
+pub(crate) fn iso8601_now() -> String {
+    chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+        .to_string()
+}
+
 /// Calculate backoff duration from crash count (exposed for testing).
 #[allow(dead_code)] // Used in tests
 pub fn calculate_backoff(consecutive_crashes: u32) -> Duration {
@@ -174,6 +187,19 @@ pub struct StdioAdapter {
     /// body with this span so events carry `endpoint`/`transport` (and
     /// `server_type` once the MCP handshake completes).
     span: tracing::Span,
+    /// Shared typed event bus for the desktop overlay's SSE stream. Set
+    /// once by [`Self::set_event_bus`] from `main.rs`/`watcher.rs` after
+    /// construction; `None` keeps `call_tool` silent (no events published)
+    /// which is what the legacy unit tests and ad-hoc constructions want.
+    /// Wrapped in `Arc<OnceLock<_>>` for symmetry with the other adapters
+    /// (SSE / HTTP derive `Clone`) and to keep the setter `&self`.
+    event_bus: Arc<OnceLock<ToolCallEventBus>>,
+    /// Per-tool annotation cache populated from `list_tools()` responses so
+    /// `call_tool` can attach hint metadata to the `started` event without
+    /// re-querying the upstream server. Stored as the raw `annotations`
+    /// JSON value so the [`annotations_from_value`] helper performs the
+    /// MCP-spec key mapping at event-emission time.
+    tool_annotations_cache: Arc<RwLock<HashMap<String, Option<Value>>>>,
     // Background task handles
     _stderr_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     _stdout_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -202,6 +228,8 @@ impl StdioAdapter {
             upstream_server_name: Arc::new(RwLock::new(None)),
             tools_changed_tx,
             span,
+            event_bus: Arc::new(OnceLock::new()),
+            tool_annotations_cache: Arc::new(RwLock::new(HashMap::new())),
             _stderr_handle: Arc::new(Mutex::new(None)),
             _stdout_handle: Arc::new(Mutex::new(None)),
         }
@@ -533,6 +561,18 @@ impl McpAdapter for StdioAdapter {
                 .get("tools")
                 .ok_or_else(|| AdapterError::ProtocolError("missing 'tools' field".into()))?;
             let tools: Vec<ToolInfo> = serde_json::from_value(tools_value.clone())?;
+            // Refresh the per-tool annotations cache used by `call_tool` to
+            // join hint metadata onto the overlay's `started` event. Mirrors
+            // the registry's tool cache lifecycle: rewritten on every
+            // successful list, never trimmed (the worst-case footprint is
+            // one entry per advertised tool, which is bounded by the
+            // upstream server's catalogue).
+            let mut cache = self.tool_annotations_cache.write().await;
+            cache.clear();
+            for tool in &tools {
+                cache.insert(tool.name.clone(), tool.annotations.clone());
+            }
+            drop(cache);
             Ok(tools)
         }
         .instrument(self.span.clone())
@@ -540,7 +580,38 @@ impl McpAdapter for StdioAdapter {
     }
 
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
+        // Pull JSON-RPC id and profile from the surrounding tracing spans
+        // (`request{id=...}` / `mcp_request{profile=...}`) BEFORE re-entering
+        // the adapter's own `endpoint` span — the endpoint span was created
+        // at adapter construction time and is not parented to the per-request
+        // span, so a `current_request_context()` call from inside the
+        // `.instrument(self.span)` body would lose the caller's span scope.
+        // See `events::SpanFieldCaptureLayer`.
+        let span_ctx = current_request_context();
         async {
+            let request_id = uuid::Uuid::new_v4().to_string();
+            // Publish `started` before the network/process round-trip so the
+            // overlay can spawn an in-flight card immediately.
+            if let Some(bus) = self.event_bus.get() {
+                let annotations = self
+                    .tool_annotations_cache
+                    .read()
+                    .await
+                    .get(name)
+                    .and_then(|v| v.as_ref().and_then(annotations_from_value));
+                bus.send(ToolCallEvent::Started {
+                    request_id: request_id.clone(),
+                    jsonrpc_id: span_ctx.jsonrpc_id.clone(),
+                    ts: iso8601_now(),
+                    endpoint: self.config.endpoint_name.clone(),
+                    transport: "stdio".into(),
+                    server_type: self.server_type.read().await.clone(),
+                    server_name: self.upstream_server_name.read().await.clone(),
+                    profile: span_ctx.profile.clone(),
+                    tool: name.to_string(),
+                    annotations,
+                });
+            }
             let params = json!({
                 "name": name,
                 "arguments": arguments,
@@ -563,10 +634,35 @@ impl McpAdapter for StdioAdapter {
                     "Tool call failed"
                 ),
             }
+            if let Some(bus) = self.event_bus.get() {
+                let duration_ms_u64 = duration_ms as u64;
+                let ts = iso8601_now();
+                match &result {
+                    Ok(_) => bus.send(ToolCallEvent::Completed {
+                        request_id,
+                        jsonrpc_id: span_ctx.jsonrpc_id.clone(),
+                        ts,
+                        duration_ms: duration_ms_u64,
+                        status: "ok".into(),
+                    }),
+                    Err(e) => bus.send(ToolCallEvent::Failed {
+                        request_id,
+                        jsonrpc_id: span_ctx.jsonrpc_id.clone(),
+                        ts,
+                        duration_ms: duration_ms_u64,
+                        status: "error".into(),
+                        error_message: e.to_string(),
+                    }),
+                }
+            }
             result
         }
         .instrument(self.span.clone())
         .await
+    }
+
+    fn set_event_bus(&self, bus: ToolCallEventBus) {
+        let _ = self.event_bus.set(bus);
     }
 
     fn health(&self) -> HealthStatus {
@@ -1289,5 +1385,65 @@ with open(record_path, "w") as rec:
             frames[1]
         );
         assert_eq!(frames[2]["method"].as_str(), Some("tools/list"));
+    }
+
+    /// End-to-end sanity check that `jsonrpc_id` flows from the surrounding
+    /// `request` tracing span into the published [`ToolCallEvent::Started`]
+    /// and [`ToolCallEvent::Failed`] events. Uses a non-spawned `StdioAdapter`
+    /// so `send_request` returns `AdapterError::NotInitialized` immediately —
+    /// the `Started` event still publishes before the network attempt, and
+    /// the `Failed` event publishes on the resulting `Err`.
+    ///
+    /// `#[test]` (not `#[tokio::test]`) because we install the capture layer
+    /// via `with_default(...)` and drive an inner current-thread runtime.
+    #[test]
+    fn call_tool_publishes_jsonrpc_id_from_request_span() {
+        use crate::events::{SpanFieldCaptureLayer, ToolCallEvent, ToolCallEventBus};
+        use tracing::Instrument;
+        use tracing_subscriber::prelude::*;
+
+        let subscriber = tracing_subscriber::registry().with(SpanFieldCaptureLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let bus = ToolCallEventBus::with_default_capacity();
+                let adapter = StdioAdapter::new(StdioConfig {
+                    command: "nonexistent-binary-for-span-test".to_string(),
+                    args: vec![],
+                    env: HashMap::new(),
+                    ..Default::default()
+                });
+                adapter.set_event_bus(bus.clone());
+                let mut rx = bus.subscribe();
+
+                let id_str = "99".to_string();
+                let span = tracing::info_span!("request", method = "tools/call", id = %id_str);
+                let result = async { adapter.call_tool("nope", serde_json::json!({})).await }
+                    .instrument(span)
+                    .await;
+                assert!(
+                    result.is_err(),
+                    "expected NotInitialized error, got {result:?}"
+                );
+
+                let started = rx.try_recv().expect("started event must be buffered");
+                match started {
+                    ToolCallEvent::Started { jsonrpc_id, .. } => {
+                        assert_eq!(jsonrpc_id.as_deref(), Some("99"));
+                    }
+                    other => panic!("expected Started event, got {other:?}"),
+                }
+                let failed = rx.try_recv().expect("failed event must be buffered");
+                match failed {
+                    ToolCallEvent::Failed { jsonrpc_id, .. } => {
+                        assert_eq!(jsonrpc_id.as_deref(), Some("99"));
+                    }
+                    other => panic!("expected Failed event, got {other:?}"),
+                }
+            });
+        });
     }
 }

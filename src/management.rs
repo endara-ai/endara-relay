@@ -21,6 +21,7 @@ use crate::adapter::sse::{SseAdapter, SseConfig};
 use crate::adapter::stdio::{StdioAdapter, StdioConfig};
 use crate::adapter::{FailedAdapter, HealthStatus, McpAdapter, StartingAdapter};
 use crate::config::Config;
+use crate::events::ToolCallEventBus;
 use crate::oauth::{OAuthFlowManager, OAuthSetupManager, PkceChallenge};
 use crate::profile_registry::ProfileRegistry;
 use crate::registry::AdapterRegistry;
@@ -56,6 +57,12 @@ pub struct ManagementState {
     /// R4.B). `None` is permitted for legacy test fixtures that don't
     /// exercise the profile routes.
     pub profile_registry: Option<Arc<ProfileRegistry>>,
+    /// Shared typed tool-call event bus consumed by the desktop overlay's
+    /// SSE stream at `GET /api/events/tool-calls`. Adapters publish
+    /// `started` / `completed` / `failed` events via the same bus. `None`
+    /// is permitted for unit-test fixtures that do not exercise the
+    /// overlay route; in that case the SSE handler returns 503.
+    pub event_bus: Option<ToolCallEventBus>,
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +352,7 @@ async fn restart_endpoint(
     let config = state.config.clone();
     let token_manager = state.token_manager.clone();
     let oauth_adapter_inners = state.oauth_adapter_inners.clone();
+    let event_bus = state.event_bus.clone();
     let task_name = name.clone();
 
     tokio::spawn(async move {
@@ -380,7 +388,8 @@ async fn restart_endpoint(
                 )))
             });
             let oai = oauth_adapter_inners.unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new())));
-            crate::watcher::create_adapter(&ep, &tm, &oai, allow_insecure_oauth).await
+            crate::watcher::create_adapter(&ep, &tm, &oai, allow_insecure_oauth, event_bus.as_ref())
+                .await
         } else {
             // Endpoint not in config: re-initialize the previous adapter in
             // place. On failure, surface the error via FailedAdapter so the
@@ -589,6 +598,7 @@ async fn reload_config(State(state): State<ManagementState>) -> Json<ActionRespo
         &token_manager,
         &oauth_adapter_inners,
         new_config.relay.allow_insecure_oauth.unwrap_or(false),
+        state.event_bus.as_ref(),
     )
     .await;
 
@@ -3268,6 +3278,7 @@ async fn apply_endpoint_change(
         &token_manager,
         &oauth_adapter_inners,
         new_cfg.relay.allow_insecure_oauth.unwrap_or(false),
+        state.event_bus.as_ref(),
     )
     .await;
 
@@ -3316,6 +3327,71 @@ async fn update_endpoint(
         return *resp;
     }
     (StatusCode::OK, Json(endpoint_summary_from(&new_ep))).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Tool-call event SSE stream
+// ---------------------------------------------------------------------------
+
+/// `GET /api/events/tool-calls` — Server-Sent-Events stream of every
+/// [`ToolCallEvent`] published on the relay's typed event bus. Each adapter
+/// emits a `started` event at `call_tool` entry and a matching
+/// `completed` / `failed` event at the end of the round-trip; the desktop
+/// overlay subscribes once per session and renders cards from those events.
+///
+/// Subscribers are independent broadcast receivers, so a slow / disconnected
+/// client only impacts itself: on `Lagged` the handler emits a single
+/// `event: lagged` SSE comment and continues from the freshest available
+/// frame. Tokio broadcast's drop-oldest semantics guarantee producers
+/// (`call_tool` invocations) never block on overlay clients.
+///
+/// A 15 s SSE keep-alive prevents idle reverse proxies (or, more relevantly,
+/// the desktop's Unix-socket HTTP client) from collapsing the connection.
+async fn tool_call_events_sse(State(state): State<ManagementState>) -> axum::response::Response {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use std::convert::Infallible;
+    use std::time::Duration;
+    use tokio::sync::broadcast::error::RecvError;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    let Some(bus) = state.event_bus.clone() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "event bus not configured").into_response();
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(64);
+    let mut event_rx = bus.subscribe();
+
+    tokio::spawn(async move {
+        loop {
+            match event_rx.recv().await {
+                Ok(ev) => {
+                    let frame = match serde_json::to_string(&ev) {
+                        Ok(s) => Event::default().data(s),
+                        Err(e) => {
+                            warn!(error = %e, "Failed to serialize ToolCallEvent for SSE stream");
+                            continue;
+                        }
+                    };
+                    if tx.send(Ok(frame)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(RecvError::Lagged(skipped)) => {
+                    let frame = Event::default()
+                        .event("lagged")
+                        .data(format!("{{\"skipped\":{}}}", skipped));
+                    if tx.send(Ok(frame)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(RecvError::Closed) => break,
+            }
+        }
+    });
+
+    Sse::new(ReceiverStream::new(rx))
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -3382,6 +3458,8 @@ pub fn management_routes(state: ManagementState) -> Router {
             "/api/endpoints/{name}/profiles",
             get(get_endpoint_profile_membership),
         )
+        // Desktop overlay's typed tool-call event SSE stream.
+        .route("/api/events/tool-calls", get(tool_call_events_sse))
         // No CORS layer: this router is served exclusively over a Unix-domain
         // socket / Windows named pipe (see `management_listener`), which is not
         // reachable from a browser and has no cross-origin attack surface.
@@ -3766,6 +3844,7 @@ mod tests {
             token_manager: None,
             setup_manager: None,
             profile_registry: None,
+            event_bus: None,
         }
     }
 
@@ -4026,6 +4105,7 @@ mod tests {
             token_manager: None,
             setup_manager: None,
             profile_registry: None,
+            event_bus: None,
         };
         let app = management_routes(state);
 
@@ -4101,6 +4181,7 @@ mod tests {
             token_manager: None,
             setup_manager: None,
             profile_registry: None,
+            event_bus: None,
         };
         let registry_for_poll = state.registry.clone();
         let app = management_routes(state);
@@ -4235,6 +4316,7 @@ mod tests {
             token_manager: None,
             setup_manager: None,
             profile_registry: None,
+            event_bus: None,
         };
         let registry_for_poll = state.registry.clone();
         let app = management_routes(state);
@@ -4342,6 +4424,7 @@ mod tests {
             token_manager: None,
             setup_manager: None,
             profile_registry: None,
+            event_bus: None,
         };
 
         // Subscribe BEFORE issuing the restart so we don't race the
@@ -4945,6 +5028,7 @@ command = "echo"
             token_manager: Some(token_manager),
             setup_manager: None,
             profile_registry: None,
+            event_bus: None,
         };
 
         (state, shared_inner)
@@ -5259,6 +5343,7 @@ command = "echo"
             token_manager: None,
             setup_manager: Some(Arc::new(OAuthSetupManager::new())),
             profile_registry: None,
+            event_bus: None,
         }
     }
 
@@ -5922,6 +6007,7 @@ command = "echo"
             token_manager: Some(token_manager.clone()),
             setup_manager: None,
             profile_registry: None,
+            event_bus: None,
         };
         (state, token_manager)
     }
@@ -6122,6 +6208,7 @@ command = "echo"
             token_manager: None,
             setup_manager: None,
             profile_registry: None,
+            event_bus: None,
         };
         (state, flow_mgr)
     }
@@ -6562,6 +6649,7 @@ command = "echo"
             token_manager: Some(token_manager),
             setup_manager: None,
             profile_registry: None,
+            event_bus: None,
         };
         let app = management_routes(state);
         let resp = app
@@ -6633,6 +6721,7 @@ client_id = "client123"
             token_manager: Some(token_manager),
             setup_manager: None,
             profile_registry: None,
+            event_bus: None,
         };
         let app = management_routes(state);
         let resp = app
@@ -6751,6 +6840,7 @@ client_id = "client123"
             token_manager: None,
             setup_manager: None,
             profile_registry: Some(profile_registry),
+            event_bus: None,
         }
     }
 
@@ -7266,6 +7356,7 @@ client_id = "client123"
             token_manager: None,
             setup_manager: None,
             profile_registry: None,
+            event_bus: None,
         }
     }
 
@@ -7569,6 +7660,109 @@ client_id = "client123"
         assert_eq!(
             before, after,
             "rejected rename must not write to config.toml"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // GET /api/events/tool-calls — desktop overlay SSE stream
+    // -------------------------------------------------------------------
+
+    /// 503 when the bus isn't wired (legacy test fixtures / first-run race
+    /// between the management socket binding and bus construction).
+    #[tokio::test]
+    async fn tool_call_events_sse_returns_503_without_bus() {
+        let mut state = test_state(vec![]).await;
+        state.event_bus = None;
+        let router = management_routes(state);
+        let req = Request::builder()
+            .uri("/api/events/tool-calls")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// Bus-wired stream returns 200 with the SSE content-type and an active
+    /// keep-alive (so the desktop's Unix-socket HTTP client doesn't drop the
+    /// idle connection). We don't assert on the keep-alive comment frame
+    /// timing here — the keep-alive interval is 15 s — but we do verify
+    /// that a published event reaches the body within a short timeout, and
+    /// that subsequent reads keep returning bytes (i.e. the stream is not
+    /// closed by axum's keep-alive layer).
+    #[tokio::test]
+    async fn tool_call_events_sse_streams_published_events() {
+        use http_body_util::BodyExt;
+        let bus = ToolCallEventBus::with_default_capacity();
+        let mut state = test_state(vec![]).await;
+        state.event_bus = Some(bus.clone());
+        let router = management_routes(state);
+        let req = Request::builder()
+            .uri("/api/events/tool-calls")
+            .body(Body::empty())
+            .unwrap();
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get(axum::http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            ct.starts_with("text/event-stream"),
+            "expected SSE content-type, got {:?}",
+            ct
+        );
+
+        // Wait for the spawned task to attach its receiver, then publish.
+        let mut body = resp.into_body();
+        for _ in 0..50 {
+            if bus.receiver_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(bus.receiver_count() > 0, "SSE handler should subscribe");
+        bus.send(crate::events::ToolCallEvent::Completed {
+            request_id: "rid-1".into(),
+            jsonrpc_id: Some("42".into()),
+            ts: "2026-05-27T00:00:00.000Z".into(),
+            duration_ms: 5,
+            status: "ok".into(),
+        });
+
+        // Read a few chunks until we observe the JSON payload.
+        let mut buf = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            let frame = tokio::time::timeout(std::time::Duration::from_millis(200), body.frame())
+                .await
+                .ok()
+                .and_then(|f| f);
+            if let Some(Ok(frame)) = frame {
+                if let Some(data) = frame.data_ref() {
+                    buf.extend_from_slice(data);
+                    if String::from_utf8_lossy(&buf).contains("\"kind\":\"completed\"") {
+                        break;
+                    }
+                }
+            }
+        }
+        let text = String::from_utf8_lossy(&buf);
+        assert!(
+            text.contains("\"kind\":\"completed\""),
+            "expected 'completed' frame in SSE body, got: {}",
+            text
+        );
+        assert!(
+            text.contains("\"request_id\":\"rid-1\""),
+            "expected request_id in SSE body, got: {}",
+            text
+        );
+        assert!(
+            text.contains("\"jsonrpc_id\":\"42\""),
+            "expected jsonrpc_id in SSE body, got: {}",
+            text
         );
     }
 }
