@@ -22,6 +22,8 @@ Add servers, manage OAuth, connect any AI client — all from one place.
 - **OAuth managed for you** — Relay handles token storage and refresh for servers that need it, so your clients don't have to.
 - **Hot-reload config** — edit your TOML, save, and Relay picks up the change without a restart.
 - **Automatic restart on crash** — flaky STDIO servers come back on their own with exponential backoff.
+- **Endpoint profiles** — serve named subsets of your endpoints under their own `/mcp/{profile}` URL so different agents can share one relay without sharing one catalog.
+- **Live tool-call event stream** — subscribe to every tool call via Server-Sent Events on the management API; powers the [Endara Desktop](https://github.com/endara-ai/endara-desktop) overlay.
 - **Fully local** — no cloud, no accounts, no telemetry. Everything runs on your machine.
 
 ---
@@ -112,6 +114,8 @@ The config file is TOML. Here's a complete reference:
 machine_name = "my-laptop"        # Required — identifies this machine
 local_js_execution = true         # Optional — enable JS execution mode (default: false)
 toon_output = true                # Optional — convert JSON tool responses to TOON (default: true)
+startup_init_timeout_secs = 60    # Optional — cap on how long the MCP listener waits for
+                                  # adapter init before binding 9400 anyway (default: 60)
 
 # STDIO endpoint — spawns a child process
 [[endpoints]]
@@ -148,6 +152,23 @@ url = "https://drivemcp.googleapis.com/mcp/v1"
 oauth_server_url = "https://accounts.google.com"
 client_id = "$GOOGLE_CLIENT_ID"
 server_type_override = "google-drive"  # Optional — overrides upstream-derived server_type
+
+# Endpoint profiles — serve named subsets of the endpoints above
+# at /mcp/{path}. Clients pointed at the prefixed URL see only the
+# tools from the listed endpoints. See "Endpoint profiles" below.
+[[profiles]]
+name = "Work"
+path = "work"
+endpoints = ["github", "drive"]
+js_execution = true
+toon_output = true
+
+[[profiles]]
+name = "Personal"
+path = "personal"
+endpoints = ["filesystem"]
+js_execution = false
+toon_output = false
 ```
 
 ### Environment variable resolution
@@ -198,6 +219,16 @@ No restart required.
 
 If a STDIO server process crashes, Relay automatically restarts it with exponential backoff. After repeated failures, the endpoint is marked unhealthy. This keeps your tool catalog available even when individual servers are flaky.
 
+### Endpoint profiles
+
+Profiles are named subsets of your registered endpoints served under their own MCP URL. Pointing a client at `http://localhost:9400/mcp/{profile}` (or `http://localhost:9400/mcp/sse/{profile}` for legacy SSE clients) exposes only the tools from the endpoints in that profile's allow-list, so different agents or clients can share one relay without sharing one catalog. The unprefixed `/mcp` URL continues to serve the union of every enabled endpoint.
+
+Each profile owns its own `local_js_execution` and `toon_output` values independent of the global `[relay]` defaults — one profile can serve raw JSON while another keeps TOON encoding on, from the same relay process. Profiles can be edited in TOML or managed through Endara Desktop's **Profiles** tab and the management API.
+
+### Tool-call event stream
+
+The management API exposes a Server-Sent Events stream at `GET /api/events/tool-calls` that publishes every MCP tool call routed through the relay, with lifecycle (in-flight, success, failure), duration, upstream endpoint, and tool name. This is what powers the [Endara Desktop](https://github.com/endara-ai/endara-desktop) tool-call overlay; you can subscribe directly for custom dashboards or telemetry pipelines.
+
 ### JS execution mode
 
 When `local_js_execution = true`, Relay replaces the full tool catalog with three meta-tools:
@@ -234,25 +265,34 @@ Relay exposes a management REST API for monitoring and control. The API is reach
 
 | Platform | Path |
 |----------|------|
-| Linux    | `$XDG_RUNTIME_DIR/endara-relay/api.sock` (fallback: `<data-dir>/api.sock`) |
-| macOS    | `$TMPDIR/endara-relay-<uid>/api.sock` |
-| Windows  | `\\.\pipe\endara-relay-<session-id>` |
+| Linux    | `$XDG_RUNTIME_DIR/endara-relay-<suffix>/api.sock` (fallback: `<data-dir>/api.sock`) |
+| macOS    | `$TMPDIR/endara-relay-<uid>-<suffix>/api.sock` |
+| Windows  | `\\.\pipe\endara-relay-<user-sid>` |
+
+`<suffix>` is a stable hash of the relay's data directory, so two relays running against different data dirs get distinct sockets. The exact path is logged at startup and is also reported by `GET /api/status`.
+
+A curated subset of the API:
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/api/status` | Relay status, uptime, endpoint/health counts |
+| `GET` | `/api/status` | Relay status, uptime, endpoint/health counts, resolved socket path |
 | `GET` | `/api/endpoints` | List all endpoints with health and transport info |
+| `GET` | `/api/catalog` | Full merged tool catalog with applied prefixes and current availability |
 | `GET` | `/api/endpoints/:name/tools` | List tools for a specific endpoint |
 | `GET` | `/api/endpoints/:name/logs` | View stderr logs for a STDIO endpoint |
 | `POST` | `/api/endpoints/:name/restart` | Restart a specific endpoint |
 | `POST` | `/api/endpoints/:name/refresh` | Re-fetch the tool catalog for an endpoint |
+| `POST` | `/api/endpoints/:name/disable` &nbsp;/ `enable` | Hide or restore an endpoint without removing it |
 | `GET` | `/api/config` | View current config (env values redacted) |
 | `POST` | `/api/config/reload` | Trigger a config reload |
+| `GET` | `/api/events/tool-calls` | Server-Sent Events stream of every tool call (in-flight, success, failure, duration) |
 
-**Example (Linux/macOS):**
+OAuth flows (`/api/endpoints/:name/oauth/*`, `/api/oauth/setup/*`) and per-tool enable/disable endpoints are documented in full on the [Endara Relay docs](https://endara.ai/docs/relay#management-api).
+
+**Example (Linux):**
 
 ```bash
-curl --unix-socket "$XDG_RUNTIME_DIR/endara-relay/api.sock" http://localhost/api/status
+curl --unix-socket "$XDG_RUNTIME_DIR/endara-relay-<suffix>/api.sock" http://localhost/api/status
 ```
 
 ---
@@ -290,7 +330,7 @@ cargo test --all-targets
 
 Releases are automated via GitHub Actions. To create a new release:
 
-1. Tag the commit: `git tag v0.1.0 && git push origin v0.1.0`
+1. Tag the commit: `git tag v0.1.8 && git push origin v0.1.8` (release candidates use `vX.Y.Z-rc.N`)
 2. The [release workflow](.github/workflows/release.yml) automatically:
    - Builds release binaries for all platforms (Linux x86_64/aarch64, macOS x86_64/aarch64, Windows x86_64)
    - Creates a GitHub Release with the tag
