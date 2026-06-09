@@ -244,7 +244,10 @@ async fn mcp_tools_list(
         // execute_tools is intentionally hidden — it is gated on
         // local_js_execution and the matching invocation-side check
         // would reject any call to it.
-        let catalog = state.registry.merged_catalog().await;
+        let catalog = match profile_ctx {
+            Some(ctx) => ctx.registry_view.merged_catalog().await,
+            None => state.registry.merged_catalog().await,
+        };
         let mut tools: Vec<Value> = catalog
             .into_iter()
             .map(|t| {

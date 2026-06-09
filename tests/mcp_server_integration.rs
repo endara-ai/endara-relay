@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use endara_relay::adapter::stdio::{StdioAdapter, StdioConfig};
 use endara_relay::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
+use endara_relay::config::ProfileConfig;
 use endara_relay::js_sandbox::MetaToolHandler;
 use endara_relay::profile_registry::ProfileRegistry;
 use endara_relay::registry::AdapterRegistry;
@@ -328,4 +329,136 @@ async fn tools_call_native_response_is_json_when_disabled() {
     assert_eq!(parsed["users"][0]["name"], "a");
     assert_eq!(parsed["users"][1]["id"], 2);
     assert_eq!(parsed["users"][1]["name"], "b");
+}
+
+/// Mock adapter exposing a single, configurable raw tool name. Used by the
+/// profile-scoping regression test to register distinct endpoints whose
+/// tools are easy to tell apart in a `tools/list` response.
+struct NamedToolAdapter {
+    tool: &'static str,
+}
+
+#[async_trait]
+impl McpAdapter for NamedToolAdapter {
+    async fn initialize(&mut self) -> Result<(), AdapterError> {
+        Ok(())
+    }
+    async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+        Ok(vec![ToolInfo {
+            name: self.tool.to_string(),
+            description: Some(format!("the {} tool", self.tool)),
+            input_schema: json!({"type": "object"}),
+            annotations: None,
+        }])
+    }
+    async fn call_tool(&self, _name: &str, _args: Value) -> Result<Value, AdapterError> {
+        Ok(json!({ "content": [{ "type": "text", "text": "ok" }] }))
+    }
+    fn health(&self) -> HealthStatus {
+        HealthStatus::Healthy
+    }
+    async fn shutdown(&mut self) -> Result<(), AdapterError> {
+        Ok(())
+    }
+}
+
+/// Regression test for endara-desktop#113: `POST /mcp/{profile}` `tools/list`
+/// must return only the tools whose owning endpoint is in the profile's
+/// allowlist, plus the `list_tools`/`search_tools` meta-tools — not the full
+/// global catalog. Exercises the normal-mode (`js_execution = false`) catalog
+/// branch over the real `/mcp/{profile}` serving path.
+#[tokio::test]
+async fn profile_tools_list_excludes_out_of_profile_tools() {
+    let registry = AdapterRegistry::new();
+    registry
+        .register(
+            "gmail".into(),
+            Box::new(NamedToolAdapter { tool: "send_email" }),
+            "stdio".into(),
+            None,
+            Some("gmail".into()),
+        )
+        .await;
+    registry
+        .register(
+            "github".into(),
+            Box::new(NamedToolAdapter {
+                tool: "list_issues",
+            }),
+            "stdio".into(),
+            None,
+            Some("github".into()),
+        )
+        .await;
+
+    let profile_registry = Arc::new(ProfileRegistry::new(registry.clone()));
+    profile_registry
+        .rebuild(&[ProfileConfig {
+            name: "Work".into(),
+            path: "work".into(),
+            endpoints: vec!["gmail".into()],
+            js_execution: false,
+            toon_output: false,
+        }])
+        .await;
+
+    let registry_arc = Arc::new(registry.clone());
+    let state = AppState {
+        registry,
+        js_execution_mode: Arc::new(AtomicBool::new(false)),
+        meta_tool_handler: Arc::new(MetaToolHandler::new(registry_arc, Duration::from_secs(30))),
+        profile_registry,
+        oauth_flow_manager: None,
+        token_manager: None,
+        oauth_adapter_inners: None,
+        setup_manager: None,
+        started_at: std::time::Instant::now(),
+        toon_enabled: false,
+    };
+    let router = build_router(state);
+    let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+    let (addr, _handle) = start_server(router, addr)
+        .await
+        .expect("server start failed");
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{}/mcp/work", addr))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "tools/list",
+            "id": 1
+        }))
+        .send()
+        .await
+        .expect("request failed");
+
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    let tools = body["result"]["tools"].as_array().expect("tools array");
+    let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+
+    // In-profile endpoint's tool plus the two normal-mode meta-tools.
+    assert!(
+        names.contains(&"gmail__send_email"),
+        "in-profile tool missing: {names:?}"
+    );
+    assert!(
+        names.contains(&"list_tools"),
+        "list_tools missing: {names:?}"
+    );
+    assert!(
+        names.contains(&"search_tools"),
+        "search_tools missing: {names:?}"
+    );
+    // Out-of-profile endpoint's tool must be filtered out.
+    assert!(
+        !names.contains(&"github__list_issues"),
+        "out-of-profile tool leaked into /mcp/work tools/list: {names:?}"
+    );
+    assert_eq!(
+        names.len(),
+        3,
+        "expected exactly gmail__send_email + 2 meta-tools, got: {names:?}"
+    );
 }
