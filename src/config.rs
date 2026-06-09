@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 /// Top-level configuration structure.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
+    #[serde(default)]
     pub relay: RelayConfig,
     #[serde(default)]
     pub endpoints: Vec<EndpointConfig>,
@@ -45,6 +46,28 @@ pub struct RelayConfig {
     /// socket and adapters keep initializing in the background.
     #[serde(default)]
     pub startup_init_timeout_secs: Option<u64>,
+}
+
+impl Default for RelayConfig {
+    /// Mirror [`default_config`]'s relay defaults: resolve `machine_name` from
+    /// the system hostname (falling back to `"unknown"`) and leave every
+    /// optional field unset. This is what `#[serde(default)]` on `Config::relay`
+    /// uses when a `config.toml` omits the `[relay]` table entirely.
+    fn default() -> Self {
+        let machine_name = hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        RelayConfig {
+            machine_name,
+            local_js_execution: None,
+            token_dir: None,
+            allow_insecure_oauth: None,
+            toon_output: None,
+            startup_init_timeout_secs: None,
+        }
+    }
 }
 
 /// Effective default for `RelayConfig::startup_init_timeout_secs` when the
@@ -336,20 +359,8 @@ pub fn expand_tilde(path: &Path) -> PathBuf {
 
 /// Create a default configuration with the system hostname and no endpoints.
 pub fn default_config() -> Config {
-    let machine_name = hostname::get()
-        .ok()
-        .and_then(|h| h.into_string().ok())
-        .unwrap_or_else(|| "unknown".to_string());
-
     Config {
-        relay: RelayConfig {
-            machine_name,
-            local_js_execution: None,
-            token_dir: None,
-            allow_insecure_oauth: None,
-            toon_output: None,
-            startup_init_timeout_secs: None,
-        },
+        relay: RelayConfig::default(),
         endpoints: Vec::new(),
         profiles: None,
     }
@@ -405,7 +416,10 @@ pub fn parse_and_validate(contents: &str) -> Result<Config, ConfigError> {
 
 /// Parse TOML string, resolve env vars, and validate **gracefully**.
 ///
-/// Fatal errors (TOML syntax, missing `[relay]`) still return `Err`.
+/// Fatal errors (TOML syntax) still return `Err`. A missing `[relay]` table is
+/// tolerated: it falls back to [`RelayConfig::default`] (hostname-derived
+/// `machine_name`), so a desktop-scaffolded config without `[relay]` still
+/// starts.
 /// Per-endpoint issues (invalid name, missing command/url, duplicate names,
 /// env var resolution failures) are collected as warnings. The returned
 /// `Config` contains **all** endpoints (valid and invalid). The caller is
@@ -1040,6 +1054,24 @@ machine_name = "test"
 "#;
         let config = parse_and_validate(toml_str).unwrap();
         assert_eq!(config.relay.machine_name, "test");
+        assert!(config.endpoints.is_empty());
+    }
+
+    #[test]
+    fn missing_relay_section_uses_default() {
+        // A config that omits `[relay]` entirely (e.g. the desktop's default
+        // scaffolded config) must still parse, falling back to the
+        // hostname-derived default `machine_name`. Unknown tables such as
+        // `[desktop.overlay]` and `[meta]` are ignored by `Config`.
+        let toml_str = r#"
+[desktop.overlay]
+enabled = true
+
+[meta]
+version = 1
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert!(!config.relay.machine_name.is_empty());
         assert!(config.endpoints.is_empty());
     }
 
@@ -1828,14 +1860,19 @@ command = "cat"
     }
 
     #[test]
-    fn graceful_missing_relay_section_still_fatal() {
+    fn graceful_missing_relay_section_uses_default() {
+        // A missing `[relay]` table is no longer fatal: it falls back to
+        // `RelayConfig::default()` so a desktop-scaffolded config still starts.
         let toml_str = r#"
 [[endpoints]]
 name = "test"
 transport = "stdio"
 command = "echo"
 "#;
-        assert!(parse_and_validate_graceful(toml_str).is_err());
+        let (config, warnings) = parse_and_validate_graceful(toml_str).unwrap();
+        assert!(!config.relay.machine_name.is_empty());
+        assert_eq!(config.endpoints.len(), 1);
+        assert!(warnings.is_empty());
     }
 
     #[test]
