@@ -12,6 +12,7 @@ use boa_engine::{Context, JsError, JsNativeError, JsResult, JsValue, NativeFunct
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
+use tracing::Instrument;
 
 use crate::adapter::{AdapterError, ToolInfo};
 use crate::registry::MetaToolRegistry;
@@ -91,6 +92,14 @@ struct SandboxState {
     /// Defaults to `false`, which preserves the existing zero-backoff override
     /// that keeps the test suite fast.
     use_real_backoff: bool,
+    /// JSON-serialised [`crate::events::ClientIdentity`] of the outer inbound
+    /// request, captured before the sandbox hops onto the blocking thread.
+    /// Empty when no caller identity is known. Used to re-establish a
+    /// `request{client=...}` span around each inner `route_tool_call` so
+    /// `SpanFieldCaptureLayer` / `current_request_context()` can surface the
+    /// caller to the upstream adapter's event emitters and log lines — the
+    /// blocking-thread hop otherwise drops the outer request span.
+    client_json: String,
 }
 
 thread_local! {
@@ -113,6 +122,11 @@ pub struct JsSandbox {
     /// schedule. Production callers leave this at `false` because production
     /// builds always apply the real schedule regardless.
     use_real_backoff: bool,
+    /// JSON-serialised [`crate::events::ClientIdentity`] of the outer inbound
+    /// request. Defaults to empty (no caller identity); set via
+    /// [`Self::with_client`] by [`MetaToolHandler::execute_tools`] so inner
+    /// upstream tool calls re-establish the caller's `request` span.
+    client_json: String,
 }
 
 impl JsSandbox {
@@ -144,7 +158,18 @@ impl JsSandbox {
             registry,
             timeout,
             use_real_backoff: false,
+            client_json: String::new(),
         }
+    }
+
+    /// Attach the outer inbound request's JSON-serialised
+    /// [`crate::events::ClientIdentity`] so inner upstream tool calls
+    /// re-establish a `request{client=...}` span on the sandbox's blocking
+    /// thread. An empty string degrades to no caller identity. Used by
+    /// [`MetaToolHandler::execute_tools`].
+    pub fn with_client(mut self, client_json: String) -> Self {
+        self.client_json = client_json;
+        self
     }
 
     /// Test-only: opt this sandbox into the real backoff schedule. Without
@@ -161,6 +186,7 @@ impl JsSandbox {
         let registry = self.registry.clone();
         let timeout = self.timeout;
         let use_real_backoff = self.use_real_backoff;
+        let client_json = self.client_json.clone();
         let script = script.to_string();
         let handle = tokio::runtime::Handle::current();
         let catalog = self.registry.merged_catalog().await;
@@ -175,6 +201,7 @@ impl JsSandbox {
                     &handle,
                     timeout,
                     use_real_backoff,
+                    client_json,
                 )
             }),
         )
@@ -199,6 +226,7 @@ fn execute_in_sandbox(
     handle: &tokio::runtime::Handle,
     sandbox_timeout: Duration,
     use_real_backoff: bool,
+    client_json: String,
 ) -> Result<Value, JsSandboxError> {
     let deadline = std::time::Instant::now() + sandbox_timeout;
     SANDBOX_STATE.with(|cell| {
@@ -207,6 +235,7 @@ fn execute_in_sandbox(
             handle: handle.clone(),
             deadline,
             use_real_backoff,
+            client_json,
         });
     });
     let result = run_js(script, catalog);
@@ -214,6 +243,31 @@ fn execute_in_sandbox(
         *cell.borrow_mut() = None;
     });
     result
+}
+
+/// Drive `fut` to completion on the sandbox's blocking thread, re-establishing
+/// the outer inbound request's `request{client=...}` span when a caller
+/// identity was captured.
+///
+/// `JsSandbox::execute` hops onto a `spawn_blocking` thread, which does not
+/// inherit the inbound `request` span. Without re-entering it here, the
+/// upstream adapter's `current_request_context()` resolves no caller for
+/// sandbox-driven tool calls, so the "Tool call completed/failed" log lines
+/// and `ToolCallEvent::Started.client` lose the aggregating client. Entering a
+/// fresh `request` span carrying `client = %client_json` lets
+/// `SpanFieldCaptureLayer` re-capture the identity exactly as the direct path
+/// does. An empty `client_json` runs the future without an extra span so
+/// callers with no identity signal degrade cleanly.
+fn block_on_with_client<F>(handle: &tokio::runtime::Handle, client_json: &str, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    if client_json.is_empty() {
+        handle.block_on(fut)
+    } else {
+        let span = tracing::info_span!("request", method = "tools/call", client = %client_json);
+        handle.block_on(fut.instrument(span))
+    }
 }
 
 fn run_js(script: &str, catalog: &[ToolInfo]) -> Result<Value, JsSandboxError> {
@@ -336,13 +390,14 @@ fn call_tool_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
         if let Some(msg) = validate_tool_args(tool, &arguments) {
             return Err(JsError::from(JsNativeError::error().with_message(msg)));
         }
-        let res = state
-            .handle
-            .block_on(state.registry.route_tool_call(&tool_name, arguments))
-            .map_err(|e| {
-                JsNativeError::error()
-                    .with_message(format!("tool call '{}' failed: {}", tool_name, e))
-            })?;
+        let res = block_on_with_client(
+            &state.handle,
+            &state.client_json,
+            state.registry.route_tool_call(&tool_name, arguments),
+        )
+        .map_err(|e| {
+            JsNativeError::error().with_message(format!("tool call '{}' failed: {}", tool_name, e))
+        })?;
         Ok::<Value, JsError>(res)
     })?;
 
@@ -432,20 +487,21 @@ fn call_tool_with_retry_native(
         let registry = state.registry.clone();
         let deadline = state.deadline;
         let use_real_backoff = state.use_real_backoff;
-        let res = state
-            .handle
-            .block_on(call_tool_with_retry_loop(
+        let res = block_on_with_client(
+            &state.handle,
+            &state.client_json,
+            call_tool_with_retry_loop(
                 registry.as_ref(),
                 &tool_name,
                 arguments,
                 max_retries,
                 deadline,
                 use_real_backoff,
-            ))
-            .map_err(|e| {
-                JsNativeError::error()
-                    .with_message(format!("tool call '{}' failed: {}", tool_name, e))
-            })?;
+            ),
+        )
+        .map_err(|e| {
+            JsNativeError::error().with_message(format!("tool call '{}' failed: {}", tool_name, e))
+        })?;
         Ok::<Value, JsError>(res)
     })?;
 
@@ -1261,8 +1317,20 @@ impl MetaToolHandler {
     /// `execute_tools` — run JS in sandbox. The sandbox inherits the
     /// handler's [`MetaToolRegistry`] backing, so a per-profile handler
     /// gives the script a profile-filtered `tools.call()`.
-    pub async fn execute_tools(&self, script: &str) -> Result<Value, JsSandboxError> {
-        let sandbox = JsSandbox::from_dyn(self.registry.clone(), self.sandbox_timeout);
+    ///
+    /// `client_json` is the JSON-serialised [`crate::events::ClientIdentity`]
+    /// of the outer inbound request (empty when no caller identity is known).
+    /// It is threaded into the sandbox so inner upstream tool calls
+    /// re-establish the caller's `request{client=...}` span across the
+    /// blocking-thread hop — keeping the caller visible on the aggregated
+    /// "Tool call completed/failed" log lines and `ToolCallEvent::Started`.
+    pub async fn execute_tools(
+        &self,
+        script: &str,
+        client_json: &str,
+    ) -> Result<Value, JsSandboxError> {
+        let sandbox = JsSandbox::from_dyn(self.registry.clone(), self.sandbox_timeout)
+            .with_client(client_json.to_string());
         sandbox.execute(script).await
     }
 }
@@ -3030,6 +3098,175 @@ mod tests {
             elapsed < Duration::from_millis(150),
             "retry loop should abort before first real sleep, took {:?}",
             elapsed
+        );
+    }
+
+    /// R1.2: a sandbox-driven upstream tool call must re-establish the outer
+    /// inbound request's caller identity across the `spawn_blocking` thread
+    /// hop. [`block_on_with_client`] enters a fresh `request{client=...}` span
+    /// before driving [`MetaToolRegistry::route_tool_call`], so the adapter's
+    /// `current_request_context().client` (the same signal feeding the "Tool
+    /// call completed/failed" log lines and `ToolCallEvent::Started.client`)
+    /// resolves the aggregating client rather than `None`. This is the exact
+    /// failure the task reproduced live before the fix.
+    #[test]
+    fn sandbox_tool_call_reestablishes_client_context() {
+        use crate::events::{current_request_context, ClientIdentity, SpanFieldCaptureLayer};
+        use std::sync::Mutex;
+        use tracing_subscriber::prelude::*;
+
+        // Adapter that records the caller identity visible via the request
+        // span at `call_tool` time, proving the span was re-established.
+        struct ClientCapturingAdapter {
+            tools: Vec<ToolInfo>,
+            seen: Arc<Mutex<Option<ClientIdentity>>>,
+        }
+
+        #[async_trait]
+        impl McpAdapter for ClientCapturingAdapter {
+            async fn initialize(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+                Ok(self.tools.clone())
+            }
+            async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
+                *self.seen.lock().unwrap() = current_request_context().client;
+                Ok(json!({ "called": name, "args": arguments }))
+            }
+            fn health(&self) -> HealthStatus {
+                HealthStatus::Healthy
+            }
+            async fn shutdown(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let seen_clone = Arc::clone(&seen);
+        let subscriber = tracing_subscriber::registry().with(SpanFieldCaptureLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let registry = rt.block_on(async {
+                let registry = AdapterRegistry::new();
+                registry
+                    .register(
+                        "ep".into(),
+                        Box::new(ClientCapturingAdapter {
+                            tools: vec![make_tool("echo", "Echo tool")],
+                            seen: seen_clone,
+                        }),
+                        "stdio".into(),
+                        None,
+                        None,
+                    )
+                    .await;
+                Arc::new(registry)
+            });
+
+            let identity = ClientIdentity {
+                name: Some("Claude Desktop".into()),
+                version: Some("0.1.0".into()),
+                user_agent: None,
+                origin: None,
+            };
+            let client_json = serde_json::to_string(&identity).unwrap();
+            let reg: Arc<dyn MetaToolRegistry> = registry;
+            let result = block_on_with_client(
+                rt.handle(),
+                &client_json,
+                reg.route_tool_call("echo", json!({})),
+            );
+            assert!(result.is_ok(), "tool call should succeed: {:?}", result);
+        });
+
+        let captured = seen.lock().unwrap().clone();
+        assert_eq!(
+            captured,
+            Some(ClientIdentity {
+                name: Some("Claude Desktop".into()),
+                version: Some("0.1.0".into()),
+                user_agent: None,
+                origin: None,
+            }),
+            "sandbox-driven tool call must re-establish the caller identity \
+             in the request context"
+        );
+    }
+
+    /// With no caller identity captured (empty `client_json`),
+    /// [`block_on_with_client`] must skip the extra span and drive the future
+    /// directly, leaving `current_request_context().client` as `None` rather
+    /// than fabricating an empty identity.
+    #[test]
+    fn sandbox_tool_call_without_client_leaves_context_none() {
+        use crate::events::{current_request_context, ClientIdentity, SpanFieldCaptureLayer};
+        use std::sync::Mutex;
+        use tracing_subscriber::prelude::*;
+
+        struct ClientCapturingAdapter {
+            tools: Vec<ToolInfo>,
+            seen: Arc<Mutex<Option<ClientIdentity>>>,
+        }
+
+        #[async_trait]
+        impl McpAdapter for ClientCapturingAdapter {
+            async fn initialize(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+            async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+                Ok(self.tools.clone())
+            }
+            async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
+                *self.seen.lock().unwrap() = current_request_context().client;
+                Ok(json!({ "called": name, "args": arguments }))
+            }
+            fn health(&self) -> HealthStatus {
+                HealthStatus::Healthy
+            }
+            async fn shutdown(&mut self) -> Result<(), AdapterError> {
+                Ok(())
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Some(ClientIdentity::default())));
+        let seen_clone = Arc::clone(&seen);
+        let subscriber = tracing_subscriber::registry().with(SpanFieldCaptureLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let registry = rt.block_on(async {
+                let registry = AdapterRegistry::new();
+                registry
+                    .register(
+                        "ep".into(),
+                        Box::new(ClientCapturingAdapter {
+                            tools: vec![make_tool("echo", "Echo tool")],
+                            seen: seen_clone,
+                        }),
+                        "stdio".into(),
+                        None,
+                        None,
+                    )
+                    .await;
+                Arc::new(registry)
+            });
+
+            let reg: Arc<dyn MetaToolRegistry> = registry;
+            let result =
+                block_on_with_client(rt.handle(), "", reg.route_tool_call("echo", json!({})));
+            assert!(result.is_ok(), "tool call should succeed: {:?}", result);
+        });
+
+        assert_eq!(
+            *seen.lock().unwrap(),
+            None,
+            "empty client_json must not fabricate a caller identity"
         );
     }
 }

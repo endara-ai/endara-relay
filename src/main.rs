@@ -619,6 +619,13 @@ async fn main() {
                 cfg.relay.toon_output.unwrap_or(true)
             };
             info!(toon_enabled, "TOON output conversion configured");
+            let session_identities = Arc::new(std::sync::Mutex::new(
+                server::SessionIdentityStore::with_capacity(
+                    cfg.relay
+                        .session_identity_max_sessions
+                        .unwrap_or(config::DEFAULT_SESSION_IDENTITY_MAX_SESSIONS),
+                ),
+            ));
             let state = AppState {
                 registry: (*registry).clone(),
                 js_execution_mode: js_execution_mode.clone(),
@@ -630,6 +637,7 @@ async fn main() {
                 setup_manager: Some(setup_manager.clone()),
                 started_at: std::time::Instant::now(),
                 toon_enabled,
+                session_identities,
             };
             // Shared config handle: a single `Arc<RwLock<Config>>` that both
             // `ManagementState` (read by `/api/*` handlers) and `ConfigWatcher`

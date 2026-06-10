@@ -27,6 +27,63 @@ use tracing_subscriber::Layer;
 /// generous 256 events/s without back-pressuring producers.
 pub const DEFAULT_BUS_CAPACITY: usize = 256;
 
+/// Identity of the inbound MCP client making a request.
+///
+/// Populated from the `clientInfo` object sent on `initialize` (locked into a
+/// `Mcp-Session-Id`-keyed session map by the relay), with a per-request
+/// fallback to the `User-Agent` / `Origin` HTTP headers when no session is
+/// known. All fields are `Option<String>` because the source signals are all
+/// independently optional, and the on-wire JSON omits any `None` fields so
+/// the overlay can render `name` / `name + version` / UA-only with the same
+/// rendering code.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientIdentity {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+}
+
+impl ClientIdentity {
+    /// Returns `true` when every field is `None`. Used by the serializer
+    /// skip-guard so empty identity objects are omitted from the wire entirely.
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none()
+            && self.version.is_none()
+            && self.user_agent.is_none()
+            && self.origin.is_none()
+    }
+
+    /// Best-effort display label for the calling app, used for the
+    /// `client_name` audit-log field. Returns `clientInfo.name` when present,
+    /// else a concise token derived from the `User-Agent` (the substring
+    /// before the first `/` or whitespace, e.g. `cursor-vscode/0.42 (Cursor
+    /// IDE)` -> `cursor-vscode`), else `None`. This lets UA-only callers still
+    /// surface a label in the logs view.
+    pub fn display_name(&self) -> Option<String> {
+        if let Some(name) = self.name.as_ref() {
+            if !name.is_empty() {
+                return Some(name.clone());
+            }
+        }
+        if let Some(ua) = self.user_agent.as_ref() {
+            let token = ua
+                .split(|c: char| c == '/' || c.is_whitespace())
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+        None
+    }
+}
+
 /// MCP tool annotations carried on every `started` event so the overlay can
 /// render hint pills (destructive / open-world / read-only / idempotent)
 /// without re-querying `tools/list`. Each field is `Option<bool>` because the
@@ -105,6 +162,12 @@ pub enum ToolCallEvent {
         tool: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<ToolAnnotations>,
+        /// Identity of the calling MCP client, captured from the surrounding
+        /// `request` tracing span (populated by the inbound dispatch from
+        /// `clientInfo` + `User-Agent`/`Origin`). `None` when no caller
+        /// signal is known (e.g. internal background calls).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        client: Option<ClientIdentity>,
     },
     /// Emitted on `Ok(_)` return from the underlying `tools/call` request.
     Completed {
@@ -196,16 +259,23 @@ pub struct RequestSpanContext {
     /// Profile path segment from `/mcp/{profile}`. `None` for the global
     /// `/mcp` endpoint.
     pub profile: Option<String>,
+    /// Identity of the inbound MCP caller, captured from the `request`
+    /// span's `client` field (a JSON-serialised [`ClientIdentity`] recorded
+    /// by the inbound dispatch). `None` when no `request` span is on the
+    /// stack, when the dispatch recorded no client signal, or when the
+    /// span's `client` field could not be parsed back.
+    pub client: Option<ClientIdentity>,
 }
 
 /// Fields captured per span by [`SpanFieldCaptureLayer`]. Stored in the
 /// span's extensions so [`current_request_context`] can read them back when
-/// an adapter publishes a [`ToolCallEvent`]. Carrying both fields in one
+/// an adapter publishes a [`ToolCallEvent`]. Carrying all fields in one
 /// extension keeps the per-span allocation count to one.
 #[derive(Debug, Default, Clone)]
 struct CapturedSpanFields {
     jsonrpc_id: Option<String>,
     profile: Option<String>,
+    client: Option<ClientIdentity>,
 }
 
 /// Visits a span's recorded fields once at span creation time, capturing the
@@ -239,6 +309,17 @@ impl<'a> CapturingVisitor<'a> {
             // emitter cannot leak a fake id into an event.
             if value != "null" {
                 self.captured.jsonrpc_id = Some(value);
+            }
+        } else if self.is_request && name == "client" {
+            // The `request` span carries `client = %client_json` where
+            // `client_json` is a JSON-serialised `ClientIdentity`. Parse it
+            // back so `current_request_context()` can hand a typed value
+            // to adapter event emitters. Silently ignore parse failures so
+            // a malformed field cannot break dispatch.
+            if let Ok(identity) = serde_json::from_str::<ClientIdentity>(&value) {
+                if !identity.is_empty() {
+                    self.captured.client = Some(identity);
+                }
             }
         } else if self.is_mcp_request && name == "profile" {
             self.captured.profile = Some(value);
@@ -305,6 +386,11 @@ pub fn current_request_context() -> RequestSpanContext {
                         ctx.profile = Some(v.clone());
                     }
                 }
+                if ctx.client.is_none() {
+                    if let Some(v) = &captured.client {
+                        ctx.client = Some(v.clone());
+                    }
+                }
             }
         }
     });
@@ -336,12 +422,28 @@ mod tests {
                 read_only: Some(true),
                 idempotent: Some(true),
             }),
+            client: Some(ClientIdentity {
+                name: Some("claude-ai".into()),
+                version: Some("0.1.0".into()),
+                user_agent: None,
+                origin: None,
+            }),
         };
         let v = serde_json::to_value(&ev).unwrap();
         assert_eq!(v["kind"], "started");
         assert_eq!(v["tool"], "list_issues");
         assert_eq!(v["annotations"]["read_only"], true);
         assert_eq!(v["jsonrpc_id"], "42");
+        assert_eq!(v["client"]["name"], "claude-ai");
+        assert_eq!(v["client"]["version"], "0.1.0");
+        assert!(
+            v["client"].get("user_agent").is_none(),
+            "user_agent should be omitted when None, got {v}"
+        );
+        assert!(
+            v["client"].get("origin").is_none(),
+            "origin should be omitted when None, got {v}"
+        );
     }
 
     #[test]
@@ -357,12 +459,100 @@ mod tests {
             profile: None,
             tool: "list_issues".into(),
             annotations: None,
+            client: None,
         };
         let v = serde_json::to_value(&ev).unwrap();
         assert!(
             v.get("jsonrpc_id").is_none(),
             "jsonrpc_id should be omitted when None, got {v}"
         );
+        assert!(
+            v.get("client").is_none(),
+            "client should be omitted when None, got {v}"
+        );
+    }
+
+    #[test]
+    fn client_identity_round_trip_serialization() {
+        let full = ClientIdentity {
+            name: Some("Claude Desktop".into()),
+            version: Some("0.7.0".into()),
+            user_agent: Some("claude-desktop/0.7.0".into()),
+            origin: Some("https://claude.ai".into()),
+        };
+        let v = serde_json::to_value(&full).unwrap();
+        assert_eq!(v["name"], "Claude Desktop");
+        assert_eq!(v["version"], "0.7.0");
+        assert_eq!(v["user_agent"], "claude-desktop/0.7.0");
+        assert_eq!(v["origin"], "https://claude.ai");
+        let back: ClientIdentity = serde_json::from_value(v).unwrap();
+        assert_eq!(back, full);
+        assert!(!full.is_empty());
+
+        let empty = ClientIdentity::default();
+        let v = serde_json::to_value(&empty).unwrap();
+        assert_eq!(v, json!({}));
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn client_identity_display_name_prefers_name_then_ua_token() {
+        // `clientInfo.name` wins when present.
+        let with_name = ClientIdentity {
+            name: Some("Claude Desktop".into()),
+            version: Some("0.7.0".into()),
+            user_agent: Some("claude-desktop/0.7.0".into()),
+            origin: None,
+        };
+        assert_eq!(with_name.display_name().as_deref(), Some("Claude Desktop"));
+
+        // UA-only callers derive a concise token (before the first `/`).
+        let ua_only = ClientIdentity {
+            name: None,
+            version: None,
+            user_agent: Some("cursor-vscode/0.42 (Cursor IDE)".into()),
+            origin: None,
+        };
+        assert_eq!(ua_only.display_name().as_deref(), Some("cursor-vscode"));
+
+        // UA whose leading token ends at whitespace (no slash).
+        let ua_space = ClientIdentity {
+            name: None,
+            version: None,
+            user_agent: Some("CustomAgent some details".into()),
+            origin: None,
+        };
+        assert_eq!(ua_space.display_name().as_deref(), Some("CustomAgent"));
+
+        // Empty identity yields no label.
+        assert_eq!(ClientIdentity::default().display_name(), None);
+
+        // An empty `name` string falls through to the UA (None here).
+        let empty_name = ClientIdentity {
+            name: Some(String::new()),
+            ..Default::default()
+        };
+        assert_eq!(empty_name.display_name(), None);
+    }
+
+    #[test]
+    fn debug_formatted_client_name_field_is_quoted_for_multiword_names() {
+        // The audit and tool-call log lines emit `client_name = ?value`, which
+        // the tracing fmt layer renders via `Debug`. Confirm a multi-word name
+        // is wrapped in quotes so the desktop `EVENT_FIELD_RE`
+        // (`(\w+)=("([^"]*)"|(\S*))`) captures it intact rather than truncating
+        // at the space.
+        let name = "Claude Desktop";
+        let field = format!("client_name={name:?}");
+        assert_eq!(field, "client_name=\"Claude Desktop\"");
+        let quoted = field.strip_prefix("client_name=").unwrap();
+        assert!(quoted.starts_with('"') && quoted.ends_with('"'));
+        let inner = &quoted[1..quoted.len() - 1];
+        assert_eq!(inner, "Claude Desktop");
+
+        // An empty value still renders as the quoted empty string the desktop
+        // parser treats as "skip".
+        assert_eq!(format!("client_name={:?}", ""), "client_name=\"\"");
     }
 
     #[test]
@@ -540,6 +730,70 @@ mod tests {
                 let span = tracing::info_span!("request", method = "x", id = %id_str);
                 let ctx = async { current_request_context() }.instrument(span).await;
                 assert_eq!(ctx.jsonrpc_id, None);
+            });
+        });
+    }
+
+    /// The `request` span's `client` field carries a JSON-serialised
+    /// [`ClientIdentity`]; [`current_request_context`] must parse it back to
+    /// a typed value so adapter event emitters can populate
+    /// [`ToolCallEvent::Started::client`] without re-deriving it.
+    #[test]
+    fn current_request_context_captures_client_from_request_span() {
+        use tracing::Instrument;
+        use tracing_subscriber::prelude::*;
+
+        let subscriber = tracing_subscriber::registry().with(SpanFieldCaptureLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let identity = ClientIdentity {
+                    name: Some("claude-ai".into()),
+                    version: Some("0.1.0".into()),
+                    user_agent: Some("claude-ai/0.1.0".into()),
+                    origin: None,
+                };
+                let client_json = serde_json::to_string(&identity).unwrap();
+                let id_str = "9".to_string();
+                let span = tracing::info_span!(
+                    "request",
+                    method = "tools/call",
+                    id = %id_str,
+                    client = %client_json,
+                );
+                let ctx = async { current_request_context() }.instrument(span).await;
+                assert_eq!(ctx.jsonrpc_id.as_deref(), Some("9"));
+                assert_eq!(ctx.client.as_ref(), Some(&identity));
+            });
+        });
+    }
+
+    /// A malformed `client` field on the `request` span must not propagate;
+    /// the visitor silently drops the value so dispatch stays resilient.
+    #[test]
+    fn current_request_context_ignores_malformed_client_field() {
+        use tracing::Instrument;
+        use tracing_subscriber::prelude::*;
+        let subscriber = tracing_subscriber::registry().with(SpanFieldCaptureLayer);
+        tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let client_str = "not-json".to_string();
+                let id_str = "1".to_string();
+                let span = tracing::info_span!(
+                    "request",
+                    method = "tools/call",
+                    id = %id_str,
+                    client = %client_str,
+                );
+                let ctx = async { current_request_context() }.instrument(span).await;
+                assert_eq!(ctx.client, None);
             });
         });
     }

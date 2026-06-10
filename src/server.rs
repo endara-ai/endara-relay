@@ -1,3 +1,5 @@
+use crate::config::DEFAULT_SESSION_IDENTITY_MAX_SESSIONS;
+use crate::events::ClientIdentity;
 use crate::js_sandbox::MetaToolHandler;
 use crate::oauth::{OAuthFlowManager, OAuthSetupManager};
 use crate::profile_registry::{ProfileContext, ProfileRegistry};
@@ -6,7 +8,7 @@ use crate::token_manager::TokenManager;
 use crate::OAuthAdapterInners;
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{
         sse::{Event, KeepAlive},
         Html, IntoResponse, Response, Sse,
@@ -16,16 +18,24 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tokio::net::TcpListener;
 
 use tokio_stream::wrappers::ReceiverStream;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::{error, info, warn, Instrument};
+
+/// Inbound MCP session header name. Returned by `initialize` so the client
+/// can echo the same identifier on every follow-up request, and looked up
+/// by [`SessionIdentityStore`] to recover the previously-captured
+/// [`ClientIdentity`]. Matches the casing used by the MCP Streamable HTTP
+/// spec.
+pub(crate) const MCP_SESSION_ID_HEADER: &str = "mcp-session-id";
 
 /// Application state shared across all routes.
 #[derive(Clone)]
@@ -51,6 +61,205 @@ pub struct AppState {
     /// Notation) before they reach the MCP client. Computed at startup from
     /// `RelayConfig::toon_output` and the `--no-toon` CLI flag.
     pub toon_enabled: bool,
+    /// Bounded LRU map of `Mcp-Session-Id` → [`ClientIdentity`] captured
+    /// from each inbound `initialize` request. Looked up on every follow-up
+    /// JSON-RPC message that echoes the session header so audit logs and
+    /// the tool-call event bus can identify the caller without re-parsing
+    /// `clientInfo`. Wrapped in `Arc<Mutex<_>>` so [`AppState`] stays
+    /// `Clone` and cheap to pass through axum extractors.
+    pub session_identities: Arc<Mutex<SessionIdentityStore>>,
+}
+
+/// Bounded LRU cache of `Mcp-Session-Id` → [`ClientIdentity`] entries.
+///
+/// Capacity defaults to [`DEFAULT_SESSION_IDENTITY_MAX_SESSIONS`]; on
+/// insert, the least-recently-used entry is evicted so a misbehaving
+/// client that never reuses its session id cannot grow the map
+/// unboundedly. Recency is tracked with a monotonically-increasing
+/// counter and a [`BTreeMap`] indexed by that counter — both `get` and
+/// `insert` re-stamp the entry as most-recently-used in `O(log n)`.
+#[derive(Debug)]
+pub struct SessionIdentityStore {
+    capacity: usize,
+    next_seq: u64,
+    /// `session_id → (identity, recency seq)`. The seq is duplicated in
+    /// [`recency`] so the LRU pop is `O(log n)` rather than `O(n)`.
+    entries: HashMap<String, (ClientIdentity, u64)>,
+    /// `recency seq → session_id`. The smallest key is the least-
+    /// recently-used entry; `pop_first` evicts it in `O(log n)`.
+    recency: BTreeMap<u64, String>,
+}
+
+impl SessionIdentityStore {
+    /// Build a store with the given capacity. A zero capacity is clamped
+    /// to `1` because the dispatch path always wants at least one slot
+    /// (the just-inserted entry) — operators who want to disable the
+    /// cache entirely can do so at the config layer, not by setting `0`.
+    pub fn with_capacity(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            capacity,
+            next_seq: 0,
+            entries: HashMap::with_capacity(capacity),
+            recency: BTreeMap::new(),
+        }
+    }
+
+    fn next_seq(&mut self) -> u64 {
+        let s = self.next_seq;
+        self.next_seq = self.next_seq.saturating_add(1);
+        s
+    }
+
+    /// Insert or refresh an entry. Evicts the least-recently-used entry
+    /// when the store is at capacity. The returned `Option` is the
+    /// previously-stored identity for the same session id (typically
+    /// `None`; a `Some` value indicates a session-id collision between
+    /// two `initialize` calls and is overwritten).
+    pub fn insert(
+        &mut self,
+        session_id: String,
+        identity: ClientIdentity,
+    ) -> Option<ClientIdentity> {
+        let new_seq = self.next_seq();
+        let previous = if let Some((prev_id, prev_seq)) = self.entries.remove(&session_id) {
+            self.recency.remove(&prev_seq);
+            Some(prev_id)
+        } else {
+            None
+        };
+        while self.entries.len() >= self.capacity {
+            let Some((evict_seq, evict_key)) = self.recency.pop_first() else {
+                break;
+            };
+            self.entries.remove(&evict_key);
+            // Defensive: drop the matching entries-table slot even if the
+            // counters somehow drifted out of sync.
+            let _ = evict_seq;
+        }
+        self.recency.insert(new_seq, session_id.clone());
+        self.entries.insert(session_id, (identity, new_seq));
+        previous
+    }
+
+    /// Resolve the [`ClientIdentity`] for a session id and mark the entry
+    /// as most-recently-used.
+    pub fn get(&mut self, session_id: &str) -> Option<ClientIdentity> {
+        let (identity, prev_seq) = self.entries.get(session_id).cloned()?;
+        self.recency.remove(&prev_seq);
+        let new_seq = self.next_seq();
+        self.recency.insert(new_seq, session_id.to_string());
+        self.entries
+            .insert(session_id.to_string(), (identity.clone(), new_seq));
+        Some(identity)
+    }
+
+    /// Number of live entries. Exposed for unit tests that exercise the
+    /// LRU eviction path and for operators that inspect the store via
+    /// future introspection hooks.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Returns `true` when no sessions are cached. Paired with [`len`] so
+    /// clippy's `len_without_is_empty` lint stays satisfied.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Effective capacity (after the `0 → 1` clamp). Surfaces the
+    /// configured limit for tests and operator introspection.
+    #[allow(dead_code)]
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+}
+
+impl Default for SessionIdentityStore {
+    fn default() -> Self {
+        Self::with_capacity(DEFAULT_SESSION_IDENTITY_MAX_SESSIONS)
+    }
+}
+
+/// Read the first header value as a UTF-8 string, returning `None` for
+/// missing or non-ASCII headers. Identity headers are best-effort signals,
+/// so a malformed value is silently dropped rather than rejected.
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// Extract a [`ClientIdentity`] from the per-request HTTP headers. Populated
+/// from `User-Agent` and `Origin`; the structured `name` / `version` fields
+/// stay `None` because no MCP-level clientInfo is available without an
+/// `initialize` body.
+fn identity_from_headers(headers: &HeaderMap) -> ClientIdentity {
+    ClientIdentity {
+        name: None,
+        version: None,
+        user_agent: header_str(headers, "user-agent").map(|s| s.to_string()),
+        origin: header_str(headers, "origin").map(|s| s.to_string()),
+    }
+}
+
+/// Extract a [`ClientIdentity`] from the `initialize` request's
+/// `params.clientInfo` object. Per the MCP spec, `clientInfo.name` is
+/// required but the relay treats every field as optional so a malformed
+/// payload (missing `params`, non-object `clientInfo`, etc.) degrades to an
+/// empty identity rather than rejecting the request.
+fn identity_from_initialize_params(params: Option<&Value>) -> ClientIdentity {
+    let Some(info) = params.and_then(|p| p.get("clientInfo")) else {
+        return ClientIdentity::default();
+    };
+    ClientIdentity {
+        name: info
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        version: info
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        user_agent: None,
+        origin: None,
+    }
+}
+
+/// Fold `fallback`'s non-empty fields into `primary` so structured
+/// `clientInfo` (name/version from `initialize`) wins over the per-request
+/// `User-Agent`/`Origin` headers when both are present.
+fn merge_identity(primary: ClientIdentity, fallback: ClientIdentity) -> ClientIdentity {
+    ClientIdentity {
+        name: primary.name.or(fallback.name),
+        version: primary.version.or(fallback.version),
+        user_agent: primary.user_agent.or(fallback.user_agent),
+        origin: primary.origin.or(fallback.origin),
+    }
+}
+
+/// Resolve the caller's [`ClientIdentity`] for a non-`initialize` inbound
+/// message. Looks up `Mcp-Session-Id` in [`SessionIdentityStore`] first
+/// (the value cached at `initialize` time wins because it carries the
+/// structured `clientInfo`), then merges in the per-request
+/// `User-Agent`/`Origin` headers as a fallback. Returns `None` only when
+/// every signal is empty so adapter event-emission can omit the `client`
+/// field entirely.
+fn resolve_inbound_identity(state: &AppState, headers: &HeaderMap) -> Option<ClientIdentity> {
+    let header_identity = identity_from_headers(headers);
+    let session_identity = header_str(headers, MCP_SESSION_ID_HEADER).and_then(|sid| {
+        let mut guard = state.session_identities.lock().ok()?;
+        guard.get(sid)
+    });
+    let merged = match session_identity {
+        Some(s) => merge_identity(s, header_identity),
+        None => header_identity,
+    };
+    if merged.is_empty() {
+        None
+    } else {
+        Some(merged)
+    }
 }
 
 /// JSON-RPC request body expected by MCP routes.
@@ -366,7 +575,18 @@ async fn mcp_tools_call(
                 .get("script")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            match handler.execute_tools(script).await {
+            // Recover the outer inbound request's identity from the
+            // surrounding `request{client=...}` span (seeded by
+            // `handle_single_message` / the logged wrappers) and re-serialise
+            // it so the sandbox can re-establish the caller's span around each
+            // inner upstream tool call across the blocking-thread hop. Without
+            // this, aggregated `execute_tools` calls emit an empty client.
+            let client_json = crate::events::current_request_context()
+                .client
+                .filter(|c| !c.is_empty())
+                .map(|c| serde_json::to_string(&c).unwrap_or_default())
+                .unwrap_or_default();
+            match handler.execute_tools(script, &client_json).await {
                 Ok(result) => {
                     return Ok(jsonrpc_response(
                         body.id,
@@ -423,6 +643,7 @@ async fn handle_single_message(
     msg: Value,
     headers_str: &str,
     profile_ctx: Option<&ProfileContext>,
+    client_identity: Option<&ClientIdentity>,
 ) -> Option<Value> {
     let method = msg
         .get("method")
@@ -433,7 +654,27 @@ async fn handle_single_message(
         .get("id")
         .map(|v| v.to_string())
         .unwrap_or_else(|| "null".to_string());
-    let span = tracing::info_span!("request", method = %method, id = %id_str);
+    // JSON-encode the identity so `SpanFieldCaptureLayer` can deserialise it
+    // back into a typed [`ClientIdentity`] via `current_request_context()`
+    // without changing the `McpAdapter::call_tool` trait signature. An empty
+    // identity is rendered as an empty `""` field so the capture visitor
+    // silently drops it.
+    let client_json = client_identity
+        .filter(|c| !c.is_empty())
+        .map(|c| serde_json::to_string(c).unwrap_or_default())
+        .unwrap_or_default();
+    let client_name = client_identity
+        .and_then(|c| c.display_name())
+        .unwrap_or_default();
+    let client_version = client_identity
+        .and_then(|c| c.version.clone())
+        .unwrap_or_default();
+    let span = tracing::info_span!(
+        "request",
+        method = %method,
+        id = %id_str,
+        client = %client_json,
+    );
     async move {
         let start = Instant::now();
         let is_notification = msg.get("id").is_none() || msg.get("id") == Some(&Value::Null);
@@ -449,6 +690,8 @@ async fn handle_single_message(
                 resp_bytes = 0,
                 status = 202,
                 headers = %headers_str,
+                client_name = ?client_name,
+                client_version = ?client_version,
                 "MCP notification"
             );
             return None;
@@ -488,6 +731,8 @@ async fn handle_single_message(
                     resp_bytes = resp_bytes,
                     status = 200,
                     headers = %headers_str,
+                    client_name = ?client_name,
+                    client_version = ?client_version,
                     "MCP request"
                 );
                 resp
@@ -503,6 +748,8 @@ async fn handle_single_message(
                         resp_bytes = resp_bytes,
                         status = status_code,
                         headers = %headers_str,
+                        client_name = ?client_name,
+                        client_version = ?client_version,
                         "MCP request"
                     );
                 } else if status_code == 200 {
@@ -514,6 +761,8 @@ async fn handle_single_message(
                         resp_bytes = resp_bytes,
                         status = status_code,
                         headers = %headers_str,
+                        client_name = ?client_name,
+                        client_version = ?client_version,
                         "MCP request"
                     );
                 } else {
@@ -524,6 +773,8 @@ async fn handle_single_message(
                         resp_bytes = resp_bytes,
                         status = status_code,
                         headers = %headers_str,
+                        client_name = ?client_name,
+                        client_version = ?client_version,
                         "MCP request"
                     );
                 }
@@ -592,6 +843,13 @@ async fn mcp_unified_profiled(
 /// is `None` for the global `/mcp` route and `Some(...)` for
 /// `/mcp/{profile}`; see [`handle_single_message`] for how it is threaded
 /// through to per-message dispatch.
+///
+/// Per-message identity resolution: an `initialize` request seeds the
+/// `Mcp-Session-Id` → [`ClientIdentity`] cache from `params.clientInfo` and
+/// echoes the new session id back on the response so the client can
+/// correlate follow-up calls. Every other message resolves its caller via
+/// [`resolve_inbound_identity`] (session lookup with per-request
+/// `User-Agent`/`Origin` fallback) before dispatch.
 async fn mcp_unified_impl(
     state: AppState,
     headers: HeaderMap,
@@ -604,29 +862,35 @@ async fn mcp_unified_impl(
         .collect::<Vec<_>>()
         .join(" ");
     let profile_ctx_ref = profile_ctx.as_deref();
+    // Collected here so a batch that opens with an `initialize` still
+    // bubbles the new session id up to the HTTP response headers. The MCP
+    // spec singleton case is the common path; the batch path is defensive.
+    let mut emitted_session_id: Option<String> = None;
 
     match body {
         Value::Array(messages) => {
             if messages.is_empty() {
-                return (
-                    StatusCode::OK,
-                    [(
-                        axum::http::header::CONTENT_TYPE,
-                        HeaderValue::from_static("application/json"),
-                    )],
-                    Json(json!({
-                        "jsonrpc": "2.0",
-                        "error": { "code": -32600, "message": "Invalid Request: empty batch" },
-                        "id": null,
-                    })),
-                )
-                    .into_response();
+                return json_response(json!({
+                    "jsonrpc": "2.0",
+                    "error": { "code": -32600, "message": "Invalid Request: empty batch" },
+                    "id": null,
+                }));
             }
 
             let mut responses: Vec<Value> = Vec::new();
             for msg in messages {
-                if let Some(resp) =
-                    handle_single_message(&state, msg, &headers_str, profile_ctx_ref).await
+                let (identity, new_session) = resolve_identity_for_message(&state, &headers, &msg);
+                if emitted_session_id.is_none() {
+                    emitted_session_id = new_session;
+                }
+                if let Some(resp) = handle_single_message(
+                    &state,
+                    msg,
+                    &headers_str,
+                    profile_ctx_ref,
+                    identity.as_ref(),
+                )
+                .await
                 {
                     responses.push(resp);
                 }
@@ -634,47 +898,102 @@ async fn mcp_unified_impl(
 
             if responses.is_empty() {
                 // All messages were notifications
-                StatusCode::ACCEPTED.into_response()
+                with_session_header(StatusCode::ACCEPTED.into_response(), emitted_session_id)
             } else {
-                (
-                    StatusCode::OK,
-                    [(
-                        axum::http::header::CONTENT_TYPE,
-                        HeaderValue::from_static("application/json"),
-                    )],
-                    Json(Value::Array(responses)),
-                )
-                    .into_response()
+                with_session_header(json_response(Value::Array(responses)), emitted_session_id)
             }
         }
         Value::Object(_) => {
-            match handle_single_message(&state, body, &headers_str, profile_ctx_ref).await {
-                Some(resp) => (
-                    StatusCode::OK,
-                    [(
-                        axum::http::header::CONTENT_TYPE,
-                        HeaderValue::from_static("application/json"),
-                    )],
-                    Json(resp),
-                )
-                    .into_response(),
-                None => StatusCode::ACCEPTED.into_response(),
+            let (identity, new_session) = resolve_identity_for_message(&state, &headers, &body);
+            emitted_session_id = new_session;
+            match handle_single_message(
+                &state,
+                body,
+                &headers_str,
+                profile_ctx_ref,
+                identity.as_ref(),
+            )
+            .await
+            {
+                Some(resp) => with_session_header(json_response(resp), emitted_session_id),
+                None => {
+                    with_session_header(StatusCode::ACCEPTED.into_response(), emitted_session_id)
+                }
             }
         }
-        _ => (
-            StatusCode::OK,
-            [(
-                axum::http::header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            )],
-            Json(json!({
-                "jsonrpc": "2.0",
-                "error": { "code": -32600, "message": "Invalid Request: expected object or array" },
-                "id": null,
-            })),
-        )
-            .into_response(),
+        _ => json_response(json!({
+            "jsonrpc": "2.0",
+            "error": { "code": -32600, "message": "Invalid Request: expected object or array" },
+            "id": null,
+        })),
     }
+}
+
+/// Build a `200 OK` JSON response body. Used by [`mcp_unified_impl`] for the
+/// non-error branches; pairs with [`with_session_header`] to attach the
+/// optional `Mcp-Session-Id` header without duplicating the `Content-Type`
+/// boilerplate at every callsite.
+fn json_response(body: Value) -> Response {
+    (
+        StatusCode::OK,
+        [(
+            axum::http::header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
+        Json(body),
+    )
+        .into_response()
+}
+
+/// Attach `Mcp-Session-Id: <session>` to an existing response when an
+/// `initialize` in the same request issued a new session id. The header is
+/// only set when `session_id` is `Some` so non-`initialize` responses stay
+/// untouched.
+fn with_session_header(mut response: Response, session_id: Option<String>) -> Response {
+    if let Some(sid) = session_id {
+        if let Ok(val) = HeaderValue::from_str(&sid) {
+            response
+                .headers_mut()
+                .insert(HeaderName::from_static(MCP_SESSION_ID_HEADER), val);
+        }
+    }
+    response
+}
+
+/// Per-message identity resolution shared by the singleton and batch
+/// branches of [`mcp_unified_impl`]. Returns the [`ClientIdentity`] to
+/// associate with `msg` and (for `initialize` messages) the newly-issued
+/// session id so the HTTP response can echo it back.
+fn resolve_identity_for_message(
+    state: &AppState,
+    headers: &HeaderMap,
+    msg: &Value,
+) -> (Option<ClientIdentity>, Option<String>) {
+    let is_initialize = msg.get("method").and_then(|v| v.as_str()) == Some("initialize");
+    if !is_initialize {
+        return (resolve_inbound_identity(state, headers), None);
+    }
+    // `initialize`: issue a fresh session id unconditionally so the
+    // client can echo it on follow-ups, even when it sent no
+    // `clientInfo`. Only cache the structured `clientInfo` (name /
+    // version) — the per-request `User-Agent`/`Origin` fallback covers
+    // the empty case on later requests without polluting the LRU with
+    // zero-signal entries.
+    let init_identity = identity_from_initialize_params(msg.get("params"));
+    let header_identity = identity_from_headers(headers);
+    let session_id = uuid::Uuid::new_v4().to_string();
+    if !init_identity.is_empty() {
+        if let Ok(mut guard) = state.session_identities.lock() {
+            guard.insert(session_id.clone(), init_identity.clone());
+        }
+    }
+    let merged = merge_identity(init_identity, header_identity);
+    let identity = if merged.is_empty() {
+        None
+    } else {
+        Some(merged)
+    };
+    (identity, Some(session_id))
 }
 
 /// JSON 404 body returned by profile-scoped routes when the URL `{profile}`
@@ -1171,31 +1490,86 @@ async fn oauth_callback(
 }
 
 /// Logged wrapper for POST /mcp/initialize (direct route).
-async fn mcp_initialize_logged(state: State<AppState>, body: Json<JsonRpcBody>) -> Json<Value> {
-    let span = tracing::info_span!("request", method = "initialize", id = ?body.id);
+///
+/// Mirrors the unified `/mcp` route: parses `clientInfo`, mints a fresh
+/// `Mcp-Session-Id`, seeds the [`SessionIdentityStore`] when structured
+/// identity is present, and echoes the new session id back on the response
+/// so the client can correlate follow-up calls. The resolved identity is
+/// embedded on the `request` span and surfaced on the audit log line.
+async fn mcp_initialize_logged(
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: Json<JsonRpcBody>,
+) -> Response {
+    let body_value = serde_json::to_value(&body.0).unwrap_or(Value::Null);
+    let (identity, new_session) = resolve_identity_for_message(&state.0, &headers, &body_value);
+    let client_json = identity
+        .as_ref()
+        .filter(|c| !c.is_empty())
+        .map(|c| serde_json::to_string(c).unwrap_or_default())
+        .unwrap_or_default();
+    let client_name = identity
+        .as_ref()
+        .and_then(|c| c.display_name())
+        .unwrap_or_default();
+    let client_version = identity
+        .as_ref()
+        .and_then(|c| c.version.clone())
+        .unwrap_or_default();
+    let span = tracing::info_span!(
+        "request",
+        method = "initialize",
+        id = ?body.id,
+        client = %client_json,
+    );
     async move {
         let start = Instant::now();
         let req_bytes = serde_json::to_string(&body.0).map(|s| s.len()).unwrap_or(0);
-        let resp = mcp_initialize(state, body, None).await;
+        let Json(resp) = mcp_initialize(state, body, None).await;
         let elapsed_ms = start.elapsed().as_millis() as u64;
-        let resp_bytes = serde_json::to_string(&resp.0).map(|s| s.len()).unwrap_or(0);
+        let resp_bytes = serde_json::to_string(&resp).map(|s| s.len()).unwrap_or(0);
         info!(
             method = "initialize",
             elapsed_ms = elapsed_ms,
             req_bytes = req_bytes,
             resp_bytes = resp_bytes,
             status = 200,
+            client_name = ?client_name,
+            client_version = ?client_version,
             "MCP request"
         );
-        resp
+        with_session_header(json_response(resp), new_session)
     }
     .instrument(span)
     .await
 }
 
 /// Logged wrapper for POST /mcp/tools/list (direct route).
-async fn mcp_tools_list_logged(state: State<AppState>, body: Json<JsonRpcBody>) -> Json<Value> {
-    let span = tracing::info_span!("request", method = "tools/list", id = ?body.id);
+async fn mcp_tools_list_logged(
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: Json<JsonRpcBody>,
+) -> Json<Value> {
+    let identity = resolve_inbound_identity(&state.0, &headers);
+    let client_json = identity
+        .as_ref()
+        .filter(|c| !c.is_empty())
+        .map(|c| serde_json::to_string(c).unwrap_or_default())
+        .unwrap_or_default();
+    let client_name = identity
+        .as_ref()
+        .and_then(|c| c.display_name())
+        .unwrap_or_default();
+    let client_version = identity
+        .as_ref()
+        .and_then(|c| c.version.clone())
+        .unwrap_or_default();
+    let span = tracing::info_span!(
+        "request",
+        method = "tools/list",
+        id = ?body.id,
+        client = %client_json,
+    );
     async move {
         let start = Instant::now();
         let req_bytes = serde_json::to_string(&body.0).map(|s| s.len()).unwrap_or(0);
@@ -1208,6 +1582,8 @@ async fn mcp_tools_list_logged(state: State<AppState>, body: Json<JsonRpcBody>) 
             req_bytes = req_bytes,
             resp_bytes = resp_bytes,
             status = 200,
+            client_name = ?client_name,
+            client_version = ?client_version,
             "MCP request"
         );
         resp
@@ -1219,9 +1595,29 @@ async fn mcp_tools_list_logged(state: State<AppState>, body: Json<JsonRpcBody>) 
 /// Logged wrapper for POST /mcp/tools/call (direct route).
 async fn mcp_tools_call_logged(
     state: State<AppState>,
+    headers: HeaderMap,
     body: Json<JsonRpcBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let span = tracing::info_span!("request", method = "tools/call", id = ?body.id);
+    let identity = resolve_inbound_identity(&state.0, &headers);
+    let client_json = identity
+        .as_ref()
+        .filter(|c| !c.is_empty())
+        .map(|c| serde_json::to_string(c).unwrap_or_default())
+        .unwrap_or_default();
+    let client_name = identity
+        .as_ref()
+        .and_then(|c| c.display_name())
+        .unwrap_or_default();
+    let client_version = identity
+        .as_ref()
+        .and_then(|c| c.version.clone())
+        .unwrap_or_default();
+    let span = tracing::info_span!(
+        "request",
+        method = "tools/call",
+        id = ?body.id,
+        client = %client_json,
+    );
     async move {
         let start = Instant::now();
         let req_bytes = serde_json::to_string(&body.0).map(|s| s.len()).unwrap_or(0);
@@ -1236,6 +1632,8 @@ async fn mcp_tools_call_logged(
                     req_bytes = req_bytes,
                     resp_bytes = resp_bytes,
                     status = 200,
+                    client_name = ?client_name,
+                    client_version = ?client_version,
                     "MCP request"
                 );
             }
@@ -1249,6 +1647,8 @@ async fn mcp_tools_call_logged(
                         req_bytes = req_bytes,
                         resp_bytes = resp_bytes,
                         status = status_code,
+                        client_name = ?client_name,
+                        client_version = ?client_version,
                         "MCP request"
                     );
                 } else if status_code == 200 {
@@ -1259,6 +1659,8 @@ async fn mcp_tools_call_logged(
                         req_bytes = req_bytes,
                         resp_bytes = resp_bytes,
                         status = status_code,
+                        client_name = ?client_name,
+                        client_version = ?client_version,
                         "MCP request"
                     );
                 } else {
@@ -1268,6 +1670,8 @@ async fn mcp_tools_call_logged(
                         req_bytes = req_bytes,
                         resp_bytes = resp_bytes,
                         status = status_code,
+                        client_name = ?client_name,
+                        client_version = ?client_version,
                         "MCP request"
                     );
                 }
@@ -1520,7 +1924,256 @@ mod tests {
             setup_manager: None,
             started_at: Instant::now(),
             toon_enabled: false,
+            session_identities: Arc::new(Mutex::new(SessionIdentityStore::default())),
         }
+    }
+
+    fn identity(name: &str, version: &str) -> ClientIdentity {
+        ClientIdentity {
+            name: Some(name.to_string()),
+            version: Some(version.to_string()),
+            user_agent: None,
+            origin: None,
+        }
+    }
+
+    #[test]
+    fn session_identity_store_default_capacity_matches_const() {
+        let store = SessionIdentityStore::default();
+        assert_eq!(store.capacity(), DEFAULT_SESSION_IDENTITY_MAX_SESSIONS);
+        assert_eq!(store.len(), 0);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn session_identity_store_zero_capacity_clamps_to_one() {
+        let mut store = SessionIdentityStore::with_capacity(0);
+        assert_eq!(store.capacity(), 1);
+        store.insert("s1".into(), identity("a", "1"));
+        assert_eq!(store.len(), 1);
+        store.insert("s2".into(), identity("b", "2"));
+        // Capacity-1 store evicts the previous entry to make room.
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get("s1"), None);
+        assert_eq!(store.get("s2"), Some(identity("b", "2")));
+    }
+
+    #[test]
+    fn session_identity_store_get_returns_inserted_identity() {
+        let mut store = SessionIdentityStore::with_capacity(4);
+        store.insert("sid".into(), identity("claude-ai", "0.1.0"));
+        assert_eq!(store.get("sid"), Some(identity("claude-ai", "0.1.0")));
+        assert_eq!(store.get("missing"), None);
+    }
+
+    #[test]
+    fn session_identity_store_evicts_lru_when_at_capacity() {
+        let mut store = SessionIdentityStore::with_capacity(3);
+        store.insert("s1".into(), identity("a", "1"));
+        store.insert("s2".into(), identity("b", "2"));
+        store.insert("s3".into(), identity("c", "3"));
+        // Touch s1 so it becomes most-recently-used.
+        assert_eq!(store.get("s1"), Some(identity("a", "1")));
+        // s4 forces eviction of the LRU entry, which is now s2.
+        store.insert("s4".into(), identity("d", "4"));
+        assert_eq!(store.len(), 3);
+        assert_eq!(store.get("s2"), None, "s2 should have been evicted");
+        assert_eq!(store.get("s1"), Some(identity("a", "1")));
+        assert_eq!(store.get("s3"), Some(identity("c", "3")));
+        assert_eq!(store.get("s4"), Some(identity("d", "4")));
+    }
+
+    #[test]
+    fn session_identity_store_refresh_does_not_grow() {
+        let mut store = SessionIdentityStore::with_capacity(2);
+        store.insert("s1".into(), identity("a", "1"));
+        store.insert("s1".into(), identity("a", "2"));
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get("s1"), Some(identity("a", "2")));
+    }
+
+    #[test]
+    fn identity_from_initialize_params_extracts_name_and_version() {
+        let params = json!({
+            "clientInfo": { "name": "claude-ai", "version": "0.1.0" },
+            "protocolVersion": "2025-03-26",
+        });
+        let id = identity_from_initialize_params(Some(&params));
+        assert_eq!(id.name.as_deref(), Some("claude-ai"));
+        assert_eq!(id.version.as_deref(), Some("0.1.0"));
+        assert!(id.user_agent.is_none());
+        assert!(id.origin.is_none());
+    }
+
+    #[test]
+    fn identity_from_initialize_params_missing_client_info_is_empty() {
+        let params = json!({ "protocolVersion": "2025-03-26" });
+        let id = identity_from_initialize_params(Some(&params));
+        assert!(id.is_empty());
+        let id = identity_from_initialize_params(None);
+        assert!(id.is_empty());
+    }
+
+    #[test]
+    fn identity_from_headers_picks_user_agent_and_origin() {
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("claude-desktop/0.7"));
+        headers.insert("origin", HeaderValue::from_static("https://claude.ai"));
+        let id = identity_from_headers(&headers);
+        assert_eq!(id.user_agent.as_deref(), Some("claude-desktop/0.7"));
+        assert_eq!(id.origin.as_deref(), Some("https://claude.ai"));
+        assert!(id.name.is_none());
+        assert!(id.version.is_none());
+    }
+
+    #[test]
+    fn merge_identity_prefers_primary_then_fills_from_fallback() {
+        let primary = ClientIdentity {
+            name: Some("claude-ai".into()),
+            version: None,
+            user_agent: None,
+            origin: None,
+        };
+        let fallback = ClientIdentity {
+            name: Some("ignored".into()),
+            version: Some("0.1.0".into()),
+            user_agent: Some("claude-desktop/0.7".into()),
+            origin: Some("https://claude.ai".into()),
+        };
+        let merged = merge_identity(primary, fallback);
+        assert_eq!(merged.name.as_deref(), Some("claude-ai"));
+        assert_eq!(merged.version.as_deref(), Some("0.1.0"));
+        assert_eq!(merged.user_agent.as_deref(), Some("claude-desktop/0.7"));
+        assert_eq!(merged.origin.as_deref(), Some("https://claude.ai"));
+    }
+
+    #[tokio::test]
+    async fn resolve_identity_for_message_initialize_stores_and_emits_session_id() {
+        let state = test_app_state();
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("claude-desktop/0.7"));
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "initialize",
+            "id": 1,
+            "params": {
+                "clientInfo": { "name": "claude-ai", "version": "0.1.0" },
+            },
+        });
+        let (identity, session_id) = resolve_identity_for_message(&state, &headers, &msg);
+        let identity = identity.expect("initialize should resolve an identity");
+        let session_id = session_id.expect("initialize should mint a session id");
+        // Merged identity carries clientInfo + User-Agent fallback.
+        assert_eq!(identity.name.as_deref(), Some("claude-ai"));
+        assert_eq!(identity.version.as_deref(), Some("0.1.0"));
+        assert_eq!(identity.user_agent.as_deref(), Some("claude-desktop/0.7"));
+        // The store is seeded with the structured (name/version) identity only.
+        let stored = state
+            .session_identities
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .expect("session id should resolve in the store");
+        assert_eq!(stored.name.as_deref(), Some("claude-ai"));
+        assert_eq!(stored.version.as_deref(), Some("0.1.0"));
+        assert!(stored.user_agent.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_identity_for_message_initialize_without_client_info_skips_store() {
+        let state = test_app_state();
+        let headers = HeaderMap::new();
+        let msg = json!({"jsonrpc":"2.0","method":"initialize","id":1});
+        let (identity, session_id) = resolve_identity_for_message(&state, &headers, &msg);
+        // Identity stays `None` when neither clientInfo nor headers say
+        // anything; a session id is still issued for future correlation.
+        assert!(identity.is_none());
+        assert!(session_id.is_some());
+        // Empty identities are not cached.
+        assert!(state.session_identities.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_inbound_identity_uses_session_then_header_fallback() {
+        let state = test_app_state();
+        // Seed the store with the identity that initialize would have cached.
+        let sid = "fixed-session";
+        state
+            .session_identities
+            .lock()
+            .unwrap()
+            .insert(sid.into(), identity("claude-ai", "0.1.0"));
+
+        // Follow-up request echoes the session header AND carries its own UA.
+        let mut headers = HeaderMap::new();
+        headers.insert(MCP_SESSION_ID_HEADER, HeaderValue::from_static(sid));
+        headers.insert("user-agent", HeaderValue::from_static("claude-desktop/0.7"));
+        headers.insert("origin", HeaderValue::from_static("https://claude.ai"));
+        let resolved = resolve_inbound_identity(&state, &headers).expect("identity must resolve");
+        assert_eq!(resolved.name.as_deref(), Some("claude-ai"));
+        assert_eq!(resolved.version.as_deref(), Some("0.1.0"));
+        assert_eq!(resolved.user_agent.as_deref(), Some("claude-desktop/0.7"));
+        assert_eq!(resolved.origin.as_deref(), Some("https://claude.ai"));
+
+        // Same request without the session header falls back to header-only
+        // identity (no name/version because no clientInfo was cached).
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("claude-desktop/0.7"));
+        let resolved = resolve_inbound_identity(&state, &headers).unwrap();
+        assert!(resolved.name.is_none());
+        assert_eq!(resolved.user_agent.as_deref(), Some("claude-desktop/0.7"));
+
+        // Bare request with no signals at all degrades to `None` so adapter
+        // event-emission can omit the `client` field entirely.
+        assert!(resolve_inbound_identity(&state, &HeaderMap::new()).is_none());
+    }
+
+    #[tokio::test]
+    async fn initialize_response_round_trip_resolves_identity_on_follow_up() {
+        use axum::body::Body;
+        use tower::ServiceExt;
+        let state = test_app_state();
+        let router = build_router(state.clone());
+
+        let init_req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&json!({
+                    "jsonrpc": "2.0",
+                    "method": "initialize",
+                    "id": 1,
+                    "params": {
+                        "clientInfo": {"name": "claude-ai", "version": "0.1.0"},
+                    },
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let init_resp = router.clone().oneshot(init_req).await.unwrap();
+        assert_eq!(init_resp.status(), StatusCode::OK);
+        let sid_header = init_resp
+            .headers()
+            .get(MCP_SESSION_ID_HEADER)
+            .expect("initialize must emit Mcp-Session-Id")
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(!sid_header.is_empty(), "session id must be non-empty");
+
+        // Re-resolve via the public helper to confirm the store was seeded
+        // and that follow-up requests can recover the identity by echoing
+        // the same header back.
+        let mut follow_up_headers = HeaderMap::new();
+        follow_up_headers.insert(
+            MCP_SESSION_ID_HEADER,
+            HeaderValue::from_str(&sid_header).unwrap(),
+        );
+        let resolved =
+            resolve_inbound_identity(&state, &follow_up_headers).expect("identity must resolve");
+        assert_eq!(resolved.name.as_deref(), Some("claude-ai"));
+        assert_eq!(resolved.version.as_deref(), Some("0.1.0"));
     }
 
     #[test]

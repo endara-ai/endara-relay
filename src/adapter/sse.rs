@@ -796,6 +796,7 @@ impl McpAdapter for SseAdapter {
                     profile: span_ctx.profile.clone(),
                     tool: name.to_string(),
                     annotations,
+                    client: span_ctx.client.clone(),
                 });
             }
             let params = json!({
@@ -819,11 +820,23 @@ impl McpAdapter for SseAdapter {
                 ),
             };
             self.activity_log.write().await.push(log_line);
+            let client_name = span_ctx
+                .client
+                .as_ref()
+                .and_then(|c| c.display_name())
+                .unwrap_or_default();
+            let client_version = span_ctx
+                .client
+                .as_ref()
+                .and_then(|c| c.version.clone())
+                .unwrap_or_default();
             match &result {
                 Ok(_) => tracing::info!(
                     tool = %name,
                     status = "ok",
                     duration_ms = duration_ms,
+                    client_name = ?client_name,
+                    client_version = ?client_version,
                     "Tool call completed"
                 ),
                 Err(e) => tracing::warn!(
@@ -831,6 +844,8 @@ impl McpAdapter for SseAdapter {
                     status = "error",
                     duration_ms = duration_ms,
                     error = %e,
+                    client_name = ?client_name,
+                    client_version = ?client_version,
                     "Tool call failed"
                 ),
             }

@@ -736,7 +736,7 @@ mod tests {
             }
         "#;
         let result = handler
-            .execute_tools(script)
+            .execute_tools(script, "")
             .await
             .expect("execute_tools should return the script's error value");
         let err_msg = result
