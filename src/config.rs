@@ -46,6 +46,14 @@ pub struct RelayConfig {
     /// socket and adapters keep initializing in the background.
     #[serde(default)]
     pub startup_init_timeout_secs: Option<u64>,
+    /// Maximum number of cached `Mcp-Session-Id` → client-identity entries
+    /// held by the inbound dispatch (see `server.rs`). `None` defers to
+    /// [`DEFAULT_SESSION_IDENTITY_MAX_SESSIONS`]. When the cache is full an
+    /// LRU eviction drops the least-recently-used entry; the per-request
+    /// `User-Agent` / `Origin` fallback still produces a best-effort caller
+    /// label so evicted sessions never block dispatch.
+    #[serde(default)]
+    pub session_identity_max_sessions: Option<usize>,
 }
 
 impl Default for RelayConfig {
@@ -66,6 +74,7 @@ impl Default for RelayConfig {
             allow_insecure_oauth: None,
             toon_output: None,
             startup_init_timeout_secs: None,
+            session_identity_max_sessions: None,
         }
     }
 }
@@ -73,6 +82,12 @@ impl Default for RelayConfig {
 /// Effective default for `RelayConfig::startup_init_timeout_secs` when the
 /// field is omitted from `config.toml`.
 pub const DEFAULT_STARTUP_INIT_TIMEOUT_SECS: u64 = 60;
+
+/// Effective default for `RelayConfig::session_identity_max_sessions` when
+/// the field is omitted from `config.toml`. Caps the inbound session →
+/// `ClientIdentity` cache so a misbehaving client that never reuses its
+/// `Mcp-Session-Id` cannot grow the map unboundedly.
+pub const DEFAULT_SESSION_IDENTITY_MAX_SESSIONS: usize = 1000;
 
 /// Transport type for an endpoint.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -1107,6 +1122,32 @@ startup_init_timeout_secs = 5
         assert_eq!(config.relay.startup_init_timeout_secs, Some(5));
     }
 
+    #[test]
+    fn session_identity_max_sessions_defaults_to_none() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(config.relay.session_identity_max_sessions, None);
+    }
+
+    #[test]
+    fn session_identity_max_sessions_nonzero_parses() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+session_identity_max_sessions = 250
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(config.relay.session_identity_max_sessions, Some(250));
+    }
+
+    #[test]
+    fn session_identity_max_sessions_default_const_is_1000() {
+        assert_eq!(DEFAULT_SESSION_IDENTITY_MAX_SESSIONS, 1000);
+    }
+
     // --- Endpoint name format validation tests ---
 
     #[test]
@@ -1585,6 +1626,7 @@ js_execution = false
                 allow_insecure_oauth: None,
                 toon_output: None,
                 startup_init_timeout_secs: None,
+                session_identity_max_sessions: None,
             },
             endpoints,
             profiles: None,

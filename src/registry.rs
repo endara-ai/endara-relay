@@ -726,6 +726,7 @@ impl AdapterRegistry {
                 profile: span_ctx.profile.clone(),
                 tool,
                 annotations: None,
+                client: span_ctx.client.clone(),
             });
             bus.send(ToolCallEvent::Failed {
                 request_id,
