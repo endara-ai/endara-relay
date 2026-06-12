@@ -193,6 +193,12 @@ impl ConfigBuilder {
             out.push_str("[[endpoints]]\n");
             out.push_str(&format!("name = \"{}\"\n", ep.name));
             out.push_str(&format!("transport = \"{}\"\n", ep.transport));
+            // Integration tests spawn fixture binaries/scripts directly on
+            // the host. Omitted `isolation` already means direct spawn; keep
+            // the explicit "none" so the harness is unambiguous.
+            if ep.transport == "stdio" {
+                out.push_str("isolation = \"none\"\n");
+            }
             if let Some(ref cmd) = ep.command {
                 out.push_str(&format!("command = \"{}\"\n", cmd));
             }

@@ -33,6 +33,7 @@ async fn setup_js_server(js_mode: bool) -> (SocketAddr, tokio::task::JoinHandle<
         env: HashMap::new(),
         server_type_override: None,
         endpoint_name: "js-test".into(),
+        ..Default::default()
     };
     let mut adapter = StdioAdapter::new(config);
     adapter.initialize().await.expect("adapter init failed");

@@ -182,6 +182,7 @@ async fn test_endpoints_api_server_name_raw_independent_of_override() {
          [[endpoints]]\n\
          name = \"good-server\"\n\
          transport = \"stdio\"\n\
+         isolation = \"none\"\n\
          command = \"{}\"\n\
          server_type_override = \"custom-name\"\n",
         bin

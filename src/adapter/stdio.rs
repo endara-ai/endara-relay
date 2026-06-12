@@ -1,6 +1,7 @@
 use super::server_name::{sanitize_server_name, ServerNameError};
 use super::server_type_resolution::{effective_server_type, strip_mcp_server_suffix};
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
+use crate::container_stats::{self, ContainerStats, StatsSlot};
 use crate::events::{
     annotations_from_value, current_request_context, ToolCallEvent, ToolCallEventBus,
 };
@@ -18,6 +19,38 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info, warn, Instrument};
 
+/// Default OCI image used for containerized stdio servers when the endpoint
+/// does not specify a `container_image`.
+pub const DEFAULT_CONTAINER_IMAGE: &str = "ghcr.io/endara-ai/mcp-runner:latest";
+
+/// Process isolation mode for a stdio endpoint.
+///
+/// `Container` spawns the server through a detected container runtime
+/// (docker/podman); `None` spawns the command directly on the host. The
+/// default is `None` (direct spawn), matching `EndpointConfig`'s
+/// "omitted means none" default that the watcher resolves when it builds
+/// the [`StdioConfig`] — pre-existing configs keep working unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum IsolationMode {
+    Container,
+    #[default]
+    None,
+}
+
+impl IsolationMode {
+    /// Resolve the raw `isolation` config value for a stdio endpoint.
+    /// Only an explicit `"container"` containerizes; omitted (or anything
+    /// other than `"container"`) means direct spawn, so pre-existing configs
+    /// keep working unchanged on upgrade — invalid values are caught earlier
+    /// as validation warnings.
+    pub fn from_config_value(value: Option<&str>) -> Self {
+        match value {
+            Some("container") => IsolationMode::Container,
+            _ => IsolationMode::None,
+        }
+    }
+}
+
 /// Configuration for spawning a STDIO MCP server.
 #[derive(Debug, Clone, Default)]
 pub struct StdioConfig {
@@ -31,6 +64,77 @@ pub struct StdioConfig {
     /// per-endpoint `tracing` span). Defaults to empty for direct test
     /// construction; production paths set this from `EndpointConfig::name`.
     pub endpoint_name: String,
+    /// Isolation mode. Defaults to [`IsolationMode::None`] (direct spawn)
+    /// for direct construction; the watcher sets this from the endpoint's
+    /// `isolation` field (omitted = none).
+    pub isolation: IsolationMode,
+    /// OCI image used when `isolation` is `Container`. `None` means
+    /// [`DEFAULT_CONTAINER_IMAGE`].
+    pub container_image: Option<String>,
+    /// Host bind mounts (`"/host/path:/container/path"`), container mode only.
+    pub mounts: Vec<String>,
+}
+
+/// Container name for an endpoint: `endara-mcp-<sanitized-endpoint>`.
+fn container_name_for(endpoint_name: &str) -> String {
+    let sanitized =
+        crate::prefix::sanitize_name(endpoint_name).unwrap_or_else(|| "endpoint".to_string());
+    format!("endara-mcp-{}", sanitized)
+}
+
+/// Build the argument vector for `docker run` (or podman, same CLI shape):
+/// `run -i --rm --name endara-mcp-<endpoint> [-v mount]* [-e K=V]* <image> <command> <args...>`.
+/// Env vars are sorted by key for deterministic output.
+fn build_container_run_args(config: &StdioConfig) -> Vec<String> {
+    let mut args = vec![
+        "run".to_string(),
+        "-i".to_string(),
+        "--rm".to_string(),
+        "--name".to_string(),
+        container_name_for(&config.endpoint_name),
+    ];
+    for mount in &config.mounts {
+        args.push("-v".to_string());
+        args.push(mount.clone());
+    }
+    let mut env_keys: Vec<&String> = config.env.keys().collect();
+    env_keys.sort();
+    for key in env_keys {
+        args.push("-e".to_string());
+        args.push(format!("{}={}", key, config.env[key]));
+    }
+    args.push(
+        config
+            .container_image
+            .clone()
+            .unwrap_or_else(|| DEFAULT_CONTAINER_IMAGE.to_string()),
+    );
+    args.push(config.command.clone());
+    args.extend(config.args.iter().cloned());
+    args
+}
+
+/// Decide what to actually spawn: the container runtime (when isolation is
+/// `Container` and a runtime was detected) or the direct command (isolation
+/// `None`, or fallback when no runtime is available).
+fn resolve_spawn_plan(config: &StdioConfig, runtime: Option<&str>) -> (String, Vec<String>) {
+    match runtime {
+        Some(rt) if config.isolation == IsolationMode::Container => {
+            (rt.to_string(), build_container_run_args(config))
+        }
+        _ => (config.command.clone(), config.args.clone()),
+    }
+}
+
+/// Detect a usable container runtime CLI via the shared
+/// [`crate::container_runtime`] detector (cached for the process lifetime).
+/// Returns the absolute path to the docker/podman binary, or `None` when no
+/// runtime — or a runtime without a usable CLI (socket-only) — is found.
+pub(crate) fn detect_container_runtime() -> Option<String> {
+    crate::container_runtime::detect_runtime()?
+        .cli_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 /// Ring buffer that stores the last N lines of stderr output.
@@ -200,6 +304,18 @@ pub struct StdioAdapter {
     /// JSON value so the [`annotations_from_value`] helper performs the
     /// MCP-spec key mapping at event-emission time.
     tool_annotations_cache: Arc<RwLock<HashMap<String, Option<Value>>>>,
+    /// When the server was spawned through a container runtime, holds
+    /// `(runtime_cli, container_name)` so shutdown can `rm -f` the container
+    /// as a backstop (killing the CLI client may orphan the container).
+    container: Arc<Mutex<Option<(String, String)>>>,
+    /// Latest container stats sample written by the background stats poller.
+    /// `None` for direct spawns, before the first sample, or when the last
+    /// poll failed. Uses a `std::sync::RwLock` so the sync
+    /// [`McpAdapter::container_stats`] accessor can read it without await.
+    container_stats: StatsSlot,
+    /// Background `stats --no-stream` poll loop for containerized spawns,
+    /// aborted on shutdown / respawn.
+    stats_poller_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     // Background task handles
     _stderr_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     _stdout_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -230,6 +346,9 @@ impl StdioAdapter {
             span,
             event_bus: Arc::new(OnceLock::new()),
             tool_annotations_cache: Arc::new(RwLock::new(HashMap::new())),
+            container: Arc::new(Mutex::new(None)),
+            container_stats: Arc::new(std::sync::RwLock::new(None)),
+            stats_poller_handle: Arc::new(Mutex::new(None)),
             _stderr_handle: Arc::new(Mutex::new(None)),
             _stdout_handle: Arc::new(Mutex::new(None)),
         }
@@ -243,27 +362,90 @@ impl StdioAdapter {
     async fn spawn_process(&self) -> Result<(), AdapterError> {
         *self.health.write().await = HealthStatus::Starting;
 
-        let mut cmd = Command::new(&self.config.command);
-        cmd.args(&self.config.args)
+        // Resolve the container runtime when isolation is requested. No
+        // runtime found → fall back to direct spawn (never hard-fail an
+        // endpoint because Docker/Podman is absent).
+        let runtime = if self.config.isolation == IsolationMode::Container {
+            let rt = detect_container_runtime();
+            if rt.is_none() {
+                warn!(
+                    "no container runtime (docker/podman) detected — falling back to direct \
+                     spawn; install Docker or Podman to run this server isolated"
+                );
+            }
+            rt
+        } else {
+            None
+        };
+
+        if let Some(ref rt) = runtime {
+            // Best-effort removal of a stale container left over from a
+            // previous run (e.g. after a crash where `--rm` didn't fire).
+            let name = container_name_for(&self.config.endpoint_name);
+            let _ = tokio::time::timeout(
+                Duration::from_secs(5),
+                Command::new(rt)
+                    .args(["rm", "-f", &name])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status(),
+            )
+            .await;
+        }
+
+        let (program, argv) = resolve_spawn_plan(&self.config, runtime.as_deref());
+
+        let mut cmd = Command::new(&program);
+        cmd.args(&argv)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        // Inject the user's login-shell PATH so that commands installed via
-        // nvm, Homebrew, pyenv, etc. are discoverable even when the relay
-        // runs as a Tauri sidecar with a minimal inherited environment.
-        if let Some(shell_path) = shell_env::resolve_shell_path() {
-            if !self.config.env.contains_key("PATH") {
-                cmd.env("PATH", shell_path);
+        if runtime.is_none() {
+            // Direct spawn: inject the user's login-shell PATH so that
+            // commands installed via nvm, Homebrew, pyenv, etc. are
+            // discoverable even when the relay runs as a Tauri sidecar with
+            // a minimal inherited environment.
+            if let Some(shell_path) = shell_env::resolve_shell_path() {
+                if !self.config.env.contains_key("PATH") {
+                    cmd.env("PATH", shell_path);
+                }
+            }
+
+            // User-specified env vars always win (applied after shell PATH).
+            cmd.envs(&self.config.env);
+        }
+        // Container spawn: env vars are passed into the container via `-e`
+        // args (see build_container_run_args); the runtime CLI itself runs
+        // with the relay's own environment.
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| AdapterError::ProcessSpawnFailed(format!("{}: {}", program, e)))?;
+
+        *self.container.lock().await = runtime
+            .as_ref()
+            .map(|rt| (rt.clone(), container_name_for(&self.config.endpoint_name)));
+
+        // (Re)start the stats poller for containerized spawns. Clear any
+        // previous sample first so a respawn never serves stale stats.
+        if let Ok(mut stats) = self.container_stats.write() {
+            *stats = None;
+        }
+        {
+            let mut handle = self.stats_poller_handle.lock().await;
+            if let Some(h) = handle.take() {
+                h.abort();
+            }
+            if let Some(rt) = runtime.as_ref() {
+                *handle = Some(container_stats::spawn_stats_poller(
+                    rt.clone(),
+                    container_name_for(&self.config.endpoint_name),
+                    self.container_stats.clone(),
+                ));
             }
         }
-
-        // User-specified env vars always win (applied after shell PATH).
-        cmd.envs(&self.config.env);
-
-        let mut child = cmd.spawn().map_err(|e| {
-            AdapterError::ProcessSpawnFailed(format!("{}: {}", self.config.command, e))
-        })?;
 
         let stdin = child
             .stdin
@@ -673,6 +855,10 @@ impl McpAdapter for StdioAdapter {
         }
     }
 
+    fn container_stats(&self) -> Option<ContainerStats> {
+        self.container_stats.read().ok().and_then(|g| (*g).clone())
+    }
+
     fn server_type(&self) -> Option<String> {
         self.server_type.try_read().ok().and_then(|g| g.clone())
     }
@@ -740,6 +926,30 @@ impl McpAdapter for StdioAdapter {
                         let _ = child.kill().await;
                     }
                 }
+            }
+
+            // Stop the stats poller and drop the last sample so a stopped
+            // endpoint never reports stale container stats.
+            if let Some(h) = self.stats_poller_handle.lock().await.take() {
+                h.abort();
+            }
+            if let Ok(mut stats) = self.container_stats.write() {
+                *stats = None;
+            }
+
+            // Containerized spawn: killing the runtime CLI client may orphan
+            // the container, so remove it by name as a best-effort backstop.
+            if let Some((runtime, name)) = self.container.lock().await.take() {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    Command::new(&runtime)
+                        .args(["rm", "-f", &name])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status(),
+                )
+                .await;
             }
 
             // Abort background tasks
@@ -896,6 +1106,157 @@ mod tests {
             rxs.push((id, rx));
         }
         (map, rxs)
+    }
+
+    // -----------------------------------------------------------------------
+    // Containerized spawn plan (no docker needed — pure arg construction)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_isolation_mode_from_config_value() {
+        // Omitted means direct spawn so pre-existing configs keep working
+        // unchanged on upgrade; only an explicit "container" containerizes.
+        assert_eq!(IsolationMode::from_config_value(None), IsolationMode::None);
+        assert_eq!(
+            IsolationMode::from_config_value(Some("container")),
+            IsolationMode::Container
+        );
+        assert_eq!(
+            IsolationMode::from_config_value(Some("none")),
+            IsolationMode::None
+        );
+    }
+
+    #[test]
+    fn test_container_name_sanitizes_endpoint_name() {
+        assert_eq!(container_name_for("my-server"), "endara-mcp-my-server");
+        assert_eq!(container_name_for("My Server!"), "endara-mcp-my_server");
+        assert_eq!(container_name_for("!!!"), "endara-mcp-endpoint");
+    }
+
+    #[test]
+    fn test_build_container_run_args_full_shape() {
+        let mut env = HashMap::new();
+        env.insert("ZED".to_string(), "z".to_string());
+        env.insert("API_KEY".to_string(), "secret".to_string());
+        let config = StdioConfig {
+            command: "npx".to_string(),
+            args: vec!["-y".to_string(), "some-server".to_string()],
+            env,
+            endpoint_name: "github".to_string(),
+            isolation: IsolationMode::Container,
+            container_image: None,
+            mounts: vec!["/host/a:/ctr/a".to_string(), "/host/b:/ctr/b".to_string()],
+            ..Default::default()
+        };
+        let args = build_container_run_args(&config);
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "-i",
+                "--rm",
+                "--name",
+                "endara-mcp-github",
+                "-v",
+                "/host/a:/ctr/a",
+                "-v",
+                "/host/b:/ctr/b",
+                "-e",
+                "API_KEY=secret",
+                "-e",
+                "ZED=z",
+                DEFAULT_CONTAINER_IMAGE,
+                "npx",
+                "-y",
+                "some-server",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_container_run_args_custom_image_no_mounts_no_env() {
+        let config = StdioConfig {
+            command: "uvx".to_string(),
+            args: vec!["mcp-fetch".to_string()],
+            endpoint_name: "fetch".to_string(),
+            isolation: IsolationMode::Container,
+            container_image: Some("example.com/custom:1".to_string()),
+            ..Default::default()
+        };
+        let args = build_container_run_args(&config);
+        assert_eq!(
+            args,
+            vec![
+                "run",
+                "-i",
+                "--rm",
+                "--name",
+                "endara-mcp-fetch",
+                "example.com/custom:1",
+                "uvx",
+                "mcp-fetch",
+            ]
+        );
+    }
+
+    #[test]
+    fn test_resolve_spawn_plan_container_with_runtime() {
+        let config = StdioConfig {
+            command: "npx".to_string(),
+            args: vec!["server".to_string()],
+            endpoint_name: "ep".to_string(),
+            isolation: IsolationMode::Container,
+            ..Default::default()
+        };
+        let (program, argv) = resolve_spawn_plan(&config, Some("/usr/local/bin/docker"));
+        assert_eq!(program, "/usr/local/bin/docker");
+        assert_eq!(argv[0], "run");
+        assert!(argv.contains(&"npx".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_spawn_plan_falls_back_to_direct_without_runtime() {
+        let config = StdioConfig {
+            command: "npx".to_string(),
+            args: vec!["server".to_string()],
+            endpoint_name: "ep".to_string(),
+            isolation: IsolationMode::Container,
+            ..Default::default()
+        };
+        let (program, argv) = resolve_spawn_plan(&config, None);
+        assert_eq!(program, "npx");
+        assert_eq!(argv, vec!["server".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_spawn_plan_omitted_isolation_spawns_directly() {
+        // Omitted `isolation` resolves to direct spawn even when a container
+        // runtime is available — legacy configs must not be containerized.
+        let config = StdioConfig {
+            command: "npx".to_string(),
+            args: vec!["server".to_string()],
+            endpoint_name: "ep".to_string(),
+            isolation: IsolationMode::from_config_value(None),
+            ..Default::default()
+        };
+        let (program, argv) = resolve_spawn_plan(&config, Some("/usr/local/bin/docker"));
+        assert_eq!(program, "npx");
+        assert_eq!(argv, vec!["server".to_string()]);
+    }
+
+    #[test]
+    fn test_resolve_spawn_plan_isolation_none_ignores_runtime() {
+        let config = StdioConfig {
+            command: "npx".to_string(),
+            args: vec!["server".to_string()],
+            endpoint_name: "ep".to_string(),
+            isolation: IsolationMode::None,
+            ..Default::default()
+        };
+        let (program, argv) = resolve_spawn_plan(&config, Some("/usr/local/bin/docker"));
+        assert_eq!(program, "npx");
+        assert_eq!(argv, vec!["server".to_string()]);
     }
 
     /// Simulate the stdout reader dispatch logic for a single line.
