@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::RwLock;
 
@@ -75,6 +75,27 @@ pub struct StatusResponse {
     pub uptime_seconds: u64,
     pub endpoint_count: usize,
     pub healthy_count: usize,
+    /// Whether a container runtime (docker/podman) was detected on the host.
+    /// `null` while background detection is still in flight; consumers should
+    /// only treat an explicit `false` as "no runtime available".
+    pub container_runtime_available: Option<bool>,
+}
+
+/// Cached result of container runtime detection, warmed off the async
+/// runtime by [`management_routes`] so the first `/api/status` call never
+/// blocks on shell/CLI probing.
+static CONTAINER_RUNTIME_AVAILABLE: OnceLock<bool> = OnceLock::new();
+
+/// Kick off container runtime detection on a background thread (idempotent;
+/// the detector itself caches for the process lifetime).
+fn warm_container_runtime_detection() {
+    if CONTAINER_RUNTIME_AVAILABLE.get().is_some() {
+        return;
+    }
+    std::thread::spawn(|| {
+        let available = crate::container_runtime::detect_runtime().is_some();
+        let _ = CONTAINER_RUNTIME_AVAILABLE.set(available);
+    });
 }
 
 /// Lifecycle state for an adapter, surfaced in the management API.
@@ -128,6 +149,10 @@ pub struct EndpointInfo {
     pub tool_prefix: Option<String>,
     /// Lifecycle state of the adapter.
     pub lifecycle: Lifecycle,
+    /// Latest resource stats sample for containerized stdio endpoints.
+    /// Omitted for direct-spawn endpoints and when no sample is available.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_stats: Option<crate::container_stats::ContainerStats>,
 }
 
 #[derive(Serialize)]
@@ -230,6 +255,7 @@ async fn get_status(State(state): State<ManagementState>) -> Json<StatusResponse
         uptime_seconds: state.start_time.elapsed().as_secs(),
         endpoint_count: entries.len(),
         healthy_count,
+        container_runtime_available: CONTAINER_RUNTIME_AVAILABLE.get().copied(),
     })
 }
 
@@ -286,6 +312,7 @@ async fn get_endpoints(State(state): State<ManagementState>) -> Json<Vec<Endpoin
             error,
             tool_prefix: entry.tool_prefix.clone(),
             lifecycle,
+            container_stats: entry.adapter.container_stats(),
         });
     }
     endpoints.sort_by(|a, b| a.name.cmp(&b.name));
@@ -2818,6 +2845,17 @@ pub struct EndpointRequest {
     pub token_endpoint: Option<String>,
     #[serde(default)]
     pub server_type_override: Option<String>,
+    /// Isolation mode for stdio endpoints: `"container"` or `"none"`
+    /// (default when omitted is direct spawn).
+    #[serde(default)]
+    pub isolation: Option<String>,
+    /// OCI image override for containerized stdio endpoints.
+    #[serde(default)]
+    pub container_image: Option<String>,
+    /// Host bind mounts (`"/host/path:/container/path"`) for containerized
+    /// stdio endpoints.
+    #[serde(default)]
+    pub mounts: Option<Vec<String>>,
     // Forbidden fields — present so we can return a precise 400 instead of
     // silently dropping the value when a client mistakenly includes them.
     #[serde(default)]
@@ -2859,6 +2897,12 @@ pub struct EndpointSummary {
     pub token_endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server_type_override: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mounts: Option<Vec<String>>,
 }
 
 fn endpoint_summary_from(ep: &crate::config::EndpointConfig) -> EndpointSummary {
@@ -2877,6 +2921,9 @@ fn endpoint_summary_from(ep: &crate::config::EndpointConfig) -> EndpointSummary 
         scopes: ep.scopes.clone().unwrap_or_default(),
         token_endpoint: ep.token_endpoint.clone(),
         server_type_override: ep.server_type_override.clone(),
+        isolation: ep.isolation.clone(),
+        container_image: ep.container_image.clone(),
+        mounts: ep.mounts.clone(),
     }
 }
 
@@ -2973,6 +3020,24 @@ fn validate_endpoint_request(
         _ => None,
     };
 
+    // isolation — must be "container" or "none" when present. Empty /
+    // whitespace-only is treated as omitted (= direct spawn for stdio).
+    let isolation = match req.isolation.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => {
+            if s != "container" && s != "none" {
+                return Err(bad_request(
+                    "invalid isolation",
+                    format!(
+                        "Endpoint '{}': invalid isolation value '{}' — expected \"container\" or \"none\"",
+                        req.name, s
+                    ),
+                ));
+            }
+            Some(s.to_string())
+        }
+        _ => None,
+    };
+
     // Uniqueness (case-sensitive exact match, matching delete_endpoint and
     // today's desktop add_endpoint Tauri behaviour). For update, skip the
     // entry currently identified by `original_name`.
@@ -3016,6 +3081,9 @@ fn validate_endpoint_request(
         scopes: scopes_vec,
         token_endpoint: req.token_endpoint.clone(),
         server_type_override,
+        isolation,
+        container_image: req.container_image.clone(),
+        mounts: req.mounts.clone(),
     };
 
     Ok(new_ep)
@@ -3095,6 +3163,21 @@ fn endpoint_to_toml_table(
             "server_type_override".into(),
             toml::Value::String(sto.clone()),
         );
+    }
+    if let Some(ref iso) = ep.isolation {
+        t.insert("isolation".into(), toml::Value::String(iso.clone()));
+    }
+    if let Some(ref img) = ep.container_image {
+        t.insert("container_image".into(), toml::Value::String(img.clone()));
+    }
+    if let Some(ref mounts) = ep.mounts {
+        if !mounts.is_empty() {
+            let arr: Vec<toml::Value> = mounts
+                .iter()
+                .map(|m| toml::Value::String(m.clone()))
+                .collect();
+            t.insert("mounts".into(), toml::Value::Array(arr));
+        }
     }
     t
 }
@@ -3400,6 +3483,7 @@ async fn tool_call_events_sse(State(state): State<ManagementState>) -> axum::res
 
 /// Build the management API router with all /api routes.
 pub fn management_routes(state: ManagementState) -> Router {
+    warm_container_runtime_detection();
     Router::new()
         .route("/api/status", get(get_status))
         .route("/api/endpoints", get(get_endpoints).post(create_endpoint))
@@ -3815,6 +3899,9 @@ mod tests {
                 scopes: None,
                 token_endpoint: None,
                 server_type_override: None,
+                isolation: Some("none".to_string()),
+                container_image: None,
+                mounts: None,
             }],
             profiles: None,
         }
@@ -3874,6 +3961,42 @@ mod tests {
         assert_eq!(body["status"], "ok");
         assert_eq!(body["endpoint_count"], 1);
         assert_eq!(body["healthy_count"], 1);
+        // Field is always serialized (null while detection is in flight).
+        assert!(body
+            .as_object()
+            .unwrap()
+            .contains_key("container_runtime_available"));
+    }
+
+    #[tokio::test]
+    async fn management_status_reports_container_runtime() {
+        let state = test_state(vec![]).await;
+        let app = management_routes(state);
+
+        // Detection runs on a background thread warmed by management_routes;
+        // poll until it resolves to a boolean, then check it matches the
+        // process-cached detector result (host-dependent true/false).
+        let mut value = None;
+        for _ in 0..100 {
+            let resp = app
+                .clone()
+                .oneshot(Request::get("/api/status").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_json(resp).await;
+            if let Some(b) = body["container_runtime_available"].as_bool() {
+                value = Some(b);
+                break;
+            }
+            assert!(body["container_runtime_available"].is_null());
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let available = value.expect("container_runtime_available never resolved to a boolean");
+        assert_eq!(
+            available,
+            crate::container_runtime::detect_runtime().is_some()
+        );
     }
 
     #[tokio::test]
@@ -5993,6 +6116,9 @@ command = "echo"
                 scopes: None,
                 token_endpoint: None,
                 server_type_override: None,
+                isolation: None,
+                container_image: None,
+                mounts: None,
             }],
             profiles: None,
         };
@@ -6194,6 +6320,9 @@ command = "echo"
                 scopes: None,
                 token_endpoint: token_endpoint.map(|s| s.to_string()),
                 server_type_override: None,
+                isolation: None,
+                container_image: None,
+                mounts: None,
             }],
             profiles: None,
         };
@@ -6608,6 +6737,9 @@ command = "echo"
                 scopes: None,
                 token_endpoint: None,
                 server_type_override: None,
+                isolation: None,
+                container_image: None,
+                mounts: None,
             }],
             profiles: None,
         }
@@ -6788,6 +6920,9 @@ client_id = "client123"
                     scopes: None,
                     token_endpoint: None,
                     server_type_override: None,
+                    isolation: None,
+                    container_image: None,
+                    mounts: None,
                 })
                 .collect(),
             profiles: None,
@@ -7340,6 +7475,9 @@ client_id = "client123"
                 scopes: None,
                 token_endpoint: None,
                 server_type_override: None,
+                isolation: None,
+                container_image: None,
+                mounts: None,
             }],
             profiles: None,
         };
@@ -7634,6 +7772,9 @@ client_id = "client123"
                 scopes: None,
                 token_endpoint: None,
                 server_type_override: None,
+                isolation: None,
+                container_image: None,
+                mounts: None,
             });
             let toml_str = toml::to_string_pretty(&*cfg).unwrap();
             std::fs::write(&config_file, toml_str).unwrap();

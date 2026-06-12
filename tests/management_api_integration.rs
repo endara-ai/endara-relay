@@ -105,6 +105,9 @@ fn test_config() -> Config {
             scopes: None,
             token_endpoint: None,
             server_type_override: None,
+            isolation: Some("none".to_string()),
+            container_image: None,
+            mounts: None,
         }],
         profiles: None,
     }
@@ -354,6 +357,7 @@ machine_name = "test-machine"
 [[endpoints]]
 name = "echo-ep"
 transport = "stdio"
+isolation = "none"
 command = "echo"
 args = ["hello"]
 "#;
@@ -373,12 +377,14 @@ machine_name = "test-machine"
 [[endpoints]]
 name = "echo-ep"
 transport = "stdio"
+isolation = "none"
 command = "echo"
 args = ["hello"]
 
 [[endpoints]]
 name = "new-ep"
 transport = "stdio"
+isolation = "none"
 command = "cat"
 "#;
     std::fs::write(&config_file, updated_toml).unwrap();
@@ -428,12 +434,14 @@ machine_name = "test-machine"
 [[endpoints]]
 name = "echo-ep"
 transport = "stdio"
+isolation = "none"
 command = "echo"
 args = ["hello"]
 
 [[endpoints]]
 name = "other-ep"
 transport = "stdio"
+isolation = "none"
 command = "cat"
 "#;
     std::fs::write(&config_file, toml_content).unwrap();
