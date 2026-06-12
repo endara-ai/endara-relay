@@ -8,6 +8,7 @@ use crate::events::{
 use crate::jsonrpc::{self, JsonRpcResponse};
 use crate::shell_env;
 use async_trait::async_trait;
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -123,6 +124,61 @@ fn resolve_spawn_plan(config: &StdioConfig, runtime: Option<&str>) -> (String, V
             (rt.to_string(), build_container_run_args(config))
         }
         _ => (config.command.clone(), config.args.clone()),
+    }
+}
+
+/// Per-endpoint isolation outcome reported via the management API.
+///
+/// Records what the endpoint config asked for (`configured`) versus what the
+/// last spawn actually did (`actual`), making the silent
+/// configured-container → direct fallback visible. `runtime`,
+/// `container_name` and `image` are present only when the spawn actually
+/// went through a container runtime.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IsolationState {
+    /// Configured isolation mode: `"container"` or `"none"`.
+    pub configured: &'static str,
+    /// Actual spawn outcome: `"container"` or `"direct"`.
+    pub actual: &'static str,
+    /// Detected runtime CLI name (`"docker"` / `"podman"`), container only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    /// Container name (`endara-mcp-<endpoint>`), container only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+    /// OCI image the container runs, container only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+}
+
+/// Build the [`IsolationState`] matching what [`resolve_spawn_plan`] decided.
+/// `runtime_kind` is the detected runtime's CLI name (`"docker"`/`"podman"`),
+/// `None` when no runtime was found (or isolation was not requested).
+fn resolve_isolation_state(config: &StdioConfig, runtime_kind: Option<&str>) -> IsolationState {
+    let configured = match config.isolation {
+        IsolationMode::Container => "container",
+        IsolationMode::None => "none",
+    };
+    match runtime_kind {
+        Some(kind) if config.isolation == IsolationMode::Container => IsolationState {
+            configured,
+            actual: "container",
+            runtime: Some(kind.to_string()),
+            container_name: Some(container_name_for(&config.endpoint_name)),
+            image: Some(
+                config
+                    .container_image
+                    .clone()
+                    .unwrap_or_else(|| DEFAULT_CONTAINER_IMAGE.to_string()),
+            ),
+        },
+        _ => IsolationState {
+            configured,
+            actual: "direct",
+            runtime: None,
+            container_name: None,
+            image: None,
+        },
     }
 }
 
@@ -316,6 +372,10 @@ pub struct StdioAdapter {
     /// Background `stats --no-stream` poll loop for containerized spawns,
     /// aborted on shutdown / respawn.
     stats_poller_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    /// Isolation outcome of the most recent spawn, reported via
+    /// [`McpAdapter::isolation_state`]. `None` until the first spawn. Uses a
+    /// `std::sync::RwLock` so the sync accessor can read it without await.
+    isolation_state: Arc<std::sync::RwLock<Option<IsolationState>>>,
     // Background task handles
     _stderr_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     _stdout_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -349,6 +409,7 @@ impl StdioAdapter {
             container: Arc::new(Mutex::new(None)),
             container_stats: Arc::new(std::sync::RwLock::new(None)),
             stats_poller_handle: Arc::new(Mutex::new(None)),
+            isolation_state: Arc::new(std::sync::RwLock::new(None)),
             _stderr_handle: Arc::new(Mutex::new(None)),
             _stdout_handle: Arc::new(Mutex::new(None)),
         }
@@ -427,6 +488,16 @@ impl StdioAdapter {
         *self.container.lock().await = runtime
             .as_ref()
             .map(|rt| (rt.clone(), container_name_for(&self.config.endpoint_name)));
+
+        // Record what this spawn actually did (container vs direct, including
+        // the configured-container → direct fallback) for the management API.
+        let runtime_kind = runtime
+            .as_ref()
+            .and_then(|_| crate::container_runtime::detect_runtime())
+            .map(|info| info.kind.cli_name());
+        if let Ok(mut state) = self.isolation_state.write() {
+            *state = Some(resolve_isolation_state(&self.config, runtime_kind));
+        }
 
         // (Re)start the stats poller for containerized spawns. Clear any
         // previous sample first so a respawn never serves stale stats.
@@ -859,6 +930,10 @@ impl McpAdapter for StdioAdapter {
         self.container_stats.read().ok().and_then(|g| (*g).clone())
     }
 
+    fn isolation_state(&self) -> Option<IsolationState> {
+        self.isolation_state.read().ok().and_then(|g| (*g).clone())
+    }
+
     fn server_type(&self) -> Option<String> {
         self.server_type.try_read().ok().and_then(|g| g.clone())
     }
@@ -1257,6 +1332,106 @@ mod tests {
         let (program, argv) = resolve_spawn_plan(&config, Some("/usr/local/bin/docker"));
         assert_eq!(program, "npx");
         assert_eq!(argv, vec!["server".to_string()]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Isolation-state reporting (configured vs actual spawn outcome)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_isolation_state_container_with_runtime_reports_full_state() {
+        let config = StdioConfig {
+            command: "npx".to_string(),
+            args: vec!["server".to_string()],
+            endpoint_name: "github".to_string(),
+            isolation: IsolationMode::Container,
+            container_image: None,
+            ..Default::default()
+        };
+        let state = resolve_isolation_state(&config, Some("docker"));
+        assert_eq!(state.configured, "container");
+        assert_eq!(state.actual, "container");
+        assert_eq!(state.runtime, Some("docker".to_string()));
+        assert_eq!(state.container_name, Some("endara-mcp-github".to_string()));
+        assert_eq!(state.image, Some(DEFAULT_CONTAINER_IMAGE.to_string()));
+    }
+
+    #[test]
+    fn test_isolation_state_container_reports_custom_image() {
+        let config = StdioConfig {
+            command: "uvx".to_string(),
+            endpoint_name: "fetch".to_string(),
+            isolation: IsolationMode::Container,
+            container_image: Some("example.com/custom:1".to_string()),
+            ..Default::default()
+        };
+        let state = resolve_isolation_state(&config, Some("podman"));
+        assert_eq!(state.actual, "container");
+        assert_eq!(state.runtime, Some("podman".to_string()));
+        assert_eq!(state.image, Some("example.com/custom:1".to_string()));
+    }
+
+    #[test]
+    fn test_isolation_state_direct_configured_reports_direct() {
+        // isolation = none reports configured=none/actual=direct, with no
+        // container details — even when a runtime happens to be available.
+        let config = StdioConfig {
+            command: "npx".to_string(),
+            endpoint_name: "ep".to_string(),
+            isolation: IsolationMode::None,
+            ..Default::default()
+        };
+        let state = resolve_isolation_state(&config, None);
+        assert_eq!(state.configured, "none");
+        assert_eq!(state.actual, "direct");
+        assert_eq!(state.runtime, None);
+        assert_eq!(state.container_name, None);
+        assert_eq!(state.image, None);
+    }
+
+    #[test]
+    fn test_isolation_state_fallback_reports_configured_container_actual_direct() {
+        // Configured container but no runtime detected: the silent fallback
+        // to direct spawn must be visible as configured=container/actual=direct.
+        let config = StdioConfig {
+            command: "npx".to_string(),
+            endpoint_name: "ep".to_string(),
+            isolation: IsolationMode::Container,
+            ..Default::default()
+        };
+        let state = resolve_isolation_state(&config, None);
+        assert_eq!(state.configured, "container");
+        assert_eq!(state.actual, "direct");
+        assert_eq!(state.runtime, None);
+        assert_eq!(state.container_name, None);
+        assert_eq!(state.image, None);
+    }
+
+    #[test]
+    fn test_isolation_state_serialization_omits_absent_container_fields() {
+        let config = StdioConfig {
+            command: "npx".to_string(),
+            endpoint_name: "ep".to_string(),
+            isolation: IsolationMode::Container,
+            ..Default::default()
+        };
+        let fallback = serde_json::to_value(resolve_isolation_state(&config, None)).unwrap();
+        assert_eq!(
+            fallback,
+            json!({ "configured": "container", "actual": "direct" })
+        );
+        let containerized =
+            serde_json::to_value(resolve_isolation_state(&config, Some("docker"))).unwrap();
+        assert_eq!(
+            containerized,
+            json!({
+                "configured": "container",
+                "actual": "container",
+                "runtime": "docker",
+                "container_name": "endara-mcp-ep",
+                "image": DEFAULT_CONTAINER_IMAGE,
+            })
+        );
     }
 
     /// Simulate the stdout reader dispatch logic for a single line.

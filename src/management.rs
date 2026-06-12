@@ -153,6 +153,10 @@ pub struct EndpointInfo {
     /// Omitted for direct-spawn endpoints and when no sample is available.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_stats: Option<crate::container_stats::ContainerStats>,
+    /// Isolation outcome (configured vs actual) of the last spawn for stdio
+    /// endpoints. Omitted for non-stdio transports and before the first spawn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub isolation_state: Option<crate::adapter::stdio::IsolationState>,
 }
 
 #[derive(Serialize)]
@@ -313,6 +317,7 @@ async fn get_endpoints(State(state): State<ManagementState>) -> Json<Vec<Endpoin
             tool_prefix: entry.tool_prefix.clone(),
             lifecycle,
             container_stats: entry.adapter.container_stats(),
+            isolation_state: entry.adapter.isolation_state(),
         });
     }
     endpoints.sort_by(|a, b| a.name.cmp(&b.name));
