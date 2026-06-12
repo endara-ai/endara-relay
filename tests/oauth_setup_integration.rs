@@ -47,6 +47,9 @@ fn empty_config() -> Config {
             scopes: None,
             token_endpoint: None,
             server_type_override: None,
+            isolation: None,
+            container_image: None,
+            mounts: None,
         }],
         profiles: None,
     }

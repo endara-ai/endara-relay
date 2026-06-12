@@ -267,6 +267,21 @@ pub struct EndpointConfig {
     /// Tool-name routing (the `tool_prefix`) is unaffected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_type_override: Option<String>,
+    /// Process isolation mode for stdio endpoints: `"container"` or `"none"`.
+    /// Omitted means `"none"` (direct spawn), so pre-existing configs keep
+    /// working unchanged on upgrade; the desktop writes an explicit
+    /// `isolation = "container"` for newly created endpoints.
+    /// Ignored for non-stdio transports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<String>,
+    /// OCI image used when `isolation = "container"`. Defaults to
+    /// `ghcr.io/endara-ai/mcp-runner:latest` when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_image: Option<String>,
+    /// Host bind mounts (`"/host/path:/container/path"`) applied when
+    /// `isolation = "container"`. Default: no host filesystem access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mounts: Option<Vec<String>>,
 }
 
 impl EndpointConfig {
@@ -287,6 +302,8 @@ impl EndpointConfig {
 /// `diff_configs` treats an endpoint as "unchanged" when only these fields differ.
 /// Note: `headers` IS included — changing headers should trigger adapter restart.
 /// OAuth fields are included — changing OAuth config should trigger adapter restart.
+/// Isolation fields (`isolation`, `container_image`, `mounts`) are included —
+/// changing them should trigger adapter restart.
 impl PartialEq for EndpointConfig {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
@@ -302,6 +319,9 @@ impl PartialEq for EndpointConfig {
             && self.client_secret == other.client_secret
             && self.scopes == other.scopes
             && self.server_type_override == other.server_type_override
+            && self.isolation == other.isolation
+            && self.container_image == other.container_image
+            && self.mounts == other.mounts
     }
 }
 
@@ -810,6 +830,20 @@ fn validate_graceful(config: &Config, warnings: &mut Vec<EndpointValidationWarni
                             message: "oauth transport requires a 'url' field".to_string(),
                         });
                     }
+                }
+            }
+
+            // Validate the isolation mode (relevant for stdio, but any invalid
+            // value is worth flagging regardless of transport).
+            if let Some(ref iso) = ep.isolation {
+                if iso != "container" && iso != "none" {
+                    warnings.push(EndpointValidationWarning {
+                        endpoint_name: ep.name.clone(),
+                        message: format!(
+                            "invalid isolation value '{}' — expected \"container\" or \"none\"",
+                            iso
+                        ),
+                    });
                 }
             }
         }
@@ -1652,6 +1686,9 @@ js_execution = false
             scopes: None,
             token_endpoint: None,
             server_type_override: None,
+            isolation: None,
+            container_image: None,
+            mounts: None,
         }
     }
 
@@ -1674,6 +1711,9 @@ js_execution = false
             scopes: None,
             token_endpoint: None,
             server_type_override: None,
+            isolation: None,
+            container_image: None,
+            mounts: None,
         }
     }
 
@@ -2114,6 +2154,9 @@ scopes = ["openid", "profile", "email"]
             scopes: None,
             token_endpoint: None,
             server_type_override: None,
+            isolation: None,
+            container_image: None,
+            mounts: None,
         };
 
         let mut ep2 = ep1.clone();
@@ -2196,5 +2239,122 @@ command = "echo"
         let new = make_config(vec![ep2]);
         let diff = diff_configs(&old, &new);
         assert_eq!(diff.changed.len(), 1);
+    }
+
+    // --- Isolation / container field tests ---
+
+    #[test]
+    fn isolation_fields_parse_from_toml() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "boxed"
+transport = "stdio"
+command = "npx"
+isolation = "container"
+container_image = "example.com/custom:1"
+mounts = ["/host/a:/ctr/a"]
+"#;
+        let (config, warnings) = parse_and_validate_graceful(toml_str).unwrap();
+        assert!(warnings.is_empty(), "unexpected warnings: {:?}", warnings);
+        let ep = &config.endpoints[0];
+        assert_eq!(ep.isolation.as_deref(), Some("container"));
+        assert_eq!(ep.container_image.as_deref(), Some("example.com/custom:1"));
+        assert_eq!(ep.mounts, Some(vec!["/host/a:/ctr/a".to_string()]));
+    }
+
+    #[test]
+    fn graceful_invalid_isolation_value_returns_warning() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "boxed"
+transport = "stdio"
+command = "echo"
+isolation = "bogus"
+"#;
+        let (config, warnings) = parse_and_validate_graceful(toml_str).unwrap();
+        assert_eq!(config.endpoints.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].message.contains("invalid isolation value"));
+    }
+
+    #[test]
+    fn graceful_valid_isolation_values_no_warning() {
+        for value in ["container", "none"] {
+            let toml_str = format!(
+                r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "boxed"
+transport = "stdio"
+command = "echo"
+isolation = "{}"
+"#,
+                value
+            );
+            let (_, warnings) = parse_and_validate_graceful(&toml_str).unwrap();
+            assert!(
+                warnings.is_empty(),
+                "unexpected warnings for '{}': {:?}",
+                value,
+                warnings
+            );
+        }
+    }
+
+    #[test]
+    fn isolation_change_triggers_config_diff() {
+        let mut ep1 = stdio_ep("boxed", "npx");
+        ep1.isolation = Some("container".to_string());
+        let mut ep2 = stdio_ep("boxed", "npx");
+        ep2.isolation = Some("none".to_string());
+
+        let old = make_config(vec![ep1]);
+        let new = make_config(vec![ep2]);
+        let diff = diff_configs(&old, &new);
+        assert_eq!(
+            diff.changed.len(),
+            1,
+            "isolation change should trigger diff"
+        );
+        assert!(diff.unchanged.is_empty());
+    }
+
+    #[test]
+    fn container_image_change_triggers_config_diff() {
+        let mut ep1 = stdio_ep("boxed", "npx");
+        ep1.container_image = Some("example.com/a:1".to_string());
+        let mut ep2 = stdio_ep("boxed", "npx");
+        ep2.container_image = Some("example.com/b:2".to_string());
+
+        let old = make_config(vec![ep1]);
+        let new = make_config(vec![ep2]);
+        let diff = diff_configs(&old, &new);
+        assert_eq!(
+            diff.changed.len(),
+            1,
+            "container_image change should trigger diff"
+        );
+        assert!(diff.unchanged.is_empty());
+    }
+
+    #[test]
+    fn mounts_change_triggers_config_diff() {
+        let ep1 = stdio_ep("boxed", "npx");
+        let mut ep2 = stdio_ep("boxed", "npx");
+        ep2.mounts = Some(vec!["/host:/ctr".to_string()]);
+
+        let old = make_config(vec![ep1]);
+        let new = make_config(vec![ep2]);
+        let diff = diff_configs(&old, &new);
+        assert_eq!(diff.changed.len(), 1, "mounts change should trigger diff");
+        assert!(diff.unchanged.is_empty());
     }
 }

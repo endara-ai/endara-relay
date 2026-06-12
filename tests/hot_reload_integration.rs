@@ -36,6 +36,7 @@ async fn test_config_diff_add_endpoint() {
         env: HashMap::new(),
         server_type_override: None,
         endpoint_name: "echo-ep".into(),
+        ..Default::default()
     };
     let mut echo_adapter = StdioAdapter::new(echo_config);
     echo_adapter.initialize().await.expect("echo init failed");
@@ -82,6 +83,9 @@ async fn test_config_diff_add_endpoint() {
             scopes: None,
             token_endpoint: None,
             server_type_override: None,
+            isolation: Some("none".to_string()),
+            container_image: None,
+            mounts: None,
         }],
         profiles: None,
     };
@@ -115,6 +119,9 @@ async fn test_config_diff_add_endpoint() {
                 scopes: None,
                 token_endpoint: None,
                 server_type_override: None,
+                isolation: Some("none".to_string()),
+                container_image: None,
+                mounts: None,
             },
             config::EndpointConfig {
                 name: "multi-ep".to_string(),
@@ -134,6 +141,9 @@ async fn test_config_diff_add_endpoint() {
                 scopes: None,
                 token_endpoint: None,
                 server_type_override: None,
+                isolation: Some("none".to_string()),
+                container_image: None,
+                mounts: None,
             },
         ],
         profiles: None,
@@ -182,6 +192,7 @@ async fn test_config_diff_remove_endpoint() {
         env: HashMap::new(),
         server_type_override: None,
         endpoint_name: "echo-ep".into(),
+        ..Default::default()
     };
     let mut echo_adapter = StdioAdapter::new(echo_config);
     echo_adapter.initialize().await.expect("echo init failed");
@@ -201,6 +212,7 @@ async fn test_config_diff_remove_endpoint() {
         env: HashMap::new(),
         server_type_override: None,
         endpoint_name: "multi-ep".into(),
+        ..Default::default()
     };
     let mut multi_adapter = StdioAdapter::new(multi_config);
     multi_adapter.initialize().await.expect("multi init failed");
@@ -247,6 +259,9 @@ async fn test_config_diff_remove_endpoint() {
                 scopes: None,
                 token_endpoint: None,
                 server_type_override: None,
+                isolation: Some("none".to_string()),
+                container_image: None,
+                mounts: None,
             },
             config::EndpointConfig {
                 name: "multi-ep".to_string(),
@@ -266,6 +281,9 @@ async fn test_config_diff_remove_endpoint() {
                 scopes: None,
                 token_endpoint: None,
                 server_type_override: None,
+                isolation: Some("none".to_string()),
+                container_image: None,
+                mounts: None,
             },
         ],
         profiles: None,
@@ -299,6 +317,9 @@ async fn test_config_diff_remove_endpoint() {
             scopes: None,
             token_endpoint: None,
             server_type_override: None,
+            isolation: Some("none".to_string()),
+            container_image: None,
+            mounts: None,
         }],
         profiles: None,
     };

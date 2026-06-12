@@ -30,6 +30,7 @@ async fn setup_server() -> (SocketAddr, AdapterRegistry, tokio::task::JoinHandle
         env: HashMap::new(),
         server_type_override: None,
         endpoint_name: "mcp-server-test".into(),
+        ..Default::default()
     };
     let mut adapter = StdioAdapter::new(config);
     adapter.initialize().await.expect("adapter init failed");

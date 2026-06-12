@@ -183,6 +183,26 @@ pub trait McpAdapter: Send + Sync {
         None
     }
 
+    /// Latest container resource stats for the endpoint.
+    ///
+    /// The default implementation returns `None` (direct-spawn endpoints and
+    /// transports that never run containers). The STDIO adapter overrides
+    /// this with the most recent sample from its background stats poller
+    /// when the endpoint runs inside a container.
+    fn container_stats(&self) -> Option<crate::container_stats::ContainerStats> {
+        None
+    }
+
+    /// Isolation outcome (configured vs actual) of the endpoint's last spawn.
+    ///
+    /// The default implementation returns `None` (transports that never spawn
+    /// processes). The STDIO adapter overrides this with the outcome recorded
+    /// at spawn time, including the configured-container → direct-spawn
+    /// fallback when no container runtime is available.
+    fn isolation_state(&self) -> Option<crate::adapter::stdio::IsolationState> {
+        None
+    }
+
     /// Wire a shared [`crate::events::ToolCallEventBus`] into the adapter so
     /// `call_tool` can publish typed `started` / `completed` / `failed`
     /// events for the desktop overlay's SSE stream.

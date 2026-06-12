@@ -19,6 +19,7 @@ async fn test_stdio_full_lifecycle() {
         env: HashMap::new(),
         server_type_override: None,
         endpoint_name: "stdio-test".into(),
+        ..Default::default()
     };
 
     let mut adapter = StdioAdapter::new(config);
@@ -62,6 +63,7 @@ async fn test_stdio_spawn_nonexistent_command() {
         env: HashMap::new(),
         server_type_override: None,
         endpoint_name: "stdio-nonexistent".into(),
+        ..Default::default()
     };
 
     let mut adapter = StdioAdapter::new(config);

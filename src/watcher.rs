@@ -1,7 +1,7 @@
 use crate::adapter::http::{HttpAdapter, HttpConfig};
 use crate::adapter::oauth::{OAuthAdapter, OAuthAdapterConfig};
 use crate::adapter::sse::{SseAdapter, SseConfig};
-use crate::adapter::stdio::{StdioAdapter, StdioConfig};
+use crate::adapter::stdio::{IsolationMode, StdioAdapter, StdioConfig};
 use crate::adapter::{FailedAdapter, McpAdapter, StartingAdapter};
 use crate::config::{self, Config, ConfigDiff, EndpointConfig, Transport};
 use crate::events::ToolCallEventBus;
@@ -720,6 +720,9 @@ pub(crate) async fn create_adapter(
                 env: ep.env.clone().unwrap_or_default(),
                 server_type_override: ep.server_type_override.clone(),
                 endpoint_name: ep.name.clone(),
+                isolation: IsolationMode::from_config_value(ep.isolation.as_deref()),
+                container_image: ep.container_image.clone(),
+                mounts: ep.mounts.clone().unwrap_or_default(),
             };
             let mut adapter = StdioAdapter::new(stdio_config);
             if let Some(bus) = event_bus {
@@ -934,6 +937,9 @@ mod tests {
             scopes: None,
             token_endpoint: None,
             server_type_override: None,
+            isolation: Some("none".to_string()),
+            container_image: None,
+            mounts: None,
         }
     }
 
@@ -1051,6 +1057,9 @@ mod tests {
             scopes: None,
             token_endpoint: None,
             server_type_override: None,
+            isolation: Some("none".to_string()),
+            container_image: None,
+            mounts: None,
         };
         let diff = ConfigDiff {
             changed: vec![("ep".to_string(), changed_ep)],
@@ -1086,6 +1095,9 @@ mod tests {
             scopes: None,
             token_endpoint: None,
             server_type_override: None,
+            isolation: Some("none".to_string()),
+            container_image: None,
+            mounts: None,
         };
         let diff = ConfigDiff {
             added: vec![new_ep],
@@ -1179,6 +1191,9 @@ mod tests {
             scopes: None,
             token_endpoint: None,
             server_type_override: None,
+            isolation: None,
+            container_image: None,
+            mounts: None,
         };
         let diff = ConfigDiff {
             added: vec![new_ep],
@@ -1248,6 +1263,9 @@ mod tests {
             scopes: None,
             token_endpoint: None,
             server_type_override: None,
+            isolation: None,
+            container_image: None,
+            mounts: None,
         };
         let diff = ConfigDiff {
             added: vec![new_ep],
@@ -1446,6 +1464,9 @@ mod tests {
             scopes: None,
             token_endpoint: None,
             server_type_override: None,
+            isolation: None,
+            container_image: None,
+            mounts: None,
         };
         let diff = ConfigDiff {
             added: vec![new_ep],
@@ -1602,6 +1623,9 @@ mod tests {
             scopes: None,
             token_endpoint: None,
             server_type_override: None,
+            isolation: None,
+            container_image: None,
+            mounts: None,
         }
     }
 
@@ -1725,6 +1749,9 @@ mod tests {
             scopes: None,
             token_endpoint: token_endpoint.map(|s| s.to_string()),
             server_type_override: None,
+            isolation: None,
+            container_image: None,
+            mounts: None,
         }
     }
 
@@ -1868,6 +1895,7 @@ machine_name = "test"
 [[endpoints]]
 name = "ep1"
 transport = "stdio"
+isolation = "none"
 command = "/bin/true"
 "#;
 
@@ -1878,6 +1906,7 @@ machine_name = "test"
 [[endpoints]]
 name = "ep1"
 transport = "stdio"
+isolation = "none"
 command = "/bin/true"
 
 [[profiles]]
@@ -1988,6 +2017,7 @@ machine_name = "test"
 [[endpoints]]
 name = "ep1"
 transport = "stdio"
+isolation = "none"
 command = "/bin/true"
 
 [[profiles]]
@@ -2069,11 +2099,13 @@ machine_name = "test"
 [[endpoints]]
 name = "keep"
 transport = "stdio"
+isolation = "none"
 command = "/bin/true"
 
 [[endpoints]]
 name = "remove_me"
 transport = "stdio"
+isolation = "none"
 command = "/bin/true"
 "#;
 
@@ -2085,11 +2117,13 @@ machine_name = "test"
 [[endpoints]]
 name = "keep"
 transport = "stdio"
+isolation = "none"
 command = "/bin/true"
 
 [[endpoints]]
 name = "add_me"
 transport = "stdio"
+isolation = "none"
 command = "/bin/true"
 "#;
 
@@ -2269,6 +2303,7 @@ machine_name = "test"
 [[endpoints]]
 name = "newserver"
 transport = "stdio"
+isolation = "none"
 command = "/bin/true"
 "#;
 

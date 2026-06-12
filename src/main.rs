@@ -9,6 +9,8 @@ mod watcher;
 
 mod adapter;
 mod advertise;
+mod container_runtime;
+mod container_stats;
 mod jsonrpc;
 mod prefix;
 mod profile_registry;
