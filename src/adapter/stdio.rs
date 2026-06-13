@@ -24,6 +24,11 @@ use tracing::{debug, error, info, warn, Instrument};
 /// does not specify a `container_image`.
 pub const DEFAULT_CONTAINER_IMAGE: &str = "ghcr.io/endara-ai/mcp-runner:latest";
 
+/// Number of recent child stderr lines appended to a crash error message so
+/// the UI surfaces the server's actual failure reason (e.g. a missing config
+/// file) instead of only "stdout channel closed".
+const CRASH_STDERR_TAIL_LINES: usize = 5;
+
 /// Process isolation mode for a stdio endpoint.
 ///
 /// `Container` spawns the server through a detected container runtime
@@ -606,6 +611,40 @@ impl StdioAdapter {
         Ok(())
     }
 
+    /// Wait briefly for the stderr reader task to drain to EOF (the child has
+    /// exited, so its stderr pipe is closed and the reader will finish), then
+    /// return the last [`CRASH_STDERR_TAIL_LINES`] captured stderr lines.
+    ///
+    /// Awaiting the reader closes the race where the child exits and the
+    /// stdout side reports the crash before the final stderr lines — which
+    /// usually carry the real failure reason — have been pushed into the
+    /// buffer. The wait is bounded so a still-open stderr pipe can't stall the
+    /// caller on a non-fatal write error.
+    async fn crash_stderr_tail(&self) -> Vec<String> {
+        if let Some(handle) = self._stderr_handle.lock().await.take() {
+            let _ = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        }
+        let buf = self.stderr_buffer.read().await;
+        let lines = buf.lines();
+        let start = lines.len().saturating_sub(CRASH_STDERR_TAIL_LINES);
+        lines[start..].iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Build an [`AdapterError::ProcessCrashed`] message, appending the child's
+    /// recent stderr (the actual failure reason) when any was captured. Falls
+    /// back to `base` alone when no stderr is available.
+    fn crashed_error(base: &str, stderr_tail: &[String]) -> AdapterError {
+        if stderr_tail.is_empty() {
+            AdapterError::ProcessCrashed(base.to_string())
+        } else {
+            AdapterError::ProcessCrashed(format!(
+                "{}\nrecent stderr:\n{}",
+                base,
+                stderr_tail.join("\n")
+            ))
+        }
+    }
+
     /// Send a JSON-RPC request and wait for the response.
     async fn send_request(
         &self,
@@ -637,17 +676,19 @@ impl StdioAdapter {
             })?;
             if let Err(e) = writer.write_all(line.as_bytes()).await {
                 self.pending_requests.lock().await.remove(&id);
-                return Err(AdapterError::ProcessCrashed(format!(
-                    "stdin write failed: {}",
-                    e
-                )));
+                let tail = self.crash_stderr_tail().await;
+                return Err(Self::crashed_error(
+                    &format!("stdin write failed: {}", e),
+                    &tail,
+                ));
             }
             if let Err(e) = writer.flush().await {
                 self.pending_requests.lock().await.remove(&id);
-                return Err(AdapterError::ProcessCrashed(format!(
-                    "stdin flush failed: {}",
-                    e
-                )));
+                let tail = self.crash_stderr_tail().await;
+                return Err(Self::crashed_error(
+                    &format!("stdin flush failed: {}", e),
+                    &tail,
+                ));
             }
         }
 
@@ -655,9 +696,11 @@ impl StdioAdapter {
         let response_line = match tokio::time::timeout(Duration::from_secs(30), rx).await {
             Ok(Ok(line)) => line,
             Ok(Err(_)) => {
-                // Sender was dropped (stdout reader shut down)
+                // Sender was dropped (stdout reader shut down) — the child has
+                // exited, so surface its recent stderr as the likely cause.
                 self.pending_requests.lock().await.remove(&id);
-                return Err(AdapterError::ProcessCrashed("stdout channel closed".into()));
+                let tail = self.crash_stderr_tail().await;
+                return Err(Self::crashed_error("stdout channel closed", &tail));
             }
             Err(_) => {
                 // Timeout — clean up the pending entry
@@ -700,16 +743,18 @@ impl StdioAdapter {
         let mut writer_guard = self.stdin_writer.lock().await;
         let writer = writer_guard.as_mut().ok_or(AdapterError::NotInitialized)?;
         if let Err(e) = writer.write_all(line.as_bytes()).await {
-            return Err(AdapterError::ProcessCrashed(format!(
-                "stdin write failed: {}",
-                e
-            )));
+            let tail = self.crash_stderr_tail().await;
+            return Err(Self::crashed_error(
+                &format!("stdin write failed: {}", e),
+                &tail,
+            ));
         }
         if let Err(e) = writer.flush().await {
-            return Err(AdapterError::ProcessCrashed(format!(
-                "stdin flush failed: {}",
-                e
-            )));
+            let tail = self.crash_stderr_tail().await;
+            return Err(Self::crashed_error(
+                &format!("stdin flush failed: {}", e),
+                &tail,
+            ));
         }
         Ok(())
     }
@@ -970,12 +1015,15 @@ impl McpAdapter for StdioAdapter {
     }
 
     async fn stderr_lines(&self) -> Vec<String> {
+        // Tag each line with a WARN level and a `[stderr]` marker so the
+        // desktop log parser renders captured child stderr as a distinct pill,
+        // set apart from the relay's own tracing lines in the Logs tab.
         self.stderr_buffer
             .read()
             .await
             .lines()
             .iter()
-            .map(|s| s.to_string())
+            .map(|s| format!("WARN [stderr] {}", s))
             .collect()
     }
 
@@ -1659,6 +1707,95 @@ for line in sys.stdin:
             Err(_) => {}                            // our 2s timeout
             other => panic!("unexpected result: {:?}", other),
         }
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stdio_crash_error_includes_stderr_tail() {
+        // A child that prints a diagnostic to stderr and exits without ever
+        // responding on stdout. The crash error must surface that stderr line
+        // (the real root cause) instead of just "stdout channel closed".
+        let mut adapter = StdioAdapter::new(StdioConfig {
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "echo 'Error: OAuth keys file not found' >&2; exit 1".to_string(),
+            ],
+            env: HashMap::new(),
+            ..Default::default()
+        });
+        adapter.spawn_process().await.unwrap();
+
+        // Either the stdin write fails (child already gone) or the response
+        // channel closes — both paths now enrich the error with stderr.
+        let result = adapter.send_request("initialize", None).await;
+        match result {
+            Err(AdapterError::ProcessCrashed(msg)) => {
+                assert!(
+                    msg.contains("OAuth keys file not found"),
+                    "crash error should include child stderr, got: {msg}"
+                );
+                assert!(
+                    msg.contains("recent stderr:"),
+                    "crash error should label the stderr tail, got: {msg}"
+                );
+            }
+            other => panic!("expected ProcessCrashed with stderr, got: {other:?}"),
+        }
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stdio_crash_error_falls_back_without_stderr() {
+        // A child that exits abnormally but writes nothing to stderr must keep
+        // the bare crash message (no dangling "recent stderr:" section).
+        let mut adapter = StdioAdapter::new(StdioConfig {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "exit 1".to_string()],
+            env: HashMap::new(),
+            ..Default::default()
+        });
+        adapter.spawn_process().await.unwrap();
+
+        let result = adapter.send_request("initialize", None).await;
+        match result {
+            Err(AdapterError::ProcessCrashed(msg)) => {
+                assert!(
+                    !msg.contains("recent stderr:"),
+                    "no captured stderr should fall back to the bare message, got: {msg}"
+                );
+            }
+            other => panic!("expected ProcessCrashed, got: {other:?}"),
+        }
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stdio_stderr_lines_tagged_for_logs() {
+        // Captured stderr surfaced to the Logs tab must be tagged distinctly so
+        // the desktop parser renders it apart from the relay's own logs.
+        let mut adapter = StdioAdapter::new(StdioConfig {
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "echo 'hello from stderr' >&2; sleep 0.2".to_string(),
+            ],
+            env: HashMap::new(),
+            ..Default::default()
+        });
+        adapter.spawn_process().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let lines = adapter.stderr_lines().await;
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("WARN [stderr] ") && l.contains("hello from stderr")),
+            "stderr lines should be tagged for the UI, got: {lines:?}"
+        );
 
         adapter.shutdown().await.unwrap();
     }
