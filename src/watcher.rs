@@ -293,7 +293,7 @@ pub async fn apply_diff(
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
         let bus = event_bus.cloned();
-        let init_span = tracing::info_span!("endpoint", endpoint = %name_clone);
+        let init_span = tracing::info_span!("endpoint_init", endpoint = %name_clone);
         tokio::spawn(
             async move {
                 let adapter =
@@ -308,7 +308,7 @@ pub async fn apply_diff(
                 drop(entries);
                 reg.rewire_tools_changed_listener(&name_clone).await;
                 reg.invalidate_endpoint_tool_cache(&name_clone).await;
-                info!("Changed endpoint initialized");
+                info!(endpoint = %name_clone, "Changed endpoint initialized");
             }
             .instrument(init_span),
         );
@@ -344,7 +344,7 @@ pub async fn apply_diff(
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
         let bus = event_bus.cloned();
-        let init_span = tracing::info_span!("endpoint", endpoint = %ep_clone.name);
+        let init_span = tracing::info_span!("endpoint_init", endpoint = %ep_clone.name);
         tokio::spawn(
             async move {
                 let adapter =
@@ -359,7 +359,7 @@ pub async fn apply_diff(
                 drop(entries);
                 reg.rewire_tools_changed_listener(&ep_clone.name).await;
                 reg.invalidate_endpoint_tool_cache(&ep_clone.name).await;
-                info!("New endpoint initialized");
+                info!(endpoint = %ep_clone.name, "New endpoint initialized");
             }
             .instrument(init_span),
         );
@@ -486,7 +486,7 @@ pub async fn apply_diff_graceful(
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
         let bus = event_bus.cloned();
-        let init_span = tracing::info_span!("endpoint", endpoint = %name_clone);
+        let init_span = tracing::info_span!("endpoint_init", endpoint = %name_clone);
         tokio::spawn(
             async move {
                 let adapter =
@@ -501,7 +501,7 @@ pub async fn apply_diff_graceful(
                 drop(entries);
                 reg.rewire_tools_changed_listener(&name_clone).await;
                 reg.invalidate_endpoint_tool_cache(&name_clone).await;
-                info!("Changed endpoint initialized");
+                info!(endpoint = %name_clone, "Changed endpoint initialized");
             }
             .instrument(init_span),
         );
@@ -564,7 +564,7 @@ pub async fn apply_diff_graceful(
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
         let bus = event_bus.cloned();
-        let init_span = tracing::info_span!("endpoint", endpoint = %ep_clone.name);
+        let init_span = tracing::info_span!("endpoint_init", endpoint = %ep_clone.name);
         tokio::spawn(
             async move {
                 let adapter =
@@ -579,7 +579,7 @@ pub async fn apply_diff_graceful(
                 drop(entries);
                 reg.rewire_tools_changed_listener(&ep_clone.name).await;
                 reg.invalidate_endpoint_tool_cache(&ep_clone.name).await;
-                info!("New endpoint initialized");
+                info!(endpoint = %ep_clone.name, "New endpoint initialized");
             }
             .instrument(init_span),
         );
