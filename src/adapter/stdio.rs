@@ -24,6 +24,13 @@ use tracing::{debug, error, info, warn, Instrument};
 /// does not specify a `container_image`.
 pub const DEFAULT_CONTAINER_IMAGE: &str = "ghcr.io/endara-ai/mcp-runner:latest";
 
+/// Short, user-facing message recorded on an [`AdapterError::ProcessCrashed`]
+/// when a stdio child fails to start or exits unexpectedly. The child's actual
+/// failure output is surfaced as individual `[stderr]` rows in the endpoint's
+/// Logs tab (see the stderr reader and [`StdioAdapter::stderr_lines`]), so the
+/// crash banner stays a single readable sentence instead of a stderr dump.
+const CRASH_USER_MESSAGE: &str = "Server failed to start. See Logs tab for details.";
+
 /// Process isolation mode for a stdio endpoint.
 ///
 /// `Container` spawns the server through a detected container runtime
@@ -586,16 +593,27 @@ impl StdioAdapter {
             }
         });
 
-        // Set up stderr ring buffer reader
+        // Set up the stderr reader. Each line is BOTH pushed into the ring
+        // buffer (the Logs-tab historical seed served by `stderr_lines`) AND
+        // emitted as a WARN tracing event inside the endpoint span, so it
+        // streams live into the desktop Logs tab as its own `[stderr]` row,
+        // interleaved with the relay's own tracing lines right where the user
+        // looks for the failure reason. Instrumenting with the endpoint span is
+        // what tags the line with `endpoint=NAME` so it survives the
+        // StdioAdapter → FailedAdapter swap on an init crash.
         let stderr_buf = self.stderr_buffer.clone();
-        let stderr_handle = tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                debug!(stderr_line = %line, "MCP server stderr");
-                stderr_buf.write().await.push(line);
+        let stderr_span = self.span.clone();
+        let stderr_handle = tokio::spawn(
+            async move {
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    warn!("[stderr] {}", line);
+                    stderr_buf.write().await.push(line);
+                }
             }
-        });
+            .instrument(stderr_span),
+        );
 
         *self.child.lock().await = Some(child);
         *self.stdin_writer.lock().await = Some(stdin);
@@ -604,6 +622,28 @@ impl StdioAdapter {
 
         info!(command = %self.config.command, "MCP server process spawned");
         Ok(())
+    }
+
+    /// Wait briefly for the stderr reader task to drain to EOF (the child has
+    /// exited, so its stderr pipe is closed and the reader will finish).
+    ///
+    /// Awaiting the reader closes the race where the child exits and the stdout
+    /// side reports the crash before the final stderr lines — which usually
+    /// carry the real failure reason — have been emitted into the Logs tab and
+    /// pushed into the ring buffer. The wait is bounded so a still-open stderr
+    /// pipe can't stall the caller on a non-fatal write error.
+    async fn await_stderr_flush(&self) {
+        if let Some(handle) = self._stderr_handle.lock().await.take() {
+            let _ = tokio::time::timeout(Duration::from_millis(500), handle).await;
+        }
+    }
+
+    /// Build an [`AdapterError::ProcessCrashed`] carrying the short, user-facing
+    /// [`CRASH_USER_MESSAGE`]. The child's actual stderr is surfaced as
+    /// individual `[stderr]` rows in the endpoint's Logs tab, so the crash
+    /// banner stays one readable sentence instead of a multi-line stderr dump.
+    fn crashed_error() -> AdapterError {
+        AdapterError::ProcessCrashed(CRASH_USER_MESSAGE.to_string())
     }
 
     /// Send a JSON-RPC request and wait for the response.
@@ -637,17 +677,15 @@ impl StdioAdapter {
             })?;
             if let Err(e) = writer.write_all(line.as_bytes()).await {
                 self.pending_requests.lock().await.remove(&id);
-                return Err(AdapterError::ProcessCrashed(format!(
-                    "stdin write failed: {}",
-                    e
-                )));
+                debug!(error = %e, "stdin write failed");
+                self.await_stderr_flush().await;
+                return Err(Self::crashed_error());
             }
             if let Err(e) = writer.flush().await {
                 self.pending_requests.lock().await.remove(&id);
-                return Err(AdapterError::ProcessCrashed(format!(
-                    "stdin flush failed: {}",
-                    e
-                )));
+                debug!(error = %e, "stdin flush failed");
+                self.await_stderr_flush().await;
+                return Err(Self::crashed_error());
             }
         }
 
@@ -655,9 +693,14 @@ impl StdioAdapter {
         let response_line = match tokio::time::timeout(Duration::from_secs(30), rx).await {
             Ok(Ok(line)) => line,
             Ok(Err(_)) => {
-                // Sender was dropped (stdout reader shut down)
+                // Sender was dropped (stdout reader shut down) — the child has
+                // exited. Its recent stderr (the likely cause) flows into the
+                // endpoint's Logs tab; wait for that to drain, then surface the
+                // short crash banner.
                 self.pending_requests.lock().await.remove(&id);
-                return Err(AdapterError::ProcessCrashed("stdout channel closed".into()));
+                debug!("stdout channel closed");
+                self.await_stderr_flush().await;
+                return Err(Self::crashed_error());
             }
             Err(_) => {
                 // Timeout — clean up the pending entry
@@ -700,16 +743,14 @@ impl StdioAdapter {
         let mut writer_guard = self.stdin_writer.lock().await;
         let writer = writer_guard.as_mut().ok_or(AdapterError::NotInitialized)?;
         if let Err(e) = writer.write_all(line.as_bytes()).await {
-            return Err(AdapterError::ProcessCrashed(format!(
-                "stdin write failed: {}",
-                e
-            )));
+            debug!(error = %e, "stdin write failed");
+            self.await_stderr_flush().await;
+            return Err(Self::crashed_error());
         }
         if let Err(e) = writer.flush().await {
-            return Err(AdapterError::ProcessCrashed(format!(
-                "stdin flush failed: {}",
-                e
-            )));
+            debug!(error = %e, "stdin flush failed");
+            self.await_stderr_flush().await;
+            return Err(Self::crashed_error());
         }
         Ok(())
     }
@@ -970,12 +1011,15 @@ impl McpAdapter for StdioAdapter {
     }
 
     async fn stderr_lines(&self) -> Vec<String> {
+        // Tag each line with a WARN level and a `[stderr]` marker so the
+        // desktop log parser renders captured child stderr as a distinct pill,
+        // set apart from the relay's own tracing lines in the Logs tab.
         self.stderr_buffer
             .read()
             .await
             .lines()
             .iter()
-            .map(|s| s.to_string())
+            .map(|s| format!("WARN [stderr] {}", s))
             .collect()
     }
 
@@ -1659,6 +1703,105 @@ for line in sys.stdin:
             Err(_) => {}                            // our 2s timeout
             other => panic!("unexpected result: {:?}", other),
         }
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stdio_crash_error_is_short_user_message() {
+        // A child that prints a diagnostic to stderr and exits without ever
+        // responding on stdout. The crash error must now be the SHORT
+        // user-facing banner — the stderr root cause is surfaced as its own
+        // `[stderr]` rows in the Logs tab, NOT embedded in the error.
+        let mut adapter = StdioAdapter::new(StdioConfig {
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "echo 'Error: OAuth keys file not found' >&2; exit 1".to_string(),
+            ],
+            env: HashMap::new(),
+            ..Default::default()
+        });
+        adapter.spawn_process().await.unwrap();
+
+        // Either the stdin write fails (child already gone) or the response
+        // channel closes — both paths now return the short crash banner.
+        let result = adapter.send_request("initialize", None).await;
+        match result {
+            Err(AdapterError::ProcessCrashed(msg)) => {
+                assert_eq!(
+                    msg, CRASH_USER_MESSAGE,
+                    "crash error should be the short user-facing banner, got: {msg}"
+                );
+                assert!(
+                    !msg.contains("recent stderr:") && !msg.contains("OAuth keys file not found"),
+                    "crash error must not embed child stderr, got: {msg}"
+                );
+            }
+            other => panic!("expected ProcessCrashed, got: {other:?}"),
+        }
+
+        // The stderr root cause is still captured for the Logs tab buffer.
+        let lines = adapter.stderr_lines().await;
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("OAuth keys file not found")),
+            "child stderr should still be captured for the Logs tab, got: {lines:?}"
+        );
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stdio_crash_error_short_message_without_stderr() {
+        // A child that exits abnormally but writes nothing to stderr must still
+        // yield the same short crash banner (no embedded stderr section).
+        let mut adapter = StdioAdapter::new(StdioConfig {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "exit 1".to_string()],
+            env: HashMap::new(),
+            ..Default::default()
+        });
+        adapter.spawn_process().await.unwrap();
+
+        let result = adapter.send_request("initialize", None).await;
+        match result {
+            Err(AdapterError::ProcessCrashed(msg)) => {
+                assert_eq!(
+                    msg, CRASH_USER_MESSAGE,
+                    "crash error should be the short user-facing banner, got: {msg}"
+                );
+            }
+            other => panic!("expected ProcessCrashed, got: {other:?}"),
+        }
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_stdio_stderr_lines_tagged_for_logs() {
+        // Captured stderr surfaced to the Logs tab must be tagged distinctly so
+        // the desktop parser renders it apart from the relay's own logs.
+        let mut adapter = StdioAdapter::new(StdioConfig {
+            command: "sh".to_string(),
+            args: vec![
+                "-c".to_string(),
+                "echo 'hello from stderr' >&2; sleep 0.2".to_string(),
+            ],
+            env: HashMap::new(),
+            ..Default::default()
+        });
+        adapter.spawn_process().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let lines = adapter.stderr_lines().await;
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("WARN [stderr] ") && l.contains("hello from stderr")),
+            "stderr lines should be tagged for the UI, got: {lines:?}"
+        );
 
         adapter.shutdown().await.unwrap();
     }
