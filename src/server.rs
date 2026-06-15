@@ -664,7 +664,7 @@ async fn handle_single_message(
         .map(|c| serde_json::to_string(c).unwrap_or_default())
         .unwrap_or_default();
     let client_name = client_identity
-        .and_then(|c| c.display_name())
+        .and_then(|c| c.client_label())
         .unwrap_or_default();
     let client_version = client_identity
         .and_then(|c| c.version.clone())
@@ -1510,7 +1510,7 @@ async fn mcp_initialize_logged(
         .unwrap_or_default();
     let client_name = identity
         .as_ref()
-        .and_then(|c| c.display_name())
+        .and_then(|c| c.client_label())
         .unwrap_or_default();
     let client_version = identity
         .as_ref()
@@ -1558,7 +1558,7 @@ async fn mcp_tools_list_logged(
         .unwrap_or_default();
     let client_name = identity
         .as_ref()
-        .and_then(|c| c.display_name())
+        .and_then(|c| c.client_label())
         .unwrap_or_default();
     let client_version = identity
         .as_ref()
@@ -1606,7 +1606,7 @@ async fn mcp_tools_call_logged(
         .unwrap_or_default();
     let client_name = identity
         .as_ref()
-        .and_then(|c| c.display_name())
+        .and_then(|c| c.client_label())
         .unwrap_or_default();
     let client_version = identity
         .as_ref()
