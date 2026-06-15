@@ -909,7 +909,7 @@ impl McpAdapter for HttpAdapter {
             let client_name = span_ctx
                 .client
                 .as_ref()
-                .and_then(|c| c.display_name())
+                .and_then(|c| c.client_label())
                 .unwrap_or_default();
             let client_version = span_ctx
                 .client

@@ -36,7 +36,7 @@ pub const DEFAULT_BUS_CAPACITY: usize = 256;
 /// independently optional, and the on-wire JSON omits any `None` fields so
 /// the overlay can render `name` / `name + version` / UA-only with the same
 /// rendering code.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 pub struct ClientIdentity {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
@@ -46,6 +46,55 @@ pub struct ClientIdentity {
     pub user_agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
+}
+
+/// Strip a trailing ` (via mcp-remote <version>)` suffix from a client name.
+///
+/// `mcp-remote` proxies append this marker to the upstream `clientInfo.name`
+/// (e.g. `local-agent-mode-Endara Relay (via mcp-remote 0.1.37)`); the relay
+/// normalizes against the underlying name, so the marker is removed before
+/// matching. The match is case-insensitive and the returned slice is
+/// trimmed of trailing whitespace. Returns the input unchanged when no marker
+/// is present.
+fn strip_mcp_remote_suffix(name: &str) -> &str {
+    let lower = name.to_ascii_lowercase();
+    if let Some(idx) = lower.find(" (via mcp-remote") {
+        name[..idx].trim_end()
+    } else {
+        name
+    }
+}
+
+impl Serialize for ClientIdentity {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let label = self.client_label();
+        let len = self.name.is_some() as usize
+            + self.version.is_some() as usize
+            + self.user_agent.is_some() as usize
+            + self.origin.is_some() as usize
+            + label.is_some() as usize;
+        let mut map = serializer.serialize_map(Some(len))?;
+        if let Some(name) = self.name.as_ref() {
+            map.serialize_entry("name", name)?;
+        }
+        if let Some(version) = self.version.as_ref() {
+            map.serialize_entry("version", version)?;
+        }
+        if let Some(user_agent) = self.user_agent.as_ref() {
+            map.serialize_entry("user_agent", user_agent)?;
+        }
+        if let Some(origin) = self.origin.as_ref() {
+            map.serialize_entry("origin", origin)?;
+        }
+        if let Some(label) = label.as_ref() {
+            map.serialize_entry("label", label)?;
+        }
+        map.end()
+    }
 }
 
 impl ClientIdentity {
@@ -58,16 +107,40 @@ impl ClientIdentity {
             && self.origin.is_none()
     }
 
-    /// Best-effort display label for the calling app, used for the
-    /// `client_name` audit-log field. Returns `clientInfo.name` when present,
-    /// else a concise token derived from the `User-Agent` (the substring
-    /// before the first `/` or whitespace, e.g. `cursor-vscode/0.42 (Cursor
-    /// IDE)` -> `cursor-vscode`), else `None`. This lets UA-only callers still
-    /// surface a label in the logs view.
-    pub fn display_name(&self) -> Option<String> {
+    /// Friendly client label for the `client_name` audit field and the overlay.
+    ///
+    /// Strips the ` (via mcp-remote <version>)` marker from `clientInfo.name`
+    /// and maps known client identifiers (case-insensitive) to a human
+    /// readable label (e.g. `local-agent-mode-*` -> `Claude Cowork`,
+    /// `claude-ai` -> `Claude Desktop`, `claude-code` -> `Claude Code`).
+    /// Unrecognized names pass through as the suffix-stripped, trimmed raw
+    /// name. When no usable name is present, falls back to a concise
+    /// `User-Agent` token (the substring before the first `/` or whitespace),
+    /// else `None`.
+    pub fn client_label(&self) -> Option<String> {
         if let Some(name) = self.name.as_ref() {
-            if !name.is_empty() {
-                return Some(name.clone());
+            let stripped = strip_mcp_remote_suffix(name).trim();
+            if !stripped.is_empty() {
+                let lower = stripped.to_ascii_lowercase();
+                if lower.starts_with("local-agent-mode-") {
+                    return Some("Claude Cowork".to_string());
+                }
+                if lower == "claude-ai" {
+                    return Some("Claude Desktop".to_string());
+                }
+                if lower == "claude-code" {
+                    return Some("Claude Code".to_string());
+                }
+                if lower == "anthropic"
+                    || lower.starts_with("anthropic-")
+                    || lower.starts_with("anthropic ")
+                {
+                    return Some("Claude".to_string());
+                }
+                if lower.starts_with("cursor-vscode") || lower == "cursor" {
+                    return Some("Cursor".to_string());
+                }
+                return Some(stripped.to_string());
             }
         }
         if let Some(ua) = self.user_agent.as_ref() {
@@ -496,15 +569,15 @@ mod tests {
     }
 
     #[test]
-    fn client_identity_display_name_prefers_name_then_ua_token() {
-        // `clientInfo.name` wins when present.
+    fn client_identity_client_label_prefers_name_then_ua_token() {
+        // `clientInfo.name` wins when present (unknown name passes through).
         let with_name = ClientIdentity {
             name: Some("Claude Desktop".into()),
             version: Some("0.7.0".into()),
             user_agent: Some("claude-desktop/0.7.0".into()),
             origin: None,
         };
-        assert_eq!(with_name.display_name().as_deref(), Some("Claude Desktop"));
+        assert_eq!(with_name.client_label().as_deref(), Some("Claude Desktop"));
 
         // UA-only callers derive a concise token (before the first `/`).
         let ua_only = ClientIdentity {
@@ -513,7 +586,7 @@ mod tests {
             user_agent: Some("cursor-vscode/0.42 (Cursor IDE)".into()),
             origin: None,
         };
-        assert_eq!(ua_only.display_name().as_deref(), Some("cursor-vscode"));
+        assert_eq!(ua_only.client_label().as_deref(), Some("cursor-vscode"));
 
         // UA whose leading token ends at whitespace (no slash).
         let ua_space = ClientIdentity {
@@ -522,17 +595,89 @@ mod tests {
             user_agent: Some("CustomAgent some details".into()),
             origin: None,
         };
-        assert_eq!(ua_space.display_name().as_deref(), Some("CustomAgent"));
+        assert_eq!(ua_space.client_label().as_deref(), Some("CustomAgent"));
 
         // Empty identity yields no label.
-        assert_eq!(ClientIdentity::default().display_name(), None);
+        assert_eq!(ClientIdentity::default().client_label(), None);
 
         // An empty `name` string falls through to the UA (None here).
         let empty_name = ClientIdentity {
             name: Some(String::new()),
             ..Default::default()
         };
-        assert_eq!(empty_name.display_name(), None);
+        assert_eq!(empty_name.client_label(), None);
+    }
+
+    #[test]
+    fn client_identity_client_label_normalizes_known_clients() {
+        let label = |name: &str| {
+            ClientIdentity {
+                name: Some(name.into()),
+                ..Default::default()
+            }
+            .client_label()
+        };
+
+        // Cowork: `local-agent-mode-*` prefix, including the mcp-remote marker.
+        assert_eq!(
+            label("local-agent-mode-foo").as_deref(),
+            Some("Claude Cowork")
+        );
+        assert_eq!(
+            label("local-agent-mode-Endara Relay (via mcp-remote 0.1.37)").as_deref(),
+            Some("Claude Cowork"),
+        );
+        // Desktop / Code exact matches.
+        assert_eq!(label("claude-ai").as_deref(), Some("Claude Desktop"));
+        assert_eq!(label("claude-code").as_deref(), Some("Claude Code"));
+        // Anthropic, with and without a service suffix, maps to Claude.
+        assert_eq!(label("Anthropic").as_deref(), Some("Claude"));
+        assert_eq!(label("anthropic-mcp").as_deref(), Some("Claude"));
+        // Cursor variants.
+        assert_eq!(label("cursor").as_deref(), Some("Cursor"));
+        assert_eq!(label("cursor-vscode").as_deref(), Some("Cursor"));
+        // Matching is case-insensitive.
+        assert_eq!(label("CLAUDE-AI").as_deref(), Some("Claude Desktop"));
+
+        // Unknown names pass through (suffix-stripped, trimmed).
+        assert_eq!(label("Some Editor").as_deref(), Some("Some Editor"));
+        assert_eq!(
+            label("Some Editor (via mcp-remote 1.2.3)").as_deref(),
+            Some("Some Editor"),
+        );
+
+        // Empty / no name falls back to the UA token, else None.
+        assert_eq!(ClientIdentity::default().client_label(), None);
+        let ua_only = ClientIdentity {
+            user_agent: Some("cursor-vscode/0.42 (Cursor IDE)".into()),
+            ..Default::default()
+        };
+        assert_eq!(ua_only.client_label().as_deref(), Some("cursor-vscode"));
+    }
+
+    #[test]
+    fn client_identity_serializes_friendly_label_and_keeps_raw_name() {
+        let id = ClientIdentity {
+            name: Some("local-agent-mode-Endara Relay (via mcp-remote 0.1.37)".into()),
+            version: Some("0.1.0".into()),
+            ..Default::default()
+        };
+        let v = serde_json::to_value(&id).unwrap();
+        // Raw name is preserved untouched.
+        assert_eq!(
+            v["name"],
+            "local-agent-mode-Endara Relay (via mcp-remote 0.1.37)"
+        );
+        assert_eq!(v["version"], "0.1.0");
+        // Friendly label is surfaced alongside it.
+        assert_eq!(v["label"], "Claude Cowork");
+
+        // `label` is omitted when there is no usable identity.
+        let empty = serde_json::to_value(ClientIdentity::default()).unwrap();
+        assert!(
+            empty.get("label").is_none(),
+            "label should be omitted, got {empty}"
+        );
     }
 
     #[test]
