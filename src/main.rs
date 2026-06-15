@@ -323,7 +323,9 @@ async fn main() {
             // `route_tool_call` (unknown prefix, missing/disabled/unhealthy
             // endpoint, disabled tool) emit `Started` + `Failed` pairs
             // alongside the per-adapter emissions.
-            let registry = AdapterRegistry::new().with_event_bus(event_bus.clone());
+            let registry = AdapterRegistry::new()
+                .with_event_bus(event_bus.clone())
+                .with_validate_inputs(cfg.relay.validate_inputs.unwrap_or(true));
 
             // Track duplicate endpoint names: first occurrence wins
             let mut registered_names = std::collections::HashSet::new();
@@ -640,6 +642,7 @@ async fn main() {
                 started_at: std::time::Instant::now(),
                 toon_enabled,
                 session_identities,
+                meta_tool_schemas: server::MetaToolSchemas::new(),
             };
             // Shared config handle: a single `Arc<RwLock<Config>>` that both
             // `ManagementState` (read by `/api/*` handlers) and `ConfigWatcher`

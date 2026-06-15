@@ -5,7 +5,9 @@ use endara_relay::config::ProfileConfig;
 use endara_relay::js_sandbox::MetaToolHandler;
 use endara_relay::profile_registry::ProfileRegistry;
 use endara_relay::registry::AdapterRegistry;
-use endara_relay::server::{build_router, start_server, AppState, SessionIdentityStore};
+use endara_relay::server::{
+    build_router, start_server, AppState, MetaToolSchemas, SessionIdentityStore,
+};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -57,6 +59,7 @@ async fn setup_server() -> (SocketAddr, AdapterRegistry, tokio::task::JoinHandle
         started_at: std::time::Instant::now(),
         toon_enabled: false,
         session_identities: Arc::new(std::sync::Mutex::new(SessionIdentityStore::default())),
+        meta_tool_schemas: MetaToolSchemas::new(),
     };
     let router = build_router(state);
     // Bind to port 0 to get a random available port
@@ -246,6 +249,7 @@ async fn setup_native_toon_server(toon_enabled: bool) -> (SocketAddr, tokio::tas
         started_at: std::time::Instant::now(),
         toon_enabled,
         session_identities: Arc::new(std::sync::Mutex::new(SessionIdentityStore::default())),
+        meta_tool_schemas: MetaToolSchemas::new(),
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
@@ -418,6 +422,7 @@ async fn profile_tools_list_excludes_out_of_profile_tools() {
         started_at: std::time::Instant::now(),
         toon_enabled: false,
         session_identities: Arc::new(std::sync::Mutex::new(SessionIdentityStore::default())),
+        meta_tool_schemas: MetaToolSchemas::new(),
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();

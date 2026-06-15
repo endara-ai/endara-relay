@@ -3883,6 +3883,7 @@ mod tests {
                 toon_output: None,
                 startup_init_timeout_secs: None,
                 session_identity_max_sessions: None,
+                validate_inputs: None,
             },
             endpoints: vec![EndpointConfig {
                 name: "echo".to_string(),
@@ -6104,6 +6105,7 @@ command = "echo"
                 toon_output: None,
                 startup_init_timeout_secs: None,
                 session_identity_max_sessions: None,
+                validate_inputs: None,
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
@@ -6309,6 +6311,7 @@ command = "echo"
                 toon_output: None,
                 startup_init_timeout_secs: None,
                 session_identity_max_sessions: None,
+                validate_inputs: None,
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
@@ -6727,6 +6730,7 @@ command = "echo"
                 toon_output: None,
                 startup_init_timeout_secs: None,
                 session_identity_max_sessions: None,
+                validate_inputs: None,
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
@@ -6848,6 +6852,7 @@ client_id = "client123"
                 toon_output: None,
                 startup_init_timeout_secs: None,
                 session_identity_max_sessions: None,
+                validate_inputs: None,
             },
             endpoints: vec![],
             profiles: None,
@@ -6910,6 +6915,7 @@ client_id = "client123"
                 toon_output: None,
                 startup_init_timeout_secs: None,
                 session_identity_max_sessions: None,
+                validate_inputs: None,
             },
             endpoints: endpoint_names
                 .iter()
@@ -7468,6 +7474,7 @@ client_id = "client123"
                 toon_output: None,
                 startup_init_timeout_secs: None,
                 session_identity_max_sessions: None,
+                validate_inputs: None,
             },
             endpoints: vec![EndpointConfig {
                 name: "existing".to_string(),

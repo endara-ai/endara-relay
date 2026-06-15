@@ -497,6 +497,83 @@ mod tests {
         assert_eq!(result["args"]["to"], "x@example.com");
     }
 
+    /// §10.4 #28: a profile-scoped call whose arguments violate the tool's
+    /// `inputSchema` is rejected by the same validation layer as the global
+    /// path. The structured `isError: true` result is returned and the
+    /// upstream adapter's `call_tool` is never invoked — proving validation
+    /// runs identically through `ProfileRegistryView::route_tool_call`.
+    #[tokio::test]
+    async fn profile_scoped_call_validates_against_tool_schema() {
+        let registry = AdapterRegistry::new();
+        // Two endpoints so the merged catalog prefixes tool names, matching
+        // how a real multi-server profile routes (`github__create_issue`).
+        registry
+            .register(
+                "github".into(),
+                Box::new(MockAdapter {
+                    tools: vec![ToolInfo {
+                        name: "create_issue".into(),
+                        description: Some("create_issue tool".into()),
+                        input_schema: json!({
+                            "type": "object",
+                            "properties": { "repo": { "type": "string" } },
+                            "required": ["repo"],
+                        }),
+                        annotations: None,
+                    }],
+                }),
+                "stdio".into(),
+                None,
+                Some("github".into()),
+            )
+            .await;
+        registry
+            .register(
+                "gmail".into(),
+                Box::new(MockAdapter {
+                    tools: vec![tool("send_email")],
+                }),
+                "stdio".into(),
+                None,
+                Some("gmail".into()),
+            )
+            .await;
+
+        let pr = ProfileRegistry::new(registry);
+        pr.rebuild(&[ProfileConfig {
+            name: "Work".into(),
+            path: "work".into(),
+            endpoints: vec!["github".into(), "gmail".into()],
+            js_execution: false,
+            toon_output: true,
+        }])
+        .await;
+
+        let ctx = pr.get("work").await.unwrap();
+        // Missing the required `repo` field → validation must reject before
+        // the call ever reaches the upstream adapter.
+        let result = ctx
+            .registry_view
+            .route_tool_call("github__create_issue", json!({}))
+            .await
+            .expect("a validation failure returns Ok(isError), not Err");
+
+        assert_eq!(
+            result["isError"],
+            json!(true),
+            "profile-scoped bad args must return the structured validation result: {result}"
+        );
+        let text = result["content"][0]["text"].as_str().unwrap_or_default();
+        assert!(
+            text.contains("Input validation failed for tool 'github__create_issue'"),
+            "validation message should name the prefixed profile-scoped tool: {text}"
+        );
+        assert!(
+            result.get("called").is_none(),
+            "upstream adapter call_tool must never run on a validation failure: {result}"
+        );
+    }
+
     #[tokio::test]
     async fn get_is_case_insensitive() {
         let pr = ProfileRegistry::new(AdapterRegistry::new());

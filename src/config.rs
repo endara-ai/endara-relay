@@ -54,6 +54,13 @@ pub struct RelayConfig {
     /// label so evicted sessions never block dispatch.
     #[serde(default)]
     pub session_identity_max_sessions: Option<usize>,
+    /// Validate `tools/call` arguments against each tool's JSON Schema
+    /// `inputSchema` at the relay before forwarding to the upstream MCP
+    /// server. Defaults to `true` when omitted; set to `false` to bypass the
+    /// validation layer entirely (escape hatch for servers with deliberately
+    /// loose schemas). Hot-reloadable via [`crate::watcher::ConfigWatcher`].
+    #[serde(default)]
+    pub validate_inputs: Option<bool>,
 }
 
 impl Default for RelayConfig {
@@ -75,6 +82,7 @@ impl Default for RelayConfig {
             toon_output: None,
             startup_init_timeout_secs: None,
             session_identity_max_sessions: None,
+            validate_inputs: None,
         }
     }
 }
@@ -1661,6 +1669,7 @@ js_execution = false
                 toon_output: None,
                 startup_init_timeout_secs: None,
                 session_identity_max_sessions: None,
+                validate_inputs: None,
             },
             endpoints,
             profiles: None,
