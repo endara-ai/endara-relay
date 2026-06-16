@@ -380,7 +380,7 @@ impl<'a> CapturingVisitor<'a> {
             // `"null"` for notifications. `call_tool` is never reached for
             // notifications, but we still skip the sentinel so a stray
             // emitter cannot leak a fake id into an event.
-            if value != "null" {
+            if value != "null" && !value.is_empty() {
                 self.captured.jsonrpc_id = Some(value);
             }
         } else if self.is_request && name == "client" {
@@ -834,7 +834,11 @@ mod tests {
                 let profile = "work".to_string();
                 let outer = tracing::info_span!("mcp_request", profile = %profile);
                 let captured = async {
-                    let inner = tracing::info_span!("request", method = "tools/call", id = %id_str);
+                    let inner = tracing::info_span!(
+                        "request",
+                        method = "tools/call",
+                        id = %id_str,
+                    );
                     async { current_request_context() }.instrument(inner).await
                 }
                 .instrument(outer)

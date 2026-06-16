@@ -682,18 +682,24 @@ async fn mcp_tools_call(
                 .get("script")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            // Recover the outer inbound request's identity from the
-            // surrounding `request{client=...}` span (seeded by
+            // Recover the outer inbound request's identity and JSON-RPC id from
+            // the surrounding `request{id=...,client=...}` span (seeded by
             // `handle_single_message` / the logged wrappers) and re-serialise
-            // it so the sandbox can re-establish the caller's span around each
+            // them so the sandbox can re-establish the caller's span around each
             // inner upstream tool call across the blocking-thread hop. Without
-            // this, aggregated `execute_tools` calls emit an empty client.
-            let client_json = crate::events::current_request_context()
+            // this, aggregated `execute_tools` inner calls emit an empty client
+            // and a `None` jsonrpc_id.
+            let request_ctx = crate::events::current_request_context();
+            let client_json = request_ctx
                 .client
                 .filter(|c| !c.is_empty())
                 .map(|c| serde_json::to_string(&c).unwrap_or_default())
                 .unwrap_or_default();
-            match handler.execute_tools(script, &client_json).await {
+            let jsonrpc_id = request_ctx.jsonrpc_id.unwrap_or_default();
+            match handler
+                .execute_tools(script, &client_json, &jsonrpc_id)
+                .await
+            {
                 Ok(result) => {
                     return Ok(jsonrpc_response(
                         body.id,
