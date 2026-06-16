@@ -212,6 +212,10 @@ pub fn annotations_from_value(value: &Value) -> Option<ToolAnnotations> {
 /// can branch on a single field.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
+// `Started` carries the full caller/identity payload while `Completed`/`Failed`
+// stay terse; the size gap is intentional for these short-lived, bus-delivered
+// events, so boxing a field to shrink the enum is not worth the indirection.
+#[allow(clippy::large_enum_variant)]
 pub enum ToolCallEvent {
     /// Emitted at `call_tool` entry, before any network/process I/O.
     Started {
@@ -223,6 +227,14 @@ pub enum ToolCallEvent {
         /// is on the stack (e.g. internal callers).
         #[serde(skip_serializing_if = "Option::is_none")]
         jsonrpc_id: Option<String>,
+        /// Canonical per-inbound-HTTP-request UID minted in
+        /// `handle_single_message` and propagated via the `request` tracing
+        /// span. This is the desktop's collision-free row/overlay key; unlike
+        /// `jsonrpc_id` (which a client controls and may reuse), this UID is
+        /// unique per inbound request. `None` when no `request` span is on the
+        /// stack (e.g. internal callers / older replays).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_uid: Option<String>,
         ts: String,
         endpoint: String,
         transport: String,
@@ -329,6 +341,10 @@ pub struct RequestSpanContext {
     /// `request` span is on the stack or when the id was the literal
     /// `"null"` sentinel (notifications, which don't reach `call_tool`).
     pub jsonrpc_id: Option<String>,
+    /// Canonical per-inbound-HTTP-request UID captured from the `request`
+    /// span's `request_uid` field (minted in `handle_single_message`). `None`
+    /// when no `request` span is on the stack or the field was empty.
+    pub request_uid: Option<String>,
     /// Profile path segment from `/mcp/{profile}`. `None` for the global
     /// `/mcp` endpoint.
     pub profile: Option<String>,
@@ -347,6 +363,7 @@ pub struct RequestSpanContext {
 #[derive(Debug, Default, Clone)]
 struct CapturedSpanFields {
     jsonrpc_id: Option<String>,
+    request_uid: Option<String>,
     profile: Option<String>,
     client: Option<ClientIdentity>,
 }
@@ -393,6 +410,14 @@ impl<'a> CapturingVisitor<'a> {
                 if !identity.is_empty() {
                     self.captured.client = Some(identity);
                 }
+            }
+        } else if self.is_request && name == "request_uid" {
+            // The `request` span carries `request_uid = %request_uid`, the
+            // per-inbound-request UID minted in `handle_single_message`. An
+            // empty value means no UID was minted (degraded callers); skip it
+            // so `current_request_context()` surfaces `None` rather than `""`.
+            if !value.is_empty() {
+                self.captured.request_uid = Some(value);
             }
         } else if self.is_mcp_request && name == "profile" {
             self.captured.profile = Some(value);
@@ -454,6 +479,11 @@ pub fn current_request_context() -> RequestSpanContext {
                         ctx.jsonrpc_id = Some(v.clone());
                     }
                 }
+                if ctx.request_uid.is_none() {
+                    if let Some(v) = &captured.request_uid {
+                        ctx.request_uid = Some(v.clone());
+                    }
+                }
                 if ctx.profile.is_none() {
                     if let Some(v) = &captured.profile {
                         ctx.profile = Some(v.clone());
@@ -482,6 +512,7 @@ mod tests {
         let ev = ToolCallEvent::Started {
             request_id: "rid-1".into(),
             jsonrpc_id: Some("42".into()),
+            request_uid: Some("uid-abc".into()),
             ts: "2026-05-27T04:36:29.710Z".into(),
             endpoint: "github".into(),
             transport: "stdio".into(),
@@ -507,6 +538,7 @@ mod tests {
         assert_eq!(v["tool"], "list_issues");
         assert_eq!(v["annotations"]["read_only"], true);
         assert_eq!(v["jsonrpc_id"], "42");
+        assert_eq!(v["request_uid"], "uid-abc");
         assert_eq!(v["client"]["name"], "claude-ai");
         assert_eq!(v["client"]["version"], "0.1.0");
         assert!(
@@ -524,6 +556,7 @@ mod tests {
         let ev = ToolCallEvent::Started {
             request_id: "rid-1".into(),
             jsonrpc_id: None,
+            request_uid: None,
             ts: "t".into(),
             endpoint: "github".into(),
             transport: "stdio".into(),
@@ -538,6 +571,10 @@ mod tests {
         assert!(
             v.get("jsonrpc_id").is_none(),
             "jsonrpc_id should be omitted when None, got {v}"
+        );
+        assert!(
+            v.get("request_uid").is_none(),
+            "request_uid should be omitted when None, got {v}"
         );
         assert!(
             v.get("client").is_none(),
@@ -831,6 +868,7 @@ mod tests {
                 .unwrap();
             rt.block_on(async {
                 let id_str = "7".to_string();
+                let request_uid = "uid-7".to_string();
                 let profile = "work".to_string();
                 let outer = tracing::info_span!("mcp_request", profile = %profile);
                 let captured = async {
@@ -838,12 +876,14 @@ mod tests {
                         "request",
                         method = "tools/call",
                         id = %id_str,
+                        request_uid = %request_uid,
                     );
                     async { current_request_context() }.instrument(inner).await
                 }
                 .instrument(outer)
                 .await;
                 assert_eq!(captured.jsonrpc_id.as_deref(), Some("7"));
+                assert_eq!(captured.request_uid.as_deref(), Some("uid-7"));
                 assert_eq!(captured.profile.as_deref(), Some("work"));
             });
         });

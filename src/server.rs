@@ -696,8 +696,9 @@ async fn mcp_tools_call(
                 .map(|c| serde_json::to_string(&c).unwrap_or_default())
                 .unwrap_or_default();
             let jsonrpc_id = request_ctx.jsonrpc_id.unwrap_or_default();
+            let request_uid = request_ctx.request_uid.unwrap_or_default();
             match handler
-                .execute_tools(script, &client_json, &jsonrpc_id)
+                .execute_tools(script, &client_json, &jsonrpc_id, &request_uid)
                 .await
             {
                 Ok(result) => {
@@ -767,6 +768,13 @@ async fn handle_single_message(
         .get("id")
         .map(|v| v.to_string())
         .unwrap_or_else(|| "null".to_string());
+    // Canonical per-inbound-HTTP-request UID. Unlike the client-controlled
+    // JSON-RPC `id` (which collides across clients and across reconnects when
+    // a client resets its counter), this UUID is unique per inbound request,
+    // so every log line and `ToolCallEvent` produced while processing this
+    // request shares one collision-free key for the desktop's row/overlay
+    // keying. `jsonrpc_id` stays on the wire for diagnostic context.
+    let request_uid = uuid::Uuid::new_v4().to_string();
     // JSON-encode the identity so `SpanFieldCaptureLayer` can deserialise it
     // back into a typed [`ClientIdentity`] via `current_request_context()`
     // without changing the `McpAdapter::call_tool` trait signature. An empty
@@ -786,6 +794,7 @@ async fn handle_single_message(
         "request",
         method = %method,
         id = %id_str,
+        request_uid = %request_uid,
         client = %client_json,
     );
     async move {
@@ -798,6 +807,7 @@ async fn handle_single_message(
             let elapsed_ms = start.elapsed().as_millis() as u64;
             info!(
                 method = %method,
+                request_uid = %request_uid,
                 elapsed_ms = elapsed_ms,
                 req_bytes = req_bytes,
                 resp_bytes = 0,
@@ -839,6 +849,7 @@ async fn handle_single_message(
                 let resp_bytes = serde_json::to_string(&resp).map(|s| s.len()).unwrap_or(0);
                 info!(
                     method = %method,
+                    request_uid = %request_uid,
                     elapsed_ms = elapsed_ms,
                     req_bytes = req_bytes,
                     resp_bytes = resp_bytes,
@@ -856,6 +867,7 @@ async fn handle_single_message(
                 if status_code >= 500 {
                     error!(
                         method = %method,
+                        request_uid = %request_uid,
                         elapsed_ms = elapsed_ms,
                         req_bytes = req_bytes,
                         resp_bytes = resp_bytes,
@@ -869,6 +881,7 @@ async fn handle_single_message(
                     // JSON-RPC 2.0: errors are returned with HTTP 200, not a sign of trouble.
                     info!(
                         method = %method,
+                        request_uid = %request_uid,
                         elapsed_ms = elapsed_ms,
                         req_bytes = req_bytes,
                         resp_bytes = resp_bytes,
@@ -881,6 +894,7 @@ async fn handle_single_message(
                 } else {
                     warn!(
                         method = %method,
+                        request_uid = %request_uid,
                         elapsed_ms = elapsed_ms,
                         req_bytes = req_bytes,
                         resp_bytes = resp_bytes,
