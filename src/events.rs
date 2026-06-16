@@ -227,12 +227,13 @@ pub enum ToolCallEvent {
         /// is on the stack (e.g. internal callers).
         #[serde(skip_serializing_if = "Option::is_none")]
         jsonrpc_id: Option<String>,
-        /// Canonical per-inbound-HTTP-request UID minted in
-        /// `handle_single_message` and propagated via the `request` tracing
-        /// span. This is the desktop's collision-free row/overlay key; unlike
-        /// `jsonrpc_id` (which a client controls and may reuse), this UID is
-        /// unique per inbound request. `None` when no `request` span is on the
-        /// stack (e.g. internal callers / older replays).
+        /// Canonical UID minted per inbound JSON-RPC message in
+        /// `handle_single_message` (once per element of a batch array) and
+        /// propagated via the `request` tracing span. This is the desktop's
+        /// collision-free row/overlay key; unlike `jsonrpc_id` (which a client
+        /// controls and may reuse), this UID is unique per message. `None` when
+        /// no `request` span is on the stack (e.g. internal callers / older
+        /// replays).
         #[serde(skip_serializing_if = "Option::is_none")]
         request_uid: Option<String>,
         ts: String,
@@ -341,9 +342,10 @@ pub struct RequestSpanContext {
     /// `request` span is on the stack or when the id was the literal
     /// `"null"` sentinel (notifications, which don't reach `call_tool`).
     pub jsonrpc_id: Option<String>,
-    /// Canonical per-inbound-HTTP-request UID captured from the `request`
-    /// span's `request_uid` field (minted in `handle_single_message`). `None`
-    /// when no `request` span is on the stack or the field was empty.
+    /// Canonical per-JSON-RPC-message UID captured from the `request` span's
+    /// `request_uid` field (minted in `handle_single_message`, once per
+    /// element of a batch array). `None` when no `request` span is on the
+    /// stack or the field was empty.
     pub request_uid: Option<String>,
     /// Profile path segment from `/mcp/{profile}`. `None` for the global
     /// `/mcp` endpoint.

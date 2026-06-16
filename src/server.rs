@@ -768,12 +768,15 @@ async fn handle_single_message(
         .get("id")
         .map(|v| v.to_string())
         .unwrap_or_else(|| "null".to_string());
-    // Canonical per-inbound-HTTP-request UID. Unlike the client-controlled
-    // JSON-RPC `id` (which collides across clients and across reconnects when
-    // a client resets its counter), this UUID is unique per inbound request,
-    // so every log line and `ToolCallEvent` produced while processing this
-    // request shares one collision-free key for the desktop's row/overlay
-    // keying. `jsonrpc_id` stays on the wire for diagnostic context.
+    // Canonical per-JSON-RPC-message UID. `handle_single_message` runs once
+    // per inbound JSON-RPC message — including once per element of a batch
+    // array — so each logical request gets its own UID. Unlike the
+    // client-controlled JSON-RPC `id` (which collides across clients and
+    // across reconnects when a client resets its counter), this UUID is unique
+    // per message, so every log line and `ToolCallEvent` produced while
+    // processing this message shares one collision-free key for the desktop's
+    // row/overlay keying. `jsonrpc_id` stays on the wire for diagnostic
+    // context.
     let request_uid = uuid::Uuid::new_v4().to_string();
     // JSON-encode the identity so `SpanFieldCaptureLayer` can deserialise it
     // back into a typed [`ClientIdentity`] via `current_request_context()`
