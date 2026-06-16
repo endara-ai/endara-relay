@@ -874,6 +874,7 @@ impl McpAdapter for HttpAdapter {
                 bus.send(ToolCallEvent::Started {
                     request_id: request_id.clone(),
                     jsonrpc_id: span_ctx.jsonrpc_id.clone(),
+                    request_uid: span_ctx.request_uid.clone(),
                     ts: iso8601_now(),
                     endpoint: self.config.endpoint_name.clone(),
                     transport: "http".into(),
