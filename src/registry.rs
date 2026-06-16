@@ -909,9 +909,12 @@ impl AdapterRegistry {
 ///
 /// Mirrors the original `validate_tool_args` bypass rules (spec §3.3): the
 /// schema must describe an object (`type` is `"object"` or absent) and carry
-/// at least one constraint — a non-empty `properties` map or a non-empty
-/// `required` list. A bare `{"type": "object"}` has nothing to validate and
-/// is skipped (pass-through).
+/// at least one constraint — a non-empty `properties` map, a non-empty
+/// `required` list, or a closed-object constraint (`additionalProperties` /
+/// `unevaluatedProperties` set to `false` or a subschema). A bare
+/// `{"type": "object"}` has nothing to validate and is skipped (pass-through),
+/// but `{"type": "object", "additionalProperties": false}` still meaningfully
+/// rejects unexpected arguments and is validated.
 fn schema_is_validatable(schema: &serde_json::Value) -> bool {
     if let Some(t) = schema.get("type") {
         if t.as_str() != Some("object") {
@@ -928,7 +931,19 @@ fn schema_is_validatable(schema: &serde_json::Value) -> bool {
         .and_then(|r| r.as_array())
         .map(|a| !a.is_empty())
         .unwrap_or(false);
-    has_properties || has_required
+    // A closed schema constrains which arguments are allowed even with no
+    // declared `properties`/`required`: `additionalProperties` (or its
+    // `unevaluatedProperties` sibling) set to `false` or a subschema enforces
+    // a real check, so it is still worth compiling.
+    let restricts_extra = ["additionalProperties", "unevaluatedProperties"]
+        .iter()
+        .any(|key| {
+            schema
+                .get(*key)
+                .map(|v| !matches!(v, serde_json::Value::Bool(true)))
+                .unwrap_or(false)
+        });
+    has_properties || has_required || restricts_extra
 }
 
 /// Compile a tool's `inputSchema` into a reusable [`Validator`], or return
@@ -992,13 +1007,19 @@ pub(crate) fn validate_with_validator(
     schema: &serde_json::Value,
     arguments: &serde_json::Value,
 ) -> Option<(serde_json::Value, String)> {
-    let errors: Vec<String> = validator
+    let mut errors: Vec<String> = validator
         .iter_errors(arguments)
         .map(|e| format_validation_error(&e, schema))
         .collect();
     if errors.is_empty() {
         return None;
     }
+    // Some schema shapes emit one error per offending value with identical text
+    // (e.g. `additionalProperties: false` with no declared `properties`, where
+    // each extra key yields the same "accepts no parameters" message). Collapse
+    // exact duplicates, preserving order, so the model sees each point once.
+    let mut seen = std::collections::HashSet::new();
+    errors.retain(|message| seen.insert(message.clone()));
     warn!(
         tool = %name,
         error_count = errors.len(),
@@ -1072,7 +1093,12 @@ fn format_validation_error(error: &ValidationError, schema: &Value) -> String {
         }
         ValidationErrorKind::AdditionalProperties { unexpected }
         | ValidationErrorKind::UnevaluatedProperties { unexpected } => {
-            let known = schema_property_names(schema);
+            // The error sits on the object that carries the unexpected keys,
+            // which may be a nested object rather than the root. Resolve the
+            // subschema at that instance path so the "Valid parameters" list
+            // names the keys that object actually allows.
+            let subschema = subschema_at_instance_path(schema, error.instance_path());
+            let known = schema_property_names(subschema);
             // The crate batches every unexpected key into one error, so name
             // them all (sorted for deterministic output) rather than just the
             // first — otherwise the model fixes one and is rejected for the
@@ -1175,6 +1201,33 @@ fn format_validation_error(error: &ValidationError, schema: &Value) -> String {
             "Field '{}': array contains duplicate items.",
             field_label(&path)
         ),
+        ValidationErrorKind::FalseSchema => {
+            // Reached when a `false` subschema rejects a value — most commonly
+            // `additionalProperties: false` on a schema with no declared
+            // `properties`. The crate emits one such error per extra key with
+            // an empty path and only the *value* as the instance, so the key
+            // name can't be recovered here. Such an object accepts nothing, so
+            // the actionable fix is simply to remove the arguments.
+            let segments: Vec<LocationSegment> = error.instance_path().iter().collect();
+            let known = schema_property_names(subschema_for_segments(schema, &segments));
+            if known.is_empty() {
+                if path.is_empty() {
+                    "Field '<root>': this tool accepts no parameters; remove all arguments and try again."
+                        .to_string()
+                } else {
+                    format!(
+                        "Field '{}': accepts no parameters; remove its arguments and try again.",
+                        path
+                    )
+                }
+            } else {
+                format!(
+                    "Field '{}': contains an unknown parameter. Valid parameters: {}.",
+                    field_label(&path),
+                    known.join(", ")
+                )
+            }
+        }
         // Anything not in the §5.2 table falls through to the crate's default
         // rendering so no error is ever dropped.
         _ => format!("Field '{}': {}", field_label(&path), error),
@@ -1286,6 +1339,39 @@ fn schema_property_names(schema: &Value) -> Vec<String> {
         .and_then(Value::as_object)
         .map(|props| props.keys().cloned().collect())
         .unwrap_or_default()
+}
+
+/// Resolve the subschema that applies to the instance at `location` by walking
+/// the root schema's `properties`/`items` along the path. Used so an
+/// `additionalProperties` error on a nested object reports that object's valid
+/// keys rather than the root's. Falls back to the root schema whenever a
+/// segment can't be resolved (e.g. `$ref`, combinator subschemas, or tuple
+/// `items` arrays), keeping the message best-effort rather than wrong.
+fn subschema_at_instance_path<'a>(root: &'a Value, location: &Location) -> &'a Value {
+    let segments: Vec<LocationSegment> = location.iter().collect();
+    subschema_for_segments(root, &segments)
+}
+
+/// Walk `root`'s `properties`/`items` along `segments`, returning the resolved
+/// subschema or falling back to `root` when a segment can't be followed. Shared
+/// by [`subschema_at_instance_path`] and the `FalseSchema` arm, which walks to
+/// the parent object to enumerate its valid keys.
+fn subschema_for_segments<'a>(root: &'a Value, segments: &[LocationSegment]) -> &'a Value {
+    let mut current = root;
+    for segment in segments {
+        let next = match segment {
+            LocationSegment::Property(name) => current
+                .get("properties")
+                .and_then(Value::as_object)
+                .and_then(|props| props.get(&**name)),
+            LocationSegment::Index(_) => current.get("items").filter(|items| items.is_object()),
+        };
+        match next {
+            Some(schema) => current = schema,
+            None => return root,
+        }
+    }
+    current
 }
 
 /// Render enum options for the "Allowed values" list: strings are shown raw
@@ -3990,6 +4076,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result["called"], "any", "degenerate schema should dispatch");
+    }
+
+    #[tokio::test]
+    async fn validate_closed_schema_without_properties_rejects_extra() {
+        // A closed schema that declares no `properties`/`required` still
+        // forbids unexpected arguments and must be validated, not skipped.
+        // Such a schema accepts nothing, so the actionable message is to
+        // remove all arguments (the offending key name is not recoverable
+        // from the crate's `FalseSchema` error).
+        let registry = registry_with_schema(
+            "noargs",
+            json!({ "type": "object", "additionalProperties": false }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("noargs", json!({ "surprise": 1 }))
+            .await
+            .unwrap();
+        let text = assert_validation_error(&result, "noargs");
+        assert!(
+            text.contains("accepts no parameters") && text.contains("remove all arguments"),
+            "closed schema should reject the unexpected argument: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_closed_schema_without_properties_passes_when_empty() {
+        // The same closed schema accepts an empty argument object.
+        let registry = registry_with_schema(
+            "noargs",
+            json!({ "type": "object", "additionalProperties": false }),
+        )
+        .await;
+        let result = registry.route_tool_call("noargs", json!({})).await.unwrap();
+        assert_eq!(result["called"], "noargs", "no-arg call should dispatch");
+    }
+
+    #[tokio::test]
+    async fn validate_nested_additional_properties_lists_nested_keys() {
+        // An unexpected key inside a nested object must report the nested
+        // object's valid parameters, not the root's.
+        let registry = registry_with_schema(
+            "configure",
+            json!({
+                "type": "object",
+                "properties": {
+                    "config": {
+                        "type": "object",
+                        "properties": {
+                            "host": { "type": "string" },
+                            "port": { "type": "integer" }
+                        },
+                        "additionalProperties": false,
+                    }
+                },
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("configure", json!({ "config": { "hostt": "x" } }))
+            .await
+            .unwrap();
+        let text = assert_validation_error(&result, "configure");
+        assert!(
+            text.contains("config.hostt") && text.contains("unknown parameter"),
+            "should name the nested unknown parameter with its dotted path: {}",
+            text
+        );
+        assert!(
+            text.contains("Valid parameters: host, port"),
+            "should list the nested object's valid parameters: {}",
+            text
+        );
     }
 
     #[tokio::test]
