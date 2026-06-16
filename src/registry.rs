@@ -1073,14 +1073,41 @@ fn format_validation_error(error: &ValidationError, schema: &Value) -> String {
         ValidationErrorKind::AdditionalProperties { unexpected }
         | ValidationErrorKind::UnevaluatedProperties { unexpected } => {
             let known = schema_property_names(schema);
-            let leaf = unexpected.first().map(String::as_str).unwrap_or_default();
-            let mut msg = format!(
-                "Field '{}': unknown parameter. Valid parameters: {}.",
-                join_field(&path, leaf),
-                known.join(", ")
-            );
-            if let Some(best) = closest_match(leaf, &known) {
-                msg.push_str(&format!(" Did you mean '{}'?", best));
+            // The crate batches every unexpected key into one error, so name
+            // them all (sorted for deterministic output) rather than just the
+            // first — otherwise the model fixes one and is rejected for the
+            // next on each retry.
+            let mut keys: Vec<&str> = unexpected.iter().map(String::as_str).collect();
+            keys.sort_unstable();
+            let fields: Vec<String> = keys.iter().map(|key| join_field(&path, key)).collect();
+            let mut msg = if fields.len() == 1 {
+                format!(
+                    "Field '{}': unknown parameter. Valid parameters: {}.",
+                    fields[0],
+                    known.join(", ")
+                )
+            } else {
+                let listed = fields
+                    .iter()
+                    .map(|field| format!("'{}'", field))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "Fields {}: unknown parameters. Valid parameters: {}.",
+                    listed,
+                    known.join(", ")
+                )
+            };
+            if fields.len() == 1 {
+                if let Some(best) = closest_match(keys[0], &known) {
+                    msg.push_str(&format!(" Did you mean '{}'?", best));
+                }
+            } else {
+                for (key, field) in keys.iter().zip(fields.iter()) {
+                    if let Some(best) = closest_match(key, &known) {
+                        msg.push_str(&format!(" Did you mean '{}' for '{}'?", best, field));
+                    }
+                }
             }
             msg
         }
@@ -3905,6 +3932,50 @@ mod tests {
         assert!(
             text.contains("Did you mean 'owner'"),
             "should suggest the closest known parameter: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_reports_all_unknown_params() {
+        // The crate batches every unexpected key into one error; the formatter
+        // must name them all (with a per-key suggestion) so the model can fix
+        // every unknown parameter in a single retry.
+        let registry = registry_with_schema(
+            "repo",
+            json!({
+                "type": "object",
+                "properties": {
+                    "owner": { "type": "string" },
+                    "repo": { "type": "string" }
+                },
+                "additionalProperties": false,
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("repo", json!({ "ownre": "x", "rep": "y" }))
+            .await
+            .unwrap();
+        let text = assert_validation_error(&result, "repo");
+        assert!(
+            text.contains("'ownre'") && text.contains("'rep'"),
+            "should name every unknown parameter: {}",
+            text
+        );
+        assert!(
+            text.contains("Did you mean 'owner' for 'ownre'"),
+            "should suggest the closest match per unknown key: {}",
+            text
+        );
+        assert!(
+            text.contains("Did you mean 'repo' for 'rep'"),
+            "should suggest the closest match per unknown key: {}",
+            text
+        );
+        assert!(
+            text.contains("Valid parameters: owner, repo"),
+            "should still list the valid parameters: {}",
             text
         );
     }

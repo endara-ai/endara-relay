@@ -2146,12 +2146,16 @@ mod tests {
         let reg = registry_with_single_tool(tool).await;
         let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
         let result = sandbox
-            .execute(r#"return call("echo", { text: "hi", zzz: 1 });"#)
+            .execute(r#"return call("echo", { text: "hi", zzz: 1, qqq: 2 });"#)
             .await;
         assert!(result.is_err(), "unknown params should reject");
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("'echo'"), "error names tool: {}", err);
-        assert!(err.contains("'zzz'"), "error lists unknown key: {}", err);
+        assert!(
+            err.contains("'zzz'") && err.contains("'qqq'"),
+            "error lists every unknown key: {}",
+            err
+        );
         assert!(
             err.contains("unknown parameter"),
             "error explains the rejection: {}",
