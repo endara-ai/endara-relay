@@ -9,7 +9,9 @@ use endara_relay::adapter::McpAdapter;
 use endara_relay::js_sandbox::MetaToolHandler;
 use endara_relay::profile_registry::ProfileRegistry;
 use endara_relay::registry::AdapterRegistry;
-use endara_relay::server::{build_router, start_server, AppState, SessionIdentityStore};
+use endara_relay::server::{
+    build_router, start_server, AppState, MetaToolSchemas, SessionIdentityStore,
+};
 use serde_json::json;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -94,6 +96,7 @@ async fn setup_multi_endpoint_server() -> (SocketAddr, AdapterRegistry, tokio::t
         started_at: std::time::Instant::now(),
         toon_enabled: false,
         session_identities: Arc::new(std::sync::Mutex::new(SessionIdentityStore::default())),
+        meta_tool_schemas: MetaToolSchemas::new(),
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
@@ -246,6 +249,7 @@ async fn test_multi_endpoint_overlapping_tool_names() {
         started_at: std::time::Instant::now(),
         toon_enabled: false,
         session_identities: Arc::new(std::sync::Mutex::new(SessionIdentityStore::default())),
+        meta_tool_schemas: MetaToolSchemas::new(),
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();

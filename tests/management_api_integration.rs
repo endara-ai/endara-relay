@@ -87,6 +87,7 @@ fn test_config() -> Config {
             toon_output: None,
             startup_init_timeout_secs: None,
             session_identity_max_sessions: None,
+            validate_inputs: None,
         },
         endpoints: vec![EndpointConfig {
             name: "echo".to_string(),

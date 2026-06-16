@@ -206,6 +206,18 @@ async fn reload_and_apply(
         info!(js_execution_mode = new_js_mode, "JS execution mode updated");
     }
 
+    // Update the input-validation toggle if it changed. The flag lives on the
+    // registry (mirroring `js_execution_mode`'s hot-reload), so a config edit
+    // takes effect on the next `route_tool_call` without restarting endpoints.
+    let new_validate_inputs = new_config.relay.validate_inputs.unwrap_or(true);
+    if new_validate_inputs != registry.validate_inputs() {
+        registry.set_validate_inputs(new_validate_inputs);
+        info!(
+            validate_inputs = new_validate_inputs,
+            "Input validation toggle updated"
+        );
+    }
+
     // Rebuild the profile registry from the reloaded config. Per recon §D4
     // the watcher is the source of truth for profile state, mirroring how
     // `js_execution_mode` is propagated above. `rebuild` performs a single
@@ -2261,6 +2273,189 @@ command = "/bin/true"
                     counts.values().sum::<usize>(),
                     2,
                     "reload should emit exactly 2 ticks total (counts={counts:?})"
+                );
+            }
+        }
+
+        // ---- §7.2: hot-reloadable `validate_inputs` toggle ----
+        //
+        // The input-validation toggle lives on the adapter registry as an
+        // `Arc<AtomicBool>` and is propagated by `reload_and_apply` exactly
+        // like `js_execution_mode` (watcher.rs ~205/~212). This module drives
+        // the real reload entry point to flip the toggle and asserts that a
+        // previously-rejected bad `tools/call` reaches the adapter once
+        // validation is off, then is rejected again once it is re-enabled —
+        // without restarting any endpoint.
+        mod validate_inputs {
+            use super::super::*;
+            use crate::config::Config;
+            use crate::profile_registry::ProfileRegistry;
+            use serde_json::json;
+            use std::path::PathBuf;
+            use std::sync::atomic::AtomicBool;
+            use std::sync::Arc;
+            use tokio::sync::RwLock;
+
+            const CONFIG_VALIDATE_ON: &str = r#"
+[relay]
+machine_name = "test"
+validate_inputs = true
+"#;
+
+            const CONFIG_VALIDATE_OFF: &str = r#"
+[relay]
+machine_name = "test"
+validate_inputs = false
+"#;
+
+            /// Build watcher state with a single mock endpoint whose one tool
+            /// carries a real `inputSchema` (a required `repo` field). The
+            /// endpoint is intentionally NOT declared in `config.toml`, so the
+            /// reload's endpoint diff is empty and leaves the adapter intact —
+            /// only the `validate_inputs` toggle changes across reloads.
+            async fn setup(
+                initial_toml: &str,
+            ) -> (
+                tempfile::TempDir,
+                PathBuf,
+                Arc<RwLock<Config>>,
+                Arc<AdapterRegistry>,
+                Arc<ProfileRegistry>,
+                Arc<AtomicBool>,
+                Arc<TokenManager>,
+                OAuthAdapterInners,
+            ) {
+                let tmp = tempfile::tempdir().unwrap();
+                let path = tmp.path().join("config.toml");
+                std::fs::write(&path, initial_toml).unwrap();
+                let (initial, _warnings) = config::load_config_graceful(&path).unwrap();
+
+                let registry = Arc::new(AdapterRegistry::new());
+                let dummy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                registry
+                    .register(
+                        "ep1".into(),
+                        Box::new(MockAdapter::healthy(
+                            vec![ToolInfo {
+                                name: "create".into(),
+                                description: Some("create tool".into()),
+                                input_schema: json!({
+                                    "type": "object",
+                                    "properties": { "repo": { "type": "string" } },
+                                    "required": ["repo"],
+                                }),
+                                annotations: None,
+                            }],
+                            dummy,
+                        )),
+                        "stdio".into(),
+                        None,
+                        Some("ep1".into()),
+                    )
+                    .await;
+
+                let profile_registry = Arc::new(ProfileRegistry::new((*registry).clone()));
+                profile_registry
+                    .rebuild(initial.profiles.as_deref().unwrap_or(&[]))
+                    .await;
+                let current_config = Arc::new(RwLock::new(initial));
+                let js_mode = Arc::new(AtomicBool::new(false));
+                let (token_manager, inners) = test_oauth_infra();
+                (
+                    tmp,
+                    path,
+                    current_config,
+                    registry,
+                    profile_registry,
+                    js_mode,
+                    token_manager,
+                    inners,
+                )
+            }
+
+            /// A bad call (missing the required `repo`) is rejected with the
+            /// structured `isError: true` result and the adapter is never hit.
+            async fn bad_call_rejected(registry: &AdapterRegistry) -> bool {
+                let result = registry
+                    .route_tool_call("create", json!({}))
+                    .await
+                    .expect("route_tool_call returns Ok even on validation failure");
+                result["isError"] == json!(true) && result.get("called").is_none()
+            }
+
+            /// The same bad call now dispatches to the adapter, which echoes
+            /// the routed tool name back via the `called` marker.
+            async fn call_reached_adapter(registry: &AdapterRegistry) -> bool {
+                let result = registry
+                    .route_tool_call("create", json!({}))
+                    .await
+                    .expect("route_tool_call should succeed");
+                result["called"] == json!("create")
+            }
+
+            /// §7.2: editing `relay.validate_inputs` in `config.toml` and
+            /// driving a watcher reload toggles validation at runtime. true→
+            /// false lets a previously-rejected bad call reach the adapter;
+            /// false→true restores rejection. Mirrors the `js_execution_mode`
+            /// hot-reload wiring exercised by the profile reload tests above.
+            #[tokio::test]
+            async fn validate_inputs_toggle_hot_reloads() {
+                let (_tmp, path, current_config, registry, profile_registry, js_mode, tm, inners) =
+                    setup(CONFIG_VALIDATE_ON).await;
+
+                // Baseline: validation on (default true) → bad call rejected
+                // before the adapter runs.
+                assert!(registry.validate_inputs(), "default toggle must be on");
+                assert!(
+                    bad_call_rejected(&registry).await,
+                    "bad args must be rejected while validation is enabled"
+                );
+
+                // true → false: reload flips the toggle; the same bad call now
+                // reaches the adapter.
+                std::fs::write(&path, CONFIG_VALIDATE_OFF).unwrap();
+                reload_and_apply(
+                    &path,
+                    &current_config,
+                    &registry,
+                    &js_mode,
+                    &profile_registry,
+                    &tm,
+                    &inners,
+                    None,
+                )
+                .await
+                .expect("reload disabling validation should succeed");
+                assert!(
+                    !registry.validate_inputs(),
+                    "toggle must be off after the reload"
+                );
+                assert!(
+                    call_reached_adapter(&registry).await,
+                    "with validation off the bad call must reach the adapter"
+                );
+
+                // false → true: reload restores validation; rejection returns.
+                std::fs::write(&path, CONFIG_VALIDATE_ON).unwrap();
+                reload_and_apply(
+                    &path,
+                    &current_config,
+                    &registry,
+                    &js_mode,
+                    &profile_registry,
+                    &tm,
+                    &inners,
+                    None,
+                )
+                .await
+                .expect("reload re-enabling validation should succeed");
+                assert!(
+                    registry.validate_inputs(),
+                    "toggle must be on after the second reload"
+                );
+                assert!(
+                    bad_call_rejected(&registry).await,
+                    "re-enabling validation must restore rejection"
                 );
             }
         }

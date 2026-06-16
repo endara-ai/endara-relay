@@ -376,18 +376,12 @@ fn call_tool_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
             .ok_or_else(|| JsNativeError::error().with_message("sandbox state not initialised"))?;
         // Pre-flight existence check so unknown tool names yield a fuzzy
         // suggestion error instead of the bare adapter "no tool found" text.
+        // Argument validation (unknown keys, types, required fields, …) is
+        // handled centrally by `route_tool_call` via JSON-Schema, so no
+        // sandbox-side schema check is needed here.
         let catalog = state.handle.block_on(state.registry.merged_catalog());
-        let tool = match catalog.iter().find(|t| t.name == tool_name) {
-            Some(t) => t,
-            None => {
-                let msg = format_unknown_tool_error(&tool_name, &catalog);
-                return Err(JsError::from(JsNativeError::error().with_message(msg)));
-            }
-        };
-        // Pre-flight strict-schema check so unknown arg keys fail fast with a
-        // helpful list of valid parameters instead of being silently dropped
-        // by the upstream MCP server.
-        if let Some(msg) = validate_tool_args(tool, &arguments) {
+        if !catalog.iter().any(|t| t.name == tool_name) {
+            let msg = format_unknown_tool_error(&tool_name, &catalog);
             return Err(JsError::from(JsNativeError::error().with_message(msg)));
         }
         let res = block_on_with_client(
@@ -464,8 +458,9 @@ fn call_tool_with_retry_native(
         let state = borrow
             .as_ref()
             .ok_or_else(|| JsNativeError::error().with_message("sandbox state not initialised"))?;
-        // Pre-flight existence + schema checks share the same shape as the
-        // plain `__call_tool` path; the eligibility gate is the only addition.
+        // Pre-flight existence + retry-eligibility checks. Argument validation
+        // is handled centrally by `route_tool_call` via JSON-Schema, so the
+        // eligibility gate is the only sandbox-side addition over `__call_tool`.
         let catalog = state.handle.block_on(state.registry.merged_catalog());
         let tool = match catalog.iter().find(|t| t.name == tool_name) {
             Some(t) => t,
@@ -474,9 +469,6 @@ fn call_tool_with_retry_native(
                 return Err(JsError::from(JsNativeError::error().with_message(msg)));
             }
         };
-        if let Some(msg) = validate_tool_args(tool, &arguments) {
-            return Err(JsError::from(JsNativeError::error().with_message(msg)));
-        }
         if !is_retry_eligible(tool.annotations.as_ref()) {
             return Err(JsError::from(JsNativeError::error().with_message(format!(
                 "call('{}'): retry not allowed (tool not declared read-only or idempotent)",
@@ -655,66 +647,6 @@ fn suggest_tool_names(name: &str, catalog: &[ToolInfo]) -> Vec<String> {
         .take(3)
         .map(|(_, n)| n.to_string())
         .collect()
-}
-
-/// Reject calls that pass keys not declared by the tool's `input_schema`.
-///
-/// Strict only when the schema is shaped like a closed object: `type` is
-/// `"object"` (or absent), `properties` is a defined object, and
-/// `additionalProperties` is **not** `true` (missing/false/schema → strict,
-/// per JSON Schema convention). Tools without `properties` accept arbitrary
-/// args and bypass the check. Returns the formatted error message when args
-/// should be rejected; `None` means pass-through.
-fn validate_tool_args(tool: &ToolInfo, args: &Value) -> Option<String> {
-    let schema = &tool.input_schema;
-    if let Some(t) = schema.get("type") {
-        if t.as_str() != Some("object") {
-            return None;
-        }
-    }
-    let properties = schema.get("properties").and_then(|p| p.as_object())?;
-    if schema.get("additionalProperties").and_then(|v| v.as_bool()) == Some(true) {
-        return None;
-    }
-    let args_obj = args.as_object()?;
-    let mut unknown: Vec<&str> = args_obj
-        .keys()
-        .filter(|k| !properties.contains_key(k.as_str()))
-        .map(|s| s.as_str())
-        .collect();
-    if unknown.is_empty() {
-        return None;
-    }
-    unknown.sort_unstable();
-
-    let unknown_list = unknown
-        .iter()
-        .map(|k| format!("'{}'", k))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let mut valid_params: Vec<(&str, Option<&str>)> = properties
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.get("description").and_then(|d| d.as_str())))
-        .collect();
-    valid_params.sort_by(|a, b| a.0.cmp(b.0));
-    let valid_list = if valid_params.is_empty() {
-        "(none)".to_string()
-    } else {
-        valid_params
-            .iter()
-            .map(|(k, d)| match d {
-                Some(desc) => format!("'{}' ({})", k, desc),
-                None => format!("'{}'", k),
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-
-    Some(format!(
-        "tool '{}' rejected unknown parameter(s) {}. Valid parameters: {}.",
-        tool.name, unknown_list, valid_list
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2190,6 +2122,9 @@ mod tests {
         Arc::new(registry)
     }
 
+    // `additionalProperties: false` makes the schema closed so the centralised
+    // `route_tool_call` JSON-Schema layer (spec §4.4) rejects unknown keys —
+    // the sandbox no longer runs its own permissive-by-default arg check.
     fn echo_strict_schema() -> Value {
         json!({
             "type": "object",
@@ -2197,34 +2132,40 @@ mod tests {
                 "text": { "type": "string", "description": "Text to echo back" },
                 "count": { "type": "number", "description": "Repeat count" }
             },
-            "required": ["text"]
+            "required": ["text"],
+            "additionalProperties": false
         })
     }
 
     #[tokio::test]
     async fn test_js_sandbox_strict_schema_rejects_unknown_param() {
+        // Migrated to the centralised `route_tool_call` JSON-Schema path (spec
+        // §10.5 #29/#30): the structured error names the tool, the offending
+        // key, and the valid parameter list so the model can self-correct.
         let tool = make_tool_with_schema("echo", "Echo tool", echo_strict_schema());
         let reg = registry_with_single_tool(tool).await;
         let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
         let result = sandbox
-            .execute(r#"return call("echo", { text: "hi", zzz: 1, aaa: 2 });"#)
+            .execute(r#"return call("echo", { text: "hi", zzz: 1, qqq: 2 });"#)
             .await;
         assert!(result.is_err(), "unknown params should reject");
         let err = format!("{}", result.unwrap_err());
         assert!(err.contains("'echo'"), "error names tool: {}", err);
-        // Unknown keys are listed alphabetically.
-        let aaa_idx = err.find("'aaa'").expect("unknown 'aaa' listed");
-        let zzz_idx = err.find("'zzz'").expect("unknown 'zzz' listed");
-        assert!(aaa_idx < zzz_idx, "unknown keys must be sorted: {}", err);
-        // Valid params + their descriptions surface.
         assert!(
-            err.contains("'text'") && err.contains("Text to echo back"),
-            "valid param 'text' with description: {}",
+            err.contains("'zzz'") && err.contains("'qqq'"),
+            "error lists every unknown key: {}",
             err
         );
         assert!(
-            err.contains("'count'") && err.contains("Repeat count"),
-            "valid param 'count' with description: {}",
+            err.contains("unknown parameter"),
+            "error explains the rejection: {}",
+            err
+        );
+        // The valid parameter names surface (descriptions are no longer part of
+        // the centralised message format).
+        assert!(
+            err.contains("text") && err.contains("count"),
+            "valid params listed: {}",
             err
         );
     }
@@ -2275,18 +2216,29 @@ mod tests {
 
     #[tokio::test]
     async fn test_js_sandbox_unknown_param_rejected_via_tools_indexer() {
-        // Parity with `call(...)`: invoking `tools["name"](args)` shares the
-        // same `__call_tool` path, so strict rejection must trigger here too.
+        // The indexer path (`tools["name"](args)`) returns the *raw* MCP
+        // envelope, so a centralised `route_tool_call` validation failure
+        // surfaces as an `isError: true` result rather than a thrown error
+        // (unlike `call()`, which unwraps and throws). The schema rejection is
+        // still reported with the offending key and tool name.
         let tool = make_tool_with_schema("echo", "Echo tool", echo_strict_schema());
         let reg = registry_with_single_tool(tool).await;
         let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
         let result = sandbox
             .execute(r#"return tools["echo"]({ text: "hi", bogus: 1 });"#)
-            .await;
-        assert!(result.is_err(), "indexer path must also reject");
-        let err = format!("{}", result.unwrap_err());
-        assert!(err.contains("'bogus'"), "error lists unknown key: {}", err);
-        assert!(err.contains("'echo'"), "error names tool: {}", err);
+            .await
+            .expect("indexer returns the raw isError envelope, not a thrown error");
+        assert_eq!(
+            result["isError"], true,
+            "indexer should surface the validation failure envelope: {result}"
+        );
+        let text = result["content"][0]["text"].as_str().unwrap_or("");
+        assert!(
+            text.contains("'bogus'"),
+            "error lists unknown key: {}",
+            text
+        );
+        assert!(text.contains("'echo'"), "error names tool: {}", text);
     }
 
     // --- suggest_tool_names unit tests ---

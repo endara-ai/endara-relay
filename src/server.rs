@@ -16,6 +16,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use jsonschema::Validator;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
@@ -68,6 +69,84 @@ pub struct AppState {
     /// `clientInfo`. Wrapped in `Arc<Mutex<_>>` so [`AppState`] stays
     /// `Clone` and cheap to pass through axum extractors.
     pub session_identities: Arc<Mutex<SessionIdentityStore>>,
+    /// Precompiled JSON-Schema validators for the three relay-defined
+    /// meta-tools. Their input shapes never change, so they are compiled once
+    /// at startup (see [`MetaToolSchemas::new`]) and shared here. Consulted by
+    /// [`validate_meta_tool_args`] at the top of each meta-tool branch in
+    /// [`mcp_tools_call`].
+    pub meta_tool_schemas: Arc<MetaToolSchemas>,
+}
+
+/// Precompiled JSON-Schema validators for the relay-defined meta-tools
+/// (`list_tools`, `search_tools`, `execute_tools`), per spec §6.
+///
+/// Unlike upstream tool schemas — which are compiled lazily and cached on the
+/// [`AdapterRegistry`] — these are owned by the relay and immutable, so they
+/// are compiled once at startup. Each entry keeps its source schema beside the
+/// compiled validator so [`crate::registry::validate_with_validator`] can list
+/// the known parameter names in `additionalProperties` errors, making
+/// meta-tool validation failures look identical to per-tool ones.
+pub struct MetaToolSchemas {
+    validators: HashMap<&'static str, (Arc<Validator>, Value)>,
+}
+
+impl MetaToolSchemas {
+    /// Compile the static meta-tool schemas (spec §6.1). These are known-valid
+    /// literals, so a compilation failure is a programmer error and panics at
+    /// startup rather than silently disabling meta-tool validation.
+    pub fn new() -> Arc<Self> {
+        let specs: [(&'static str, Value); 3] = [
+            (
+                "list_tools",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "limit": { "type": "integer", "minimum": 1 },
+                        "offset": { "type": "integer", "minimum": 0 }
+                    },
+                    "additionalProperties": false
+                }),
+            ),
+            (
+                "search_tools",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "query": { "type": "string" },
+                        "limit": { "type": "integer", "minimum": 1 }
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false
+                }),
+            ),
+            (
+                "execute_tools",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "script": { "type": "string" }
+                    },
+                    "required": ["script"],
+                    "additionalProperties": false
+                }),
+            ),
+        ];
+        let mut validators = HashMap::with_capacity(specs.len());
+        for (name, schema) in specs {
+            let validator = jsonschema::options()
+                .should_validate_formats(true)
+                .build(&schema)
+                .unwrap_or_else(|e| panic!("meta-tool schema for '{name}' must compile: {e}"));
+            validators.insert(name, (Arc::new(validator), schema));
+        }
+        Arc::new(Self { validators })
+    }
+
+    /// Look up the compiled validator and source schema for a meta-tool by
+    /// name. `None` for any non-meta-tool name.
+    fn get(&self, name: &str) -> Option<&(Arc<Validator>, Value)> {
+        self.validators.get(name)
+    }
 }
 
 /// Bounded LRU cache of `Mcp-Session-Id` → [`ClientIdentity`] entries.
@@ -297,6 +376,25 @@ fn wrap_meta_tool_result(result: Value, toon_enabled: bool) -> Value {
     })
 }
 
+/// Validate a meta-tool's `arguments` against its precompiled schema (spec
+/// §6). Returns `Some(isError result)` to short-circuit the branch when the
+/// arguments are invalid; `None` when they pass, when validation is disabled
+/// (`relay.validate_inputs = false`), or when `name` is not a meta-tool.
+///
+/// Honours the same global `validate_inputs` toggle as the per-tool path and
+/// reuses [`crate::registry::validate_with_validator`] so the returned
+/// `isError` result is shaped identically to schema failures from
+/// `route_tool_call`.
+fn validate_meta_tool_args(state: &AppState, name: &str, arguments: &Value) -> Option<Value> {
+    if !state.registry.validate_inputs() {
+        return None;
+    }
+    let (validator, schema) = state.meta_tool_schemas.get(name)?;
+    let (result, _message) =
+        crate::registry::validate_with_validator(name, validator, schema, arguments)?;
+    Some(result)
+}
+
 fn jsonrpc_error(id: Option<Value>, code: i64, message: &str) -> (StatusCode, Json<Value>) {
     (
         StatusCode::OK,
@@ -522,6 +620,9 @@ async fn mcp_tools_call(
     // Check if this is a meta-tool call
     match tool_name {
         "list_tools" => {
+            if let Some(err) = validate_meta_tool_args(&state, "list_tools", &arguments) {
+                return Ok(jsonrpc_response(body.id, err));
+            }
             let limit = arguments
                 .get("limit")
                 .and_then(|v| v.as_u64())
@@ -541,6 +642,9 @@ async fn mcp_tools_call(
             }
         }
         "search_tools" => {
+            if let Some(err) = validate_meta_tool_args(&state, "search_tools", &arguments) {
+                return Ok(jsonrpc_response(body.id, err));
+            }
             let query = arguments
                 .get("query")
                 .and_then(|v| v.as_str())
@@ -570,6 +674,9 @@ async fn mcp_tools_call(
                     -32601,
                     "execute_tools is disabled — set relay.local_js_execution = true to enable the JS sandbox.",
                 ));
+            }
+            if let Some(err) = validate_meta_tool_args(&state, "execute_tools", &arguments) {
+                return Ok(jsonrpc_response(body.id, err));
             }
             let script = arguments
                 .get("script")
@@ -1925,6 +2032,7 @@ mod tests {
             started_at: Instant::now(),
             toon_enabled: false,
             session_identities: Arc::new(Mutex::new(SessionIdentityStore::default())),
+            meta_tool_schemas: MetaToolSchemas::new(),
         }
     }
 
@@ -2485,6 +2593,130 @@ mod tests {
                 // An error response is acceptable for empty script
             }
         }
+    }
+
+    // --- Meta-tool input validation (spec §6 / §10.2) ---
+    //
+    // `validate_meta_tool_args` runs at the top of each meta-tool branch in
+    // `mcp_tools_call`, validating against the precompiled static schemas on
+    // `AppState::meta_tool_schemas`. Failures return the same `isError: true`
+    // result shape as the per-tool `route_tool_call` path.
+
+    /// Build a `tools/call` JSON-RPC body for a meta-tool with `arguments`.
+    fn meta_call_body(name: &str, arguments: Value) -> JsonRpcBody {
+        JsonRpcBody {
+            jsonrpc: Some("2.0".to_string()),
+            method: Some("tools/call".to_string()),
+            params: Some(json!({ "name": name, "arguments": arguments })),
+            id: Some(json!(1)),
+        }
+    }
+
+    // §10.2 #16 — a wrong key name (`search` instead of `query`) is rejected
+    // as an unknown parameter instead of silently falling through to an empty
+    // search, and the valid parameter list surfaces `query`.
+    #[tokio::test]
+    async fn search_tools_wrong_key_rejected() {
+        let state = test_app_state();
+        let body = meta_call_body("search_tools", json!({ "search": "foo" }));
+        let Json(resp) = mcp_tools_call(State(state), Json(body), None)
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], true, "got: {resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("'search'"), "names the bad key: {text}");
+        assert!(
+            text.contains("unknown parameter"),
+            "explains rejection: {text}"
+        );
+        assert!(
+            text.contains("query"),
+            "lists the valid 'query' param: {text}"
+        );
+    }
+
+    // §10.2 #17 — `search_tools` without the required `query` is rejected.
+    #[tokio::test]
+    async fn search_tools_missing_query_rejected() {
+        let state = test_app_state();
+        let body = meta_call_body("search_tools", json!({}));
+        let Json(resp) = mcp_tools_call(State(state), Json(body), None)
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], true, "got: {resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("query") && text.contains("required field is missing"),
+            "should report the missing required field: {text}"
+        );
+    }
+
+    // §10.2 #18 — `execute_tools` without the required `script` is rejected
+    // (JS mode on so the branch is reachable past the disabled gate).
+    #[tokio::test]
+    async fn execute_tools_missing_script_rejected() {
+        let state = test_app_state();
+        state.js_execution_mode.store(true, Ordering::Relaxed);
+        let body = meta_call_body("execute_tools", json!({}));
+        let Json(resp) = mcp_tools_call(State(state), Json(body), None)
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], true, "got: {resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("script") && text.contains("required field is missing"),
+            "should report the missing required field: {text}"
+        );
+    }
+
+    // §10.2 #19 — a negative `limit` violates the schema's `minimum: 1`.
+    #[tokio::test]
+    async fn list_tools_negative_limit_rejected() {
+        let state = test_app_state();
+        let body = meta_call_body("list_tools", json!({ "limit": -1 }));
+        let Json(resp) = mcp_tools_call(State(state), Json(body), None)
+            .await
+            .unwrap();
+        assert_eq!(resp["result"]["isError"], true, "got: {resp}");
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("limit") && text.contains("outside range"),
+            "should frame the violation as a range problem: {text}"
+        );
+    }
+
+    // §10.2 #20 — a valid `list_tools` call passes validation and returns the
+    // normal (non-error) result envelope.
+    #[tokio::test]
+    async fn list_tools_valid_limit_passes() {
+        let state = test_app_state();
+        let body = meta_call_body("list_tools", json!({ "limit": 5 }));
+        let Json(resp) = mcp_tools_call(State(state), Json(body), None)
+            .await
+            .unwrap();
+        assert!(
+            resp["result"].get("isError").is_none(),
+            "valid input should not produce an error envelope: {resp}"
+        );
+        let inner: Value =
+            serde_json::from_str(resp["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(inner["tools"].is_array(), "got: {inner}");
+    }
+
+    // The `validate_inputs = false` toggle bypasses meta-tool validation: a
+    // wrong key falls through to the handler instead of an `isError` result.
+    #[tokio::test]
+    async fn meta_tool_validation_respects_disabled_toggle() {
+        let state = test_app_state();
+        state.registry.set_validate_inputs(false);
+        let body = meta_call_body("search_tools", json!({ "search": "foo" }));
+        let Json(resp) = mcp_tools_call(State(state), Json(body), None)
+            .await
+            .unwrap();
+        assert!(
+            resp["result"].get("isError").is_none(),
+            "toggle off should bypass meta-tool validation: {resp}"
+        );
     }
 
     // §5 row 16: `list_tools` response text is TOON when `toon_enabled` is on.

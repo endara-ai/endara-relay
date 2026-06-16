@@ -3,9 +3,12 @@ use crate::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::events::{current_request_context, ToolCallEvent, ToolCallEventBus};
 use crate::prefix;
 use async_trait::async_trait;
+use jsonschema::error::{TypeKind, ValidationErrorKind};
+use jsonschema::paths::{Location, LocationSegment};
+use jsonschema::{ValidationError, Validator};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -93,6 +96,13 @@ impl RegisteredAdapter {
 /// Cached catalog type: `(tool_list, reverse_lookup_map)`.
 type CatalogCache = (Vec<ToolInfo>, HashMap<String, (String, String)>);
 
+/// Compiled JSON Schema validators keyed by prefixed tool name. Lazily
+/// populated on the first `route_tool_call` for each tool and cleared by
+/// [`AdapterRegistry::invalidate_catalog_cache`]. `None` means the tool has
+/// no useful schema to validate against (degenerate schema, or one that
+/// failed to compile) and the call passes through unvalidated.
+type CompiledSchemaCache = HashMap<String, Option<Arc<Validator>>>;
+
 /// Thread-safe registry of MCP adapters keyed by endpoint name.
 #[derive(Clone)]
 pub struct AdapterRegistry {
@@ -122,6 +132,17 @@ pub struct AdapterRegistry {
     /// the same `Started` → `Failed` transition adapters produce for calls
     /// that do reach the network.
     event_bus: Option<ToolCallEventBus>,
+    /// Lazily-populated cache of compiled `inputSchema` validators, keyed by
+    /// prefixed tool name. Populated on first validation in
+    /// [`Self::route_tool_call`] and cleared alongside the catalog cache in
+    /// [`Self::invalidate_catalog_cache`]. See [`CompiledSchemaCache`].
+    schema_cache: Arc<RwLock<CompiledSchemaCache>>,
+    /// When `true` (the effective default), [`Self::route_tool_call`]
+    /// validates `tools/call` arguments against the tool's `inputSchema`
+    /// before dispatch. Hot-reloadable: `ConfigWatcher` calls
+    /// [`Self::set_validate_inputs`] on every reload, mirroring the
+    /// `js_execution_mode` flag pattern.
+    validate_inputs: Arc<AtomicBool>,
 }
 
 impl Default for AdapterRegistry {
@@ -140,7 +161,30 @@ impl AdapterRegistry {
             catalog_generation: Arc::new(AtomicU64::new(0)),
             tools_changed_tx,
             event_bus: None,
+            schema_cache: Arc::new(RwLock::new(HashMap::new())),
+            validate_inputs: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// Set the initial value of the input-validation toggle. Builder style so
+    /// the many `AdapterRegistry::new()` call sites keep compiling; `main.rs`
+    /// wires the effective default (`relay.validate_inputs`, defaulting to
+    /// `true`) at startup.
+    pub fn with_validate_inputs(self, enabled: bool) -> Self {
+        self.validate_inputs.store(enabled, Ordering::Relaxed);
+        self
+    }
+
+    /// Update the input-validation toggle at runtime. Called by
+    /// `ConfigWatcher` on every config reload so the flag is hot-reloadable
+    /// without restarting the relay. Mirrors the `js_execution_mode` pattern.
+    pub fn set_validate_inputs(&self, enabled: bool) {
+        self.validate_inputs.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Current value of the input-validation toggle.
+    pub fn validate_inputs(&self) -> bool {
+        self.validate_inputs.load(Ordering::Relaxed)
     }
 
     /// Attach a shared [`ToolCallEventBus`] so [`Self::route_tool_call`]
@@ -322,6 +366,7 @@ impl AdapterRegistry {
     pub async fn invalidate_catalog_cache(&self) {
         self.invalidate_all_tool_caches().await;
         *self.catalog_cache.write().await = None;
+        self.schema_cache.write().await.clear();
         self.catalog_generation.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -598,7 +643,7 @@ impl AdapterRegistry {
         prefixed_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value, AdapterError> {
-        let (_, lookup) = self.merged_catalog_with_lookup().await;
+        let (catalog, lookup) = self.merged_catalog_with_lookup().await;
 
         let (endpoint, tool) = match lookup.get(prefixed_name) {
             Some(v) => v,
@@ -677,6 +722,32 @@ impl AdapterRegistry {
             ));
         }
 
+        // Schema validation. Runs after the disabled-tools check and before
+        // adapter dispatch so both the direct (`mcp_tools_call`) and the
+        // JS-sandbox paths are covered by this single insertion. Skipped
+        // entirely when `relay.validate_inputs` is `false`. Validation
+        // failures return `Ok(isError: true)` — the call was understood, the
+        // arguments just don't match the schema, so the model can self-correct
+        // through the normal tool-result channel rather than a JSON-RPC error.
+        if self.validate_inputs.load(Ordering::Relaxed) {
+            if let Some(tool_info) = catalog.iter().find(|t| t.name == prefixed_name) {
+                if let Some((result, error_message)) = self
+                    .validate_arguments(prefixed_name, &tool_info.input_schema, &arguments)
+                    .await
+                {
+                    self.publish_validation_failure(
+                        tool.clone(),
+                        endpoint.clone(),
+                        entry.transport.clone(),
+                        entry.adapter.server_type(),
+                        entry.adapter.upstream_server_name(),
+                        error_message,
+                    );
+                    return Ok(result);
+                }
+            }
+        }
+
         info!(
             tool = %tool,
             endpoint = %endpoint,
@@ -739,6 +810,633 @@ impl AdapterRegistry {
         }
         AdapterError::ProtocolError(error_message)
     }
+
+    /// Publish a `Started` + `Failed` pair on the shared
+    /// [`ToolCallEventBus`] (when wired) for an input-validation failure in
+    /// [`Self::route_tool_call`]. Mirrors [`Self::publish_early_rejection`]
+    /// but tags the `Failed` event with `status: "validation_error"` so the
+    /// overlay can distinguish schema failures from upstream failures, and
+    /// returns nothing — the caller returns the `isError: true` tool result
+    /// to the client rather than an [`AdapterError`].
+    fn publish_validation_failure(
+        &self,
+        tool: String,
+        endpoint: String,
+        transport: String,
+        server_type: Option<String>,
+        server_name: Option<String>,
+        error_message: String,
+    ) {
+        if let Some(bus) = &self.event_bus {
+            let span_ctx = current_request_context();
+            let request_id = uuid::Uuid::new_v4().to_string();
+            // Emit `Started` first so the overlay spawns an in-flight card
+            // before it sees `Failed`, matching the adapter-side ordering.
+            bus.send(ToolCallEvent::Started {
+                request_id: request_id.clone(),
+                jsonrpc_id: span_ctx.jsonrpc_id.clone(),
+                ts: iso8601_now(),
+                endpoint,
+                transport,
+                server_type,
+                server_name,
+                profile: span_ctx.profile.clone(),
+                tool,
+                annotations: None,
+                client: span_ctx.client.clone(),
+            });
+            bus.send(ToolCallEvent::Failed {
+                request_id,
+                jsonrpc_id: span_ctx.jsonrpc_id,
+                ts: iso8601_now(),
+                duration_ms: 0,
+                status: "validation_error".to_string(),
+                error_message,
+            });
+        }
+    }
+
+    /// Validate `arguments` against the tool's compiled `inputSchema`.
+    ///
+    /// Returns `None` when the call should pass through — either the schema
+    /// is degenerate/malformed (no compiled validator cached) or the
+    /// arguments are valid. Returns `Some((result, message))` when validation
+    /// fails: `result` is the MCP `isError: true` tool result to return to the
+    /// client and `message` is the formatted error text for the event bus.
+    ///
+    /// Compilation is lazy and cached per prefixed tool name — see
+    /// [`Self::compiled_validator`].
+    async fn validate_arguments(
+        &self,
+        prefixed_name: &str,
+        schema: &serde_json::Value,
+        arguments: &serde_json::Value,
+    ) -> Option<(serde_json::Value, String)> {
+        let validator = self.compiled_validator(prefixed_name, schema).await?;
+        validate_with_validator(prefixed_name, &validator, schema, arguments)
+    }
+
+    /// Return the compiled validator for `prefixed_name`, compiling and
+    /// caching it on first use. `None` means there is no useful schema to
+    /// validate against (degenerate schema or a schema that failed to
+    /// compile); the cache stores `None` in that case so compilation is not
+    /// retried until the catalog is invalidated.
+    async fn compiled_validator(
+        &self,
+        prefixed_name: &str,
+        schema: &serde_json::Value,
+    ) -> Option<Arc<Validator>> {
+        // Fast path: read-locked cache hit.
+        {
+            let cache = self.schema_cache.read().await;
+            if let Some(entry) = cache.get(prefixed_name) {
+                return entry.clone();
+            }
+        }
+        // Slow path: take the write lock and re-check so concurrent callers
+        // don't compile the same schema twice.
+        let mut cache = self.schema_cache.write().await;
+        if let Some(entry) = cache.get(prefixed_name) {
+            return entry.clone();
+        }
+        let compiled = compile_input_schema(prefixed_name, schema);
+        cache.insert(prefixed_name.to_string(), compiled.clone());
+        compiled
+    }
+}
+
+/// Decide whether a tool's `inputSchema` is worth compiling for validation.
+///
+/// Mirrors the original `validate_tool_args` bypass rules (spec §3.3): the
+/// schema must describe an object (`type` is `"object"` or absent) and carry
+/// at least one real constraint. A bare `{"type": "object"}` has nothing to
+/// validate and is skipped (pass-through), but anything that meaningfully
+/// constrains the arguments is compiled and enforced. Constraints can be
+/// expressed as object shape (`properties`/`required`), a closed object
+/// (`additionalProperties`/`unevaluatedProperties` set to `false` or a
+/// subschema), references/combinators (`$ref`, `allOf`, `anyOf`, `oneOf`,
+/// `not`, `if`), or other object-shape keywords (`patternProperties`,
+/// `propertyNames`, `dependentRequired`, `dependentSchemas`, `dependencies`,
+/// `minProperties`, `maxProperties`, `enum`, `const`). Recognizing these (and
+/// not just `properties`/`required`) ensures schemas that constrain solely via
+/// `$ref`/combinators/object keywords are validated instead of passed through.
+fn schema_is_validatable(schema: &serde_json::Value) -> bool {
+    let Some(obj) = schema.as_object() else {
+        return false;
+    };
+    if let Some(t) = obj.get("type") {
+        if t.as_str() != Some("object") {
+            return false;
+        }
+    }
+    obj.iter()
+        .any(|(key, value)| schema_keyword_constrains(key, value))
+}
+
+/// Whether a single top-level schema keyword (with a non-trivial value)
+/// meaningfully constrains the instance, used by [`schema_is_validatable`].
+fn schema_keyword_constrains(key: &str, value: &serde_json::Value) -> bool {
+    match key {
+        // Object shape / key-restricting keywords whose value is a map.
+        "properties" | "patternProperties" | "dependentRequired" | "dependentSchemas"
+        | "dependencies" => value.as_object().map(|o| !o.is_empty()).unwrap_or(false),
+        // Keywords whose value is a (non-empty) array.
+        "required" | "allOf" | "anyOf" | "oneOf" | "enum" => {
+            value.as_array().map(|a| !a.is_empty()).unwrap_or(false)
+        }
+        // A closed object: `false` or a subschema constrains, plain `true` does not.
+        "additionalProperties" | "unevaluatedProperties" => {
+            !matches!(value, serde_json::Value::Bool(true))
+        }
+        // `minProperties: 0` is a no-op; any positive bound constrains.
+        "minProperties" => value.as_u64().map(|n| n > 0).unwrap_or(false),
+        "maxProperties" => value.is_number(),
+        // A `$ref` defers to another (presumably constraining) schema.
+        "$ref" => value.is_string(),
+        // Presence alone constrains (subschemas / conditional / fixed value).
+        "not" | "if" | "propertyNames" | "const" => true,
+        _ => false,
+    }
+}
+
+/// Compile a tool's `inputSchema` into a reusable [`Validator`], or return
+/// `None` to signal pass-through. Degenerate schemas (see
+/// [`schema_is_validatable`]) and schemas the upstream server shipped
+/// malformed both yield `None` — the relay never blocks a call because of a
+/// bad upstream schema; it lets the upstream handle it. `format` is enforced
+/// as an assertion (spec §11.1).
+fn compile_input_schema(prefixed_name: &str, schema: &serde_json::Value) -> Option<Arc<Validator>> {
+    if !schema_is_validatable(schema) {
+        return None;
+    }
+    match jsonschema::options()
+        .should_validate_formats(true)
+        .build(schema)
+    {
+        Ok(validator) => {
+            debug!(tool = %prefixed_name, "Compiled input schema for validation");
+            Some(Arc::new(validator))
+        }
+        Err(e) => {
+            warn!(
+                tool = %prefixed_name,
+                error = %e,
+                "Failed to compile input schema — validation will be skipped for this tool"
+            );
+            None
+        }
+    }
+}
+
+/// Format the collected validation errors into the model-friendly MCP error
+/// text (spec §5.5). All errors from a single pass are listed together so the
+/// model can correct every field in one retry.
+fn format_validation_message(prefixed_name: &str, errors: &[String]) -> String {
+    let mut message = format!("Input validation failed for tool '{}':\n\n", prefixed_name);
+    for error in errors {
+        message.push_str("• ");
+        message.push_str(error);
+        message.push('\n');
+    }
+    message.push_str("\nPlease correct these fields and try again.");
+    message
+}
+
+/// Validate `arguments` against an already-compiled [`Validator`], formatting
+/// any failures with the same per-kind message table the registry's per-tool
+/// path uses. `schema` is the validator's source schema, consulted to
+/// enumerate known parameter names for `additionalProperties` enrichment.
+///
+/// Returns `Some((result, message))` — the `isError: true` MCP tool result to
+/// return to the client and the formatted error text for logs/event bus — when
+/// validation fails, or `None` when the arguments are valid.
+///
+/// `AdapterRegistry::validate_arguments` calls this after a lazy cache lookup;
+/// the meta-tool path in `server.rs` calls it with schemas precompiled at
+/// startup, so both surfaces emit identical error text.
+pub(crate) fn validate_with_validator(
+    name: &str,
+    validator: &Validator,
+    schema: &serde_json::Value,
+    arguments: &serde_json::Value,
+) -> Option<(serde_json::Value, String)> {
+    let mut errors: Vec<String> = validator
+        .iter_errors(arguments)
+        .map(|e| format_validation_error(&e, schema))
+        .collect();
+    if errors.is_empty() {
+        return None;
+    }
+    // Some schema shapes emit one error per offending value with identical text
+    // (e.g. `additionalProperties: false` with no declared `properties`, where
+    // each extra key yields the same "accepts no parameters" message). Collapse
+    // exact duplicates, preserving order, so the model sees each point once.
+    let mut seen = std::collections::HashSet::new();
+    errors.retain(|message| seen.insert(message.clone()));
+    warn!(
+        tool = %name,
+        error_count = errors.len(),
+        "Input validation failed — returning structured error to client"
+    );
+    for message in &errors {
+        debug!(tool = %name, "Validation error: {}", message);
+    }
+    let text = format_validation_message(name, &errors);
+    let result = serde_json::json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": true,
+    });
+    Some((result, text))
+}
+
+/// Maximum edit distance for a "did you mean …?" suggestion (spec §5.4).
+const SUGGESTION_MAX_DISTANCE: usize = 2;
+
+/// Format a single [`ValidationError`] into a model-friendly bullet line per the
+/// spec §5.2 kind→message table, §5.3 path rendering, and §5.4 suggestions.
+///
+/// `schema` is the tool's `inputSchema`, used to enumerate the known property
+/// names for `additionalProperties` errors (the error kind only carries the
+/// *unexpected* names) and for close-match suggestions. Any kind the table does
+/// not cover falls through to the crate's default `ValidationError::to_string()`.
+fn format_validation_error(error: &ValidationError, schema: &Value) -> String {
+    let path = render_instance_path(error.instance_path());
+    let instance = error.instance();
+    match error.kind() {
+        ValidationErrorKind::Required { property } => {
+            let name = property.as_str().unwrap_or_default();
+            let field = join_field(&path, name);
+            format!("Field '{}': required field is missing.", field)
+        }
+        ValidationErrorKind::Type { kind } => {
+            let expected = type_kind_label(kind);
+            let actual = json_type_name(instance);
+            let mut msg = format!(
+                "Field '{}': expected {}, got {}.",
+                field_label(&path),
+                expected,
+                actual
+            );
+            if expected == "array" {
+                if let Some(s) = instance.as_str() {
+                    if s.contains(',') {
+                        msg.push_str(&format!(
+                            " Did you mean {}?",
+                            comma_string_to_array_suggestion(s)
+                        ));
+                    }
+                }
+            }
+            msg
+        }
+        ValidationErrorKind::Enum { options } => {
+            let variants = enum_variant_labels(options);
+            let mut msg = format!(
+                "Field '{}': value {} is not allowed. Allowed values: {}.",
+                field_label(&path),
+                render_instance_value(instance),
+                variants.join(", ")
+            );
+            if let Some(s) = instance.as_str() {
+                if let Some(best) = closest_match(s, &enum_string_variants(options)) {
+                    msg.push_str(&format!(" Did you mean \"{}\"?", best));
+                }
+            }
+            msg
+        }
+        ValidationErrorKind::AdditionalProperties { unexpected }
+        | ValidationErrorKind::UnevaluatedProperties { unexpected } => {
+            // The error sits on the object that carries the unexpected keys,
+            // which may be a nested object rather than the root. Resolve the
+            // subschema at that instance path so the "Valid parameters" list
+            // names the keys that object actually allows.
+            let subschema = subschema_at_instance_path(schema, error.instance_path());
+            let known = schema_property_names(subschema);
+            // The crate batches every unexpected key into one error, so name
+            // them all (sorted for deterministic output) rather than just the
+            // first — otherwise the model fixes one and is rejected for the
+            // next on each retry.
+            let mut keys: Vec<&str> = unexpected.iter().map(String::as_str).collect();
+            keys.sort_unstable();
+            let fields: Vec<String> = keys.iter().map(|key| join_field(&path, key)).collect();
+            let mut msg = if fields.len() == 1 {
+                format!(
+                    "Field '{}': unknown parameter. Valid parameters: {}.",
+                    fields[0],
+                    known.join(", ")
+                )
+            } else {
+                let listed = fields
+                    .iter()
+                    .map(|field| format!("'{}'", field))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "Fields {}: unknown parameters. Valid parameters: {}.",
+                    listed,
+                    known.join(", ")
+                )
+            };
+            if fields.len() == 1 {
+                if let Some(best) = closest_match(keys[0], &known) {
+                    msg.push_str(&format!(" Did you mean '{}'?", best));
+                }
+            } else {
+                for (key, field) in keys.iter().zip(fields.iter()) {
+                    if let Some(best) = closest_match(key, &known) {
+                        msg.push_str(&format!(" Did you mean '{}' for '{}'?", best, field));
+                    }
+                }
+            }
+            msg
+        }
+        ValidationErrorKind::MinLength { limit } => format!(
+            "Field '{}': string length {} is outside range; minimum length is {}.",
+            field_label(&path),
+            string_len(instance),
+            limit
+        ),
+        ValidationErrorKind::MaxLength { limit } => format!(
+            "Field '{}': string length {} is outside range; maximum length is {}.",
+            field_label(&path),
+            string_len(instance),
+            limit
+        ),
+        ValidationErrorKind::Minimum { limit } => format!(
+            "Field '{}': value {} is outside range; minimum is {}.",
+            field_label(&path),
+            render_instance_value(instance),
+            limit
+        ),
+        ValidationErrorKind::Maximum { limit } => format!(
+            "Field '{}': value {} is outside range; maximum is {}.",
+            field_label(&path),
+            render_instance_value(instance),
+            limit
+        ),
+        ValidationErrorKind::ExclusiveMinimum { limit } => format!(
+            "Field '{}': value {} is outside range; must be greater than {}.",
+            field_label(&path),
+            render_instance_value(instance),
+            limit
+        ),
+        ValidationErrorKind::ExclusiveMaximum { limit } => format!(
+            "Field '{}': value {} is outside range; must be less than {}.",
+            field_label(&path),
+            render_instance_value(instance),
+            limit
+        ),
+        ValidationErrorKind::Pattern { pattern } => format!(
+            "Field '{}': value {} does not match pattern {}.",
+            field_label(&path),
+            render_instance_value(instance),
+            pattern
+        ),
+        ValidationErrorKind::Format { format } => format!(
+            "Field '{}': value {} is not a valid {}.",
+            field_label(&path),
+            render_instance_value(instance),
+            format
+        ),
+        ValidationErrorKind::MinItems { limit } => format!(
+            "Field '{}': array length {} is outside range; minimum is {}.",
+            field_label(&path),
+            array_len(instance),
+            limit
+        ),
+        ValidationErrorKind::MaxItems { limit } => format!(
+            "Field '{}': array length {} is outside range; maximum is {}.",
+            field_label(&path),
+            array_len(instance),
+            limit
+        ),
+        ValidationErrorKind::UniqueItems => format!(
+            "Field '{}': array contains duplicate items.",
+            field_label(&path)
+        ),
+        ValidationErrorKind::FalseSchema => {
+            // Reached when a `false` subschema rejects a value — most commonly
+            // `additionalProperties: false` on a schema with no declared
+            // `properties`. The crate emits one such error per extra key with
+            // an empty path and only the *value* as the instance, so the key
+            // name can't be recovered here. Such an object accepts nothing, so
+            // the actionable fix is simply to remove the arguments.
+            let segments: Vec<LocationSegment> = error.instance_path().iter().collect();
+            let known = schema_property_names(subschema_for_segments(schema, &segments));
+            if known.is_empty() {
+                if path.is_empty() {
+                    "Field '<root>': this tool accepts no parameters; remove all arguments and try again."
+                        .to_string()
+                } else {
+                    format!(
+                        "Field '{}': accepts no parameters; remove its arguments and try again.",
+                        path
+                    )
+                }
+            } else {
+                format!(
+                    "Field '{}': contains an unknown parameter. Valid parameters: {}.",
+                    field_label(&path),
+                    known.join(", ")
+                )
+            }
+        }
+        // Anything not in the §5.2 table falls through to the crate's default
+        // rendering so no error is ever dropped.
+        _ => format!("Field '{}': {}", field_label(&path), error),
+    }
+}
+
+/// Render a [`Location`] (JSON Pointer) as dot/bracket notation for readability
+/// (spec §5.3): `/assignees/0` → `assignees[0]`, `/nested/config` →
+/// `nested.config`, root → empty string.
+fn render_instance_path(location: &Location) -> String {
+    let mut out = String::new();
+    for segment in location.iter() {
+        match segment {
+            LocationSegment::Property(name) => {
+                if out.is_empty() {
+                    out.push_str(&name);
+                } else {
+                    out.push('.');
+                    out.push_str(&name);
+                }
+            }
+            LocationSegment::Index(index) => {
+                out.push('[');
+                out.push_str(&index.to_string());
+                out.push(']');
+            }
+        }
+    }
+    out
+}
+
+/// Display label for a field path, falling back to `<root>` when the error sits
+/// on the instance root and no property name is available.
+fn field_label(path: &str) -> &str {
+    if path.is_empty() {
+        "<root>"
+    } else {
+        path
+    }
+}
+
+/// Join a base path and a leaf property name with dot notation (spec §5.3),
+/// handling the root case where the base is empty.
+fn join_field(base: &str, leaf: &str) -> String {
+    if base.is_empty() {
+        leaf.to_string()
+    } else if leaf.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}.{}", base, leaf)
+    }
+}
+
+/// Human-readable label for an expected [`TypeKind`].
+fn type_kind_label(kind: &TypeKind) -> String {
+    match kind {
+        TypeKind::Single(ty) => ty.to_string(),
+        TypeKind::Multiple(set) => set
+            .iter()
+            .map(|ty| ty.to_string())
+            .collect::<Vec<_>>()
+            .join(" or "),
+    }
+}
+
+/// Human-readable label for the actual JSON type of `value`.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(n) => {
+            if n.is_f64() {
+                "number"
+            } else {
+                "integer"
+            }
+        }
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// Render an instance value for inclusion in a message: strings are quoted,
+/// everything else uses its compact JSON form.
+fn render_instance_value(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("\"{}\"", s),
+        other => other.to_string(),
+    }
+}
+
+/// Character length of a string instance (0 for non-strings).
+fn string_len(value: &Value) -> usize {
+    value.as_str().map(|s| s.chars().count()).unwrap_or(0)
+}
+
+/// Element count of an array instance (0 for non-arrays).
+fn array_len(value: &Value) -> usize {
+    value.as_array().map(Vec::len).unwrap_or(0)
+}
+
+/// Property names declared by a schema's `properties` map (sorted by serde_json's
+/// default object ordering), used for `additionalProperties` valid-parameter
+/// lists and close-match suggestions.
+fn schema_property_names(schema: &Value) -> Vec<String> {
+    schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|props| props.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// Resolve the subschema that applies to the instance at `location` by walking
+/// the root schema's `properties`/`items` along the path. Used so an
+/// `additionalProperties` error on a nested object reports that object's valid
+/// keys rather than the root's. Falls back to the root schema whenever a
+/// segment can't be resolved (e.g. `$ref`, combinator subschemas, or tuple
+/// `items` arrays), keeping the message best-effort rather than wrong.
+fn subschema_at_instance_path<'a>(root: &'a Value, location: &Location) -> &'a Value {
+    let segments: Vec<LocationSegment> = location.iter().collect();
+    subschema_for_segments(root, &segments)
+}
+
+/// Walk `root`'s `properties`/`items` along `segments`, returning the resolved
+/// subschema or falling back to `root` when a segment can't be followed. Shared
+/// by [`subschema_at_instance_path`] and the `FalseSchema` arm, which walks to
+/// the parent object to enumerate its valid keys.
+fn subschema_for_segments<'a>(root: &'a Value, segments: &[LocationSegment]) -> &'a Value {
+    let mut current = root;
+    for segment in segments {
+        let next = match segment {
+            LocationSegment::Property(name) => current
+                .get("properties")
+                .and_then(Value::as_object)
+                .and_then(|props| props.get(&**name)),
+            LocationSegment::Index(_) => current.get("items").filter(|items| items.is_object()),
+        };
+        match next {
+            Some(schema) => current = schema,
+            None => return root,
+        }
+    }
+    current
+}
+
+/// Render enum options for the "Allowed values" list: strings are shown raw
+/// (unquoted), other JSON values use their compact form.
+fn enum_variant_labels(options: &Value) -> Vec<String> {
+    options
+        .as_array()
+        .map(|variants| {
+            variants
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// String-typed enum options only, used for close-match suggestions.
+fn enum_string_variants(options: &Value) -> Vec<String> {
+    options
+        .as_array()
+        .map(|variants| {
+            variants
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Convert a comma-containing string into a suggested JSON array literal
+/// (spec §5.4): `"bug,urgent"` → `["bug", "urgent"]`.
+fn comma_string_to_array_suggestion(value: &str) -> String {
+    let parts: Vec<String> = value
+        .split(',')
+        .map(|part| format!("\"{}\"", part.trim()))
+        .collect();
+    format!("[{}]", parts.join(", "))
+}
+
+/// Closest candidate to `input` within [`SUGGESTION_MAX_DISTANCE`] OSA edit
+/// distance (spec §5.4), or `None` when nothing is close enough. Ties break on
+/// the candidate name for determinism, mirroring the search_tools fuzzy matcher.
+fn closest_match<'a>(input: &str, candidates: &'a [String]) -> Option<&'a str> {
+    candidates
+        .iter()
+        .map(|candidate| (strsim::osa_distance(input, candidate), candidate))
+        .filter(|(distance, _)| *distance <= SUGGESTION_MAX_DISTANCE)
+        .min_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)))
+        .map(|(_, candidate)| candidate.as_str())
 }
 
 /// Abstraction over the catalog/routing surface used by [`MetaToolHandler`]
@@ -2952,5 +3650,737 @@ mod tests {
             "registry must not publish events on the happy path; got {:?}",
             try_recv
         );
+    }
+
+    // --- Input schema validation (route_tool_call) ---
+    //
+    // These tests exercise the validation layer wired into
+    // `route_tool_call`. Slice 2 replaces the basic
+    // `ValidationError::to_string()` rendering with the per-kind message
+    // table (§5.2), dot/bracket path rendering (§5.3), and close-match /
+    // coercion suggestions (§5.4). Assertions pin the `isError: true`
+    // shape, the `format_validation_message` wrapper text, and the
+    // human-readable per-field fragments and suggestions.
+
+    fn make_tool_with_schema(name: &str, schema: serde_json::Value) -> ToolInfo {
+        ToolInfo {
+            name: name.to_string(),
+            description: Some(format!("{} tool", name)),
+            input_schema: schema,
+            annotations: None,
+        }
+    }
+
+    /// Register a single healthy adapter exposing one tool with `schema`.
+    /// Single-server no-prefix mode means the routed name equals `tool`.
+    async fn registry_with_schema(tool: &str, schema: serde_json::Value) -> AdapterRegistry {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool_with_schema(
+                    tool, schema,
+                )])),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+        registry
+    }
+
+    fn assert_validation_error(result: &serde_json::Value, tool: &str) -> String {
+        assert_eq!(result["isError"], json!(true), "expected isError: true");
+        let text = result["content"][0]["text"]
+            .as_str()
+            .expect("content text present")
+            .to_string();
+        assert!(
+            text.contains(&format!("Input validation failed for tool '{}'", tool)),
+            "message should carry the wrapper header: {}",
+            text
+        );
+        text
+    }
+
+    #[tokio::test]
+    async fn validate_required_field_missing() {
+        let registry = registry_with_schema(
+            "create",
+            json!({
+                "type": "object",
+                "properties": { "repo": { "type": "string" }, "title": { "type": "string" } },
+                "required": ["repo", "title"],
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("create", json!({ "repo": "x" }))
+            .await
+            .unwrap();
+        let text = assert_validation_error(&result, "create");
+        assert!(
+            text.contains("title"),
+            "should name the missing field: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_type_mismatch() {
+        let registry = registry_with_schema(
+            "count",
+            json!({
+                "type": "object",
+                "properties": { "count": { "type": "number" } },
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("count", json!({ "count": "five" }))
+            .await
+            .unwrap();
+        let text = assert_validation_error(&result, "count");
+        assert!(
+            text.contains("number"),
+            "should mention expected type: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_enum_violation() {
+        let registry = registry_with_schema(
+            "set",
+            json!({
+                "type": "object",
+                "properties": { "priority": { "enum": ["low", "medium", "high"] } },
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("set", json!({ "priority": "critical" }))
+            .await
+            .unwrap();
+        let text = assert_validation_error(&result, "set");
+        assert!(
+            text.contains("critical"),
+            "should echo the bad value: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_additional_properties_rejected() {
+        let registry = registry_with_schema(
+            "note",
+            json!({
+                "type": "object",
+                "properties": { "text": { "type": "string" } },
+                "additionalProperties": false,
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("note", json!({ "text": "hi", "zzz": 1 }))
+            .await
+            .unwrap();
+        let text = assert_validation_error(&result, "note");
+        assert!(
+            text.contains("zzz"),
+            "should name the unknown parameter: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_additional_properties_true_passes() {
+        let registry = registry_with_schema(
+            "note",
+            json!({
+                "type": "object",
+                "properties": { "text": { "type": "string" } },
+                "additionalProperties": true,
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("note", json!({ "text": "hi", "extra": 1 }))
+            .await
+            .unwrap();
+        assert_eq!(result["called"], "note", "valid input should dispatch");
+    }
+
+    #[tokio::test]
+    async fn validate_min_length_violation() {
+        let registry = registry_with_schema(
+            "name",
+            json!({
+                "type": "object",
+                "properties": { "name": { "type": "string", "minLength": 3 } },
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("name", json!({ "name": "ab" }))
+            .await
+            .unwrap();
+        // §10.1 #8: the message reports the offending string length.
+        let text = assert_validation_error(&result, "name");
+        assert!(
+            text.contains("string length 2"),
+            "should report the string length: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_maximum_violation() {
+        let registry = registry_with_schema(
+            "count",
+            json!({
+                "type": "object",
+                "properties": { "count": { "type": "integer", "maximum": 100 } },
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("count", json!({ "count": 150 }))
+            .await
+            .unwrap();
+        // §10.1 #9: the message frames the violation as a range problem.
+        let text = assert_validation_error(&result, "count");
+        assert!(
+            text.contains("150") && text.contains("outside range"),
+            "should echo the value and the range phrasing: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_type_mismatch_array_coercion_suggestion() {
+        // §10.1 #3: a comma-containing string for an array field suggests the
+        // array form.
+        let registry = registry_with_schema(
+            "label",
+            json!({
+                "type": "object",
+                "properties": { "labels": { "type": "array" } },
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("label", json!({ "labels": "bug,urgent" }))
+            .await
+            .unwrap();
+        let text = assert_validation_error(&result, "label");
+        assert!(
+            text.contains("expected array"),
+            "should name the expected type: {}",
+            text
+        );
+        assert!(
+            text.contains("Did you mean [\"bug\", \"urgent\"]"),
+            "should suggest the array form: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_enum_close_match_suggestion() {
+        // §10.1 #5: a near-miss enum value suggests the closest variant.
+        let registry = registry_with_schema(
+            "state",
+            json!({
+                "type": "object",
+                "properties": { "state": { "enum": ["open", "closed"] } },
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("state", json!({ "state": "opne" }))
+            .await
+            .unwrap();
+        let text = assert_validation_error(&result, "state");
+        assert!(
+            text.contains("Did you mean \"open\""),
+            "should suggest the closest enum variant: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_additional_properties_valid_params_list() {
+        // §10.1 #7: an unknown parameter lists the valid parameter names.
+        let registry = registry_with_schema(
+            "note",
+            json!({
+                "type": "object",
+                "properties": { "text": { "type": "string" } },
+                "additionalProperties": false,
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("note", json!({ "text": "hi", "zzz": 1 }))
+            .await
+            .unwrap();
+        let text = assert_validation_error(&result, "note");
+        assert!(
+            text.contains("unknown parameter") && text.contains("Valid parameters: text"),
+            "should list the valid parameters: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_pattern_violation() {
+        // §10.1 #10: a pattern mismatch is reported as such.
+        let registry = registry_with_schema(
+            "slugify",
+            json!({
+                "type": "object",
+                "properties": { "slug": { "type": "string", "pattern": "^[a-z-]+$" } },
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("slugify", json!({ "slug": "My Slug" }))
+            .await
+            .unwrap();
+        let text = assert_validation_error(&result, "slugify");
+        assert!(
+            text.contains("does not match pattern"),
+            "should report a pattern mismatch: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_format_email_violation() {
+        // §10.1 #11: a bad `format: email` value is reported by name.
+        let registry = registry_with_schema(
+            "invite",
+            json!({
+                "type": "object",
+                "properties": { "email": { "type": "string", "format": "email" } },
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("invite", json!({ "email": "notanemail" }))
+            .await
+            .unwrap();
+        let text = assert_validation_error(&result, "invite");
+        assert!(
+            text.contains("not a valid email"),
+            "should name the failing format: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_multiple_errors_collected() {
+        // §10.1 #12: every error from a single pass is collected together.
+        let registry = registry_with_schema(
+            "multi",
+            json!({
+                "type": "object",
+                "properties": { "a": { "type": "number" } },
+                "required": ["a", "b"],
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("multi", json!({ "a": "x" }))
+            .await
+            .unwrap();
+        let text = assert_validation_error(&result, "multi");
+        assert!(
+            text.contains("'b': required field is missing"),
+            "should report the missing required field: {}",
+            text
+        );
+        assert!(
+            text.contains("expected number"),
+            "should report the type mismatch in the same pass: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_unknown_param_close_match() {
+        // §10.1 #15: a misspelled parameter suggests the closest known name.
+        let registry = registry_with_schema(
+            "repo",
+            json!({
+                "type": "object",
+                "properties": {
+                    "owner": { "type": "string" },
+                    "repo": { "type": "string" }
+                },
+                "additionalProperties": false,
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("repo", json!({ "ownre": "x" }))
+            .await
+            .unwrap();
+        let text = assert_validation_error(&result, "repo");
+        assert!(
+            text.contains("Did you mean 'owner'"),
+            "should suggest the closest known parameter: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_reports_all_unknown_params() {
+        // The crate batches every unexpected key into one error; the formatter
+        // must name them all (with a per-key suggestion) so the model can fix
+        // every unknown parameter in a single retry.
+        let registry = registry_with_schema(
+            "repo",
+            json!({
+                "type": "object",
+                "properties": {
+                    "owner": { "type": "string" },
+                    "repo": { "type": "string" }
+                },
+                "additionalProperties": false,
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("repo", json!({ "ownre": "x", "rep": "y" }))
+            .await
+            .unwrap();
+        let text = assert_validation_error(&result, "repo");
+        assert!(
+            text.contains("'ownre'") && text.contains("'rep'"),
+            "should name every unknown parameter: {}",
+            text
+        );
+        assert!(
+            text.contains("Did you mean 'owner' for 'ownre'"),
+            "should suggest the closest match per unknown key: {}",
+            text
+        );
+        assert!(
+            text.contains("Did you mean 'repo' for 'rep'"),
+            "should suggest the closest match per unknown key: {}",
+            text
+        );
+        assert!(
+            text.contains("Valid parameters: owner, repo"),
+            "should still list the valid parameters: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_degenerate_schema_passes() {
+        // `{"type": "object"}` with no constraints is not validatable, so the
+        // call passes through to the adapter unchanged.
+        let registry = registry_with_schema("any", json!({ "type": "object" })).await;
+        let result = registry
+            .route_tool_call("any", json!({ "anything": true }))
+            .await
+            .unwrap();
+        assert_eq!(result["called"], "any", "degenerate schema should dispatch");
+    }
+
+    #[tokio::test]
+    async fn validate_closed_schema_without_properties_rejects_extra() {
+        // A closed schema that declares no `properties`/`required` still
+        // forbids unexpected arguments and must be validated, not skipped.
+        // Such a schema accepts nothing, so the actionable message is to
+        // remove all arguments (the offending key name is not recoverable
+        // from the crate's `FalseSchema` error).
+        let registry = registry_with_schema(
+            "noargs",
+            json!({ "type": "object", "additionalProperties": false }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("noargs", json!({ "surprise": 1 }))
+            .await
+            .unwrap();
+        let text = assert_validation_error(&result, "noargs");
+        assert!(
+            text.contains("accepts no parameters") && text.contains("remove all arguments"),
+            "closed schema should reject the unexpected argument: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_closed_schema_without_properties_passes_when_empty() {
+        // The same closed schema accepts an empty argument object.
+        let registry = registry_with_schema(
+            "noargs",
+            json!({ "type": "object", "additionalProperties": false }),
+        )
+        .await;
+        let result = registry.route_tool_call("noargs", json!({})).await.unwrap();
+        assert_eq!(result["called"], "noargs", "no-arg call should dispatch");
+    }
+
+    #[tokio::test]
+    async fn validate_ref_only_schema_is_enforced() {
+        // A schema that constrains solely via `$ref` (no top-level
+        // `properties`/`required`) must still be compiled and enforced rather
+        // than treated as degenerate and passed through.
+        let registry = registry_with_schema(
+            "reffed",
+            json!({
+                "type": "object",
+                "$ref": "#/$defs/payload",
+                "$defs": {
+                    "payload": {
+                        "type": "object",
+                        "properties": { "name": { "type": "string" } },
+                        "required": ["name"],
+                        "additionalProperties": false,
+                    }
+                },
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("reffed", json!({ "nope": 1 }))
+            .await
+            .unwrap();
+        assert_validation_error(&result, "reffed");
+    }
+
+    #[tokio::test]
+    async fn validate_combinator_only_schema_is_enforced() {
+        // A schema whose only constraint is a `oneOf` combinator must be
+        // validated, not skipped.
+        let registry = registry_with_schema(
+            "combo",
+            json!({
+                "type": "object",
+                "oneOf": [
+                    { "required": ["a"] },
+                    { "required": ["b"] }
+                ],
+            }),
+        )
+        .await;
+        let result = registry.route_tool_call("combo", json!({})).await.unwrap();
+        assert_validation_error(&result, "combo");
+    }
+
+    #[tokio::test]
+    async fn validate_nested_additional_properties_lists_nested_keys() {
+        // An unexpected key inside a nested object must report the nested
+        // object's valid parameters, not the root's.
+        let registry = registry_with_schema(
+            "configure",
+            json!({
+                "type": "object",
+                "properties": {
+                    "config": {
+                        "type": "object",
+                        "properties": {
+                            "host": { "type": "string" },
+                            "port": { "type": "integer" }
+                        },
+                        "additionalProperties": false,
+                    }
+                },
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("configure", json!({ "config": { "hostt": "x" } }))
+            .await
+            .unwrap();
+        let text = assert_validation_error(&result, "configure");
+        assert!(
+            text.contains("config.hostt") && text.contains("unknown parameter"),
+            "should name the nested unknown parameter with its dotted path: {}",
+            text
+        );
+        assert!(
+            text.contains("Valid parameters: host, port"),
+            "should list the nested object's valid parameters: {}",
+            text
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_malformed_schema_passes() {
+        // A schema that fails to compile (invalid `type` keyword value) must
+        // not block the call — the relay defers to the upstream server.
+        let registry = registry_with_schema(
+            "weird",
+            json!({
+                "type": "object",
+                "properties": { "x": { "type": 12345 } },
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("weird", json!({ "x": 1 }))
+            .await
+            .unwrap();
+        assert_eq!(
+            result["called"], "weird",
+            "malformed schema should dispatch"
+        );
+        // The compilation failure is cached as `None` so it is not retried.
+        let cache = registry.schema_cache.read().await;
+        assert!(matches!(cache.get("weird"), Some(None)));
+    }
+
+    #[tokio::test]
+    async fn validate_schema_compiled_once_and_cached() {
+        let registry = registry_with_schema(
+            "create",
+            json!({
+                "type": "object",
+                "properties": { "repo": { "type": "string" } },
+                "required": ["repo"],
+            }),
+        )
+        .await;
+        // First call populates the cache with a compiled validator.
+        let _ = registry
+            .route_tool_call("create", json!({ "repo": "x" }))
+            .await;
+        {
+            let cache = registry.schema_cache.read().await;
+            assert!(
+                matches!(cache.get("create"), Some(Some(_))),
+                "validator should be cached after first call"
+            );
+        }
+        // Second call reuses it (no panic, still cached).
+        let _ = registry
+            .route_tool_call("create", json!({ "repo": "y" }))
+            .await;
+        let cache = registry.schema_cache.read().await;
+        assert_eq!(cache.len(), 1, "no duplicate compilation entries");
+    }
+
+    #[tokio::test]
+    async fn validate_cache_cleared_on_catalog_invalidation() {
+        let registry = registry_with_schema(
+            "create",
+            json!({
+                "type": "object",
+                "properties": { "repo": { "type": "string" } },
+                "required": ["repo"],
+            }),
+        )
+        .await;
+        let _ = registry
+            .route_tool_call("create", json!({ "repo": "x" }))
+            .await;
+        assert!(!registry.schema_cache.read().await.is_empty());
+        registry.invalidate_catalog_cache().await;
+        assert!(
+            registry.schema_cache.read().await.is_empty(),
+            "schema cache must clear when the catalog is invalidated"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_error_before_upstream_dispatch() {
+        // A validation failure returns the `isError: true` result without the
+        // `called` marker the MockAdapter would add, proving the adapter was
+        // never invoked.
+        let registry = registry_with_schema(
+            "create",
+            json!({
+                "type": "object",
+                "properties": { "repo": { "type": "string" } },
+                "required": ["repo"],
+            }),
+        )
+        .await;
+        let result = registry.route_tool_call("create", json!({})).await.unwrap();
+        assert_validation_error(&result, "create");
+        assert!(
+            result.get("called").is_none(),
+            "adapter must not be dispatched on validation failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_disabled_toggle_skips_validation() {
+        let registry = registry_with_schema(
+            "create",
+            json!({
+                "type": "object",
+                "properties": { "repo": { "type": "string" } },
+                "required": ["repo"],
+            }),
+        )
+        .await
+        .with_validate_inputs(false);
+        // Missing required field, but validation is off, so it dispatches.
+        let result = registry.route_tool_call("create", json!({})).await.unwrap();
+        assert_eq!(
+            result["called"], "create",
+            "toggle off should bypass validation"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_failure_emits_validation_error_event() {
+        let bus = ToolCallEventBus::with_default_capacity();
+        let mut rx = bus.subscribe();
+        let registry = AdapterRegistry::new().with_event_bus(bus);
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool_with_schema(
+                    "create",
+                    json!({
+                        "type": "object",
+                        "properties": { "repo": { "type": "string" } },
+                        "required": ["repo"],
+                    }),
+                )])),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        let result = registry.route_tool_call("create", json!({})).await.unwrap();
+        assert_validation_error(&result, "create");
+
+        let started = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("started event arrived")
+            .expect("started recv ok");
+        let sid = match started {
+            ToolCallEvent::Started {
+                request_id, tool, ..
+            } => {
+                assert_eq!(tool, "create");
+                request_id
+            }
+            other => panic!("expected Started, got {:?}", other),
+        };
+        let failed = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+            .await
+            .expect("failed event arrived")
+            .expect("failed recv ok");
+        match failed {
+            ToolCallEvent::Failed {
+                request_id, status, ..
+            } => {
+                assert_eq!(request_id, sid);
+                assert_eq!(status, "validation_error");
+            }
+            other => panic!("expected Failed, got {:?}", other),
+        }
     }
 }
