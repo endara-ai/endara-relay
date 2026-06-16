@@ -909,41 +909,54 @@ impl AdapterRegistry {
 ///
 /// Mirrors the original `validate_tool_args` bypass rules (spec §3.3): the
 /// schema must describe an object (`type` is `"object"` or absent) and carry
-/// at least one constraint — a non-empty `properties` map, a non-empty
-/// `required` list, or a closed-object constraint (`additionalProperties` /
-/// `unevaluatedProperties` set to `false` or a subschema). A bare
-/// `{"type": "object"}` has nothing to validate and is skipped (pass-through),
-/// but `{"type": "object", "additionalProperties": false}` still meaningfully
-/// rejects unexpected arguments and is validated.
+/// at least one real constraint. A bare `{"type": "object"}` has nothing to
+/// validate and is skipped (pass-through), but anything that meaningfully
+/// constrains the arguments is compiled and enforced. Constraints can be
+/// expressed as object shape (`properties`/`required`), a closed object
+/// (`additionalProperties`/`unevaluatedProperties` set to `false` or a
+/// subschema), references/combinators (`$ref`, `allOf`, `anyOf`, `oneOf`,
+/// `not`, `if`), or other object-shape keywords (`patternProperties`,
+/// `propertyNames`, `dependentRequired`, `dependentSchemas`, `dependencies`,
+/// `minProperties`, `maxProperties`, `enum`, `const`). Recognizing these (and
+/// not just `properties`/`required`) ensures schemas that constrain solely via
+/// `$ref`/combinators/object keywords are validated instead of passed through.
 fn schema_is_validatable(schema: &serde_json::Value) -> bool {
-    if let Some(t) = schema.get("type") {
+    let Some(obj) = schema.as_object() else {
+        return false;
+    };
+    if let Some(t) = obj.get("type") {
         if t.as_str() != Some("object") {
             return false;
         }
     }
-    let has_properties = schema
-        .get("properties")
-        .and_then(|p| p.as_object())
-        .map(|o| !o.is_empty())
-        .unwrap_or(false);
-    let has_required = schema
-        .get("required")
-        .and_then(|r| r.as_array())
-        .map(|a| !a.is_empty())
-        .unwrap_or(false);
-    // A closed schema constrains which arguments are allowed even with no
-    // declared `properties`/`required`: `additionalProperties` (or its
-    // `unevaluatedProperties` sibling) set to `false` or a subschema enforces
-    // a real check, so it is still worth compiling.
-    let restricts_extra = ["additionalProperties", "unevaluatedProperties"]
-        .iter()
-        .any(|key| {
-            schema
-                .get(*key)
-                .map(|v| !matches!(v, serde_json::Value::Bool(true)))
-                .unwrap_or(false)
-        });
-    has_properties || has_required || restricts_extra
+    obj.iter()
+        .any(|(key, value)| schema_keyword_constrains(key, value))
+}
+
+/// Whether a single top-level schema keyword (with a non-trivial value)
+/// meaningfully constrains the instance, used by [`schema_is_validatable`].
+fn schema_keyword_constrains(key: &str, value: &serde_json::Value) -> bool {
+    match key {
+        // Object shape / key-restricting keywords whose value is a map.
+        "properties" | "patternProperties" | "dependentRequired" | "dependentSchemas"
+        | "dependencies" => value.as_object().map(|o| !o.is_empty()).unwrap_or(false),
+        // Keywords whose value is a (non-empty) array.
+        "required" | "allOf" | "anyOf" | "oneOf" | "enum" => {
+            value.as_array().map(|a| !a.is_empty()).unwrap_or(false)
+        }
+        // A closed object: `false` or a subschema constrains, plain `true` does not.
+        "additionalProperties" | "unevaluatedProperties" => {
+            !matches!(value, serde_json::Value::Bool(true))
+        }
+        // `minProperties: 0` is a no-op; any positive bound constrains.
+        "minProperties" => value.as_u64().map(|n| n > 0).unwrap_or(false),
+        "maxProperties" => value.is_number(),
+        // A `$ref` defers to another (presumably constraining) schema.
+        "$ref" => value.is_string(),
+        // Presence alone constrains (subschemas / conditional / fixed value).
+        "not" | "if" | "propertyNames" | "const" => true,
+        _ => false,
+    }
 }
 
 /// Compile a tool's `inputSchema` into a reusable [`Validator`], or return
@@ -4112,6 +4125,53 @@ mod tests {
         .await;
         let result = registry.route_tool_call("noargs", json!({})).await.unwrap();
         assert_eq!(result["called"], "noargs", "no-arg call should dispatch");
+    }
+
+    #[tokio::test]
+    async fn validate_ref_only_schema_is_enforced() {
+        // A schema that constrains solely via `$ref` (no top-level
+        // `properties`/`required`) must still be compiled and enforced rather
+        // than treated as degenerate and passed through.
+        let registry = registry_with_schema(
+            "reffed",
+            json!({
+                "type": "object",
+                "$ref": "#/$defs/payload",
+                "$defs": {
+                    "payload": {
+                        "type": "object",
+                        "properties": { "name": { "type": "string" } },
+                        "required": ["name"],
+                        "additionalProperties": false,
+                    }
+                },
+            }),
+        )
+        .await;
+        let result = registry
+            .route_tool_call("reffed", json!({ "nope": 1 }))
+            .await
+            .unwrap();
+        assert_validation_error(&result, "reffed");
+    }
+
+    #[tokio::test]
+    async fn validate_combinator_only_schema_is_enforced() {
+        // A schema whose only constraint is a `oneOf` combinator must be
+        // validated, not skipped.
+        let registry = registry_with_schema(
+            "combo",
+            json!({
+                "type": "object",
+                "oneOf": [
+                    { "required": ["a"] },
+                    { "required": ["b"] }
+                ],
+            }),
+        )
+        .await;
+        let result = registry.route_tool_call("combo", json!({})).await.unwrap();
+        assert_validation_error(&result, "combo");
     }
 
     #[tokio::test]
