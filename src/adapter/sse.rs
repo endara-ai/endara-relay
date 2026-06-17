@@ -787,7 +787,6 @@ impl McpAdapter for SseAdapter {
                     .and_then(|v| v.as_ref().and_then(annotations_from_value));
                 bus.send(ToolCallEvent::Started {
                     request_id: request_id.clone(),
-                    jsonrpc_id: span_ctx.jsonrpc_id.clone(),
                     request_uid: span_ctx.request_uid.clone(),
                     ts: iso8601_now(),
                     endpoint: self.config.endpoint_name.clone(),
@@ -856,14 +855,12 @@ impl McpAdapter for SseAdapter {
                 match &result {
                     Ok(_) => bus.send(ToolCallEvent::Completed {
                         request_id,
-                        jsonrpc_id: span_ctx.jsonrpc_id.clone(),
                         ts,
                         duration_ms: duration_ms_u64,
                         status: "ok".into(),
                     }),
                     Err(e) => bus.send(ToolCallEvent::Failed {
                         request_id,
-                        jsonrpc_id: span_ctx.jsonrpc_id.clone(),
                         ts,
                         duration_ms: duration_ms_u64,
                         status: "error".into(),

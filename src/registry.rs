@@ -788,7 +788,6 @@ impl AdapterRegistry {
             // adapter-side ordering.
             bus.send(ToolCallEvent::Started {
                 request_id: request_id.clone(),
-                jsonrpc_id: span_ctx.jsonrpc_id.clone(),
                 request_uid: span_ctx.request_uid.clone(),
                 ts: iso8601_now(),
                 endpoint,
@@ -802,7 +801,6 @@ impl AdapterRegistry {
             });
             bus.send(ToolCallEvent::Failed {
                 request_id,
-                jsonrpc_id: span_ctx.jsonrpc_id,
                 ts: iso8601_now(),
                 duration_ms: 0,
                 status: "error".to_string(),
@@ -835,7 +833,6 @@ impl AdapterRegistry {
             // before it sees `Failed`, matching the adapter-side ordering.
             bus.send(ToolCallEvent::Started {
                 request_id: request_id.clone(),
-                jsonrpc_id: span_ctx.jsonrpc_id.clone(),
                 request_uid: span_ctx.request_uid.clone(),
                 ts: iso8601_now(),
                 endpoint,
@@ -849,7 +846,6 @@ impl AdapterRegistry {
             });
             bus.send(ToolCallEvent::Failed {
                 request_id,
-                jsonrpc_id: span_ctx.jsonrpc_id,
                 ts: iso8601_now(),
                 duration_ms: 0,
                 status: "validation_error".to_string(),

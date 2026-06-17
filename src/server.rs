@@ -682,23 +682,22 @@ async fn mcp_tools_call(
                 .get("script")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            // Recover the outer inbound request's identity and JSON-RPC id from
-            // the surrounding `request{id=...,client=...}` span (seeded by
-            // `handle_single_message` / the logged wrappers) and re-serialise
-            // them so the sandbox can re-establish the caller's span around each
-            // inner upstream tool call across the blocking-thread hop. Without
-            // this, aggregated `execute_tools` inner calls emit an empty client
-            // and a `None` jsonrpc_id.
+            // Recover the outer inbound request's identity and canonical UID
+            // from the surrounding `request{request_uid=...,client=...}` span
+            // (seeded by `handle_single_message` / the logged wrappers) and
+            // re-serialise them so the sandbox can re-establish the caller's
+            // span around each inner upstream tool call across the
+            // blocking-thread hop. Without this, aggregated `execute_tools`
+            // inner calls emit an empty client and a `None` request_uid.
             let request_ctx = crate::events::current_request_context();
             let client_json = request_ctx
                 .client
                 .filter(|c| !c.is_empty())
                 .map(|c| serde_json::to_string(&c).unwrap_or_default())
                 .unwrap_or_default();
-            let jsonrpc_id = request_ctx.jsonrpc_id.unwrap_or_default();
             let request_uid = request_ctx.request_uid.unwrap_or_default();
             match handler
-                .execute_tools(script, &client_json, &jsonrpc_id, &request_uid)
+                .execute_tools(script, &client_json, &request_uid)
                 .await
             {
                 Ok(result) => {
@@ -775,8 +774,7 @@ async fn handle_single_message(
     // across reconnects when a client resets its counter), this UUID is unique
     // per message, so every log line and `ToolCallEvent` produced while
     // processing this message shares one collision-free key for the desktop's
-    // row/overlay keying. `jsonrpc_id` stays on the wire for diagnostic
-    // context.
+    // row/overlay keying.
     let request_uid = uuid::Uuid::new_v4().to_string();
     // JSON-encode the identity so `SpanFieldCaptureLayer` can deserialise it
     // back into a typed [`ClientIdentity`] via `current_request_context()`

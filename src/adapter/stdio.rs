@@ -895,7 +895,6 @@ impl McpAdapter for StdioAdapter {
                     .and_then(|v| v.as_ref().and_then(annotations_from_value));
                 bus.send(ToolCallEvent::Started {
                     request_id: request_id.clone(),
-                    jsonrpc_id: span_ctx.jsonrpc_id.clone(),
                     request_uid: span_ctx.request_uid.clone(),
                     ts: iso8601_now(),
                     endpoint: self.config.endpoint_name.clone(),
@@ -950,14 +949,12 @@ impl McpAdapter for StdioAdapter {
                 match &result {
                     Ok(_) => bus.send(ToolCallEvent::Completed {
                         request_id,
-                        jsonrpc_id: span_ctx.jsonrpc_id.clone(),
                         ts,
                         duration_ms: duration_ms_u64,
                         status: "ok".into(),
                     }),
                     Err(e) => bus.send(ToolCallEvent::Failed {
                         request_id,
-                        jsonrpc_id: span_ctx.jsonrpc_id.clone(),
                         ts,
                         duration_ms: duration_ms_u64,
                         status: "error".into(),
@@ -2082,17 +2079,17 @@ with open(record_path, "w") as rec:
         assert_eq!(frames[2]["method"].as_str(), Some("tools/list"));
     }
 
-    /// End-to-end sanity check that `jsonrpc_id` flows from the surrounding
+    /// End-to-end sanity check that `request_uid` flows from the surrounding
     /// `request` tracing span into the published [`ToolCallEvent::Started`]
-    /// and [`ToolCallEvent::Failed`] events. Uses a non-spawned `StdioAdapter`
-    /// so `send_request` returns `AdapterError::NotInitialized` immediately —
-    /// the `Started` event still publishes before the network attempt, and
-    /// the `Failed` event publishes on the resulting `Err`.
+    /// event. Uses a non-spawned `StdioAdapter` so `send_request` returns
+    /// `AdapterError::NotInitialized` immediately — the `Started` event still
+    /// publishes before the network attempt, and the `Failed` event publishes
+    /// on the resulting `Err`.
     ///
     /// `#[test]` (not `#[tokio::test]`) because we install the capture layer
     /// via `with_default(...)` and drive an inner current-thread runtime.
     #[test]
-    fn call_tool_publishes_jsonrpc_id_from_request_span() {
+    fn call_tool_publishes_request_uid_from_request_span() {
         use crate::events::{SpanFieldCaptureLayer, ToolCallEvent, ToolCallEventBus};
         use tracing::Instrument;
         use tracing_subscriber::prelude::*;
@@ -2114,8 +2111,9 @@ with open(record_path, "w") as rec:
                 adapter.set_event_bus(bus.clone());
                 let mut rx = bus.subscribe();
 
-                let id_str = "99".to_string();
-                let span = tracing::info_span!("request", method = "tools/call", id = %id_str);
+                let uid_str = "uid-99".to_string();
+                let span =
+                    tracing::info_span!("request", method = "tools/call", request_uid = %uid_str);
                 let result = async { adapter.call_tool("nope", serde_json::json!({})).await }
                     .instrument(span)
                     .await;
@@ -2126,16 +2124,14 @@ with open(record_path, "w") as rec:
 
                 let started = rx.try_recv().expect("started event must be buffered");
                 match started {
-                    ToolCallEvent::Started { jsonrpc_id, .. } => {
-                        assert_eq!(jsonrpc_id.as_deref(), Some("99"));
+                    ToolCallEvent::Started { request_uid, .. } => {
+                        assert_eq!(request_uid.as_deref(), Some("uid-99"));
                     }
                     other => panic!("expected Started event, got {other:?}"),
                 }
                 let failed = rx.try_recv().expect("failed event must be buffered");
                 match failed {
-                    ToolCallEvent::Failed { jsonrpc_id, .. } => {
-                        assert_eq!(jsonrpc_id.as_deref(), Some("99"));
-                    }
+                    ToolCallEvent::Failed { .. } => {}
                     other => panic!("expected Failed event, got {other:?}"),
                 }
             });
