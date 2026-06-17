@@ -1196,9 +1196,17 @@ mod tests {
             "surfaced text should carry the authorize URL, got: {}",
             text
         );
-        // The raw upstream 401 / challenge is never leaked downstream.
-        assert!(!text.contains("401"));
-        assert!(!text.contains("WWW-Authenticate"));
+        // The raw upstream 401 / challenge is never leaked downstream. Scope
+        // these checks to the message PROSE (everything before the authorize
+        // URL): the relay-composed authorize URL legitimately embeds a random
+        // ephemeral port and base64url PKCE challenge/state, any of which can
+        // contain "401" by chance — asserting over the whole string is flaky.
+        let prose = text
+            .split(&format!("{}/authorize?", base))
+            .next()
+            .expect("prose segment before authorize URL");
+        assert!(!prose.contains("401"));
+        assert!(!prose.contains("WWW-Authenticate"));
 
         server.abort();
     }
