@@ -169,6 +169,7 @@ async fn test_config_diff_add_endpoint() {
         &oauth_adapter_inners,
         false,
         None,
+        None,
     )
     .await;
 
@@ -343,6 +344,7 @@ async fn test_config_diff_remove_endpoint() {
         &token_manager2,
         &oauth_adapter_inners2,
         false,
+        None,
         None,
     )
     .await;

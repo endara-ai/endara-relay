@@ -1,3 +1,4 @@
+use super::oauth::jit::{self, JitInterceptor};
 use super::server_name::{sanitize_server_name, ServerNameError};
 use super::server_type_resolution::{effective_server_type, strip_mcp_server_suffix};
 use super::stdio::{iso8601_now, RingBuffer};
@@ -108,6 +109,17 @@ pub struct HttpAdapter {
     /// upstreams that don't issue a session ID — those servers continue to
     /// work without the header.
     session_id: Arc<RwLock<Option<String>>>,
+    /// Optional just-in-time OAuth interceptor. `None` for every adapter built
+    /// today, so the call path is behaviorally unchanged. When attached (by
+    /// follow-up task 098e0e03), a hard `HTTP 401` + `WWW-Authenticate: Bearer`
+    /// on a tool call is swallowed and self-initiates the OAuth flow instead of
+    /// being forwarded downstream.
+    jit_interceptor: Option<Arc<JitInterceptor>>,
+    /// Most recent `WWW-Authenticate` header observed on a `401` response,
+    /// captured before the response body is consumed so [`Self::call_tool`] can
+    /// hand it to the JIT interceptor. Per-host challenges are effectively
+    /// constant, so a concurrent overwrite is harmless.
+    last_www_authenticate: Arc<RwLock<Option<String>>>,
 }
 
 /// HTTP header name reqwest reads/writes for the MCP session ID. Reqwest's
@@ -176,6 +188,8 @@ impl HttpAdapter {
             event_bus: Arc::new(OnceLock::new()),
             tool_annotations_cache: Arc::new(RwLock::new(HashMap::new())),
             session_id: Arc::new(RwLock::new(None)),
+            jit_interceptor: None,
+            last_www_authenticate: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -222,6 +236,8 @@ impl HttpAdapter {
             event_bus: Arc::new(OnceLock::new()),
             tool_annotations_cache: Arc::new(RwLock::new(HashMap::new())),
             session_id: Arc::new(RwLock::new(None)),
+            jit_interceptor: None,
+            last_www_authenticate: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -231,6 +247,66 @@ impl HttpAdapter {
     /// `OnceLock` cell across every inner adapter it rebuilds.
     pub(crate) fn set_event_bus_handle(&mut self, handle: Arc<OnceLock<ToolCallEventBus>>) {
         self.event_bus = handle;
+    }
+
+    /// Attach a just-in-time OAuth interceptor. Wired by follow-up task
+    /// 098e0e03; unused today (every adapter is built without one).
+    #[allow(dead_code)]
+    pub(crate) fn set_jit_interceptor(&mut self, interceptor: Arc<JitInterceptor>) {
+        self.jit_interceptor = Some(interceptor);
+    }
+
+    /// Apply the JIT 401 interception policy to a tool-call outcome.
+    ///
+    /// When a JIT interceptor is attached and the upstream returned a hard
+    /// `HTTP 401` (per [`jit::should_intercept_outcome`]) with a `Bearer`
+    /// `WWW-Authenticate` challenge, the 401 is SWALLOWED — never forwarded
+    /// downstream — and the OAuth flow is self-initiated. Otherwise the
+    /// original outcome (including 200-`isError` results) is returned
+    /// unchanged.
+    ///
+    /// On a successful self-initiation the produced authorize URL is SURFACED to
+    /// the downstream client as an actionable tool result (`isError: true` with
+    /// an "open this to sign in" instruction) via [`jit::surface_authorize_url`],
+    /// rather than a protocol-level error — the model/CLI can act on it directly.
+    ///
+    /// Retry seam (chosen approach): the client re-issues the same tool call
+    /// after completing the loopback `/oauth/callback`. The next call carries the
+    /// now-persisted bearer (injected in [`Self::send_request`]) and succeeds.
+    /// This "client re-issue" path fits the request/response adapter with the
+    /// least surprise — no blocking the first call on a human-in-the-loop
+    /// browser round-trip, and no hidden server-side retry state machine.
+    async fn maybe_intercept_401(
+        &self,
+        result: Result<Value, AdapterError>,
+    ) -> Result<Value, AdapterError> {
+        let Some(ref interceptor) = self.jit_interceptor else {
+            return result;
+        };
+        if !jit::should_intercept_outcome(&result) {
+            return result;
+        }
+        let Some(challenge) = self.last_www_authenticate.read().await.clone() else {
+            return result;
+        };
+        if jit::parse_bearer_challenge(&challenge).is_none() {
+            return result;
+        }
+        match interceptor
+            .intercept(&self.config.url, &challenge, &self.config.endpoint_name)
+            .await
+        {
+            Ok(authorize_url) => Ok(jit::surface_authorize_url(&authorize_url)),
+            Err(e) => {
+                // The raw upstream 401 / WWW-Authenticate challenge must NEVER
+                // reach the downstream client. When self-initiation fails we
+                // still swallow the 401 and surface a sanitized, actionable
+                // sign-in-unavailable result; the underlying error stays in the
+                // server-side log only.
+                warn!(error = %e, "JIT OAuth self-initiation failed; surfacing sanitized sign-in-unavailable result");
+                Ok(jit::surface_oauth_unavailable())
+            }
+        }
     }
 
     fn next_id(&self) -> u64 {
@@ -390,6 +466,21 @@ impl HttpAdapter {
                 builder = builder.header(MCP_SESSION_ID_HEADER.clone(), val);
             }
         }
+        // JIT retry-after-sign-in seam: when a JIT interceptor is attached and a
+        // valid bearer has been persisted for this endpoint (after the human
+        // completed the loopback `/oauth/callback`), inject it so a re-issued
+        // tool call uses the held token and succeeds instead of re-triggering
+        // the JIT flow. No-op when no interceptor is attached or no valid token
+        // is stored, leaving the default request path unchanged.
+        if let Some(ref interceptor) = self.jit_interceptor {
+            if let Some(token) = interceptor.current_bearer(&self.config.endpoint_name).await {
+                if let Ok(val) =
+                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))
+                {
+                    builder = builder.header(reqwest::header::AUTHORIZATION, val);
+                }
+            }
+        }
         let resp = builder.send().await.map_err(|e| {
             if e.is_timeout() {
                 AdapterError::Timeout(self.config.timeout_secs)
@@ -405,6 +496,20 @@ impl HttpAdapter {
 
         let status = resp.status();
         if !status.is_success() {
+            // Capture the `WWW-Authenticate` challenge BEFORE consuming the
+            // body so the JIT 401 interceptor (if attached) can self-initiate
+            // OAuth. Only meaningful on a 401; cleared otherwise so a stale
+            // challenge can't leak into a later unrelated error.
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                let challenge = resp
+                    .headers()
+                    .get(reqwest::header::WWW_AUTHENTICATE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                *self.last_www_authenticate.write().await = challenge;
+            } else {
+                *self.last_www_authenticate.write().await = None;
+            }
             let body = resp.text().await.unwrap_or_default();
             return Err(AdapterError::HttpError {
                 status: status.as_u16(),
@@ -891,6 +996,10 @@ impl McpAdapter for HttpAdapter {
             });
             let start = Instant::now();
             let result = self.send_request("tools/call", Some(params)).await;
+            // JIT 401 interception: swallow a hard 401 + Bearer challenge and
+            // self-initiate OAuth instead of forwarding it downstream. No-op
+            // unless a JIT interceptor is attached (none are today).
+            let result = self.maybe_intercept_401(result).await;
             let duration_ms = start.elapsed().as_millis();
             let now = chrono::Utc::now()
                 .format("%Y-%m-%dT%H:%M:%S%.3fZ")
@@ -1669,6 +1778,249 @@ mod tests {
             .expect("send_request succeeds without a session header");
         assert_eq!(result["ok"], true);
 
+        server.abort();
+    }
+
+    // --- JIT 401 interception (Wave 2 Path B) ---
+
+    /// Fixture whose `POST /mcp` gates every call with a hard 401 + Bearer
+    /// `WWW-Authenticate`, and which also advertises full standard OAuth so the
+    /// attached [`JitInterceptor`] can self-initiate the flow.
+    async fn spawn_gated_mcp_fixture() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::extract::State;
+        use axum::http::{header::WWW_AUTHENTICATE, StatusCode};
+        use axum::response::IntoResponse;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+
+        async fn mcp(State(base): State<String>) -> impl IntoResponse {
+            let val = format!(
+                "Bearer realm=\"Test\", resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
+                base
+            );
+            (
+                StatusCode::UNAUTHORIZED,
+                [(WWW_AUTHENTICATE, val)],
+                "unauthorized",
+            )
+        }
+        async fn protected_resource(State(base): State<String>) -> Json<serde_json::Value> {
+            Json(json!({ "resource": base, "authorization_servers": [base] }))
+        }
+        async fn auth_server(State(base): State<String>) -> Json<serde_json::Value> {
+            Json(json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{}/authorize", base),
+                "token_endpoint": format!("{}/token", base),
+                "registration_endpoint": format!("{}/register", base),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        async fn register() -> Json<serde_json::Value> {
+            Json(json!({ "client_id": "jit-cid", "client_secret": "jit-secret" }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let router = Router::new()
+            .route("/mcp", post(mcp))
+            .route(
+                "/.well-known/oauth-protected-resource",
+                get(protected_resource),
+            )
+            .route("/.well-known/oauth-authorization-server", get(auth_server))
+            .route("/register", post(register))
+            .with_state(base.clone());
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        (base, handle)
+    }
+
+    /// Fixture whose `POST /mcp` returns `200 {ok:true}` ONLY when the request
+    /// carries `Authorization: Bearer <expected>`; otherwise it returns a hard
+    /// 401 + Bearer `WWW-Authenticate`. Models the authenticated-retry upstream:
+    /// after the human signs in, the persisted bearer is injected and the call
+    /// succeeds.
+    async fn spawn_bearer_gated_mcp_fixture(
+        expected_token: &str,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::extract::State;
+        use axum::http::{header::AUTHORIZATION, header::WWW_AUTHENTICATE, StatusCode};
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        #[derive(Clone)]
+        struct FixtureState {
+            base: String,
+            expected: String,
+        }
+
+        async fn mcp(
+            State(st): State<FixtureState>,
+            req: axum::extract::Request,
+        ) -> axum::response::Response {
+            let authed = req
+                .headers()
+                .get(AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v == format!("Bearer {}", st.expected))
+                .unwrap_or(false);
+            if authed {
+                // The application/json response path does not validate the
+                // JSON-RPC id, so a fixed-id success result is sufficient.
+                Json(json!({"jsonrpc": "2.0", "result": {"ok": true}, "id": 1})).into_response()
+            } else {
+                let val = format!(
+                    "Bearer realm=\"Test\", resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
+                    st.base
+                );
+                (
+                    StatusCode::UNAUTHORIZED,
+                    [(WWW_AUTHENTICATE, val)],
+                    "unauthorized",
+                )
+                    .into_response()
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let st = FixtureState {
+            base: base.clone(),
+            expected: expected_token.to_string(),
+        };
+        let router = Router::new().route("/mcp", post(mcp)).with_state(st);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        (base, handle)
+    }
+
+    /// With a JIT interceptor attached, a gated tool call's 401 is SWALLOWED
+    /// (never forwarded as a raw `HttpError { 401 }`) and the produced authorize
+    /// URL is SURFACED to the downstream client as an actionable tool result
+    /// (`isError: true` with an "open this to sign in" instruction). The raw
+    /// upstream challenge is never leaked.
+    #[tokio::test]
+    async fn call_tool_401_with_interceptor_surfaces_authorize_url() {
+        use crate::adapter::oauth::jit::JitInterceptor;
+        use crate::oauth::OAuthFlowManager;
+
+        let (base, server) = spawn_gated_mcp_fixture().await;
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let interceptor = Arc::new(JitInterceptor::new(9400, flow_mgr, None, true));
+
+        let mut adapter = HttpAdapter::new(HttpConfig::new(format!("{}/mcp", base)));
+        adapter.set_jit_interceptor(interceptor.clone());
+
+        let result = adapter.call_tool("search", json!({})).await;
+        let value = match result {
+            Ok(v) => v,
+            other => panic!("expected surfaced Ok result, got {:?}", other),
+        };
+
+        // Surfaced as a tool-error result, not a forwarded protocol failure.
+        assert_eq!(value["isError"], true);
+        let text = value["content"][0]["text"]
+            .as_str()
+            .expect("surfaced content text");
+        // Carries the composed authorize URL and a sign-in instruction.
+        assert!(
+            text.contains(&format!("{}/authorize?", base)),
+            "surfaced text should contain the authorize URL, got: {}",
+            text
+        );
+        assert!(text.to_lowercase().contains("sign-in"));
+        // The raw upstream 401 / WWW-Authenticate challenge is never leaked.
+        assert!(!text.contains("401"));
+        assert!(!text.contains("WWW-Authenticate"));
+
+        // State machine advanced and the URL is also stored on the interceptor.
+        assert_eq!(
+            interceptor.state().await,
+            crate::adapter::oauth::OAuthState::NeedsLogin
+        );
+        assert!(interceptor.pending_authorize_url().await.is_some());
+
+        server.abort();
+    }
+
+    /// Once a valid bearer token has been persisted for the endpoint (the state
+    /// after the loopback `/oauth/callback` completes the code→token exchange),
+    /// the tool-call path injects it and a re-issued call SUCCEEDS — without
+    /// re-triggering the JIT flow. This exercises the retry-after-sign-in seam.
+    #[tokio::test]
+    async fn call_tool_uses_persisted_bearer_and_does_not_retrigger_jit() {
+        use crate::adapter::oauth::jit::JitInterceptor;
+        use crate::oauth::OAuthFlowManager;
+        use crate::token_manager::{TokenManager, TokenSet};
+
+        let token = "good-access-token";
+        let (base, server) = spawn_bearer_gated_mcp_fixture(token).await;
+
+        // Persist a valid (unexpired) token under the endpoint name, exactly as
+        // the `/oauth/callback` handler does after the human signs in.
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        tm.save(
+            "ep-retry",
+            &TokenSet {
+                access_token: token.to_string(),
+                refresh_token: None,
+                expires_at: Some(now + 3600),
+                token_type: "Bearer".to_string(),
+                scope: None,
+                issued_at: Some(now),
+            },
+        )
+        .await
+        .unwrap();
+
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let interceptor = Arc::new(JitInterceptor::new(9400, flow_mgr, Some(tm), true));
+
+        let mut config = HttpConfig::new(format!("{}/mcp", base));
+        config.endpoint_name = "ep-retry".to_string();
+        let mut adapter = HttpAdapter::new(config);
+        adapter.set_jit_interceptor(interceptor.clone());
+
+        let result = adapter.call_tool("search", json!({})).await;
+        match result {
+            Ok(v) => assert_eq!(v["ok"], true),
+            other => panic!("expected authenticated success, got {:?}", other),
+        }
+
+        // The JIT flow was never triggered: no NeedsLogin transition, no URL.
+        assert_ne!(
+            interceptor.state().await,
+            crate::adapter::oauth::OAuthState::NeedsLogin
+        );
+        assert!(interceptor.pending_authorize_url().await.is_none());
+
+        server.abort();
+    }
+
+    /// Without an interceptor (the default for every adapter today), a 401 is
+    /// forwarded unchanged — confirming the wiring is dormant by default.
+    #[tokio::test]
+    async fn call_tool_401_without_interceptor_is_forwarded_unchanged() {
+        let (base, server) = spawn_gated_mcp_fixture().await;
+        let adapter = HttpAdapter::new(HttpConfig::new(format!("{}/mcp", base)));
+        let result = adapter.call_tool("search", json!({})).await;
+        match result {
+            Err(AdapterError::HttpError { status: 401, .. }) => {}
+            other => panic!("expected HttpError {{ 401 }}, got {:?}", other),
+        }
         server.abort();
     }
 }
