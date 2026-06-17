@@ -9,6 +9,7 @@ pub mod jsonrpc;
 pub mod management;
 pub mod management_listener;
 pub mod oauth;
+pub mod observability;
 pub mod prefix;
 pub mod profile_registry;
 pub mod registry;

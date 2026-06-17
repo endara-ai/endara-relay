@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, post},
@@ -20,9 +20,11 @@ use crate::adapter::oauth::OAuthState;
 use crate::adapter::sse::{SseAdapter, SseConfig};
 use crate::adapter::stdio::{StdioAdapter, StdioConfig};
 use crate::adapter::{FailedAdapter, HealthStatus, McpAdapter, StartingAdapter};
-use crate::config::Config;
+use crate::config::{Config, ObservabilityConfig};
 use crate::events::ToolCallEventBus;
 use crate::oauth::{OAuthFlowManager, OAuthSetupManager, PkceChallenge};
+use crate::observability::payloads::StoredPayloads;
+use crate::observability::store::{AggregateBucket, CallRecord, QueryFilter};
 use crate::profile_registry::ProfileRegistry;
 use crate::registry::AdapterRegistry;
 use crate::token_manager::{DcrCredentials, TokenManager};
@@ -537,6 +539,10 @@ struct SanitizedRelay {
     machine_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     local_js_execution: Option<bool>,
+    /// Agent-call observability settings (`[relay.observability]`). Exposed so
+    /// the desktop Settings tab can render the Observability section; contains
+    /// no secrets, so it is surfaced verbatim.
+    observability: ObservabilityConfig,
 }
 
 #[derive(Serialize)]
@@ -558,6 +564,7 @@ fn sanitize_config(config: &Config) -> SanitizedConfig {
         relay: SanitizedRelay {
             machine_name: config.relay.machine_name.clone(),
             local_js_execution: config.relay.local_js_execution,
+            observability: config.relay.observability.clone(),
         },
         endpoints: config
             .endpoints
@@ -733,6 +740,55 @@ async fn delete_endpoint(
             Some(&e.to_string()),
         )
         .into_response();
+    }
+
+    // R6: cascade observability cleanup for the deleted server. The metadata
+    // store is keyed by `server_name`, but the in-memory payload buffer is
+    // keyed by `request_uid` — so derive the request_uids for this server from
+    // the metadata rows BEFORE deleting them, then delete the rows and drop the
+    // matching buffered payloads. No-op when observability is unwired/disabled.
+    if let Some(obs) = state.registry.observability().filter(|o| o.is_enabled()) {
+        let store = obs.store();
+        let filter = crate::observability::store::QueryFilter {
+            server_name: Some(name.clone()),
+            ..Default::default()
+        };
+        let mut uids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        const UID_PAGE: i64 = 1000;
+        let mut offset = 0i64;
+        loop {
+            match store.query(&filter, UID_PAGE, offset) {
+                Ok(rows) => {
+                    let fetched = rows.len() as i64;
+                    for row in rows {
+                        if let Some(uid) = row.request_uid {
+                            uids.insert(uid);
+                        }
+                    }
+                    if fetched < UID_PAGE {
+                        break;
+                    }
+                    offset += UID_PAGE;
+                }
+                Err(e) => {
+                    warn!(error = %e, server = %name, "observability: failed to collect request_uids for delete cascade");
+                    break;
+                }
+            }
+        }
+
+        match store.delete_for_server(&name) {
+            Ok(removed) => {
+                tracing::debug!(server = %name, removed, "observability: deleted metadata rows for deleted server")
+            }
+            Err(e) => {
+                warn!(error = %e, server = %name, "observability: failed to delete metadata rows for deleted server")
+            }
+        }
+
+        if !uids.is_empty() {
+            obs.payloads().remove_for_server(&uids);
+        }
     }
 
     // Return success — the config watcher will pick up the file change and
@@ -3483,6 +3539,453 @@ async fn tool_call_events_sse(State(state): State<ManagementState>) -> axum::res
 }
 
 // ---------------------------------------------------------------------------
+// Observability API (R5)
+// ---------------------------------------------------------------------------
+
+/// Serializable view of a [`CallRecord`] for the observability API. Mirrors the
+/// stored metadata row; request/response bodies are surfaced separately on the
+/// drill-through route, never on the list.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CallRecordDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    jsonrpc_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_user_agent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_origin: Option<String>,
+    tool: String,
+    ts_start: i64,
+    ts_end: i64,
+    duration_ms: i64,
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_message: Option<String>,
+    request_bytes: i64,
+    response_bytes: i64,
+    streamed: bool,
+}
+
+impl From<CallRecord> for CallRecordDto {
+    fn from(r: CallRecord) -> Self {
+        CallRecordDto {
+            id: r.id,
+            request_uid: r.request_uid,
+            jsonrpc_id: r.jsonrpc_id,
+            endpoint: r.endpoint,
+            server_name: r.server_name,
+            server_type: r.server_type,
+            transport: r.transport,
+            profile: r.profile,
+            client_name: r.client_name,
+            client_version: r.client_version,
+            client_user_agent: r.client_user_agent,
+            client_origin: r.client_origin,
+            tool: r.tool,
+            ts_start: r.ts_start,
+            ts_end: r.ts_end,
+            duration_ms: r.duration_ms,
+            success: r.success,
+            error_message: r.error_message,
+            request_bytes: r.request_bytes,
+            response_bytes: r.response_bytes,
+            streamed: r.streamed,
+        }
+    }
+}
+
+/// Query string for `GET /api/observability/calls`. All filters are optional
+/// and ANDed; `since`/`until` bound `ts_start` as epoch milliseconds.
+#[derive(Deserialize)]
+struct CallsQuery {
+    server_name: Option<String>,
+    tool: Option<String>,
+    success: Option<bool>,
+    request_uid: Option<String>,
+    since: Option<i64>,
+    until: Option<i64>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// Response for `GET /api/observability/calls`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CallsResponse {
+    calls: Vec<CallRecordDto>,
+    limit: i64,
+    offset: i64,
+}
+
+/// Default and maximum page sizes for the calls list.
+const CALLS_DEFAULT_LIMIT: i64 = 100;
+const CALLS_MAX_LIMIT: i64 = 1000;
+
+/// 503 body used when the observability subsystem is unwired (e.g. the metadata
+/// store failed to open at startup). Distinct from a wired-but-disabled handle:
+/// a disabled handle still answers reads (its store is empty / frozen).
+fn observability_unavailable() -> axum::response::Response {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "observability not available",
+        Some("The observability subsystem is not initialised."),
+    )
+    .into_response()
+}
+
+/// Current wall-clock time in epoch milliseconds (default `until` bound).
+fn now_epoch_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// GET /api/observability/calls — filtered, paged metadata list (payloads
+/// excluded; use the drill-through route for those).
+async fn get_observability_calls(
+    State(state): State<ManagementState>,
+    Query(q): Query<CallsQuery>,
+) -> axum::response::Response {
+    let Some(obs) = state.registry.observability() else {
+        return observability_unavailable();
+    };
+    let limit = q
+        .limit
+        .unwrap_or(CALLS_DEFAULT_LIMIT)
+        .clamp(1, CALLS_MAX_LIMIT);
+    let offset = q.offset.unwrap_or(0).max(0);
+    let filter = QueryFilter {
+        server_name: q.server_name,
+        tool: q.tool,
+        success: q.success,
+        request_uid: q.request_uid,
+        since: q.since,
+        until: q.until,
+    };
+    match obs.store().query(&filter, limit, offset) {
+        Ok(rows) => Json(CallsResponse {
+            calls: rows.into_iter().map(CallRecordDto::from).collect(),
+            limit,
+            offset,
+        })
+        .into_response(),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to query observability records",
+            Some(&e.to_string()),
+        )
+        .into_response(),
+    }
+}
+
+/// Payload availability on the drill-through route.
+#[derive(Serialize)]
+#[serde(rename_all = "lowercase")]
+enum PayloadStatus {
+    /// Payloads are still buffered and returned inline.
+    Stored,
+    /// Payload capture is enabled but the entry aged out of the ring buffer.
+    Expired,
+    /// Payload capture is disabled (`store_payloads = false`).
+    Disabled,
+}
+
+/// Response for `GET /api/observability/calls/{request_uid}`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CallDetailResponse {
+    record: CallRecordDto,
+    payload_status: PayloadStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    payloads: Option<StoredPayloads>,
+}
+
+/// GET /api/observability/calls/{request_uid} — full metadata row plus buffered
+/// payloads when still retained.
+async fn get_observability_call_detail(
+    State(state): State<ManagementState>,
+    Path(request_uid): Path<String>,
+) -> axum::response::Response {
+    let Some(obs) = state.registry.observability() else {
+        return observability_unavailable();
+    };
+    let record = match obs.store().get_by_request_uid(&request_uid) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "call record not found",
+                Some(&format!("No record for request_uid {request_uid}")),
+            )
+            .into_response();
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to load observability record",
+                Some(&e.to_string()),
+            )
+            .into_response();
+        }
+    };
+    let (payload_status, payloads) = if !obs.store_payloads() {
+        (PayloadStatus::Disabled, None)
+    } else {
+        match obs.payloads().get(&request_uid) {
+            Some(p) => (PayloadStatus::Stored, Some(p)),
+            None => (PayloadStatus::Expired, None),
+        }
+    };
+    Json(CallDetailResponse {
+        record: record.into(),
+        payload_status,
+        payloads,
+    })
+    .into_response()
+}
+
+/// Serializable view of an [`AggregateBucket`] sparkline point.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AggregateBucketDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server: Option<String>,
+    bucket_start: i64,
+    count: u64,
+    error_count: u64,
+    p50_ms: u64,
+    p95_ms: u64,
+}
+
+impl From<AggregateBucket> for AggregateBucketDto {
+    fn from(b: AggregateBucket) -> Self {
+        AggregateBucketDto {
+            server: b.server,
+            bucket_start: b.bucket_start,
+            count: b.count,
+            error_count: b.error_count,
+            p50_ms: b.p50_ms,
+            p95_ms: b.p95_ms,
+        }
+    }
+}
+
+/// Global counters surfaced alongside the sparkline buckets so the desktop can
+/// render overflow and buffer-pressure indicators.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ObservabilitySummary {
+    enabled: bool,
+    store_payloads: bool,
+    dropped: u64,
+    payload_buffer_len: usize,
+    payload_buffer_bytes: usize,
+}
+
+/// Query string for `GET /api/observability/aggregates`.
+#[derive(Deserialize)]
+struct AggregatesQuery {
+    bucket_seconds: Option<i64>,
+    since: Option<i64>,
+    until: Option<i64>,
+}
+
+/// Response for `GET /api/observability/aggregates`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AggregatesResponse {
+    buckets: Vec<AggregateBucketDto>,
+    summary: ObservabilitySummary,
+}
+
+/// Default sparkline window (1 hour) and bucket width (1 minute).
+const AGGREGATES_DEFAULT_WINDOW_MS: i64 = 3_600_000;
+const AGGREGATES_DEFAULT_BUCKET_SECONDS: i64 = 60;
+
+/// GET /api/observability/aggregates — time-bucketed per-server + global
+/// metrics for the SVG sparklines, plus global overflow / buffer counters.
+async fn get_observability_aggregates(
+    State(state): State<ManagementState>,
+    Query(q): Query<AggregatesQuery>,
+) -> axum::response::Response {
+    let Some(obs) = state.registry.observability() else {
+        return observability_unavailable();
+    };
+    let until = q.until.unwrap_or_else(now_epoch_ms);
+    let since = q.since.unwrap_or(until - AGGREGATES_DEFAULT_WINDOW_MS);
+    let bucket_seconds = q
+        .bucket_seconds
+        .unwrap_or(AGGREGATES_DEFAULT_BUCKET_SECONDS)
+        .max(1);
+    let summary = ObservabilitySummary {
+        enabled: obs.is_enabled(),
+        store_payloads: obs.store_payloads(),
+        dropped: obs.dropped(),
+        payload_buffer_len: obs.payloads().len(),
+        payload_buffer_bytes: obs.payloads().total_bytes(),
+    };
+    match obs.store().aggregate(bucket_seconds, since, until) {
+        Ok(buckets) => Json(AggregatesResponse {
+            buckets: buckets.into_iter().map(AggregateBucketDto::from).collect(),
+            summary,
+        })
+        .into_response(),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to aggregate observability records",
+            Some(&e.to_string()),
+        )
+        .into_response(),
+    }
+}
+
+/// POST /api/observability/purge — drop every buffered payload and metadata row.
+async fn purge_observability(State(state): State<ManagementState>) -> axum::response::Response {
+    let Some(obs) = state.registry.observability() else {
+        return observability_unavailable();
+    };
+    if let Err(e) = obs.store().purge_all() {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to purge observability metadata",
+            Some(&e.to_string()),
+        )
+        .into_response();
+    }
+    obs.payloads().purge_all();
+    Json(ActionResponse {
+        ok: true,
+        message: "observability records purged".to_string(),
+    })
+    .into_response()
+}
+
+/// GET /api/observability/config — current `[relay.observability]` settings.
+async fn get_observability_config(
+    State(state): State<ManagementState>,
+) -> Json<ObservabilityConfig> {
+    let config = state.config.read().await;
+    Json(config.relay.observability.clone())
+}
+
+/// PUT /api/observability/config — persist new `[relay.observability]` settings
+/// to disk (targeted edit, preserving the rest of the file) and swap the
+/// in-memory baseline. Runtime store sizing (windows, budgets, enable/disable)
+/// is re-read on the next relay restart.
+async fn update_observability_config(
+    State(state): State<ManagementState>,
+    Json(new_cfg): Json<ObservabilityConfig>,
+) -> axum::response::Response {
+    let Some(config_path) = &state.config_path else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_path not configured",
+            Some("The management API was not initialised with a config file path."),
+        )
+        .into_response();
+    };
+    let resolved = crate::config::expand_tilde(config_path);
+
+    let contents = match std::fs::read_to_string(&resolved) {
+        Ok(c) => c,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to read config file",
+                Some(&e.to_string()),
+            )
+            .into_response();
+        }
+    };
+    let mut parsed: toml::Table = match contents.parse() {
+        Ok(t) => t,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to parse config file",
+                Some(&e.to_string()),
+            )
+            .into_response();
+        }
+    };
+
+    let obs_value = match toml::Value::try_from(&new_cfg) {
+        Ok(v) => v,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to serialize observability config",
+                Some(&e.to_string()),
+            )
+            .into_response();
+        }
+    };
+
+    // Insert/replace `[relay.observability]`, creating `[relay]` if absent.
+    let relay_tbl = parsed
+        .entry("relay".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+    let Some(relay_tbl) = relay_tbl.as_table_mut() else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "invalid config file",
+            Some("`relay` is not a table"),
+        )
+        .into_response();
+    };
+    relay_tbl.insert("observability".to_string(), obs_value);
+
+    let new_contents = match toml::to_string_pretty(&parsed) {
+        Ok(s) => s,
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to serialize config",
+                Some(&e.to_string()),
+            )
+            .into_response();
+        }
+    };
+    if let Err(e) = crate::config::write_config_file(&resolved, &new_contents) {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to write config file",
+            Some(&e.to_string()),
+        )
+        .into_response();
+    }
+
+    // Swap the in-memory baseline so `GET /api/config` and
+    // `GET /api/observability/config` reflect the change immediately.
+    {
+        let mut config = state.config.write().await;
+        config.relay.observability = new_cfg.clone();
+    }
+
+    Json(new_cfg).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Router builder
 // ---------------------------------------------------------------------------
 
@@ -3549,6 +4052,23 @@ pub fn management_routes(state: ManagementState) -> Router {
         )
         // Desktop overlay's typed tool-call event SSE stream.
         .route("/api/events/tool-calls", get(tool_call_events_sse))
+        // Observability tab (R5): query, drill-through, aggregates, purge,
+        // config, and a live SSE feed reusing the tool-call event bus.
+        .route("/api/observability/calls", get(get_observability_calls))
+        .route(
+            "/api/observability/calls/{request_uid}",
+            get(get_observability_call_detail),
+        )
+        .route(
+            "/api/observability/aggregates",
+            get(get_observability_aggregates),
+        )
+        .route("/api/observability/purge", post(purge_observability))
+        .route(
+            "/api/observability/config",
+            get(get_observability_config).put(update_observability_config),
+        )
+        .route("/api/observability/events", get(tool_call_events_sse))
         // No CORS layer: this router is served exclusively over a Unix-domain
         // socket / Windows named pipe (see `management_listener`), which is not
         // reachable from a browser and has no cross-origin attack surface.
@@ -3884,6 +4404,7 @@ mod tests {
                 startup_init_timeout_secs: None,
                 session_identity_max_sessions: None,
                 validate_inputs: None,
+                observability: crate::config::ObservabilityConfig::default(),
             },
             endpoints: vec![EndpointConfig {
                 name: "echo".to_string(),
@@ -4635,6 +5156,119 @@ command = "cat"
         assert!(updated.contains("keep-me"));
 
         // Clean up
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn management_delete_endpoint_cascades_observability() {
+        use crate::observability::payloads::PayloadStore;
+        use crate::observability::pipeline::Observability;
+        use crate::observability::store::{CallRecord, QueryFilter, Store};
+
+        // Two endpoints on disk; we delete one and assert the other's
+        // observability data survives.
+        let dir =
+            std::env::temp_dir().join(format!("relay-test-delete-cascade-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_file = dir.join("config.toml");
+        let toml_content = r#"[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "echo"
+transport = "stdio"
+command = "echo"
+
+[[endpoints]]
+name = "keep-me"
+transport = "stdio"
+command = "cat"
+"#;
+        std::fs::write(&config_file, toml_content).unwrap();
+
+        // Seed the metadata store + payload buffer for both servers, keyed by
+        // request_uid.
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let payloads = Arc::new(PayloadStore::new(10, 128, 256 * 1024));
+        let row = |uid: &str, server: &str| CallRecord {
+            request_uid: Some(uid.to_string()),
+            server_name: Some(server.to_string()),
+            tool: format!("{server}__do"),
+            ts_start: 1000,
+            ts_end: 1005,
+            duration_ms: 5,
+            success: true,
+            ..Default::default()
+        };
+        store
+            .insert_batch(&[
+                row("echo-1", "echo"),
+                row("echo-2", "echo"),
+                row("keep-1", "keep-me"),
+                row("keep-2", "keep-me"),
+            ])
+            .unwrap();
+        for uid in ["echo-1", "echo-2", "keep-1", "keep-2"] {
+            payloads.insert(
+                uid,
+                &serde_json::json!({"q": uid}),
+                &serde_json::json!({"ok": true}),
+                false,
+            );
+        }
+
+        let obs = Observability::new(
+            &crate::config::ObservabilityConfig::default(),
+            Arc::clone(&store),
+            Arc::clone(&payloads),
+        );
+        let registry = AdapterRegistry::new().with_observability(obs);
+
+        let mut state = test_state(vec![]).await;
+        state.registry = Arc::new(registry);
+        state.config_path = Some(config_file.clone());
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::delete("/api/endpoints/echo")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The deleted server's metadata + payloads are gone.
+        let echo_rows = store
+            .query(
+                &QueryFilter {
+                    server_name: Some("echo".to_string()),
+                    ..Default::default()
+                },
+                100,
+                0,
+            )
+            .unwrap();
+        assert!(echo_rows.is_empty(), "echo metadata rows should be deleted");
+        assert!(payloads.get("echo-1").is_none());
+        assert!(payloads.get("echo-2").is_none());
+
+        // The surviving server is untouched.
+        let keep_rows = store
+            .query(
+                &QueryFilter {
+                    server_name: Some("keep-me".to_string()),
+                    ..Default::default()
+                },
+                100,
+                0,
+            )
+            .unwrap();
+        assert_eq!(keep_rows.len(), 2, "keep-me metadata rows should survive");
+        assert!(payloads.get("keep-1").is_some());
+        assert!(payloads.get("keep-2").is_some());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6106,6 +6740,7 @@ command = "echo"
                 startup_init_timeout_secs: None,
                 session_identity_max_sessions: None,
                 validate_inputs: None,
+                observability: crate::config::ObservabilityConfig::default(),
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
@@ -6312,6 +6947,7 @@ command = "echo"
                 startup_init_timeout_secs: None,
                 session_identity_max_sessions: None,
                 validate_inputs: None,
+                observability: crate::config::ObservabilityConfig::default(),
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
@@ -6731,6 +7367,7 @@ command = "echo"
                 startup_init_timeout_secs: None,
                 session_identity_max_sessions: None,
                 validate_inputs: None,
+                observability: crate::config::ObservabilityConfig::default(),
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
@@ -6853,6 +7490,7 @@ client_id = "client123"
                 startup_init_timeout_secs: None,
                 session_identity_max_sessions: None,
                 validate_inputs: None,
+                observability: crate::config::ObservabilityConfig::default(),
             },
             endpoints: vec![],
             profiles: None,
@@ -6916,6 +7554,7 @@ client_id = "client123"
                 startup_init_timeout_secs: None,
                 session_identity_max_sessions: None,
                 validate_inputs: None,
+                observability: crate::config::ObservabilityConfig::default(),
             },
             endpoints: endpoint_names
                 .iter()
@@ -7475,6 +8114,7 @@ client_id = "client123"
                 startup_init_timeout_secs: None,
                 session_identity_max_sessions: None,
                 validate_inputs: None,
+                observability: crate::config::ObservabilityConfig::default(),
             },
             endpoints: vec![EndpointConfig {
                 name: "existing".to_string(),

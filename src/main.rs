@@ -4,6 +4,15 @@ mod js_sandbox;
 mod management;
 mod management_listener;
 mod oauth;
+// R4 wires the ingestion path (`Store::open`, `PayloadStore::new`,
+// `Observability`), but the binary does not yet consume the R5 query API
+// (`Store::query`/`stats`/percentiles) or the R6 retention surface
+// (`purge_all`, `enforce_retention`, `enforce_size_cap`, …). Keep the allow
+// until those land so the binary target stays warning-clean under
+// `clippy --all-targets -D warnings`; the lib target already exercises them
+// via its own tests.
+#[allow(dead_code)]
+mod observability;
 mod token_manager;
 mod watcher;
 
@@ -318,14 +327,112 @@ async fn main() {
             // semantics.
             let event_bus = ToolCallEventBus::with_default_capacity();
 
+            // Observability ingestion pipeline (R4). Open the durable SQLite
+            // metadata store under the data dir and pair it with the in-memory
+            // payload ring buffer, sized from `[relay.observability]`. The
+            // handle spawns its own background consumer when enabled and is a
+            // cheap no-op otherwise. If the store cannot be opened we log and
+            // continue without observability rather than failing relay startup.
+            let observability = {
+                let obs_cfg = &cfg.relay.observability;
+                if let Err(e) = std::fs::create_dir_all(&data_dir_path) {
+                    warn!(error = %e, path = %data_dir_path.display(), "Failed to create data directory for observability store");
+                }
+                match observability::store::Store::open(&data_dir_path) {
+                    Ok(store) => {
+                        let payloads = observability::payloads::PayloadStore::new(
+                            obs_cfg.payload_window_minutes,
+                            obs_cfg.payload_buffer_budget_mb,
+                            obs_cfg.max_payload_bytes as usize,
+                        );
+                        Some(observability::pipeline::Observability::new(
+                            obs_cfg,
+                            Arc::new(store),
+                            Arc::new(payloads),
+                        ))
+                    }
+                    Err(e) => {
+                        error!(error = %e, "Failed to open observability metadata store; observability disabled");
+                        None
+                    }
+                }
+            };
+
             // Create adapter registry. Wire the same bus into the
             // registry so its early-rejection branches in
             // `route_tool_call` (unknown prefix, missing/disabled/unhealthy
             // endpoint, disabled tool) emit `Started` + `Failed` pairs
             // alongside the per-adapter emissions.
-            let registry = AdapterRegistry::new()
+            let mut registry = AdapterRegistry::new()
                 .with_event_bus(event_bus.clone())
                 .with_validate_inputs(cfg.relay.validate_inputs.unwrap_or(true));
+            if let Some(obs) = observability.clone() {
+                registry = registry.with_observability(obs);
+            }
+
+            // R6: periodic retention + size-cap enforcement. When observability
+            // is enabled, evict metadata rows past the configured retention
+            // window, drop oldest rows to stay under the DB size cap, and sweep
+            // expired payloads from the ring buffer on a fixed cadence so both
+            // tiers stay bounded without operator intervention. Store ops run on
+            // a blocking thread so the SQLite work never stalls the runtime.
+            if let Some(obs) = observability.clone().filter(|o| o.is_enabled()) {
+                let retention_days = cfg.relay.observability.record_retention_days as i64;
+                let max_db_mb = cfg.relay.observability.max_db_size_mb;
+                tokio::spawn(async move {
+                    const RETENTION_SWEEP_INTERVAL_SECS: u64 = 60;
+                    let mut ticker =
+                        tokio::time::interval(Duration::from_secs(RETENTION_SWEEP_INTERVAL_SECS));
+                    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    // Consume the immediate first tick so we don't sweep the
+                    // instant the relay starts.
+                    ticker.tick().await;
+                    loop {
+                        ticker.tick().await;
+                        let store = Arc::clone(obs.store());
+                        let swept = tokio::task::spawn_blocking(move || {
+                            let retention = store.enforce_retention(retention_days);
+                            let size_cap = store.enforce_size_cap(max_db_mb);
+                            (retention, size_cap)
+                        })
+                        .await;
+                        match swept {
+                            Ok((retention, size_cap)) => {
+                                obs.payloads().sweep_expired();
+                                let retention_pruned = match retention {
+                                    Ok(n) => n,
+                                    Err(e) => {
+                                        warn!(error = %e, "observability: retention enforcement failed");
+                                        0
+                                    }
+                                };
+                                match size_cap {
+                                    Ok(result) => {
+                                        if retention_pruned > 0 || result.evicted {
+                                            info!(
+                                                retention_pruned,
+                                                size_evicted = result.deleted_rows,
+                                                oldest_retained_ts = ?result.oldest_retained_ts,
+                                                "observability: retention sweep pruned records"
+                                            );
+                                        } else {
+                                            tracing::debug!(
+                                                "observability: retention sweep, nothing to prune"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(error = %e, "observability: size-cap enforcement failed")
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!(error = %e, "observability: retention sweep task panicked")
+                            }
+                        }
+                    }
+                });
+            }
 
             // Track duplicate endpoint names: first occurrence wins
             let mut registered_names = std::collections::HashSet::new();
