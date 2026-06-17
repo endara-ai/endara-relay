@@ -166,11 +166,13 @@ fn init_tracing(
             .boxed(),
     };
 
-    // SpanFieldCaptureLayer captures the JSON-RPC id (from `request` spans)
-    // and profile (from `mcp_request` spans) into per-span extensions so
-    // adapters can populate `jsonrpc_id` / `profile` on every
-    // `ToolCallEvent` without a breaking `McpAdapter::call_tool` signature
-    // change. Cheap: only allocates for the two named spans.
+    // SpanFieldCaptureLayer captures the canonical UID and caller identity
+    // (from `request` spans) and profile (from `mcp_request` spans) into
+    // per-span extensions so adapters can populate `request_uid` / `profile`
+    // on the `ToolCallEvent::Started` they emit (only `Started` carries them;
+    // `Completed`/`Failed` are terse and correlate back via the shared
+    // per-call `request_id`) without a breaking `McpAdapter::call_tool`
+    // signature change. Cheap: only allocates for the two named spans.
     tracing_subscriber::registry()
         .with(events::SpanFieldCaptureLayer)
         .with(stdout_layer)
@@ -617,16 +619,30 @@ async fn main() {
             let settled_inits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut init_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
             let allow_insecure_oauth = cfg.relay.allow_insecure_oauth.unwrap_or(false);
+            // JIT wiring for plain-`http` adapters built during initial load —
+            // the same bundle the config watcher uses for hot-reloads. The
+            // loopback redirect_uri uses the runtime `port`, never hardcoded.
+            let jit = watcher::JitWiring {
+                relay_port: port,
+                flow_manager: oauth_flow_manager.clone(),
+            };
             for ep in deferred_init {
                 let reg = registry.clone();
                 let tm = token_manager.clone();
                 let oai = oauth_adapter_inners.clone();
                 let settled = settled_inits.clone();
                 let bus = event_bus.clone();
+                let jit_ep = jit.clone();
                 let handle = tokio::spawn(async move {
-                    let adapter =
-                        watcher::create_adapter(&ep, &tm, &oai, allow_insecure_oauth, Some(&bus))
-                            .await;
+                    let adapter = watcher::create_adapter(
+                        &ep,
+                        &tm,
+                        &oai,
+                        allow_insecure_oauth,
+                        Some(&bus),
+                        Some(&jit_ep),
+                    )
+                    .await;
                     let mut entries = reg.entries().write().await;
                     if let Some(entry) = entries.get_mut(ep.name.as_str()) {
                         entry.adapter = adapter;
@@ -901,6 +917,7 @@ async fn main() {
                         profile_registry.clone(),
                         token_manager.clone(),
                         oauth_flow_manager.clone(),
+                        port,
                         oauth_adapter_inners.clone(),
                         shared_config.clone(),
                         Some(event_bus.clone()),

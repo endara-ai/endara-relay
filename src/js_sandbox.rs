@@ -100,14 +100,6 @@ struct SandboxState {
     /// caller to the upstream adapter's event emitters and log lines — the
     /// blocking-thread hop otherwise drops the outer request span.
     client_json: String,
-    /// JSON-RPC envelope id of the outer inbound request, captured before the
-    /// sandbox hops onto the blocking thread. Empty when no id is known. Used
-    /// to re-establish a `request{id=...}` span around each inner
-    /// `route_tool_call` so `SpanFieldCaptureLayer` / `current_request_context()`
-    /// surface the id to the upstream adapter's event emitters
-    /// (`ToolCallEvent::Started.jsonrpc_id`) — the blocking-thread hop otherwise
-    /// drops the outer request span.
-    jsonrpc_id: String,
     /// Canonical per-inbound-request UID of the outer inbound request,
     /// captured before the sandbox hops onto the blocking thread. Empty when
     /// no UID was minted. Used to re-establish a `request{request_uid=...}`
@@ -143,11 +135,6 @@ pub struct JsSandbox {
     /// [`Self::with_client`] by [`MetaToolHandler::execute_tools`] so inner
     /// upstream tool calls re-establish the caller's `request` span.
     client_json: String,
-    /// JSON-RPC envelope id of the outer inbound request. Defaults to empty
-    /// (no id); set via [`Self::with_jsonrpc_id`] by
-    /// [`MetaToolHandler::execute_tools`] so inner upstream tool calls
-    /// re-establish the outer request's `request{id=...}` span.
-    jsonrpc_id: String,
     /// Canonical per-inbound-request UID of the outer inbound request.
     /// Defaults to empty (no UID); set via [`Self::with_request_uid`] by
     /// [`MetaToolHandler::execute_tools`] so inner upstream tool calls
@@ -185,7 +172,6 @@ impl JsSandbox {
             timeout,
             use_real_backoff: false,
             client_json: String::new(),
-            jsonrpc_id: String::new(),
             request_uid: String::new(),
         }
     }
@@ -197,15 +183,6 @@ impl JsSandbox {
     /// [`MetaToolHandler::execute_tools`].
     pub fn with_client(mut self, client_json: String) -> Self {
         self.client_json = client_json;
-        self
-    }
-
-    /// Attach the outer inbound request's JSON-RPC envelope id so inner
-    /// upstream tool calls re-establish a `request{id=...}` span on the
-    /// sandbox's blocking thread. An empty string degrades to no id. Used by
-    /// [`MetaToolHandler::execute_tools`].
-    pub fn with_jsonrpc_id(mut self, jsonrpc_id: String) -> Self {
-        self.jsonrpc_id = jsonrpc_id;
         self
     }
 
@@ -233,7 +210,6 @@ impl JsSandbox {
         let timeout = self.timeout;
         let use_real_backoff = self.use_real_backoff;
         let client_json = self.client_json.clone();
-        let jsonrpc_id = self.jsonrpc_id.clone();
         let request_uid = self.request_uid.clone();
         let script = script.to_string();
         let handle = tokio::runtime::Handle::current();
@@ -250,7 +226,6 @@ impl JsSandbox {
                     timeout,
                     use_real_backoff,
                     client_json,
-                    jsonrpc_id,
                     request_uid,
                 )
             }),
@@ -278,7 +253,6 @@ fn execute_in_sandbox(
     sandbox_timeout: Duration,
     use_real_backoff: bool,
     client_json: String,
-    jsonrpc_id: String,
     request_uid: String,
 ) -> Result<Value, JsSandboxError> {
     let deadline = std::time::Instant::now() + sandbox_timeout;
@@ -289,7 +263,6 @@ fn execute_in_sandbox(
             deadline,
             use_real_backoff,
             client_json,
-            jsonrpc_id,
             request_uid,
         });
     });
@@ -301,38 +274,35 @@ fn execute_in_sandbox(
 }
 
 /// Drive `fut` to completion on the sandbox's blocking thread, re-establishing
-/// the outer inbound request's `request{id=...,request_uid=...,client=...}`
-/// span when any of those signals was captured.
+/// the outer inbound request's `request{request_uid=...,client=...}` span when
+/// either of those signals was captured.
 ///
 /// `JsSandbox::execute` hops onto a `spawn_blocking` thread, which does not
 /// inherit the inbound `request` span. Without re-entering it here, the
-/// upstream adapter's `current_request_context()` resolves no JSON-RPC id, no
-/// request UID and no caller for sandbox-driven tool calls, so the "Tool call
+/// upstream adapter's `current_request_context()` resolves no request UID and
+/// no caller for sandbox-driven tool calls, so the "Tool call
 /// completed/failed" log lines and
-/// `ToolCallEvent::Started.{jsonrpc_id,request_uid,client}` lose those signals.
-/// Entering a fresh `request` span carrying `id = %jsonrpc_id`,
-/// `request_uid = %request_uid` and `client = %client_json` lets
-/// `SpanFieldCaptureLayer` re-capture them exactly as the direct path does.
-/// `SpanFieldCaptureLayer`'s visitor skips empty `id`/`request_uid`/`client`
-/// values, so a missing signal records no field; when all three are empty the
-/// future runs without an extra span.
+/// `ToolCallEvent::Started.{request_uid,client}` lose those signals.
+/// Entering a fresh `request` span carrying `request_uid = %request_uid` and
+/// `client = %client_json` lets `SpanFieldCaptureLayer` re-capture them exactly
+/// as the direct path does. `SpanFieldCaptureLayer`'s visitor skips empty
+/// `request_uid`/`client` values, so a missing signal records no field; when
+/// both are empty the future runs without an extra span.
 fn block_on_with_request_context<F>(
     handle: &tokio::runtime::Handle,
     client_json: &str,
-    jsonrpc_id: &str,
     request_uid: &str,
     fut: F,
 ) -> F::Output
 where
     F: std::future::Future,
 {
-    if jsonrpc_id.is_empty() && client_json.is_empty() && request_uid.is_empty() {
+    if client_json.is_empty() && request_uid.is_empty() {
         return handle.block_on(fut);
     }
     let span = tracing::info_span!(
         "request",
         method = "tools/call",
-        id = %jsonrpc_id,
         request_uid = %request_uid,
         client = %client_json,
     );
@@ -456,7 +426,6 @@ fn call_tool_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
         let res = block_on_with_request_context(
             &state.handle,
             &state.client_json,
-            &state.jsonrpc_id,
             &state.request_uid,
             state.registry.route_tool_call(&tool_name, arguments),
         )
@@ -553,7 +522,6 @@ fn call_tool_with_retry_native(
         let res = block_on_with_request_context(
             &state.handle,
             &state.client_json,
-            &state.jsonrpc_id,
             &state.request_uid,
             call_tool_with_retry_loop(
                 registry.as_ref(),
@@ -1324,25 +1292,21 @@ impl MetaToolHandler {
     /// gives the script a profile-filtered `tools.call()`.
     ///
     /// `client_json` is the JSON-serialised [`crate::events::ClientIdentity`]
-    /// of the outer inbound request (empty when no caller identity is known),
-    /// `jsonrpc_id` is the outer request's JSON-RPC envelope id (empty when
-    /// none is known) and `request_uid` is the outer request's canonical
-    /// collision-free UID (empty when none was minted). All three are threaded
-    /// into the sandbox so inner upstream tool calls re-establish the caller's
-    /// `request{id=...,request_uid=...,client=...}` span across the
-    /// blocking-thread hop — keeping the id, UID and caller visible on the
-    /// aggregated "Tool call completed/failed" log lines and
-    /// `ToolCallEvent::Started`.
+    /// of the outer inbound request (empty when no caller identity is known)
+    /// and `request_uid` is the outer request's canonical collision-free UID
+    /// (empty when none was minted). Both are threaded into the sandbox so
+    /// inner upstream tool calls re-establish the caller's
+    /// `request{request_uid=...,client=...}` span across the blocking-thread
+    /// hop — keeping the UID and caller visible on the aggregated "Tool call
+    /// completed/failed" log lines and `ToolCallEvent::Started`.
     pub async fn execute_tools(
         &self,
         script: &str,
         client_json: &str,
-        jsonrpc_id: &str,
         request_uid: &str,
     ) -> Result<Value, JsSandboxError> {
         let sandbox = JsSandbox::from_dyn(self.registry.clone(), self.sandbox_timeout)
             .with_client(client_json.to_string())
-            .with_jsonrpc_id(jsonrpc_id.to_string())
             .with_request_uid(request_uid.to_string());
         sandbox.execute(script).await
     }
@@ -3212,7 +3176,6 @@ mod tests {
                 rt.handle(),
                 &client_json,
                 "",
-                "",
                 reg.route_tool_call("echo", json!({})),
             );
             assert!(result.is_ok(), "tool call should succeed: {:?}", result);
@@ -3228,91 +3191,6 @@ mod tests {
                 origin: None,
             }),
             "sandbox-driven tool call must re-establish the caller identity \
-             in the request context"
-        );
-    }
-
-    /// A sandbox-driven upstream tool call must re-establish the outer inbound
-    /// request's JSON-RPC id across the `spawn_blocking` thread hop.
-    /// [`block_on_with_request_context`] enters a fresh `request{id=...}` span
-    /// before driving [`MetaToolRegistry::route_tool_call`], so the adapter's
-    /// `current_request_context().jsonrpc_id` (the signal feeding
-    /// `ToolCallEvent::Started.jsonrpc_id` and the desktop overlay's `log_id`)
-    /// resolves the outer id rather than `None`. This is the exact failure the
-    /// task reproduced live before the fix.
-    #[test]
-    fn sandbox_tool_call_reestablishes_jsonrpc_id() {
-        use crate::events::{current_request_context, SpanFieldCaptureLayer};
-        use std::sync::Mutex;
-        use tracing_subscriber::prelude::*;
-
-        // Adapter that records the JSON-RPC id visible via the request span at
-        // `call_tool` time, proving the span was re-established.
-        struct IdCapturingAdapter {
-            tools: Vec<ToolInfo>,
-            seen: Arc<Mutex<Option<String>>>,
-        }
-
-        #[async_trait]
-        impl McpAdapter for IdCapturingAdapter {
-            async fn initialize(&mut self) -> Result<(), AdapterError> {
-                Ok(())
-            }
-            async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
-                Ok(self.tools.clone())
-            }
-            async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
-                *self.seen.lock().unwrap() = current_request_context().jsonrpc_id;
-                Ok(json!({ "called": name, "args": arguments }))
-            }
-            fn health(&self) -> HealthStatus {
-                HealthStatus::Healthy
-            }
-            async fn shutdown(&mut self) -> Result<(), AdapterError> {
-                Ok(())
-            }
-        }
-
-        let seen = Arc::new(Mutex::new(None));
-        let seen_clone = Arc::clone(&seen);
-        let subscriber = tracing_subscriber::registry().with(SpanFieldCaptureLayer);
-        tracing::subscriber::with_default(subscriber, || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let registry = rt.block_on(async {
-                let registry = AdapterRegistry::new();
-                registry
-                    .register(
-                        "ep".into(),
-                        Box::new(IdCapturingAdapter {
-                            tools: vec![make_tool("echo", "Echo tool")],
-                            seen: seen_clone,
-                        }),
-                        "stdio".into(),
-                        None,
-                        None,
-                    )
-                    .await;
-                Arc::new(registry)
-            });
-
-            let reg: Arc<dyn MetaToolRegistry> = registry;
-            let result = block_on_with_request_context(
-                rt.handle(),
-                "",
-                "42",
-                "",
-                reg.route_tool_call("echo", json!({})),
-            );
-            assert!(result.is_ok(), "tool call should succeed: {:?}", result);
-        });
-
-        assert_eq!(
-            *seen.lock().unwrap(),
-            Some("42".to_string()),
-            "sandbox-driven tool call must re-establish the outer JSON-RPC id \
              in the request context"
         );
     }
@@ -3387,7 +3265,6 @@ mod tests {
             let result = block_on_with_request_context(
                 rt.handle(),
                 "",
-                "",
                 "req-uid-123",
                 reg.route_tool_call("echo", json!({})),
             );
@@ -3402,11 +3279,11 @@ mod tests {
         );
     }
 
-    /// With no caller identity captured (empty `client_json`), no id (empty
-    /// `jsonrpc_id`) and no UID (empty `request_uid`),
-    /// [`block_on_with_request_context`] must skip the extra span and drive the
-    /// future directly, leaving `current_request_context().client` as `None`
-    /// rather than fabricating an empty identity.
+    /// With no caller identity captured (empty `client_json`) and no UID (empty
+    /// `request_uid`), [`block_on_with_request_context`] must skip the extra
+    /// span and drive the future directly, leaving
+    /// `current_request_context().client` as `None` rather than fabricating an
+    /// empty identity.
     #[test]
     fn sandbox_tool_call_without_client_leaves_context_none() {
         use crate::events::{current_request_context, ClientIdentity, SpanFieldCaptureLayer};
@@ -3466,7 +3343,6 @@ mod tests {
             let reg: Arc<dyn MetaToolRegistry> = registry;
             let result = block_on_with_request_context(
                 rt.handle(),
-                "",
                 "",
                 "",
                 reg.route_tool_call("echo", json!({})),

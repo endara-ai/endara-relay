@@ -387,6 +387,11 @@ async fn restart_endpoint(
     let token_manager = state.token_manager.clone();
     let oauth_adapter_inners = state.oauth_adapter_inners.clone();
     let event_bus = state.event_bus.clone();
+    // Captured for JIT wiring of a rebuilt plain-`http` adapter (mirrors the
+    // initial-load and hot-reload paths). The loopback redirect_uri uses the
+    // live relay_port; if no flow manager is configured, JIT stays dormant.
+    let oauth_flow_manager = state.oauth_flow_manager.clone();
+    let relay_port = state.relay_port;
     let task_name = name.clone();
 
     tokio::spawn(async move {
@@ -422,8 +427,21 @@ async fn restart_endpoint(
                 )))
             });
             let oai = oauth_adapter_inners.unwrap_or_else(|| Arc::new(RwLock::new(HashMap::new())));
-            crate::watcher::create_adapter(&ep, &tm, &oai, allow_insecure_oauth, event_bus.as_ref())
-                .await
+            let jit = oauth_flow_manager
+                .as_ref()
+                .map(|fm| crate::watcher::JitWiring {
+                    relay_port,
+                    flow_manager: fm.clone(),
+                });
+            crate::watcher::create_adapter(
+                &ep,
+                &tm,
+                &oai,
+                allow_insecure_oauth,
+                event_bus.as_ref(),
+                jit.as_ref(),
+            )
+            .await
         } else {
             // Endpoint not in config: re-initialize the previous adapter in
             // place. On failure, surface the error via FailedAdapter so the
@@ -629,6 +647,13 @@ async fn reload_config(State(state): State<ManagementState>) -> Json<ActionRespo
         .clone()
         .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())));
 
+    let jit = state
+        .oauth_flow_manager
+        .as_ref()
+        .map(|fm| crate::watcher::JitWiring {
+            relay_port: state.relay_port,
+            flow_manager: fm.clone(),
+        });
     crate::watcher::apply_diff_graceful(
         &diff,
         &state.registry,
@@ -638,6 +663,7 @@ async fn reload_config(State(state): State<ManagementState>) -> Json<ActionRespo
         &oauth_adapter_inners,
         new_config.relay.allow_insecure_oauth.unwrap_or(false),
         state.event_bus.as_ref(),
+        jit.as_ref(),
     )
     .await;
 
@@ -1768,6 +1794,90 @@ async fn oauth_metrics(
     };
 
     Json(inner.metrics.snapshot()).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// OAuth capability probe (add-time)
+// ---------------------------------------------------------------------------
+
+/// Request body for POST /api/oauth/probe
+#[derive(Deserialize)]
+struct OAuthProbeRequest {
+    /// The MCP server URL to probe for OAuth support.
+    url: String,
+}
+
+/// Response for POST /api/oauth/probe.
+///
+/// JSON contract (consumed by the desktop add-server flow):
+///   Request:  `{ "url": "<mcp server url>" }`
+///   Response: `{ "oauth_supported": bool,
+///               "authorization_server"?: string,
+///               "scopes_supported"?: [string] }`
+///
+/// `authorization_server` and `scopes_supported` are present only when
+/// `oauth_supported` is `true` (and `scopes_supported` only when non-empty).
+#[derive(Serialize)]
+struct OAuthProbeResponse {
+    oauth_supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorization_server: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scopes_supported: Option<Vec<String>>,
+}
+
+/// POST /api/oauth/probe
+///
+/// Best-effort check of whether an MCP server supports OAuth (RFC 9728 →
+/// RFC 8414), used by the desktop add-server flow to decide whether to start
+/// an OAuth setup or proceed with a plain HTTP add. This runs discovery only —
+/// it does NOT start a flow, perform DCR, or persist anything.
+///
+/// JSON contract:
+///   Request:  `{ "url": "<mcp server url>" }`
+///   Response: `{ "oauth_supported": bool,
+///               "authorization_server"?: string,
+///               "scopes_supported"?: [string] }`
+///
+/// Any discovery failure (no metadata, 404, connection error, timeout) is
+/// reported as a normal HTTP 200 with `oauth_supported: false` so the caller
+/// can fall back to a plain (non-OAuth) add without treating it as an error.
+async fn oauth_probe(
+    State(state): State<ManagementState>,
+    Json(body): Json<OAuthProbeRequest>,
+) -> impl IntoResponse {
+    use crate::oauth::discovery;
+
+    let allow_insecure_oauth = {
+        let config = state.config.read().await;
+        config.relay.allow_insecure_oauth.unwrap_or(false)
+    };
+
+    // Bound the overall probe so a slow/unreachable well-known endpoint can
+    // never stall the caller. Discovery performs up to two sequential fetches
+    // (each with its own 10s timeout); cap the whole operation here as a
+    // backstop.
+    let probe = discovery::discover_oauth_server(body.url.trim(), allow_insecure_oauth);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(15), probe).await;
+
+    match result {
+        Ok(Ok(disc)) => Json(OAuthProbeResponse {
+            oauth_supported: true,
+            authorization_server: Some(disc.auth_server_url),
+            scopes_supported: if disc.scopes_supported.is_empty() {
+                None
+            } else {
+                Some(disc.scopes_supported)
+            },
+        })
+        .into_response(),
+        Ok(Err(_)) | Err(_) => Json(OAuthProbeResponse {
+            oauth_supported: false,
+            authorization_server: None,
+            scopes_supported: None,
+        })
+        .into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3414,6 +3524,13 @@ async fn apply_endpoint_change(
         .oauth_adapter_inners
         .clone()
         .unwrap_or_else(|| Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())));
+    let jit = state
+        .oauth_flow_manager
+        .as_ref()
+        .map(|fm| crate::watcher::JitWiring {
+            relay_port: state.relay_port,
+            flow_manager: fm.clone(),
+        });
     crate::watcher::apply_diff_graceful(
         &diff,
         &state.registry,
@@ -3423,6 +3540,7 @@ async fn apply_endpoint_change(
         &oauth_adapter_inners,
         new_cfg.relay.allow_insecure_oauth.unwrap_or(false),
         state.event_bus.as_ref(),
+        jit.as_ref(),
     )
     .await;
 
@@ -4026,6 +4144,8 @@ pub fn management_routes(state: ManagementState) -> Router {
         .route("/api/endpoints/{name}/oauth/revoke", post(oauth_revoke))
         .route("/api/endpoints/{name}/oauth/refresh", post(oauth_refresh))
         .route("/api/endpoints/{name}/oauth/metrics", get(oauth_metrics))
+        // OAuth capability probe (add-time)
+        .route("/api/oauth/probe", post(oauth_probe))
         // OAuth setup (preflight) routes
         .route("/api/oauth/setup", post(oauth_setup))
         .route(
@@ -6998,6 +7118,101 @@ command = "echo"
             .expect("authorize URL has state param")
     }
 
+    // -----------------------------------------------------------------------
+    // oauth_probe: add-time OAuth-capability probe (RFC 9728 → 8414)
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn oauth_probe_reports_supported_when_metadata_present() {
+        // Bind first so the protected-resource metadata can point its
+        // authorization_servers at this same mock origin.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://127.0.0.1:{}", addr.port());
+
+        async fn protected_resource(State(base): State<String>) -> Json<Value> {
+            Json(serde_json::json!({
+                "resource": base,
+                "authorization_servers": [base],
+                "scopes_supported": ["read", "write"],
+            }))
+        }
+        async fn auth_server(State(base): State<String>) -> Json<Value> {
+            Json(serde_json::json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{}/authorize", base),
+                "token_endpoint": format!("{}/token", base),
+                "code_challenge_methods_supported": ["S256"],
+                "scopes_supported": ["read", "write"],
+            }))
+        }
+        let router = Router::new()
+            .route(
+                "/.well-known/oauth-protected-resource",
+                get(protected_resource),
+            )
+            .route("/.well-known/oauth-authorization-server", get(auth_server))
+            .with_state(base.clone());
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let state = test_state(vec![]).await;
+        state.config.write().await.relay.allow_insecure_oauth = Some(true);
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/oauth/probe")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({ "url": base }).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["oauth_supported"], true);
+        assert_eq!(body["authorization_server"], base);
+        assert_eq!(
+            body["scopes_supported"],
+            serde_json::json!(["read", "write"])
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_probe_reports_unsupported_on_404() {
+        // Mock server returns 404 for the well-known endpoints → discovery
+        // fails and the probe must report oauth_supported:false as a 200.
+        async fn not_found() -> StatusCode {
+            StatusCode::NOT_FOUND
+        }
+        let router = Router::new()
+            .route("/.well-known/oauth-protected-resource", get(not_found))
+            .route("/.well-known/oauth-authorization-server", get(not_found));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let state = test_state(vec![]).await;
+        state.config.write().await.relay.allow_insecure_oauth = Some(true);
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/oauth/probe")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "url": base_url }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["oauth_supported"], false);
+        assert!(body.get("authorization_server").is_none());
+        assert!(body.get("scopes_supported").is_none());
+    }
+
     #[tokio::test]
     async fn oauth_start_with_oauth_server_url_uses_discovery_when_available() {
         // Mock AS: serve real-looking endpoints at /.well-known/oauth-authorization-server.
@@ -8525,7 +8740,6 @@ client_id = "client123"
         assert!(bus.receiver_count() > 0, "SSE handler should subscribe");
         bus.send(crate::events::ToolCallEvent::Completed {
             request_id: "rid-1".into(),
-            jsonrpc_id: Some("42".into()),
             ts: "2026-05-27T00:00:00.000Z".into(),
             duration_ms: 5,
             status: "ok".into(),
@@ -8557,11 +8771,6 @@ client_id = "client123"
         assert!(
             text.contains("\"request_id\":\"rid-1\""),
             "expected request_id in SSE body, got: {}",
-            text
-        );
-        assert!(
-            text.contains("\"jsonrpc_id\":\"42\""),
-            "expected jsonrpc_id in SSE body, got: {}",
             text
         );
     }
