@@ -182,6 +182,42 @@ pub async fn discover_oauth_server(
     discover_authorization_server(&auth_server_url, allow_insecure).await
 }
 
+/// Discover OAuth server metadata starting from an EXPLICIT RFC 9728
+/// protected-resource metadata URL (e.g. the `resource_metadata` value of a
+/// `WWW-Authenticate: Bearer` challenge).
+///
+/// Unlike [`discover_oauth_server`], the protected-resource metadata document
+/// is fetched at the EXACT given URL — its full path is honored — rather than
+/// re-deriving the conventional well-known location from an origin. RFC 9728
+/// permits path-based protected-resource metadata
+/// (e.g. `https://host/.well-known/oauth-protected-resource/<resource-path>`),
+/// so when the server points us at a specific document we must fetch that one.
+///
+/// The URL is validated through [`url_guard`] before any HTTP request is sent,
+/// and the request uses a per-host pinned client. After parsing, the first
+/// listed authorization server is resolved via
+/// [`discover_authorization_server`] (RFC 8414).
+pub async fn discover_oauth_server_from_metadata(
+    resource_metadata_url: &str,
+    allow_insecure: bool,
+) -> Result<DiscoveryResult, DiscoveryError> {
+    let resource_client =
+        url_guard::validated_client(resource_metadata_url, allow_insecure).await?;
+    let resource_meta: ProtectedResourceMetadata =
+        fetch_well_known(&resource_client, resource_metadata_url)
+            .await?
+            .json()
+            .await?;
+
+    let auth_server_url = resource_meta
+        .authorization_servers
+        .first()
+        .ok_or(DiscoveryError::NoAuthorizationServer)?
+        .clone();
+
+    discover_authorization_server(&auth_server_url, allow_insecure).await
+}
+
 /// Discover OAuth authorization server metadata directly (RFC 8414 only).
 ///
 /// Unlike [`discover_oauth_server`], this skips the RFC 9728 protected

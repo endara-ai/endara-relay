@@ -105,6 +105,25 @@ pub fn surface_authorize_url(authorize_url: &str) -> Value {
     })
 }
 
+/// Build the downstream-facing tool result for when a sign-in is required but
+/// the relay could not start the OAuth flow (e.g. discovery or DCR failed).
+///
+/// Like [`surface_authorize_url`], this returns an MCP `CallToolResult`-shaped
+/// value with `isError: true` carrying an actionable, sanitized message. The
+/// raw upstream `401` status and `WWW-Authenticate` challenge are deliberately
+/// NOT included — downstream clients must never see the upstream credential
+/// challenge. The underlying error is logged server-side (see
+/// [`crate::adapter::http::HttpAdapter`]) rather than surfaced here.
+pub fn surface_oauth_unavailable() -> Value {
+    let text = "Sign-in is required to use this tool, but the sign-in flow could not be started \
+         right now. Please retry in a moment; if the problem persists, contact the server \
+         administrator.";
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": true,
+    })
+}
+
 /// Errors raised while self-initiating the OAuth flow.
 #[derive(Debug, thiserror::Error)]
 pub enum JitError {
@@ -203,19 +222,27 @@ impl JitInterceptor {
         let challenge =
             parse_bearer_challenge(www_authenticate).ok_or(JitError::NotABearerChallenge)?;
 
-        // Prefer the RFC 9728 `resource_metadata` origin as the discovery base;
-        // `discover_oauth_server` re-derives the conventional well-known path
-        // from it. Fall back to the resource (endpoint) URL when the challenge
-        // carries no `resource_metadata`.
-        let discovery_base = challenge
+        // Prefer the RFC 9728 `resource_metadata` URL from the challenge and
+        // honor its FULL path: per RFC 9728 the protected-resource metadata may
+        // live at a path-based location (e.g.
+        // `…/.well-known/oauth-protected-resource/<resource-path>`), so we fetch
+        // the exact document the server pointed us at rather than re-deriving
+        // the conventional well-known location from its origin. Fall back to the
+        // resource (endpoint) URL when the challenge carries no parseable
+        // `resource_metadata`.
+        let metadata_url = challenge
             .resource_metadata
             .as_deref()
-            .and_then(|m| Url::parse(m).ok())
-            .map(|u| u.origin().ascii_serialization())
-            .unwrap_or_else(|| resource_url.to_string());
+            .filter(|m| Url::parse(m).is_ok());
 
-        let disc =
-            discovery::discover_oauth_server(&discovery_base, self.allow_insecure_oauth).await?;
+        let disc = match metadata_url {
+            Some(m) => {
+                discovery::discover_oauth_server_from_metadata(m, self.allow_insecure_oauth).await?
+            }
+            None => {
+                discovery::discover_oauth_server(resource_url, self.allow_insecure_oauth).await?
+            }
+        };
 
         let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", self.relay_port);
 
@@ -237,9 +264,20 @@ impl JitInterceptor {
             )
             .await;
 
+        // Choose the query separator based on whether the discovered
+        // authorization endpoint already carries a query string; appending a
+        // bare `?` to an endpoint that already has one would yield a malformed
+        // double-`?` URL. Subsequent params (including `&scope=`) always use `&`
+        // because at least one query param is present after this point.
+        let sep = if disc.authorization_endpoint.contains('?') {
+            '&'
+        } else {
+            '?'
+        };
         let mut authorize_url = format!(
-            "{}?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
+            "{}{}response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
             disc.authorization_endpoint,
+            sep,
             urlencoding(&client_id),
             urlencoding(&redirect_uri),
             urlencoding(&state_param),
@@ -388,6 +426,32 @@ mod tests {
         assert!(!should_intercept_outcome(&ok));
     }
 
+    // --- surface_oauth_unavailable: sanitized failure surface ---
+
+    /// The sign-in-unavailable surface must be an actionable `isError: true`
+    /// tool result that NEVER leaks the raw upstream `401` status or the
+    /// `WWW-Authenticate` challenge text downstream.
+    #[test]
+    fn surface_oauth_unavailable_is_sanitized() {
+        let v = surface_oauth_unavailable();
+        assert_eq!(v["isError"], json!(true));
+        let text = v["content"][0]["text"]
+            .as_str()
+            .expect("text content present");
+        let lower = text.to_ascii_lowercase();
+        assert!(!text.contains("401"), "must not leak status code: {}", text);
+        assert!(
+            !lower.contains("www-authenticate"),
+            "must not leak challenge header: {}",
+            text
+        );
+        assert!(
+            lower.contains("sign-in") || lower.contains("sign in"),
+            "should be actionable: {}",
+            text
+        );
+    }
+
     // --- self-initiation engine integration ---
 
     /// Spawn an axum fixture on `127.0.0.1:0` advertising full standard OAuth:
@@ -517,5 +581,151 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, JitError::NotABearerChallenge));
+    }
+
+    /// Spawn an OAuth fixture that additionally serves RFC 9728
+    /// protected-resource metadata at a PATH-based well-known location
+    /// (`/.well-known/oauth-protected-resource/{*tail}`) and lets the AS
+    /// `authorization_endpoint` optionally carry a pre-existing query string.
+    async fn spawn_oauth_fixture_ex(
+        authorize_query: Option<&'static str>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::extract::State;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+
+        #[derive(Clone)]
+        struct Cfg {
+            base: String,
+            authorize_query: Option<&'static str>,
+        }
+
+        async fn protected_resource(State(cfg): State<Cfg>) -> Json<Value> {
+            Json(json!({
+                "resource": cfg.base,
+                "authorization_servers": [cfg.base],
+                "bearer_methods_supported": ["header"],
+            }))
+        }
+        async fn auth_server(State(cfg): State<Cfg>) -> Json<Value> {
+            let authorization_endpoint = match cfg.authorize_query {
+                Some(q) => format!("{}/authorize?{}", cfg.base, q),
+                None => format!("{}/authorize", cfg.base),
+            };
+            Json(json!({
+                "issuer": cfg.base,
+                "authorization_endpoint": authorization_endpoint,
+                "token_endpoint": format!("{}/token", cfg.base),
+                "registration_endpoint": format!("{}/register", cfg.base),
+                "code_challenge_methods_supported": ["S256"],
+                "scopes_supported": ["read", "write"],
+            }))
+        }
+        async fn register() -> Json<Value> {
+            Json(json!({
+                "client_id": "jit-client-123",
+                "client_secret": "jit-secret-456",
+                "client_secret_expires_at": 0,
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let cfg = Cfg {
+            base: base.clone(),
+            authorize_query,
+        };
+        let router = Router::new()
+            .route(
+                "/.well-known/oauth-protected-resource",
+                get(protected_resource),
+            )
+            .route(
+                "/.well-known/oauth-protected-resource/{*tail}",
+                get(protected_resource),
+            )
+            .route("/.well-known/oauth-authorization-server", get(auth_server))
+            .route("/register", post(register))
+            .with_state(cfg);
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        (base, handle)
+    }
+
+    /// Finding 2 (RFC 9728 path): when the challenge supplies a PATH-based
+    /// `resource_metadata` URL, discovery must fetch that EXACT document — not
+    /// the origin-rooted well-known location (which the fixture does NOT serve
+    /// at root for this path), so honoring the path is what makes it succeed.
+    #[tokio::test]
+    async fn intercept_honors_path_based_resource_metadata() {
+        let (base, server) = spawn_oauth_fixture_ex(None).await;
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let interceptor = JitInterceptor::new(9400, flow_mgr.clone(), None, true);
+
+        let metadata_url = format!("{}/.well-known/oauth-protected-resource/tenant-a", base);
+        let www_authenticate = format!("Bearer resource_metadata=\"{}\"", metadata_url);
+        let resource_url = format!("{}/mcp", base);
+
+        let authorize_url = interceptor
+            .intercept(&resource_url, &www_authenticate, "tenant-a")
+            .await
+            .expect("intercept should honor the path-based resource_metadata URL");
+
+        assert!(
+            authorize_url.starts_with(&format!("{}/authorize?", base)),
+            "got: {}",
+            authorize_url
+        );
+        assert_eq!(interceptor.state().await, OAuthState::NeedsLogin);
+
+        server.abort();
+    }
+
+    /// Finding 3 (authorize-URL query separator): when the discovered
+    /// `authorization_endpoint` already contains a `?query`, the composed
+    /// authorize URL must remain valid — exactly one `?`, the pre-existing
+    /// param preserved, and all PKCE params present.
+    #[tokio::test]
+    async fn intercept_authorize_endpoint_with_existing_query_stays_valid() {
+        let (base, server) = spawn_oauth_fixture_ex(Some("audience=test-aud")).await;
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let interceptor = JitInterceptor::new(9400, flow_mgr.clone(), None, true);
+
+        let www_authenticate = format!(
+            "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
+            base
+        );
+        let resource_url = format!("{}/mcp", base);
+
+        let authorize_url = interceptor
+            .intercept(&resource_url, &www_authenticate, "ep")
+            .await
+            .expect("intercept should self-initiate the OAuth flow");
+
+        assert_eq!(
+            authorize_url.matches('?').count(),
+            1,
+            "exactly one '?' expected, got: {}",
+            authorize_url
+        );
+        let url = Url::parse(&authorize_url).expect("authorize URL must be parseable");
+        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(q.get("audience").map(String::as_str), Some("test-aud"));
+        assert_eq!(q.get("response_type").map(String::as_str), Some("code"));
+        assert_eq!(
+            q.get("client_id").map(String::as_str),
+            Some("jit-client-123")
+        );
+        assert_eq!(
+            q.get("code_challenge_method").map(String::as_str),
+            Some("S256")
+        );
+        assert!(q.contains_key("code_challenge"));
+        assert!(q.contains_key("scope"));
+
+        server.abort();
     }
 }

@@ -298,8 +298,13 @@ impl HttpAdapter {
         {
             Ok(authorize_url) => Ok(jit::surface_authorize_url(&authorize_url)),
             Err(e) => {
-                warn!(error = %e, "JIT OAuth self-initiation failed; forwarding original error");
-                result
+                // The raw upstream 401 / WWW-Authenticate challenge must NEVER
+                // reach the downstream client. When self-initiation fails we
+                // still swallow the 401 and surface a sanitized, actionable
+                // sign-in-unavailable result; the underlying error stays in the
+                // server-side log only.
+                warn!(error = %e, "JIT OAuth self-initiation failed; surfacing sanitized sign-in-unavailable result");
+                Ok(jit::surface_oauth_unavailable())
             }
         }
     }
