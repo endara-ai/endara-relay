@@ -1001,9 +1001,9 @@ impl McpAdapter for OAuthAdapter {
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
         // NB: do NOT wrap the inner adapter's `call_tool` invocations in
         // `.instrument(self.inner.span)`. The inner `HttpAdapter::call_tool`
-        // captures the caller's per-request span context (`request{id}`,
+        // captures the caller's per-request span context (`request{request_uid}`,
         // `mcp_request{profile}`) BEFORE entering its own span so it can
-        // attach `jsonrpc_id`/`profile` to the published `ToolCallEvent`s.
+        // attach `request_uid`/`profile` to the published `ToolCallEvent`s.
         // OAuth's `inner.span` is the persistent endpoint span built at init
         // time with no parent linkage to per-request spans, so wrapping the
         // inner call here would zero out those fields on every OAuth-routed
@@ -2749,21 +2749,21 @@ mod tests {
 
     /// Regression: a `call_tool` routed through `OAuthAdapter` (which wraps an
     /// inner `HttpAdapter`) must publish a [`ToolCallEvent::Started`] whose
-    /// `jsonrpc_id` and `profile` fields are populated from the caller's
-    /// per-request span scope (`mcp_request{profile}` > `request{id}`).
+    /// `request_uid` and `profile` fields are populated from the caller's
+    /// per-request span scope (`mcp_request{profile}` > `request{request_uid}`).
     ///
     /// Before the fix, `OAuthAdapter::call_tool` wrapped the inner-adapter
     /// invocation in `.instrument(self.inner.span)` — the OAuth endpoint span
     /// has no parent linkage to the per-request spans, so the inner
     /// `HttpAdapter::call_tool`'s `current_request_context()` walk found
-    /// neither field and emitted `jsonrpc_id: None` / `profile: None` for
+    /// neither field and emitted `request_uid: None` / `profile: None` for
     /// every OAuth-authenticated endpoint.
     ///
     /// `#[test]` (not `#[tokio::test]`) because we install the capture layer
     /// via `with_default(...)` and drive an inner current-thread runtime so
     /// the dispatcher stays attached across `tokio::spawn`'d tasks.
     #[test]
-    fn call_tool_publishes_jsonrpc_id_and_profile_from_request_span() {
+    fn call_tool_publishes_request_uid_and_profile_from_request_span() {
         use crate::events::{SpanFieldCaptureLayer, ToolCallEvent, ToolCallEventBus};
         use tracing::Instrument;
         use tracing_subscriber::prelude::*;
@@ -2798,14 +2798,13 @@ mod tests {
                     })
                     .await;
 
-                let id_str = "42".to_string();
+                let uid_str = "uid-42".to_string();
                 let profile_str = "test".to_string();
                 let mcp_span = tracing::info_span!(
                     "mcp_request",
                     profile = %profile_str,
                 );
-                let req_span =
-                    tracing::info_span!(parent: &mcp_span, "request", method = "tools/call", id = %id_str);
+                let req_span = tracing::info_span!(parent: &mcp_span, "request", method = "tools/call", request_uid = %uid_str);
 
                 let result =
                     async { adapter.call_tool("ping", serde_json::json!({})).await }
@@ -2816,12 +2815,12 @@ mod tests {
                 let started = rx.try_recv().expect("started event must be buffered");
                 match started {
                     ToolCallEvent::Started {
-                        jsonrpc_id,
+                        request_uid,
                         profile,
                         transport,
                         ..
                     } => {
-                        assert_eq!(jsonrpc_id.as_deref(), Some("42"));
+                        assert_eq!(request_uid.as_deref(), Some("uid-42"));
                         assert_eq!(profile.as_deref(), Some("test"));
                         // Inner is HttpAdapter, so transport should be "http".
                         assert_eq!(transport, "http");
@@ -2830,9 +2829,7 @@ mod tests {
                 }
                 let completed = rx.try_recv().expect("completed event must be buffered");
                 match completed {
-                    ToolCallEvent::Completed { jsonrpc_id, .. } => {
-                        assert_eq!(jsonrpc_id.as_deref(), Some("42"));
-                    }
+                    ToolCallEvent::Completed { .. } => {}
                     other => panic!("expected Completed event, got {other:?}"),
                 }
 

@@ -220,18 +220,10 @@ pub enum ToolCallEvent {
     /// Emitted at `call_tool` entry, before any network/process I/O.
     Started {
         request_id: String,
-        /// JSON-RPC envelope id (as serialised by `serde_json::Value::to_string`)
-        /// extracted from the surrounding `request` tracing span. Used by the
-        /// desktop overlay to click-to-jump from an overlay card to the
-        /// matching `request{id="..."}` log row. `None` when no `request` span
-        /// is on the stack (e.g. internal callers).
-        #[serde(skip_serializing_if = "Option::is_none")]
-        jsonrpc_id: Option<String>,
         /// Canonical UID minted per inbound JSON-RPC message in
         /// `handle_single_message` (once per element of a batch array) and
         /// propagated via the `request` tracing span. This is the desktop's
-        /// collision-free row/overlay key; unlike `jsonrpc_id` (which a client
-        /// controls and may reuse), this UID is unique per message. `None` when
+        /// collision-free row/overlay key, unique per message. `None` when
         /// no `request` span is on the stack (e.g. internal callers / older
         /// replays).
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -258,8 +250,6 @@ pub enum ToolCallEvent {
     /// Emitted on `Ok(_)` return from the underlying `tools/call` request.
     Completed {
         request_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        jsonrpc_id: Option<String>,
         ts: String,
         duration_ms: u64,
         /// Always `"ok"` for completed events; carried so the overlay can use
@@ -270,8 +260,6 @@ pub enum ToolCallEvent {
     /// overlay can render the failure reason without re-querying logs.
     Failed {
         request_id: String,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        jsonrpc_id: Option<String>,
         ts: String,
         duration_ms: u64,
         /// Always `"error"` for failed events.
@@ -332,16 +320,11 @@ impl Default for ToolCallEventBus {
 /// Subset of the `request{...}` and `mcp_request{...}` span fields captured
 /// into span extensions by [`SpanFieldCaptureLayer`] and surfaced to adapter
 /// code via [`current_request_context`]. Adapters use this to populate
-/// `jsonrpc_id` (from the inner `request` span) and `profile` (from the outer
+/// `request_uid` (from the inner `request` span) and `profile` (from the outer
 /// `mcp_request` span) on every emitted [`ToolCallEvent`] without taking a
 /// breaking change to the [`crate::adapter::McpAdapter::call_tool`] signature.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RequestSpanContext {
-    /// JSON-RPC envelope id as serialised by `Value::to_string` (numbers
-    /// render unquoted, strings render with quotes). `None` when no
-    /// `request` span is on the stack or when the id was the literal
-    /// `"null"` sentinel (notifications, which don't reach `call_tool`).
-    pub jsonrpc_id: Option<String>,
     /// Canonical per-JSON-RPC-message UID captured from the `request` span's
     /// `request_uid` field (minted in `handle_single_message`, once per
     /// element of a batch array). `None` when no `request` span is on the
@@ -364,15 +347,14 @@ pub struct RequestSpanContext {
 /// extension keeps the per-span allocation count to one.
 #[derive(Debug, Default, Clone)]
 struct CapturedSpanFields {
-    jsonrpc_id: Option<String>,
     request_uid: Option<String>,
     profile: Option<String>,
     client: Option<ClientIdentity>,
 }
 
 /// Visits a span's recorded fields once at span creation time, capturing the
-/// JSON-RPC id from the `request` span and the profile path from the
-/// `mcp_request` span. Other fields are ignored.
+/// caller identity and canonical UID from the `request` span and the profile
+/// path from the `mcp_request` span. Other fields are ignored.
 struct CapturingVisitor<'a> {
     captured: &'a mut CapturedSpanFields,
     is_request: bool,
@@ -394,15 +376,7 @@ impl<'a> Visit for CapturingVisitor<'a> {
 
 impl<'a> CapturingVisitor<'a> {
     fn record(&mut self, name: &str, value: String) {
-        if self.is_request && name == "id" {
-            // The `request` span uses `id = %id_str` where `id_str` is
-            // `"null"` for notifications. `call_tool` is never reached for
-            // notifications, but we still skip the sentinel so a stray
-            // emitter cannot leak a fake id into an event.
-            if value != "null" && !value.is_empty() {
-                self.captured.jsonrpc_id = Some(value);
-            }
-        } else if self.is_request && name == "client" {
+        if self.is_request && name == "client" {
             // The `request` span carries `client = %client_json` where
             // `client_json` is a JSON-serialised `ClientIdentity`. Parse it
             // back so `current_request_context()` can hand a typed value
@@ -427,10 +401,10 @@ impl<'a> CapturingVisitor<'a> {
     }
 }
 
-/// Tracing [`Layer`] that captures the JSON-RPC id and profile fields from
-/// the relay's `request` and `mcp_request` spans into span extensions so
-/// [`current_request_context`] can surface them to adapter code without a
-/// trait-level signature change. Install once at process start in
+/// Tracing [`Layer`] that captures the caller identity, canonical UID and
+/// profile fields from the relay's `request` and `mcp_request` spans into span
+/// extensions so [`current_request_context`] can surface them to adapter code
+/// without a trait-level signature change. Install once at process start in
 /// `main.rs` via `tracing_subscriber::registry().with(SpanFieldCaptureLayer)`.
 pub struct SpanFieldCaptureLayer;
 
@@ -458,12 +432,13 @@ where
     }
 }
 
-/// Walk the current tracing span scope and pull the JSON-RPC id (from the
-/// nearest `request` span) and profile (from the nearest `mcp_request`
-/// span) previously captured by [`SpanFieldCaptureLayer`]. Returns a
-/// fully-`None` [`RequestSpanContext`] when no subscriber is installed (e.g.
-/// in unit tests that do not configure tracing) or when the capture layer is
-/// not in the layer stack — adapters degrade to omitting both fields.
+/// Walk the current tracing span scope and pull the canonical UID and caller
+/// identity (from the nearest `request` span) and profile (from the nearest
+/// `mcp_request` span) previously captured by [`SpanFieldCaptureLayer`].
+/// Returns a fully-`None` [`RequestSpanContext`] when no subscriber is
+/// installed (e.g. in unit tests that do not configure tracing) or when the
+/// capture layer is not in the layer stack — adapters degrade to omitting the
+/// fields.
 pub fn current_request_context() -> RequestSpanContext {
     let mut ctx = RequestSpanContext::default();
     tracing::Span::current().with_subscriber(|(id, sub)| {
@@ -476,11 +451,6 @@ pub fn current_request_context() -> RequestSpanContext {
         for s in span.scope() {
             let ext = s.extensions();
             if let Some(captured) = ext.get::<CapturedSpanFields>() {
-                if ctx.jsonrpc_id.is_none() {
-                    if let Some(v) = &captured.jsonrpc_id {
-                        ctx.jsonrpc_id = Some(v.clone());
-                    }
-                }
                 if ctx.request_uid.is_none() {
                     if let Some(v) = &captured.request_uid {
                         ctx.request_uid = Some(v.clone());
@@ -513,7 +483,6 @@ mod tests {
     fn started_event_serializes_with_kind_tag() {
         let ev = ToolCallEvent::Started {
             request_id: "rid-1".into(),
-            jsonrpc_id: Some("42".into()),
             request_uid: Some("uid-abc".into()),
             ts: "2026-05-27T04:36:29.710Z".into(),
             endpoint: "github".into(),
@@ -539,7 +508,6 @@ mod tests {
         assert_eq!(v["kind"], "started");
         assert_eq!(v["tool"], "list_issues");
         assert_eq!(v["annotations"]["read_only"], true);
-        assert_eq!(v["jsonrpc_id"], "42");
         assert_eq!(v["request_uid"], "uid-abc");
         assert_eq!(v["client"]["name"], "claude-ai");
         assert_eq!(v["client"]["version"], "0.1.0");
@@ -554,10 +522,9 @@ mod tests {
     }
 
     #[test]
-    fn started_event_omits_jsonrpc_id_when_none() {
+    fn started_event_omits_optional_fields_when_none() {
         let ev = ToolCallEvent::Started {
             request_id: "rid-1".into(),
-            jsonrpc_id: None,
             request_uid: None,
             ts: "t".into(),
             endpoint: "github".into(),
@@ -570,10 +537,6 @@ mod tests {
             client: None,
         };
         let v = serde_json::to_value(&ev).unwrap();
-        assert!(
-            v.get("jsonrpc_id").is_none(),
-            "jsonrpc_id should be omitted when None, got {v}"
-        );
         assert!(
             v.get("request_uid").is_none(),
             "request_uid should be omitted when None, got {v}"
@@ -743,14 +706,12 @@ mod tests {
     fn completed_and_failed_serialize_with_status() {
         let completed = ToolCallEvent::Completed {
             request_id: "rid-1".into(),
-            jsonrpc_id: Some("\"abc\"".into()),
             ts: "t".into(),
             duration_ms: 12,
             status: "ok".into(),
         };
         let failed = ToolCallEvent::Failed {
             request_id: "rid-2".into(),
-            jsonrpc_id: None,
             ts: "t".into(),
             duration_ms: 9,
             status: "error".into(),
@@ -760,14 +721,9 @@ mod tests {
         let f = serde_json::to_value(&failed).unwrap();
         assert_eq!(c["kind"], "completed");
         assert_eq!(c["status"], "ok");
-        assert_eq!(c["jsonrpc_id"], "\"abc\"");
         assert_eq!(f["kind"], "failed");
         assert_eq!(f["status"], "error");
         assert_eq!(f["error_message"], "boom");
-        assert!(
-            f.get("jsonrpc_id").is_none(),
-            "failed jsonrpc_id None should be omitted, got {f}"
-        );
     }
 
     #[test]
@@ -800,7 +756,6 @@ mod tests {
         let mut b = bus.subscribe();
         bus.send(ToolCallEvent::Completed {
             request_id: "r".into(),
-            jsonrpc_id: None,
             ts: "t".into(),
             duration_ms: 1,
             status: "ok".into(),
@@ -821,7 +776,6 @@ mod tests {
         for i in 0..10 {
             bus.send(ToolCallEvent::Completed {
                 request_id: format!("r-{i}"),
-                jsonrpc_id: None,
                 ts: "t".into(),
                 duration_ms: i,
                 status: "ok".into(),
@@ -846,7 +800,6 @@ mod tests {
         assert_eq!(bus.receiver_count(), 0);
         bus.send(ToolCallEvent::Completed {
             request_id: "r".into(),
-            jsonrpc_id: None,
             ts: "t".into(),
             duration_ms: 1,
             status: "ok".into(),
@@ -854,9 +807,9 @@ mod tests {
     }
 
     /// With [`SpanFieldCaptureLayer`] installed, an adapter running inside an
-    /// `mcp_request{profile=...}` > `request{id=...}` scope can pull both
-    /// values via [`current_request_context`] — this is the foundation for
-    /// per-event `jsonrpc_id` plumbing without a `call_tool` trait change.
+    /// `mcp_request{profile=...}` > `request{request_uid=...}` scope can pull
+    /// both values via [`current_request_context`] — this is the foundation for
+    /// per-event `request_uid` plumbing without a `call_tool` trait change.
     #[test]
     fn current_request_context_walks_request_and_mcp_request_spans() {
         use tracing::Instrument;
@@ -869,7 +822,6 @@ mod tests {
                 .build()
                 .unwrap();
             rt.block_on(async {
-                let id_str = "7".to_string();
                 let request_uid = "uid-7".to_string();
                 let profile = "work".to_string();
                 let outer = tracing::info_span!("mcp_request", profile = %profile);
@@ -877,14 +829,12 @@ mod tests {
                     let inner = tracing::info_span!(
                         "request",
                         method = "tools/call",
-                        id = %id_str,
                         request_uid = %request_uid,
                     );
                     async { current_request_context() }.instrument(inner).await
                 }
                 .instrument(outer)
                 .await;
-                assert_eq!(captured.jsonrpc_id.as_deref(), Some("7"));
                 assert_eq!(captured.request_uid.as_deref(), Some("uid-7"));
                 assert_eq!(captured.profile.as_deref(), Some("work"));
             });
@@ -901,27 +851,6 @@ mod tests {
         tracing::subscriber::with_default(subscriber, || {
             let ctx = current_request_context();
             assert_eq!(ctx, RequestSpanContext::default());
-        });
-    }
-
-    /// Sanity-check the "null" id sentinel: notifications would record
-    /// `id = "null"`; the visitor must not propagate that as a real id.
-    #[test]
-    fn null_jsonrpc_id_is_ignored_by_capture_visitor() {
-        use tracing::Instrument;
-        use tracing_subscriber::prelude::*;
-        let subscriber = tracing_subscriber::registry().with(SpanFieldCaptureLayer);
-        tracing::subscriber::with_default(subscriber, || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async {
-                let id_str = "null".to_string();
-                let span = tracing::info_span!("request", method = "x", id = %id_str);
-                let ctx = async { current_request_context() }.instrument(span).await;
-                assert_eq!(ctx.jsonrpc_id, None);
-            });
         });
     }
 
@@ -948,15 +877,12 @@ mod tests {
                     origin: None,
                 };
                 let client_json = serde_json::to_string(&identity).unwrap();
-                let id_str = "9".to_string();
                 let span = tracing::info_span!(
                     "request",
                     method = "tools/call",
-                    id = %id_str,
                     client = %client_json,
                 );
                 let ctx = async { current_request_context() }.instrument(span).await;
-                assert_eq!(ctx.jsonrpc_id.as_deref(), Some("9"));
                 assert_eq!(ctx.client.as_ref(), Some(&identity));
             });
         });
