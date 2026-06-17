@@ -1,4 +1,5 @@
 use crate::adapter::http::{HttpAdapter, HttpConfig};
+use crate::adapter::oauth::jit::JitInterceptor;
 use crate::adapter::oauth::{OAuthAdapter, OAuthAdapterConfig};
 use crate::adapter::sse::{SseAdapter, SseConfig};
 use crate::adapter::stdio::{IsolationMode, StdioAdapter, StdioConfig};
@@ -39,11 +40,20 @@ impl ConfigWatcher {
         js_execution_mode: Arc<AtomicBool>,
         profile_registry: Arc<ProfileRegistry>,
         token_manager: Arc<TokenManager>,
-        _oauth_flow_manager: Arc<OAuthFlowManager>,
+        oauth_flow_manager: Arc<OAuthFlowManager>,
+        relay_port: u16,
         oauth_adapter_inners: OAuthAdapterInners,
         shared_config: Arc<RwLock<Config>>,
         event_bus: Option<ToolCallEventBus>,
     ) -> JoinHandle<()> {
+        // Bundle the JIT wiring so plain-`http` adapters rebuilt during a
+        // hot-reload get a `JitInterceptor` attached, mirroring the
+        // initial-load path in `main.rs`. The loopback `redirect_uri` uses the
+        // live `relay_port`, never a hardcoded value.
+        let jit = Some(JitWiring {
+            relay_port,
+            flow_manager: oauth_flow_manager,
+        });
         tokio::spawn(async move {
             if let Err(e) = watch_loop(
                 config_path,
@@ -55,6 +65,7 @@ impl ConfigWatcher {
                 oauth_adapter_inners,
                 shared_config,
                 event_bus,
+                jit,
             )
             .await
             {
@@ -75,6 +86,7 @@ async fn watch_loop(
     oauth_adapter_inners: OAuthAdapterInners,
     shared_config: Arc<RwLock<Config>>,
     event_bus: Option<ToolCallEventBus>,
+    jit: Option<JitWiring>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (tx, mut rx) = tokio::sync::mpsc::channel(16);
 
@@ -130,6 +142,7 @@ async fn watch_loop(
             &token_manager,
             &oauth_adapter_inners,
             event_bus.as_ref(),
+            jit.as_ref(),
         )
         .await;
     }
@@ -160,6 +173,7 @@ async fn reload_and_apply(
     token_manager: &Arc<TokenManager>,
     oauth_adapter_inners: &OAuthAdapterInners,
     event_bus: Option<&ToolCallEventBus>,
+    jit: Option<&JitWiring>,
 ) -> Result<(), config::ConfigError> {
     // Parse new config gracefully. Fatal errors (parse failure or
     // fail-fast profile-validation failure) bail out without touching the
@@ -195,6 +209,7 @@ async fn reload_and_apply(
         oauth_adapter_inners,
         new_config.relay.allow_insecure_oauth.unwrap_or(false),
         event_bus,
+        jit,
     )
     .await;
 
@@ -245,6 +260,7 @@ pub async fn apply_diff(
     oauth_adapter_inners: &OAuthAdapterInners,
     allow_insecure_oauth: bool,
     event_bus: Option<&ToolCallEventBus>,
+    jit: Option<&JitWiring>,
 ) {
     // Remove endpoints
     for name in &diff.removed {
@@ -305,11 +321,19 @@ pub async fn apply_diff(
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
         let bus = event_bus.cloned();
+        let jit_owned = jit.cloned();
         let init_span = tracing::info_span!("endpoint_init", endpoint = %name_clone);
         tokio::spawn(
             async move {
-                let adapter =
-                    create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth, bus.as_ref()).await;
+                let adapter = create_adapter(
+                    &ep_clone,
+                    &tm,
+                    &oai,
+                    allow_insecure_oauth,
+                    bus.as_ref(),
+                    jit_owned.as_ref(),
+                )
+                .await;
                 let mut entries = reg.entries().write().await;
                 if let Some(entry) = entries.get_mut(name_clone.as_str()) {
                     entry.adapter = adapter;
@@ -356,11 +380,19 @@ pub async fn apply_diff(
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
         let bus = event_bus.cloned();
+        let jit_owned = jit.cloned();
         let init_span = tracing::info_span!("endpoint_init", endpoint = %ep_clone.name);
         tokio::spawn(
             async move {
-                let adapter =
-                    create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth, bus.as_ref()).await;
+                let adapter = create_adapter(
+                    &ep_clone,
+                    &tm,
+                    &oai,
+                    allow_insecure_oauth,
+                    bus.as_ref(),
+                    jit_owned.as_ref(),
+                )
+                .await;
                 let mut entries = reg.entries().write().await;
                 if let Some(entry) = entries.get_mut(ep_clone.name.as_str()) {
                     entry.adapter = adapter;
@@ -399,6 +431,7 @@ pub async fn apply_diff_graceful(
     oauth_adapter_inners: &OAuthAdapterInners,
     allow_insecure_oauth: bool,
     event_bus: Option<&ToolCallEventBus>,
+    jit: Option<&JitWiring>,
 ) {
     // Build warning message map
     let warning_messages: std::collections::HashMap<String, String> = {
@@ -498,11 +531,19 @@ pub async fn apply_diff_graceful(
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
         let bus = event_bus.cloned();
+        let jit_owned = jit.cloned();
         let init_span = tracing::info_span!("endpoint_init", endpoint = %name_clone);
         tokio::spawn(
             async move {
-                let adapter =
-                    create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth, bus.as_ref()).await;
+                let adapter = create_adapter(
+                    &ep_clone,
+                    &tm,
+                    &oai,
+                    allow_insecure_oauth,
+                    bus.as_ref(),
+                    jit_owned.as_ref(),
+                )
+                .await;
                 let mut entries = reg.entries().write().await;
                 if let Some(entry) = entries.get_mut(name_clone.as_str()) {
                     entry.adapter = adapter;
@@ -576,11 +617,19 @@ pub async fn apply_diff_graceful(
         let tm = token_manager.clone();
         let oai = oauth_adapter_inners.clone();
         let bus = event_bus.cloned();
+        let jit_owned = jit.cloned();
         let init_span = tracing::info_span!("endpoint_init", endpoint = %ep_clone.name);
         tokio::spawn(
             async move {
-                let adapter =
-                    create_adapter(&ep_clone, &tm, &oai, allow_insecure_oauth, bus.as_ref()).await;
+                let adapter = create_adapter(
+                    &ep_clone,
+                    &tm,
+                    &oai,
+                    allow_insecure_oauth,
+                    bus.as_ref(),
+                    jit_owned.as_ref(),
+                )
+                .await;
                 let mut entries = reg.entries().write().await;
                 if let Some(entry) = entries.get_mut(ep_clone.name.as_str()) {
                     entry.adapter = adapter;
@@ -713,6 +762,18 @@ pub(crate) async fn resolve_oauth_client_creds(
     }
 }
 
+/// Dependencies needed to attach a [`JitInterceptor`] to a production-built
+/// plain-`http` adapter. Threaded as an `Option` through the construction
+/// chain so unit tests pass `None` (JIT dormant) while the real relay passes
+/// `Some` from `main.rs` (initial load), the config watcher (hot-reload) and
+/// the management restart path. The loopback `redirect_uri` always uses the
+/// runtime `relay_port` — never a hardcoded value.
+#[derive(Clone)]
+pub struct JitWiring {
+    pub relay_port: u16,
+    pub flow_manager: Arc<OAuthFlowManager>,
+}
+
 /// Create an adapter from an endpoint configuration.
 ///
 /// Always returns an adapter. If initialization fails, returns a [`FailedAdapter`]
@@ -723,6 +784,7 @@ pub(crate) async fn create_adapter(
     oauth_adapter_inners: &OAuthAdapterInners,
     allow_insecure_oauth: bool,
     event_bus: Option<&ToolCallEventBus>,
+    jit: Option<&JitWiring>,
 ) -> Box<dyn McpAdapter> {
     match ep.transport {
         Transport::Stdio => {
@@ -781,6 +843,19 @@ pub(crate) async fn create_adapter(
             let mut adapter = HttpAdapter::new(http_config);
             if let Some(bus) = event_bus {
                 adapter.set_event_bus(bus.clone());
+            }
+            // Attach a JIT interceptor so a hard 401 + Bearer challenge on a
+            // tool call self-initiates the OAuth flow instead of being
+            // forwarded downstream. Only reached for plain `http` endpoints;
+            // `transport=oauth` uses `OAuthAdapter` and handles auth itself,
+            // so it never gets a JIT interceptor (no double-handling).
+            if let Some(jit) = jit {
+                adapter.set_jit_interceptor(Arc::new(JitInterceptor::new(
+                    jit.relay_port,
+                    jit.flow_manager.clone(),
+                    Some(token_manager.clone()),
+                    allow_insecure_oauth,
+                )));
             }
             match adapter.initialize().await {
                 Ok(()) => Box::new(adapter),
@@ -973,6 +1048,180 @@ mod tests {
         (token_manager, inners)
     }
 
+    fn http_endpoint(name: &str, url: &str) -> EndpointConfig {
+        EndpointConfig {
+            name: name.to_string(),
+            description: None,
+            tool_prefix: None,
+            transport: Transport::Http,
+            command: None,
+            args: None,
+            url: Some(url.to_string()),
+            env: None,
+            headers: None,
+            disabled: false,
+            disabled_tools: Vec::new(),
+            oauth_server_url: None,
+            client_id: None,
+            client_secret: None,
+            scopes: None,
+            token_endpoint: None,
+            server_type_override: None,
+            isolation: Some("none".to_string()),
+            container_image: None,
+            mounts: None,
+        }
+    }
+
+    /// Spawn an upstream MCP fixture whose handshake (`initialize` +
+    /// `tools/list`) SUCCEEDS but whose `tools/call` is gated behind a hard
+    /// `401` + Bearer `WWW-Authenticate`. It also advertises full standard
+    /// OAuth (RFC 9728 → 8414 + DCR) so an attached `JitInterceptor` can
+    /// self-initiate the flow. Returns the base URL and the server task handle.
+    async fn spawn_handshake_ok_call_gated_fixture() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::extract::State;
+        use axum::http::{header::WWW_AUTHENTICATE, StatusCode};
+        use axum::response::IntoResponse;
+        use axum::routing::{get, post};
+        use axum::{Json, Router};
+
+        async fn mcp(
+            State(base): State<String>,
+            Json(body): Json<serde_json::Value>,
+        ) -> axum::response::Response {
+            let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            let id = body.get("id").cloned();
+            match method {
+                "initialize" => Json(json!({
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "serverInfo": {"name": "gated-http", "version": "0.0.0"}
+                    },
+                    "id": id,
+                }))
+                .into_response(),
+                "tools/list" => Json(json!({
+                    "jsonrpc": "2.0",
+                    "result": {"tools": [
+                        {"name": "search", "description": "s", "inputSchema": {"type": "object"}}
+                    ]},
+                    "id": id,
+                }))
+                .into_response(),
+                "tools/call" => {
+                    let val = format!(
+                        "Bearer realm=\"Test\", resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
+                        base
+                    );
+                    (
+                        StatusCode::UNAUTHORIZED,
+                        [(WWW_AUTHENTICATE, val)],
+                        "unauthorized",
+                    )
+                        .into_response()
+                }
+                // notifications/initialized and any other notification (no id).
+                _ => (StatusCode::ACCEPTED, "").into_response(),
+            }
+        }
+        async fn protected_resource(State(base): State<String>) -> Json<serde_json::Value> {
+            Json(json!({ "resource": base, "authorization_servers": [base] }))
+        }
+        async fn auth_server(State(base): State<String>) -> Json<serde_json::Value> {
+            Json(json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{}/authorize", base),
+                "token_endpoint": format!("{}/token", base),
+                "registration_endpoint": format!("{}/register", base),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        async fn register() -> Json<serde_json::Value> {
+            Json(json!({ "client_id": "jit-cid", "client_secret": "jit-secret" }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let router = Router::new()
+            .route("/mcp", post(mcp))
+            .route(
+                "/.well-known/oauth-protected-resource",
+                get(protected_resource),
+            )
+            .route("/.well-known/oauth-authorization-server", get(auth_server))
+            .route("/register", post(register))
+            .with_state(base.clone());
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        (base, handle)
+    }
+
+    /// Production-path JIT wiring: an `http` endpoint built through
+    /// `create_adapter` WITH a `JitWiring` (not via a manual
+    /// `set_jit_interceptor` in the test) must intercept a gated `tools/call`
+    /// 401 and surface an actionable authorize URL instead of forwarding the
+    /// raw challenge. This is the live construction path used by `main.rs`, the
+    /// config watcher, and the management restart/reload endpoints.
+    #[tokio::test]
+    async fn create_adapter_http_wires_jit_interceptor_and_intercepts_401() {
+        let (base, server) = spawn_handshake_ok_call_gated_fixture().await;
+        let (tm, inners) = test_oauth_infra();
+        let ep = http_endpoint("jit_http", &format!("{}/mcp", base));
+        let jit = JitWiring {
+            relay_port: 9400,
+            flow_manager: Arc::new(crate::oauth::OAuthFlowManager::new()),
+        };
+
+        // PRODUCTION construction path — the interceptor is attached inside
+        // create_adapter, never by the test.
+        let adapter = create_adapter(&ep, &tm, &inners, true, None, Some(&jit)).await;
+        assert!(matches!(adapter.health(), HealthStatus::Healthy));
+
+        let result = adapter.call_tool("search", json!({})).await;
+        let value = match result {
+            Ok(v) => v,
+            other => panic!("expected surfaced Ok result, got {:?}", other),
+        };
+        assert_eq!(value["isError"], true);
+        let text = value["content"][0]["text"]
+            .as_str()
+            .expect("surfaced content text");
+        assert!(
+            text.contains(&format!("{}/authorize?", base)),
+            "surfaced text should carry the authorize URL, got: {}",
+            text
+        );
+        // The raw upstream 401 / challenge is never leaked downstream.
+        assert!(!text.contains("401"));
+        assert!(!text.contains("WWW-Authenticate"));
+
+        server.abort();
+    }
+
+    /// Control: the same `http` endpoint built WITHOUT JIT wiring (`None`)
+    /// forwards the raw 401 unchanged — proving the interception above comes
+    /// from the production wiring, not from `HttpAdapter` itself.
+    #[tokio::test]
+    async fn create_adapter_http_without_jit_forwards_401() {
+        let (base, server) = spawn_handshake_ok_call_gated_fixture().await;
+        let (tm, inners) = test_oauth_infra();
+        let ep = http_endpoint("plain_http", &format!("{}/mcp", base));
+
+        let adapter = create_adapter(&ep, &tm, &inners, true, None, None).await;
+        let result = adapter.call_tool("search", json!({})).await;
+        match result {
+            Err(AdapterError::HttpError { status: 401, .. }) => {}
+            other => panic!("expected forwarded HttpError 401, got {:?}", other),
+        }
+
+        server.abort();
+    }
+
     #[tokio::test]
     async fn apply_diff_empty_is_noop() {
         let registry = Arc::new(AdapterRegistry::new());
@@ -988,7 +1237,7 @@ mod tests {
             )
             .await;
 
-        apply_diff(&empty_diff(), &registry, &tm, &inners, false, None).await;
+        apply_diff(&empty_diff(), &registry, &tm, &inners, false, None, None).await;
 
         // Existing adapter should still be there, not shut down
         assert!(!shutdown.load(std::sync::atomic::Ordering::SeqCst));
@@ -1015,7 +1264,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners, false, None).await;
+        apply_diff(&diff, &registry, &tm, &inners, false, None, None).await;
 
         assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
         assert!(registry.merged_catalog().await.is_empty());
@@ -1031,7 +1280,7 @@ mod tests {
         };
 
         // Should not panic
-        apply_diff(&diff, &registry, &tm, &inners, false, None).await;
+        apply_diff(&diff, &registry, &tm, &inners, false, None, None).await;
     }
 
     #[tokio::test]
@@ -1078,7 +1327,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners, false, None).await;
+        apply_diff(&diff, &registry, &tm, &inners, false, None, None).await;
 
         // Old adapter should have been shut down
         assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
@@ -1116,7 +1365,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners, false, None).await;
+        apply_diff(&diff, &registry, &tm, &inners, false, None, None).await;
 
         // Wait for background initialization to complete
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1168,7 +1417,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners, false, None).await;
+        apply_diff(&diff, &registry, &tm, &inners, false, None, None).await;
 
         // "keep" should still be alive
         assert!(!shutdown_keep.load(std::sync::atomic::Ordering::SeqCst));
@@ -1212,7 +1461,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners, false, None).await;
+        apply_diff(&diff, &registry, &tm, &inners, false, None, None).await;
 
         // Wait for background initialization to complete
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1284,7 +1533,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners, true, None).await;
+        apply_diff(&diff, &registry, &tm, &inners, true, None, None).await;
 
         // Wait for background initialization to register the OAuth adapter inner.
         let stop = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1331,6 +1580,7 @@ mod tests {
             &tm,
             &inners,
             false,
+            None,
             None,
         )
         .await;
@@ -1379,7 +1629,7 @@ mod tests {
             warnings.iter().map(|w| w.endpoint_name.clone()).collect();
 
         apply_diff_graceful(
-            &diff, &registry, &warnings, &warned, &tm, &inners, false, None,
+            &diff, &registry, &warnings, &warned, &tm, &inners, false, None, None,
         )
         .await;
 
@@ -1432,7 +1682,7 @@ mod tests {
         let warned: std::collections::HashSet<String> = ["ep".to_string()].into_iter().collect();
 
         apply_diff_graceful(
-            &diff, &registry, &warnings, &warned, &tm, &inners, false, None,
+            &diff, &registry, &warnings, &warned, &tm, &inners, false, None, None,
         )
         .await;
 
@@ -1488,7 +1738,7 @@ mod tests {
         let warned: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         apply_diff_graceful(
-            &diff, &registry, &warnings, &warned, &tm, &inners, true, None,
+            &diff, &registry, &warnings, &warned, &tm, &inners, true, None, None,
         )
         .await;
 
@@ -1948,6 +2198,7 @@ toon_output = true
                     &tm,
                     &inners,
                     None,
+                    None,
                 )
                 .await
                 .expect("reload should succeed");
@@ -1990,6 +2241,7 @@ toon_output = true
                     &profile_registry,
                     &tm,
                     &inners,
+                    None,
                     None,
                 )
                 .await
@@ -2049,6 +2301,7 @@ toon_output = true
                     &profile_registry,
                     &tm,
                     &inners,
+                    None,
                     None,
                 )
                 .await
@@ -2248,6 +2501,7 @@ command = "/bin/true"
                     &tm,
                     &inners,
                     None,
+                    None,
                 )
                 .await
                 .expect("reload should succeed");
@@ -2423,6 +2677,7 @@ validate_inputs = false
                     &tm,
                     &inners,
                     None,
+                    None,
                 )
                 .await
                 .expect("reload disabling validation should succeed");
@@ -2445,6 +2700,7 @@ validate_inputs = false
                     &profile_registry,
                     &tm,
                     &inners,
+                    None,
                     None,
                 )
                 .await
@@ -2567,6 +2823,7 @@ command = "/bin/true"
                     &profile_registry,
                     &token_manager,
                     &inners,
+                    None,
                     None,
                 )
                 .await
