@@ -5,7 +5,7 @@
 
 mod common;
 
-use endara_relay::config::{Config, EndpointConfig, RelayConfig, Transport};
+use endara_relay::config::{Config, EndpointConfig, ObservabilityConfig, RelayConfig, Transport};
 use endara_relay::management::{management_routes, ManagementState};
 use endara_relay::oauth::{OAuthFlowManager, OAuthSetupManager};
 use endara_relay::registry::AdapterRegistry;
@@ -29,6 +29,7 @@ fn empty_config() -> Config {
             startup_init_timeout_secs: None,
             session_identity_max_sessions: None,
             validate_inputs: None,
+            observability: ObservabilityConfig::default(),
         },
         endpoints: vec![EndpointConfig {
             name: "echo".to_string(),

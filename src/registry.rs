@@ -1,6 +1,8 @@
 use crate::adapter::stdio::iso8601_now;
 use crate::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::events::{current_request_context, ToolCallEvent, ToolCallEventBus};
+use crate::observability::pipeline::{CaptureRecord, CapturedPayloads, Observability};
+use crate::observability::store::CallRecord;
 use crate::prefix;
 use async_trait::async_trait;
 use jsonschema::error::{TypeKind, ValidationErrorKind};
@@ -143,6 +145,13 @@ pub struct AdapterRegistry {
     /// [`Self::set_validate_inputs`] on every reload, mirroring the
     /// `js_execution_mode` flag pattern.
     validate_inputs: Arc<AtomicBool>,
+    /// Optional observability ingestion pipeline (R4). When wired via
+    /// [`Self::with_observability`] and enabled, [`Self::route_tool_call`]
+    /// captures each dispatched `tools/call` (args + result + timing +
+    /// `current_request_context()`) and enqueues it without blocking the
+    /// request path. `None` by default so the many test-only call sites that
+    /// construct a bare registry keep compiling.
+    observability: Option<Observability>,
 }
 
 impl Default for AdapterRegistry {
@@ -163,6 +172,7 @@ impl AdapterRegistry {
             event_bus: None,
             schema_cache: Arc::new(RwLock::new(HashMap::new())),
             validate_inputs: Arc::new(AtomicBool::new(true)),
+            observability: None,
         }
     }
 
@@ -198,6 +208,25 @@ impl AdapterRegistry {
     pub fn with_event_bus(mut self, bus: ToolCallEventBus) -> Self {
         self.event_bus = Some(bus);
         self
+    }
+
+    /// Attach the observability ingestion pipeline (R4) so
+    /// [`Self::route_tool_call`] captures each dispatched `tools/call`. Builder
+    /// style so the existing `AdapterRegistry::new()` call sites keep compiling;
+    /// `main.rs` wires the handle constructed from `relay.observability`.
+    pub fn with_observability(mut self, observability: Observability) -> Self {
+        self.observability = Some(observability);
+        self
+    }
+
+    /// Borrow the wired observability handle, if any. Lets management/API
+    /// (R5) and the retention/cascade driver (R6) reach the shared `Store`,
+    /// `PayloadStore`, overflow stats and capture entrypoint through the
+    /// registry the management state already holds. Unused until R5/R6 wire
+    /// their consumers; the allow keeps the binary target warning-clean.
+    #[allow(dead_code)]
+    pub fn observability(&self) -> Option<&Observability> {
+        self.observability.as_ref()
     }
 
     /// Subscribe to the relay-wide tools-changed broadcast. Each `recv()`
@@ -754,7 +783,104 @@ impl AdapterRegistry {
             prefixed = %prefixed_name,
             "Routing tool call"
         );
-        entry.adapter.call_tool(tool, arguments).await
+
+        // Observability capture (R4). Inline on the dispatched `tools/call`
+        // path. Cheap no-op when the pipeline is unwired or disabled, and
+        // skipped for internal callers that have no `request_uid`. Enqueue is
+        // non-blocking (`try_send`); overflow drops are counted in the handle.
+        let Some(obs) = self.observability.as_ref().filter(|o| o.is_enabled()) else {
+            return entry.adapter.call_tool(tool, arguments).await;
+        };
+        let span_ctx = current_request_context();
+        // Gate capture on an inbound request context (skip internal callers),
+        // but key the row/payload on a freshly-minted per-call uuid rather than
+        // the span's inbound `request_uid`. An `execute_tools` JS batch reuses a
+        // single inbound `request_uid` across all its inner `tools/call`s, so
+        // reusing it here would collapse them into one row and overwrite each
+        // other's payloads. Batched calls stay correlated via the shared inbound
+        // request span and the per-call `request_uid`s minted below.
+        if span_ctx.request_uid.is_none() {
+            return entry.adapter.call_tool(tool, arguments).await;
+        }
+        let request_uid = uuid::Uuid::new_v4().to_string();
+
+        let store_payloads = obs.store_payloads();
+        let request_value = arguments.clone();
+        let request_bytes = request_value.to_string().len() as i64;
+        let server_type = entry.adapter.server_type();
+        let server_name = entry.adapter.upstream_server_name();
+        let transport = entry.transport.clone();
+        let endpoint_name = endpoint.clone();
+        let tool_name = tool.clone();
+        let (client_name, client_version, client_user_agent, client_origin) = match &span_ctx.client
+        {
+            Some(c) => (
+                c.name.clone(),
+                c.version.clone(),
+                c.user_agent.clone(),
+                c.origin.clone(),
+            ),
+            None => (None, None, None, None),
+        };
+
+        let ts_start = chrono::Utc::now().timestamp_millis();
+        let started = Instant::now();
+        let result = entry.adapter.call_tool(tool, arguments).await;
+        let duration_ms = started.elapsed().as_millis() as i64;
+        let ts_end = ts_start + duration_ms;
+
+        let (success, error_message, response_value, response_bytes) = match &result {
+            Ok(v) => {
+                let bytes = v.to_string().len() as i64;
+                // A transport-level `Ok` can still carry a tool-level error
+                // envelope (`{ content: [...], isError: true }`). Record it as a
+                // failed call while preserving the response payload/bytes.
+                match tool_result_error_message(v) {
+                    Some(msg) => (false, Some(msg), v.clone(), bytes),
+                    None => (true, None, v.clone(), bytes),
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // The error envelope is a populated `{"error": ...}` JSON that
+                // gets stored/returned, so record its serialized length rather
+                // than 0 to keep size metrics consistent with the success branch.
+                let response_value = serde_json::json!({ "error": msg });
+                let bytes = response_value.to_string().len() as i64;
+                (false, Some(msg), response_value, bytes)
+            }
+        };
+
+        let record = CallRecord {
+            id: None,
+            request_uid: Some(request_uid),
+            endpoint: Some(endpoint_name),
+            server_name,
+            server_type,
+            transport: Some(transport),
+            profile: span_ctx.profile.clone(),
+            client_name,
+            client_version,
+            client_user_agent,
+            client_origin,
+            tool: tool_name,
+            ts_start,
+            ts_end,
+            duration_ms,
+            success,
+            error_message,
+            request_bytes,
+            response_bytes,
+            streamed: false,
+        };
+        let payloads = store_payloads.then(|| CapturedPayloads {
+            request: request_value,
+            response: response_value,
+            streamed: false,
+        });
+        obs.capture(CaptureRecord { record, payloads });
+
+        result
     }
 
     /// Publish a `Started` + `Failed` pair on the shared
@@ -984,6 +1110,35 @@ fn compile_input_schema(prefixed_name: &str, schema: &serde_json::Value) -> Opti
             None
         }
     }
+}
+
+/// Upper bound on a captured tool-level `error_message`, in characters. Tool
+/// error envelopes are usually short, but a misbehaving server could return a
+/// large blob; cap it so the durable row stays bounded.
+const MAX_CAPTURED_ERROR_MESSAGE_CHARS: usize = 2048;
+
+/// Inspect a transport-level `Ok` `tools/call` result for a tool-level error
+/// envelope (`{ content: [...], isError: true }`). Returns the captured
+/// `error_message` (the first `content[].text` string, truncated) when the tool
+/// reported an error, or `None` for a normal success (`isError` absent/false).
+fn tool_result_error_message(value: &serde_json::Value) -> Option<String> {
+    if value.get("isError").and_then(|e| e.as_bool()) != Some(true) {
+        return None;
+    }
+    let text = value
+        .get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|items| {
+            items
+                .iter()
+                .find_map(|item| item.get("text").and_then(|t| t.as_str()))
+        })
+        .unwrap_or("tool call returned an error result");
+    let truncated: String = text
+        .chars()
+        .take(MAX_CAPTURED_ERROR_MESSAGE_CHARS)
+        .collect();
+    Some(truncated)
 }
 
 /// Format the collected validation errors into the model-friendly MCP error
@@ -1526,6 +1681,141 @@ mod tests {
     use crate::adapter::StartingAdapter;
     use async_trait::async_trait;
     use serde_json::json;
+
+    #[test]
+    fn tool_result_iserror_envelope_is_captured_as_failure() {
+        // A transport-level `Ok` carrying a tool-level error envelope must be
+        // recorded as a failed call with a non-empty error_message taken from
+        // the first text item in `content`.
+        let envelope = json!({
+            "content": [{ "type": "text", "text": "invalid_grant" }],
+            "isError": true,
+        });
+        let msg =
+            tool_result_error_message(&envelope).expect("isError envelope captured as failure");
+        assert_eq!(msg, "invalid_grant");
+    }
+
+    #[test]
+    fn tool_result_success_envelope_is_not_a_failure() {
+        // `isError` absent → success; explicit `isError: false` → success.
+        assert!(tool_result_error_message(&json!({ "content": [] })).is_none());
+        assert!(tool_result_error_message(&json!({
+            "content": [{ "type": "text", "text": "ok" }],
+            "isError": false,
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn tool_result_iserror_without_text_still_yields_message() {
+        // isError with no usable text content still produces a non-empty
+        // error_message so the durable row reflects the failure.
+        let msg = tool_result_error_message(&json!({ "isError": true, "content": [] }))
+            .expect("isError envelope captured as failure");
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn tool_result_error_message_is_truncated() {
+        let long = "x".repeat(MAX_CAPTURED_ERROR_MESSAGE_CHARS + 500);
+        let msg = tool_result_error_message(&json!({
+            "isError": true,
+            "content": [{ "type": "text", "text": long }],
+        }))
+        .expect("isError envelope captured as failure");
+        assert_eq!(msg.chars().count(), MAX_CAPTURED_ERROR_MESSAGE_CHARS);
+    }
+
+    /// Regression: an `execute_tools` JS batch reuses one inbound
+    /// `request_uid` across all its inner `tools/call`s. The observability
+    /// capture block must mint a fresh per-call uuid for each captured row so
+    /// the inner calls produce distinct rows (and distinct payload entries when
+    /// `store_payloads` is on) instead of collapsing into one row that
+    /// overwrites the others. The batch stays correlated via the shared inbound
+    /// request span and the per-call `request_uid`s minted by the capture block.
+    #[tokio::test]
+    async fn batched_inner_calls_get_distinct_request_uids() {
+        use crate::config::ObservabilityConfig;
+        use crate::events::SpanFieldCaptureLayer;
+        use crate::observability::payloads::PayloadStore;
+        use crate::observability::store::{QueryFilter, Store};
+        use tracing::Instrument;
+        use tracing_subscriber::prelude::*;
+
+        let subscriber = tracing_subscriber::registry().with(SpanFieldCaptureLayer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let payloads = Arc::new(PayloadStore::new(10, 128, 256 * 1024));
+        let config = ObservabilityConfig {
+            enabled: true,
+            store_payloads: true,
+            ..ObservabilityConfig::default()
+        };
+        let obs = Observability::new(&config, Arc::clone(&store), Arc::clone(&payloads));
+
+        let registry = AdapterRegistry::new().with_observability(obs);
+        registry
+            .register(
+                "ep".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("echo")])),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+
+        // Both inner calls run inside ONE inbound `request` span (same
+        // `request_uid`), exactly as `execute_tools` dispatches a JS batch.
+        let shared_uid = "inbound-uid-shared";
+        async {
+            registry
+                .route_tool_call("echo", json!({ "n": 1 }))
+                .await
+                .unwrap();
+            registry
+                .route_tool_call("echo", json!({ "n": 2 }))
+                .await
+                .unwrap();
+        }
+        .instrument(tracing::info_span!(
+            "request",
+            method = "tools/call",
+            request_uid = %shared_uid,
+        ))
+        .await;
+
+        // Drain: poll until both rows land via the background consumer.
+        let mut rows = Vec::new();
+        for _ in 0..50 {
+            rows = store.query(&QueryFilter::default(), 10, 0).unwrap();
+            if rows.len() >= 2 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(rows.len(), 2, "both inner calls captured as separate rows");
+
+        let uids: Vec<String> = rows
+            .iter()
+            .map(|r| r.request_uid.clone().expect("request_uid set"))
+            .collect();
+        assert_ne!(uids[0], uids[1], "rows have distinct request_uids");
+        assert!(
+            uids.iter().all(|u| u != shared_uid),
+            "row uids are minted per-call, not the shared inbound request_uid"
+        );
+
+        // Each row's payload resolves by its own minted uid and is not
+        // overwritten by the sibling call.
+        let p0 = payloads.get(&uids[0]).expect("payload for row 0");
+        let p1 = payloads.get(&uids[1]).expect("payload for row 1");
+        assert_ne!(
+            p0.request, p1.request,
+            "inner-call payloads not overwritten"
+        );
+    }
 
     /// A mock adapter for testing.
     struct MockAdapter {

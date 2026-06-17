@@ -61,6 +61,11 @@ pub struct RelayConfig {
     /// loose schemas). Hot-reloadable via [`crate::watcher::ConfigWatcher`].
     #[serde(default)]
     pub validate_inputs: Option<bool>,
+    /// Agent-call observability store configuration (`[relay.observability]`).
+    /// `#[serde(default)]` means a `config.toml` that omits the table entirely
+    /// falls back to [`ObservabilityConfig::default`].
+    #[serde(default)]
+    pub observability: ObservabilityConfig,
 }
 
 impl Default for RelayConfig {
@@ -83,6 +88,80 @@ impl Default for RelayConfig {
             startup_init_timeout_secs: None,
             session_identity_max_sessions: None,
             validate_inputs: None,
+            observability: ObservabilityConfig::default(),
+        }
+    }
+}
+
+/// Agent-call observability store configuration, nested under
+/// `[relay.observability]`. Controls the durable metadata store (SQLite) and
+/// the in-memory payload ring buffer. Every field carries a `#[serde(default
+/// = "…")]` so a config that includes the `[relay.observability]` table but
+/// omits individual keys keeps the documented defaults; the struct-level
+/// `#[serde(default)]` on `RelayConfig::observability` covers a fully-omitted
+/// table. This keeps configs that predate the feature working unchanged.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct ObservabilityConfig {
+    /// Master switch for the subsystem. When `false`, no metadata rows are
+    /// recorded and no payloads are buffered. Default: `true`.
+    #[serde(default = "default_observability_enabled")]
+    pub enabled: bool,
+    /// Capture full request/response payloads into the in-memory ring buffer.
+    /// Metadata is still recorded when this is `false`. Default: `true`.
+    #[serde(default = "default_observability_store_payloads")]
+    pub store_payloads: bool,
+    /// How long (minutes) payloads stay retrievable in the ring buffer before
+    /// they expire. Default: `10`.
+    #[serde(default = "default_observability_payload_window_minutes")]
+    pub payload_window_minutes: u64,
+    /// How long (days) metadata rows are retained before eviction. Default: `7`.
+    #[serde(default = "default_observability_record_retention_days")]
+    pub record_retention_days: u64,
+    /// Maximum on-disk size (MB) of the metadata database; oldest rows are
+    /// evicted first once the cap is reached. Default: `1024` (1 GB).
+    #[serde(default = "default_observability_max_db_size_mb")]
+    pub max_db_size_mb: u64,
+    /// Maximum bytes captured per payload; larger payloads are truncated and
+    /// flagged. Default: `262144` (256 KB).
+    #[serde(default = "default_observability_max_payload_bytes")]
+    pub max_payload_bytes: u64,
+    /// Total memory budget (MB) for the payload ring buffer. Default: `128`.
+    #[serde(default = "default_observability_payload_buffer_budget_mb")]
+    pub payload_buffer_budget_mb: u64,
+}
+
+fn default_observability_enabled() -> bool {
+    true
+}
+fn default_observability_store_payloads() -> bool {
+    true
+}
+fn default_observability_payload_window_minutes() -> u64 {
+    10
+}
+fn default_observability_record_retention_days() -> u64 {
+    7
+}
+fn default_observability_max_db_size_mb() -> u64 {
+    1024
+}
+fn default_observability_max_payload_bytes() -> u64 {
+    262144
+}
+fn default_observability_payload_buffer_budget_mb() -> u64 {
+    128
+}
+
+impl Default for ObservabilityConfig {
+    fn default() -> Self {
+        ObservabilityConfig {
+            enabled: default_observability_enabled(),
+            store_payloads: default_observability_store_payloads(),
+            payload_window_minutes: default_observability_payload_window_minutes(),
+            record_retention_days: default_observability_record_retention_days(),
+            max_db_size_mb: default_observability_max_db_size_mb(),
+            max_payload_bytes: default_observability_max_payload_bytes(),
+            payload_buffer_budget_mb: default_observability_payload_buffer_budget_mb(),
         }
     }
 }
@@ -1670,10 +1749,84 @@ js_execution = false
                 startup_init_timeout_secs: None,
                 session_identity_max_sessions: None,
                 validate_inputs: None,
+                observability: ObservabilityConfig::default(),
             },
             endpoints,
             profiles: None,
         }
+    }
+
+    // --- Observability config tests ---
+
+    #[test]
+    fn observability_default_impl_matches_documented_defaults() {
+        let obs = ObservabilityConfig::default();
+        assert!(obs.enabled);
+        assert!(obs.store_payloads);
+        assert_eq!(obs.payload_window_minutes, 10);
+        assert_eq!(obs.record_retention_days, 7);
+        assert_eq!(obs.max_db_size_mb, 1024);
+        assert_eq!(obs.max_payload_bytes, 262144);
+        assert_eq!(obs.payload_buffer_budget_mb, 128);
+    }
+
+    #[test]
+    fn observability_defaults_when_section_omitted() {
+        // No `[relay.observability]` table at all — the struct-level
+        // `#[serde(default)]` on `RelayConfig::observability` applies.
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(config.relay.observability, ObservabilityConfig::default());
+    }
+
+    #[test]
+    fn observability_partial_section_keeps_other_defaults() {
+        // Table present but only some keys set — omitted keys fall back to the
+        // per-field `#[serde(default = "…")]` values, not bool/u64 zero values.
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[relay.observability]
+enabled = false
+payload_window_minutes = 30
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        let obs = &config.relay.observability;
+        assert!(!obs.enabled);
+        assert_eq!(obs.payload_window_minutes, 30);
+        assert!(obs.store_payloads);
+        assert_eq!(obs.record_retention_days, 7);
+        assert_eq!(obs.max_db_size_mb, 1024);
+        assert_eq!(obs.max_payload_bytes, 262144);
+        assert_eq!(obs.payload_buffer_budget_mb, 128);
+    }
+
+    #[test]
+    fn observability_full_round_trip() {
+        let original = ObservabilityConfig {
+            enabled: false,
+            store_payloads: false,
+            payload_window_minutes: 42,
+            record_retention_days: 3,
+            max_db_size_mb: 512,
+            max_payload_bytes: 1024,
+            payload_buffer_budget_mb: 64,
+        };
+        let config = Config {
+            relay: RelayConfig {
+                observability: original.clone(),
+                ..RelayConfig::default()
+            },
+            endpoints: vec![],
+            profiles: None,
+        };
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.relay.observability, original);
     }
 
     fn stdio_ep(name: &str, cmd: &str) -> EndpointConfig {

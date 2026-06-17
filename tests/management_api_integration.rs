@@ -6,8 +6,11 @@
 
 use async_trait::async_trait;
 use endara_relay::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
-use endara_relay::config::{Config, EndpointConfig, RelayConfig, Transport};
+use endara_relay::config::{Config, EndpointConfig, ObservabilityConfig, RelayConfig, Transport};
 use endara_relay::management::{management_routes, ManagementState};
+use endara_relay::observability::payloads::PayloadStore;
+use endara_relay::observability::pipeline::Observability;
+use endara_relay::observability::store::{CallRecord, Store};
 use endara_relay::registry::AdapterRegistry;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
@@ -88,6 +91,7 @@ fn test_config() -> Config {
             startup_init_timeout_secs: None,
             session_identity_max_sessions: None,
             validate_inputs: None,
+            observability: ObservabilityConfig::default(),
         },
         endpoints: vec![EndpointConfig {
             name: "echo".to_string(),
@@ -746,4 +750,359 @@ async fn test_management_api_test_connection_happy_path() {
     // The echo server exposes one tool called "echo"
     let tools = body["tools"].as_array().unwrap();
     assert!(tools.iter().any(|t| t.as_str() == Some("echo")));
+}
+
+// ---------------------------------------------------------------------------
+// Observability API (R5)
+// ---------------------------------------------------------------------------
+
+/// Build a seeded `CallRecord` for the observability store fixtures.
+fn obs_record(server: &str, uid: &str, ts: i64, success: bool, dur: i64, tool: &str) -> CallRecord {
+    CallRecord {
+        request_uid: Some(uid.to_string()),
+        server_name: Some(server.to_string()),
+        endpoint: Some(server.to_string()),
+        tool: tool.to_string(),
+        ts_start: ts,
+        ts_end: ts + dur,
+        duration_ms: dur,
+        success,
+        request_bytes: 10,
+        response_bytes: 20,
+        ..Default::default()
+    }
+}
+
+/// Start a management server with observability wired into the registry and the
+/// store/payload buffer pre-seeded with three calls (two `alpha`, one `beta`).
+/// Only `uid-a1` has a buffered payload. Returns the seeded handles so tests can
+/// assert side effects (e.g. purge).
+async fn start_observability_server(
+    config_path: Option<std::path::PathBuf>,
+    store_payloads: bool,
+) -> (
+    SocketAddr,
+    Arc<Store>,
+    Arc<PayloadStore>,
+    tokio::task::JoinHandle<()>,
+) {
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    let payloads = Arc::new(PayloadStore::new(10, 128, 256 * 1024));
+    store
+        .insert_batch(&[
+            obs_record("alpha", "uid-a1", 1000, true, 10, "alpha__do"),
+            obs_record("alpha", "uid-a2", 2000, false, 100, "alpha__do"),
+            obs_record("beta", "uid-b1", 3000, true, 30, "beta__go"),
+        ])
+        .unwrap();
+    payloads.insert("uid-a1", &json!({"a": 1}), &json!({"ok": true}), false);
+
+    let obs_cfg = ObservabilityConfig {
+        enabled: true,
+        store_payloads,
+        ..ObservabilityConfig::default()
+    };
+    let obs = Observability::new(&obs_cfg, Arc::clone(&store), Arc::clone(&payloads));
+    let registry = Arc::new(AdapterRegistry::new().with_observability(obs));
+
+    let state = ManagementState {
+        registry,
+        config: Arc::new(tokio::sync::RwLock::new(test_config())),
+        start_time: Instant::now(),
+        config_path,
+        oauth_flow_manager: None,
+        relay_port: 9400,
+        oauth_adapter_inners: None,
+        token_manager: None,
+        setup_manager: None,
+        profile_registry: None,
+        event_bus: None,
+    };
+
+    let app = management_routes(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    (addr, store, payloads, handle)
+}
+
+#[tokio::test]
+async fn test_observability_calls_list_filter_and_paging() {
+    let (addr, _store, _payloads, _handle) = start_observability_server(None, true).await;
+    let client = reqwest::Client::new();
+
+    // Full list, newest-first.
+    let resp = client
+        .get(format!("http://{}/api/observability/calls", addr))
+        .send()
+        .await
+        .expect("request failed");
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    let calls = body["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0]["tsStart"], 3000);
+    assert_eq!(calls[0]["serverName"], "beta");
+    assert_eq!(body["limit"], 100);
+    assert_eq!(body["offset"], 0);
+
+    // Filter by server.
+    let resp = client
+        .get(format!(
+            "http://{}/api/observability/calls?server_name=alpha",
+            addr
+        ))
+        .send()
+        .await
+        .expect("request failed");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["calls"].as_array().unwrap().len(), 2);
+
+    // Filter by success.
+    let resp = client
+        .get(format!(
+            "http://{}/api/observability/calls?success=false",
+            addr
+        ))
+        .send()
+        .await
+        .expect("request failed");
+    let body: Value = resp.json().await.unwrap();
+    let calls = body["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["requestUid"], "uid-a2");
+
+    // Paging: second page of size 1 is the middle record (ts 2000).
+    let resp = client
+        .get(format!(
+            "http://{}/api/observability/calls?limit=1&offset=1",
+            addr
+        ))
+        .send()
+        .await
+        .expect("request failed");
+    let body: Value = resp.json().await.unwrap();
+    let calls = body["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["tsStart"], 2000);
+}
+
+#[tokio::test]
+async fn test_observability_call_detail_payload_states() {
+    let (addr, _store, _payloads, _handle) = start_observability_server(None, true).await;
+    let client = reqwest::Client::new();
+
+    // Buffered payload present → status "stored".
+    let resp = client
+        .get(format!("http://{}/api/observability/calls/uid-a1", addr))
+        .send()
+        .await
+        .expect("request failed");
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["record"]["serverName"], "alpha");
+    assert_eq!(body["payloadStatus"], "stored");
+    assert_eq!(body["payloads"]["request"], "{\"a\":1}");
+
+    // No buffered payload → status "expired", no payloads field.
+    let resp = client
+        .get(format!("http://{}/api/observability/calls/uid-a2", addr))
+        .send()
+        .await
+        .expect("request failed");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["payloadStatus"], "expired");
+    assert!(body.get("payloads").is_none() || body["payloads"].is_null());
+
+    // Unknown request_uid → 404.
+    let resp = client
+        .get(format!("http://{}/api/observability/calls/missing", addr))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status().as_u16(), 404);
+}
+
+#[tokio::test]
+async fn test_observability_call_detail_payloads_disabled() {
+    let (addr, _store, _payloads, _handle) = start_observability_server(None, false).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("http://{}/api/observability/calls/uid-a1", addr))
+        .send()
+        .await
+        .expect("request failed");
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["payloadStatus"], "disabled");
+    assert!(body.get("payloads").is_none() || body["payloads"].is_null());
+}
+
+#[tokio::test]
+async fn test_observability_aggregates() {
+    let (addr, _store, _payloads, _handle) = start_observability_server(None, true).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!(
+            "http://{}/api/observability/aggregates?since=0&until=10000000&bucket_seconds=60",
+            addr
+        ))
+        .send()
+        .await
+        .expect("request failed");
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    let buckets = body["buckets"].as_array().unwrap();
+    assert!(!buckets.is_empty());
+    // Global series (server omitted) present with all three calls.
+    let global_total: u64 = buckets
+        .iter()
+        .filter(|b| b.get("server").is_none() || b["server"].is_null())
+        .map(|b| b["count"].as_u64().unwrap())
+        .sum();
+    assert_eq!(global_total, 3);
+
+    let summary = &body["summary"];
+    assert_eq!(summary["enabled"], true);
+    assert_eq!(summary["storePayloads"], true);
+    assert_eq!(summary["dropped"], 0);
+    assert_eq!(summary["payloadBufferLen"], 1);
+}
+
+#[tokio::test]
+async fn test_observability_purge() {
+    let (addr, store, payloads, _handle) = start_observability_server(None, true).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("http://{}/api/observability/purge", addr))
+        .send()
+        .await
+        .expect("request failed");
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["ok"], true);
+
+    // Both tiers are now empty.
+    assert_eq!(
+        store
+            .query(
+                &endara_relay::observability::store::QueryFilter::default(),
+                10,
+                0
+            )
+            .unwrap()
+            .len(),
+        0
+    );
+    assert!(payloads.is_empty());
+
+    let resp = client
+        .get(format!("http://{}/api/observability/calls", addr))
+        .send()
+        .await
+        .expect("request failed");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["calls"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn test_observability_config_get_put_persists() {
+    let dir = std::env::temp_dir().join(format!("relay-integ-obs-cfg-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let config_file = dir.join("config.toml");
+    std::fs::write(&config_file, "[relay]\nmachine_name = \"test-machine\"\n").unwrap();
+
+    let (addr, _store, _payloads, _handle) =
+        start_observability_server(Some(config_file.clone()), true).await;
+    let client = reqwest::Client::new();
+
+    // GET returns the in-memory defaults.
+    let resp = client
+        .get(format!("http://{}/api/observability/config", addr))
+        .send()
+        .await
+        .expect("request failed");
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["enabled"], true);
+    assert_eq!(body["payload_window_minutes"], 10);
+
+    // PUT a modified config.
+    let resp = client
+        .put(format!("http://{}/api/observability/config", addr))
+        .json(&json!({
+            "enabled": false,
+            "store_payloads": false,
+            "payload_window_minutes": 30,
+            "record_retention_days": 3,
+            "max_db_size_mb": 512,
+            "max_payload_bytes": 1024,
+            "payload_buffer_budget_mb": 64
+        }))
+        .send()
+        .await
+        .expect("request failed");
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["payload_window_minutes"], 30);
+
+    // The change is persisted to disk under [relay.observability].
+    let written = std::fs::read_to_string(&config_file).unwrap();
+    assert!(written.contains("[relay.observability]"));
+    assert!(written.contains("enabled = false"));
+    assert!(written.contains("payload_window_minutes = 30"));
+    assert!(written.contains("machine_name = \"test-machine\""));
+
+    // GET now reflects the new in-memory baseline.
+    let resp = client
+        .get(format!("http://{}/api/observability/config", addr))
+        .send()
+        .await
+        .expect("request failed");
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["enabled"], false);
+    assert_eq!(body["max_db_size_mb"], 512);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_observability_block_in_sanitized_config() {
+    let (addr, _handle) =
+        start_management_server(vec![("echo-ep", MockAdapter::healthy_with_tools(vec![]))]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("http://{}/api/config", addr))
+        .send()
+        .await
+        .expect("request failed");
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    let obs = &body["relay"]["observability"];
+    assert_eq!(obs["enabled"], true);
+    assert_eq!(obs["store_payloads"], true);
+    assert_eq!(obs["payload_window_minutes"], 10);
+}
+
+#[tokio::test]
+async fn test_observability_unavailable_when_unwired() {
+    // The default harness wires no observability handle → 503.
+    let (addr, _handle) =
+        start_management_server(vec![("echo-ep", MockAdapter::healthy_with_tools(vec![]))]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("http://{}/api/observability/calls", addr))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status().as_u16(), 503);
 }
