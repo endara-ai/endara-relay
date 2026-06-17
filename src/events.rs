@@ -321,8 +321,12 @@ impl Default for ToolCallEventBus {
 /// into span extensions by [`SpanFieldCaptureLayer`] and surfaced to adapter
 /// code via [`current_request_context`]. Adapters use this to populate
 /// `request_uid` (from the inner `request` span) and `profile` (from the outer
-/// `mcp_request` span) on every emitted [`ToolCallEvent`] without taking a
-/// breaking change to the [`crate::adapter::McpAdapter::call_tool`] signature.
+/// `mcp_request` span) on the [`ToolCallEvent::Started`] they emit, without
+/// taking a breaking change to the [`crate::adapter::McpAdapter::call_tool`]
+/// signature. Only `Started` carries these fields; the matching
+/// [`ToolCallEvent::Completed`]/[`ToolCallEvent::Failed`] stay terse and are
+/// correlated back to their `Started` (and thus to that `request_uid`) via the
+/// shared per-call `request_id`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct RequestSpanContext {
     /// Canonical per-JSON-RPC-message UID captured from the `request` span's

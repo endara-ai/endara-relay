@@ -1003,13 +1003,15 @@ impl McpAdapter for OAuthAdapter {
         // `.instrument(self.inner.span)`. The inner `HttpAdapter::call_tool`
         // captures the caller's per-request span context (`request{request_uid}`,
         // `mcp_request{profile}`) BEFORE entering its own span so it can
-        // attach `request_uid`/`profile` to the published `ToolCallEvent`s.
+        // attach `request_uid`/`profile` to the `ToolCallEvent::Started` it
+        // publishes (the matching `Completed`/`Failed` are terse and correlate
+        // back via the shared per-call `request_id`).
         // OAuth's `inner.span` is the persistent endpoint span built at init
         // time with no parent linkage to per-request spans, so wrapping the
-        // inner call here would zero out those fields on every OAuth-routed
-        // tool call. The OAuth endpoint span is still applied around the
-        // refresh / state-transition branches below where it actually adds
-        // useful context.
+        // inner call here would zero out those fields on the `Started` event for
+        // every OAuth-routed tool call. The OAuth endpoint span is still applied
+        // around the refresh / state-transition branches below where it actually
+        // adds useful context.
         let guard = self.inner.inner_adapter.read().await;
         let adapter = match guard.as_ref() {
             Some(a) => a,
