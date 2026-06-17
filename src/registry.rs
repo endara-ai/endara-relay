@@ -842,12 +842,12 @@ impl AdapterRegistry {
             }
             Err(e) => {
                 let msg = e.to_string();
-                (
-                    false,
-                    Some(msg.clone()),
-                    serde_json::json!({ "error": msg }),
-                    0,
-                )
+                // The error envelope is a populated `{"error": ...}` JSON that
+                // gets stored/returned, so record its serialized length rather
+                // than 0 to keep size metrics consistent with the success branch.
+                let response_value = serde_json::json!({ "error": msg });
+                let bytes = response_value.to_string().len() as i64;
+                (false, Some(msg), response_value, bytes)
             }
         };
 

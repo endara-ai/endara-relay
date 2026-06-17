@@ -774,46 +774,44 @@ async fn delete_endpoint(
     // the metadata rows BEFORE deleting them, then delete the rows and drop the
     // matching buffered payloads. No-op when observability is unwired/disabled.
     if let Some(obs) = state.registry.observability().filter(|o| o.is_enabled()) {
-        let store = obs.store();
-        let filter = crate::observability::store::QueryFilter {
-            server_name: Some(name.clone()),
-            ..Default::default()
-        };
-        let mut uids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        const UID_PAGE: i64 = 1000;
-        let mut offset = 0i64;
-        loop {
-            match store.query(&filter, UID_PAGE, offset) {
-                Ok(rows) => {
-                    let fetched = rows.len() as i64;
-                    for row in rows {
-                        if let Some(uid) = row.request_uid {
-                            uids.insert(uid);
+        // Exact-match collection (`WHERE server_name = ?1`) so a sibling server
+        // whose name contains this one as a substring (e.g. `foo-staging` when
+        // deleting `foo`) is not over-collected. SQLite work runs on a blocking
+        // thread so it never stalls the async runtime.
+        let store = Arc::clone(obs.store());
+        let server = name.clone();
+        let cascade = tokio::task::spawn_blocking(move || {
+            let uids = store.request_uids_for_server(&server);
+            let removed = store.delete_for_server(&server);
+            (uids, removed)
+        })
+        .await;
+        match cascade {
+            Ok((uids, removed)) => {
+                match removed {
+                    Ok(removed) => {
+                        tracing::debug!(server = %name, removed, "observability: deleted metadata rows for deleted server")
+                    }
+                    Err(e) => {
+                        warn!(error = %e, server = %name, "observability: failed to delete metadata rows for deleted server")
+                    }
+                }
+                match uids {
+                    Ok(uids) => {
+                        if !uids.is_empty() {
+                            let uids: std::collections::HashSet<String> =
+                                uids.into_iter().collect();
+                            obs.payloads().remove_for_server(&uids);
                         }
                     }
-                    if fetched < UID_PAGE {
-                        break;
+                    Err(e) => {
+                        warn!(error = %e, server = %name, "observability: failed to collect request_uids for delete cascade")
                     }
-                    offset += UID_PAGE;
                 }
-                Err(e) => {
-                    warn!(error = %e, server = %name, "observability: failed to collect request_uids for delete cascade");
-                    break;
-                }
-            }
-        }
-
-        match store.delete_for_server(&name) {
-            Ok(removed) => {
-                tracing::debug!(server = %name, removed, "observability: deleted metadata rows for deleted server")
             }
             Err(e) => {
-                warn!(error = %e, server = %name, "observability: failed to delete metadata rows for deleted server")
+                warn!(error = %e, server = %name, "observability: delete cascade task panicked")
             }
-        }
-
-        if !uids.is_empty() {
-            obs.payloads().remove_for_server(&uids);
         }
     }
 
@@ -3797,12 +3795,22 @@ async fn get_observability_calls(
         since: q.since,
         until: q.until,
     };
-    match obs.store().query(&filter, limit, offset) {
-        Ok(rows) => Json(CallsResponse {
+    // Offload the synchronous rusqlite query to a blocking thread so a slow
+    // query never stalls the async runtime serving management + relay tasks.
+    let store = Arc::clone(obs.store());
+    let queried = tokio::task::spawn_blocking(move || store.query(&filter, limit, offset)).await;
+    match queried {
+        Ok(Ok(rows)) => Json(CallsResponse {
             calls: rows.into_iter().map(CallRecordDto::from).collect(),
             limit,
             offset,
         })
+        .into_response(),
+        Ok(Err(e)) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to query observability records",
+            Some(&e.to_string()),
+        )
         .into_response(),
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3844,13 +3852,26 @@ async fn get_observability_call_detail(
     let Some(obs) = state.registry.observability() else {
         return observability_unavailable();
     };
-    let record = match obs.store().get_by_request_uid(&request_uid) {
-        Ok(Some(r)) => r,
-        Ok(None) => {
+    // Offload the synchronous rusqlite lookup to a blocking thread so a slow
+    // query never stalls the async runtime serving management + relay tasks.
+    let store = Arc::clone(obs.store());
+    let uid = request_uid.clone();
+    let looked_up = tokio::task::spawn_blocking(move || store.get_by_request_uid(&uid)).await;
+    let record = match looked_up {
+        Ok(Ok(Some(r))) => r,
+        Ok(Ok(None)) => {
             return error_response(
                 StatusCode::NOT_FOUND,
                 "call record not found",
                 Some(&format!("No record for request_uid {request_uid}")),
+            )
+            .into_response();
+        }
+        Ok(Err(e)) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to load observability record",
+                Some(&e.to_string()),
             )
             .into_response();
         }
@@ -3959,11 +3980,22 @@ async fn get_observability_aggregates(
         payload_buffer_len: obs.payloads().len(),
         payload_buffer_bytes: obs.payloads().total_bytes(),
     };
-    match obs.store().aggregate(bucket_seconds, since, until) {
-        Ok(buckets) => Json(AggregatesResponse {
+    // Offload the synchronous rusqlite aggregation to a blocking thread so a
+    // slow query never stalls the async runtime serving management + relay tasks.
+    let store = Arc::clone(obs.store());
+    let aggregated =
+        tokio::task::spawn_blocking(move || store.aggregate(bucket_seconds, since, until)).await;
+    match aggregated {
+        Ok(Ok(buckets)) => Json(AggregatesResponse {
             buckets: buckets.into_iter().map(AggregateBucketDto::from).collect(),
             summary,
         })
+        .into_response(),
+        Ok(Err(e)) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to aggregate observability records",
+            Some(&e.to_string()),
+        )
         .into_response(),
         Err(e) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3979,13 +4011,28 @@ async fn purge_observability(State(state): State<ManagementState>) -> axum::resp
     let Some(obs) = state.registry.observability() else {
         return observability_unavailable();
     };
-    if let Err(e) = obs.store().purge_all() {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to purge observability metadata",
-            Some(&e.to_string()),
-        )
-        .into_response();
+    // Offload the synchronous rusqlite purge to a blocking thread so it never
+    // stalls the async runtime serving management + relay tasks.
+    let store = Arc::clone(obs.store());
+    let purged = tokio::task::spawn_blocking(move || store.purge_all()).await;
+    match purged {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to purge observability metadata",
+                Some(&e.to_string()),
+            )
+            .into_response();
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to purge observability metadata",
+                Some(&e.to_string()),
+            )
+            .into_response();
+        }
     }
     obs.payloads().purge_all();
     Json(ActionResponse {
@@ -4004,9 +4051,12 @@ async fn get_observability_config(
 }
 
 /// PUT /api/observability/config — persist new `[relay.observability]` settings
-/// to disk (targeted edit, preserving the rest of the file) and swap the
-/// in-memory baseline. Runtime store sizing (windows, budgets, enable/disable)
-/// is re-read on the next relay restart.
+/// to disk and swap the in-memory baseline. Like `persist_disabled_state`, this
+/// reparses the whole config file into a `toml::Table`, replaces the
+/// `[relay.observability]` table, and reserializes the entire file — so
+/// comments/formatting are not preserved and sections may be reordered. Runtime
+/// store sizing (windows, budgets, enable/disable) is re-read on the next relay
+/// restart.
 async fn update_observability_config(
     State(state): State<ManagementState>,
     Json(new_cfg): Json<ObservabilityConfig>,

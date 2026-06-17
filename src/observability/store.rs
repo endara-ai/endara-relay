@@ -369,6 +369,20 @@ impl Store {
         Ok(out)
     }
 
+    /// Collect the `request_uid`s for every row whose `server_name` matches
+    /// `name` exactly (`WHERE server_name = ?1`, no substring `LIKE`). Used by
+    /// the delete cascade to drop only the buffered payloads belonging to the
+    /// removed server — not siblings whose name merely contains `name` as a
+    /// substring (e.g. deleting `foo` must not collect `foo-staging`'s UIDs).
+    pub fn request_uids_for_server(&self, name: &str) -> rusqlite::Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT request_uid FROM calls WHERE server_name = ?1 AND request_uid IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![name], |row| row.get::<_, String>(0))?;
+        rows.collect()
+    }
+
     /// Delete all records for a server (cascade on server deletion). Returns rows removed.
     pub fn delete_for_server(&self, name: &str) -> rusqlite::Result<usize> {
         let conn = self.conn.lock().unwrap();
@@ -757,5 +771,28 @@ mod tests {
             store.query(&QueryFilter::default(), 10, 0).unwrap().len(),
             0
         );
+    }
+
+    #[test]
+    fn request_uids_for_server_is_exact_not_substring() {
+        let store = Store::open_in_memory().unwrap();
+        // `foo` is a substring of `foo-staging`; a `LIKE %foo%` collection
+        // would over-collect the sibling server's UIDs.
+        store
+            .insert_batch(&[
+                rec("foo", 1000, true, 5),
+                rec("foo", 2000, true, 5),
+                rec("foo-staging", 3000, true, 5),
+            ])
+            .unwrap();
+
+        let mut uids = store.request_uids_for_server("foo").unwrap();
+        uids.sort();
+        assert_eq!(uids, vec!["uid-foo-1000", "uid-foo-2000"]);
+
+        let staging = store.request_uids_for_server("foo-staging").unwrap();
+        assert_eq!(staging, vec!["uid-foo-staging-3000"]);
+
+        assert!(store.request_uids_for_server("missing").unwrap().is_empty());
     }
 }

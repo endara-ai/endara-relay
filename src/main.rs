@@ -379,7 +379,12 @@ async fn main() {
             // tiers stay bounded without operator intervention. Store ops run on
             // a blocking thread so the SQLite work never stalls the runtime.
             if let Some(obs) = observability.clone().filter(|o| o.is_enabled()) {
-                let retention_days = cfg.relay.observability.record_retention_days as i64;
+                // Saturate rather than wrap on misconfigured retention windows
+                // larger than `i64::MAX`; a wrapped negative value would make
+                // `enforce_retention` treat it as 0 days and prune almost
+                // everything on the next sweep.
+                let retention_days = i64::try_from(cfg.relay.observability.record_retention_days)
+                    .unwrap_or(i64::MAX);
                 let max_db_mb = cfg.relay.observability.max_db_size_mb;
                 tokio::spawn(async move {
                     const RETENTION_SWEEP_INTERVAL_SECS: u64 = 60;
