@@ -1,4 +1,5 @@
 mod heartbeat;
+pub mod jit;
 pub mod metrics;
 mod state;
 
