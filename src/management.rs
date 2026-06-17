@@ -3671,8 +3671,6 @@ struct CallRecordDto {
     #[serde(skip_serializing_if = "Option::is_none")]
     request_uid: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    jsonrpc_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     endpoint: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     server_name: Option<String>,
@@ -3707,7 +3705,6 @@ impl From<CallRecord> for CallRecordDto {
         CallRecordDto {
             id: r.id,
             request_uid: r.request_uid,
-            jsonrpc_id: r.jsonrpc_id,
             endpoint: r.endpoint,
             server_name: r.server_name,
             server_type: r.server_type,

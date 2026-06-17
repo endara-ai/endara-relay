@@ -797,7 +797,8 @@ impl AdapterRegistry {
         // the span's inbound `request_uid`. An `execute_tools` JS batch reuses a
         // single inbound `request_uid` across all its inner `tools/call`s, so
         // reusing it here would collapse them into one row and overwrite each
-        // other's payloads. `jsonrpc_id` (recorded below) still groups a batch.
+        // other's payloads. Batched calls stay correlated via the shared inbound
+        // request span and the per-call `request_uid`s minted below.
         if span_ctx.request_uid.is_none() {
             return entry.adapter.call_tool(tool, arguments).await;
         }
@@ -853,7 +854,6 @@ impl AdapterRegistry {
         let record = CallRecord {
             id: None,
             request_uid: Some(request_uid),
-            jsonrpc_id: span_ctx.jsonrpc_id.clone(),
             endpoint: Some(endpoint_name),
             server_name,
             server_type,
@@ -1732,7 +1732,8 @@ mod tests {
     /// capture block must mint a fresh per-call uuid for each captured row so
     /// the inner calls produce distinct rows (and distinct payload entries when
     /// `store_payloads` is on) instead of collapsing into one row that
-    /// overwrites the others, while `jsonrpc_id` still groups the batch.
+    /// overwrites the others. The batch stays correlated via the shared inbound
+    /// request span and the per-call `request_uid`s minted by the capture block.
     #[tokio::test]
     async fn batched_inner_calls_get_distinct_request_uids() {
         use crate::config::ObservabilityConfig;
@@ -1768,7 +1769,6 @@ mod tests {
         // Both inner calls run inside ONE inbound `request` span (same
         // `request_uid`), exactly as `execute_tools` dispatches a JS batch.
         let shared_uid = "inbound-uid-shared";
-        let jsonrpc_id = "42".to_string();
         async {
             registry
                 .route_tool_call("echo", json!({ "n": 1 }))
@@ -1782,7 +1782,6 @@ mod tests {
         .instrument(tracing::info_span!(
             "request",
             method = "tools/call",
-            id = %jsonrpc_id,
             request_uid = %shared_uid,
         ))
         .await;
@@ -1807,9 +1806,6 @@ mod tests {
             uids.iter().all(|u| u != shared_uid),
             "row uids are minted per-call, not the shared inbound request_uid"
         );
-
-        // `jsonrpc_id` is unchanged, so it still groups the batch together.
-        assert!(rows.iter().all(|r| r.jsonrpc_id.as_deref() == Some("42")));
 
         // Each row's payload resolves by its own minted uid and is not
         // overwritten by the sibling call.

@@ -14,7 +14,7 @@ use std::sync::Mutex;
 use rusqlite::{params, Connection, OptionalExtension};
 
 /// Columns selected (and mapped) in [`Store::query`] / [`Store::get_by_request_uid`].
-const SELECT_COLUMNS: &str = "id, request_uid, jsonrpc_id, endpoint, server_name, \
+const SELECT_COLUMNS: &str = "id, request_uid, endpoint, server_name, \
     server_type, transport, profile, client_name, client_version, \
     client_user_agent, client_origin, tool, ts_start, ts_end, duration_ms, \
     success, error_message, request_bytes, response_bytes, streamed";
@@ -28,7 +28,6 @@ pub struct CallRecord {
     pub id: Option<i64>,
     /// Canonical per-message correlation key from `current_request_context()`.
     pub request_uid: Option<String>,
-    pub jsonrpc_id: Option<String>,
     pub endpoint: Option<String>,
     pub server_name: Option<String>,
     pub server_type: Option<String>,
@@ -112,7 +111,6 @@ impl Store {
             "CREATE TABLE IF NOT EXISTS calls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 request_uid TEXT,
-                jsonrpc_id TEXT,
                 endpoint TEXT,
                 server_name TEXT,
                 server_type TEXT,
@@ -154,20 +152,19 @@ impl Store {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO calls (
-                    request_uid, jsonrpc_id, endpoint, server_name, server_type,
+                    request_uid, endpoint, server_name, server_type,
                     transport, profile, client_name, client_version,
                     client_user_agent, client_origin, tool, ts_start, ts_end,
                     duration_ms, success, error_message, request_bytes,
                     response_bytes, streamed
                 ) VALUES (
-                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                    ?15, ?16, ?17, ?18, ?19, ?20
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                    ?14, ?15, ?16, ?17, ?18, ?19
                 )",
             )?;
             for r in records {
                 stmt.execute(params![
                     r.request_uid,
-                    r.jsonrpc_id,
                     r.endpoint,
                     r.server_name,
                     r.server_type,
@@ -250,25 +247,24 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CallRecord> {
     Ok(CallRecord {
         id: row.get(0)?,
         request_uid: row.get(1)?,
-        jsonrpc_id: row.get(2)?,
-        endpoint: row.get(3)?,
-        server_name: row.get(4)?,
-        server_type: row.get(5)?,
-        transport: row.get(6)?,
-        profile: row.get(7)?,
-        client_name: row.get(8)?,
-        client_version: row.get(9)?,
-        client_user_agent: row.get(10)?,
-        client_origin: row.get(11)?,
-        tool: row.get(12)?,
-        ts_start: row.get(13)?,
-        ts_end: row.get(14)?,
-        duration_ms: row.get(15)?,
-        success: row.get::<_, i64>(16)? != 0,
-        error_message: row.get(17)?,
-        request_bytes: row.get(18)?,
-        response_bytes: row.get(19)?,
-        streamed: row.get::<_, i64>(20)? != 0,
+        endpoint: row.get(2)?,
+        server_name: row.get(3)?,
+        server_type: row.get(4)?,
+        transport: row.get(5)?,
+        profile: row.get(6)?,
+        client_name: row.get(7)?,
+        client_version: row.get(8)?,
+        client_user_agent: row.get(9)?,
+        client_origin: row.get(10)?,
+        tool: row.get(11)?,
+        ts_start: row.get(12)?,
+        ts_end: row.get(13)?,
+        duration_ms: row.get(14)?,
+        success: row.get::<_, i64>(15)? != 0,
+        error_message: row.get(16)?,
+        request_bytes: row.get(17)?,
+        response_bytes: row.get(18)?,
+        streamed: row.get::<_, i64>(19)? != 0,
     })
 }
 
