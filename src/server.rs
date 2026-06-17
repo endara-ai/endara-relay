@@ -1644,10 +1644,15 @@ async fn mcp_initialize_logged(
         .as_ref()
         .and_then(|c| c.version.clone())
         .unwrap_or_default();
+    // Mint a per-message UID (mirrors `handle_single_message`) so the direct
+    // route's `request` span and audit log carry a collision-free key for the
+    // desktop's row/overlay keying.
+    let request_uid = uuid::Uuid::new_v4().to_string();
     let span = tracing::info_span!(
         "request",
         method = "initialize",
         id = ?body.id,
+        request_uid = %request_uid,
         client = %client_json,
     );
     async move {
@@ -1658,6 +1663,7 @@ async fn mcp_initialize_logged(
         let resp_bytes = serde_json::to_string(&resp).map(|s| s.len()).unwrap_or(0);
         info!(
             method = "initialize",
+            request_uid = %request_uid,
             elapsed_ms = elapsed_ms,
             req_bytes = req_bytes,
             resp_bytes = resp_bytes,
@@ -1692,10 +1698,15 @@ async fn mcp_tools_list_logged(
         .as_ref()
         .and_then(|c| c.version.clone())
         .unwrap_or_default();
+    // Mint a per-message UID (mirrors `handle_single_message`) so the direct
+    // route's `request` span and audit log carry a collision-free key for the
+    // desktop's row/overlay keying.
+    let request_uid = uuid::Uuid::new_v4().to_string();
     let span = tracing::info_span!(
         "request",
         method = "tools/list",
         id = ?body.id,
+        request_uid = %request_uid,
         client = %client_json,
     );
     async move {
@@ -1706,6 +1717,7 @@ async fn mcp_tools_list_logged(
         let resp_bytes = serde_json::to_string(&resp.0).map(|s| s.len()).unwrap_or(0);
         info!(
             method = "tools/list",
+            request_uid = %request_uid,
             elapsed_ms = elapsed_ms,
             req_bytes = req_bytes,
             resp_bytes = resp_bytes,
@@ -1740,10 +1752,15 @@ async fn mcp_tools_call_logged(
         .as_ref()
         .and_then(|c| c.version.clone())
         .unwrap_or_default();
+    // Mint a per-message UID (mirrors `handle_single_message`) so the direct
+    // route's `request` span and audit log carry a collision-free key for the
+    // desktop's row/overlay keying.
+    let request_uid = uuid::Uuid::new_v4().to_string();
     let span = tracing::info_span!(
         "request",
         method = "tools/call",
         id = ?body.id,
+        request_uid = %request_uid,
         client = %client_json,
     );
     async move {
@@ -1756,6 +1773,7 @@ async fn mcp_tools_call_logged(
                 let resp_bytes = serde_json::to_string(resp).map(|s| s.len()).unwrap_or(0);
                 info!(
                     method = "tools/call",
+                    request_uid = %request_uid,
                     elapsed_ms = elapsed_ms,
                     req_bytes = req_bytes,
                     resp_bytes = resp_bytes,
@@ -1771,6 +1789,7 @@ async fn mcp_tools_call_logged(
                 if status_code >= 500 {
                     error!(
                         method = "tools/call",
+                        request_uid = %request_uid,
                         elapsed_ms = elapsed_ms,
                         req_bytes = req_bytes,
                         resp_bytes = resp_bytes,
@@ -1783,6 +1802,7 @@ async fn mcp_tools_call_logged(
                     // JSON-RPC 2.0: errors are returned with HTTP 200, not a sign of trouble.
                     info!(
                         method = "tools/call",
+                        request_uid = %request_uid,
                         elapsed_ms = elapsed_ms,
                         req_bytes = req_bytes,
                         resp_bytes = resp_bytes,
@@ -1794,6 +1814,7 @@ async fn mcp_tools_call_logged(
                 } else {
                     warn!(
                         method = "tools/call",
+                        request_uid = %request_uid,
                         elapsed_ms = elapsed_ms,
                         req_bytes = req_bytes,
                         resp_bytes = resp_bytes,
@@ -2359,6 +2380,172 @@ mod tests {
         assert!(result["capabilities"]["tools"].is_object());
         // No connected adapters → instructions field omitted (spec §2.1).
         assert!(result.get("instructions").is_none());
+    }
+
+    /// Test-only tracing [`Layer`] that records the `request_uid` field recorded
+    /// on each `request` span at creation. This reads the very field that
+    /// [`crate::events::SpanFieldCaptureLayer`] captures and
+    /// [`crate::events::current_request_context`] surfaces as
+    /// `RequestSpanContext::request_uid`, so capturing a non-empty value here
+    /// proves the direct-route logged wrappers mint a per-call UID onto their
+    /// `request` span.
+    use ::tracing::field::{Field, Visit};
+    use ::tracing::span::{Attributes, Id};
+    use ::tracing::Subscriber;
+    use ::tracing_subscriber::layer::Context;
+    use ::tracing_subscriber::registry::LookupSpan;
+    use ::tracing_subscriber::Layer as TracingLayer;
+
+    struct RequestUidProbeLayer {
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl<S> TracingLayer<S> for RequestUidProbeLayer
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
+            if attrs.metadata().name() != "request" {
+                return;
+            }
+            struct V<'a> {
+                out: &'a mut Option<String>,
+            }
+            impl Visit for V<'_> {
+                fn record_str(&mut self, field: &Field, value: &str) {
+                    if field.name() == "request_uid" {
+                        *self.out = Some(value.to_string());
+                    }
+                }
+                fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                    if field.name() == "request_uid" {
+                        *self.out = Some(format!("{:?}", value));
+                    }
+                }
+            }
+            let mut uid = None;
+            attrs.record(&mut V { out: &mut uid });
+            if let Some(uid) = uid {
+                self.seen.lock().unwrap().push(uid);
+            }
+        }
+    }
+
+    /// Drive a logged-wrapper future under the [`RequestUidProbeLayer`] and
+    /// return every `request_uid` minted onto a `request` span while it ran.
+    fn request_uids_for<F: std::future::Future>(fut: F) -> Vec<String> {
+        use ::tracing_subscriber::prelude::*;
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = ::tracing_subscriber::registry().with(RequestUidProbeLayer {
+            seen: Arc::clone(&seen),
+        });
+        ::tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(fut);
+        });
+        let captured = seen.lock().unwrap().clone();
+        captured
+    }
+
+    fn body_for(method: &str, params: Option<Value>) -> JsonRpcBody {
+        JsonRpcBody {
+            jsonrpc: Some("2.0".to_string()),
+            method: Some(method.to_string()),
+            params,
+            id: Some(json!(1)),
+        }
+    }
+
+    /// `mcp_initialize_logged` mints a fresh, non-empty UUID `request_uid` onto
+    /// its `request` span (the field `current_request_context()` surfaces).
+    #[test]
+    fn mcp_initialize_logged_mints_request_uid_span_field() {
+        let uids = request_uids_for(async {
+            let state = test_app_state();
+            let _ = mcp_initialize_logged(
+                State(state),
+                HeaderMap::new(),
+                Json(body_for("initialize", None)),
+            )
+            .await;
+        });
+        assert_eq!(uids.len(), 1, "expected one request span: {:?}", uids);
+        assert!(
+            uuid::Uuid::parse_str(&uids[0]).is_ok(),
+            "request_uid must be a valid UUID, got {:?}",
+            uids[0]
+        );
+    }
+
+    /// `mcp_tools_list_logged` mints a fresh, non-empty UUID `request_uid` onto
+    /// its `request` span.
+    #[test]
+    fn mcp_tools_list_logged_mints_request_uid_span_field() {
+        let uids = request_uids_for(async {
+            let state = test_app_state();
+            let _ = mcp_tools_list_logged(
+                State(state),
+                HeaderMap::new(),
+                Json(body_for("tools/list", None)),
+            )
+            .await;
+        });
+        assert_eq!(uids.len(), 1, "expected one request span: {:?}", uids);
+        assert!(
+            uuid::Uuid::parse_str(&uids[0]).is_ok(),
+            "request_uid must be a valid UUID, got {:?}",
+            uids[0]
+        );
+    }
+
+    /// `mcp_tools_call_logged` mints a fresh, non-empty UUID `request_uid` onto
+    /// its `request` span — the route whose inner upstream calls feed
+    /// `ToolCallEvent::Started.request_uid`.
+    #[test]
+    fn mcp_tools_call_logged_mints_request_uid_span_field() {
+        let uids = request_uids_for(async {
+            let state = test_app_state();
+            let _ = mcp_tools_call_logged(
+                State(state),
+                HeaderMap::new(),
+                Json(body_for(
+                    "tools/call",
+                    Some(json!({ "name": "list_tools", "arguments": {} })),
+                )),
+            )
+            .await;
+        });
+        assert_eq!(uids.len(), 1, "expected one request span: {:?}", uids);
+        assert!(
+            uuid::Uuid::parse_str(&uids[0]).is_ok(),
+            "request_uid must be a valid UUID, got {:?}",
+            uids[0]
+        );
+    }
+
+    /// Each direct-route call mints its own UID, so concurrent direct callers
+    /// never collide on the desktop's row/overlay key.
+    #[test]
+    fn direct_route_request_uids_are_unique_per_call() {
+        let uids = request_uids_for(async {
+            for _ in 0..2 {
+                let state = test_app_state();
+                let _ = mcp_tools_call_logged(
+                    State(state),
+                    HeaderMap::new(),
+                    Json(body_for(
+                        "tools/call",
+                        Some(json!({ "name": "list_tools", "arguments": {} })),
+                    )),
+                )
+                .await;
+            }
+        });
+        assert_eq!(uids.len(), 2, "expected two request spans: {:?}", uids);
+        assert_ne!(uids[0], uids[1], "each call must mint a fresh UID");
     }
 
     #[tokio::test]
