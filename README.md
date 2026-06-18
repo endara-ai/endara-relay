@@ -19,11 +19,13 @@ Add servers, manage OAuth, connect any AI client — all from one place.
 ## Why?
 
 - **One endpoint, not N** — point every AI client at `localhost:9400` instead of pasting the same MCP server config into each app.
-- **OAuth managed for you** — Relay handles token storage and refresh for servers that need it, so your clients don't have to.
+- **Works out of the box** — the `[relay]` table is optional; `machine_name` defaults to your system hostname, so a fresh install runs with nothing but a list of endpoints.
+- **OAuth managed for you** — Relay handles token storage and refresh for servers that need it, and signs you in just in time when an upstream returns `401`.
+- **Run servers in containers** — opt-in Docker / Podman isolation for STDIO servers, with a direct-spawn fallback when no runtime is present.
 - **Hot-reload config** — edit your TOML, save, and Relay picks up the change without a restart.
 - **Automatic restart on crash** — flaky STDIO servers come back on their own with exponential backoff.
 - **Endpoint profiles** — serve named subsets of your endpoints under their own `/mcp/{profile}` URL so different agents can share one relay without sharing one catalog.
-- **Live tool-call event stream** — subscribe to every tool call via Server-Sent Events on the management API; powers the [Endara Desktop](https://github.com/endara-ai/endara-desktop) overlay.
+- **Live tool-call event stream** — subscribe to every tool call (with the calling client's identity) via Server-Sent Events on the management API; powers the [Endara Desktop](https://github.com/endara-ai/endara-desktop) overlay and Observability tab.
 - **Fully local** — no cloud, no accounts, no telemetry. Everything runs on your machine.
 
 ---
@@ -70,8 +72,8 @@ cargo install endara-relay
 ```bash
 mkdir -p ~/.endara
 cat > ~/.endara/config.toml << 'EOF'
-[relay]
-machine_name = "my-laptop"
+# The [relay] table is optional — when omitted, machine_name defaults to your
+# system hostname. The minimal config is just a list of endpoints.
 
 [[endpoints]]
 name = "filesystem"
@@ -110,10 +112,14 @@ Point Claude Desktop (or any MCP client) to `http://localhost:9400/mcp`. You'll 
 The config file is TOML. Here's a complete reference:
 
 ```toml
+# The entire [relay] table is optional. Omit it and every field below takes
+# its default; machine_name falls back to your system hostname.
 [relay]
-machine_name = "my-laptop"        # Required — identifies this machine
+machine_name = "my-laptop"        # Optional — defaults to the system hostname
 local_js_execution = true         # Optional — enable JS execution mode (default: false)
 toon_output = true                # Optional — convert JSON tool responses to TOON (default: true)
+validate_inputs = true            # Optional — validate tools/call arguments against each
+                                  # tool's inputSchema before forwarding (default: true)
 startup_init_timeout_secs = 60    # Optional — cap on how long the MCP listener waits for
                                   # adapter init before binding 9400 anyway (default: 60)
 
@@ -124,6 +130,10 @@ transport = "stdio"               # Required — "stdio", "sse", or "http"
 command = "npx"                   # Required for stdio — command to run
 args = ["-y", "@modelcontextprotocol/server-github"]  # Optional — command arguments
 env = { GITHUB_TOKEN = "$GITHUB_TOKEN" }              # Optional — environment variables
+# Optional container isolation (stdio only) — run the server in Docker / Podman
+isolation = "container"           # Optional — "container" or "none" (default: "none")
+container_image = "ghcr.io/endara-ai/mcp-runner:latest"  # Optional — defaults to mcp-runner
+mounts = ["/Users/me/projects:/projects"]  # Optional — host:container bind mounts
 
 # SSE endpoint — connects to a Server-Sent Events MCP server
 [[endpoints]]
@@ -219,6 +229,14 @@ No restart required.
 
 If a STDIO server process crashes, Relay automatically restarts it with exponential backoff. After repeated failures, the endpoint is marked unhealthy. This keeps your tool catalog available even when individual servers are flaky.
 
+### Container isolation
+
+STDIO servers can run inside a container instead of directly on your machine. Set `isolation = "container"` on a stdio endpoint and Relay autodetects Docker or Podman, runs the server in the `ghcr.io/endara-ai/mcp-runner` image (override with `container_image`), and grants no host filesystem access unless you list `mounts` (`"host/path:/container/path"`). When no container runtime is present, Relay falls back to spawning the process directly so the endpoint keeps working. Container stderr is captured into the endpoint logs just like a direct spawn.
+
+### Input validation
+
+Before forwarding a `tools/call` to the upstream server, Relay validates the supplied `arguments` against that tool's advertised JSON Schema `inputSchema`. Malformed calls are rejected at the relay with a schema error instead of reaching the server. This is on by default; set `validate_inputs = false` under `[relay]` to bypass it for servers with deliberately loose schemas. The toggle is hot-reloadable.
+
 ### Endpoint profiles
 
 Profiles are named subsets of your registered endpoints served under their own MCP URL. Pointing a client at `http://localhost:9400/mcp/{profile}` (or `http://localhost:9400/mcp/sse/{profile}` for legacy SSE clients) exposes only the tools from the endpoints in that profile's allow-list, so different agents or clients can share one relay without sharing one catalog. The unprefixed `/mcp` URL continues to serve the union of every enabled endpoint.
@@ -227,7 +245,11 @@ Each profile owns its own `local_js_execution` and `toon_output` values independ
 
 ### Tool-call event stream
 
-The management API exposes a Server-Sent Events stream at `GET /api/events/tool-calls` that publishes every MCP tool call routed through the relay, with lifecycle (in-flight, success, failure), duration, upstream endpoint, and tool name. This is what powers the [Endara Desktop](https://github.com/endara-ai/endara-desktop) tool-call overlay; you can subscribe directly for custom dashboards or telemetry pipelines.
+The management API exposes a Server-Sent Events stream at `GET /api/events/tool-calls` that publishes every MCP tool call routed through the relay, with lifecycle (in-flight, success, failure), duration, upstream endpoint, tool name, and the identity of the calling MCP client (captured from each session's `initialize` request). This is what powers the [Endara Desktop](https://github.com/endara-ai/endara-desktop) tool-call overlay; you can subscribe directly for custom dashboards or telemetry pipelines.
+
+### Agent-call observability
+
+Beyond the live event stream, Relay keeps a durable record of every tool call so you can review history after the fact. Metadata (endpoint, tool, timing, success/failure, byte counts) is written to an on-disk SQLite store, and full request/response payloads are held in an in-memory ring buffer for a configurable window. Configure it under `[relay.observability]` (retention, size caps, payload window — all optional with sensible defaults) and query it through the `/api/observability/*` management endpoints. This powers [Endara Desktop](https://github.com/endara-ai/endara-desktop)'s **Observability** tab.
 
 ### JS execution mode
 
@@ -285,7 +307,11 @@ A curated subset of the API:
 | `POST` | `/api/endpoints/:name/disable` &nbsp;/ `enable` | Hide or restore an endpoint without removing it |
 | `GET` | `/api/config` | View current config (env values redacted) |
 | `POST` | `/api/config/reload` | Trigger a config reload |
-| `GET` | `/api/events/tool-calls` | Server-Sent Events stream of every tool call (in-flight, success, failure, duration) |
+| `GET` | `/api/events/tool-calls` | Server-Sent Events stream of every tool call (in-flight, success, failure, duration, calling client) |
+| `GET` | `/api/observability/calls` | Query recorded tool calls (filter by endpoint, tool, status, time window) |
+| `GET` | `/api/observability/calls/:request_uid` | Full request/response payload for one recorded call |
+| `GET` | `/api/observability/aggregates` | Time-bucketed call counts and latency aggregates |
+| `POST` | `/api/observability/purge` | Clear all recorded calls and buffered payloads |
 
 OAuth flows (`/api/endpoints/:name/oauth/*`, `/api/oauth/setup/*`) and per-tool enable/disable endpoints are documented in full on the [Endara Relay docs](https://endara.ai/docs/relay#management-api).
 
