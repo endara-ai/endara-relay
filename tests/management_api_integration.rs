@@ -4,7 +4,10 @@
 //! /api/endpoints/:name/tools, /api/endpoints/:name/refresh,
 //! /api/endpoints/:name/logs, /api/config.
 
+mod common;
+
 use async_trait::async_trait;
+use common::wait::{poll_until, wait_http_ready};
 use endara_relay::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use endara_relay::config::{Config, EndpointConfig, ObservabilityConfig, RelayConfig, Transport};
 use endara_relay::management::{management_routes, ManagementState};
@@ -15,7 +18,7 @@ use endara_relay::registry::AdapterRegistry;
 use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 
 /// Mock adapter for management API tests.
@@ -157,8 +160,11 @@ async fn start_management_server(
         axum::serve(listener, app).await.ok();
     });
 
-    // Give server a moment to start
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Wait until the server is accepting connections.
+    assert!(
+        wait_http_ready(&format!("http://{addr}/"), Duration::from_secs(10)).await,
+        "management server did not become ready within 10s"
+    );
 
     (addr, handle)
 }
@@ -347,7 +353,11 @@ async fn start_management_server_with_config(
         axum::serve(listener, app).await.ok();
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Wait until the server is accepting connections.
+    assert!(
+        wait_http_ready(&format!("http://{addr}/"), Duration::from_secs(10)).await,
+        "management server did not become ready within 10s"
+    );
     (addr, handle)
 }
 
@@ -406,8 +416,31 @@ command = "cat"
     assert_eq!(body["ok"], true);
     assert_eq!(body["message"], "config reloaded");
 
-    // Allow a moment for the adapter to initialize
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // Wait until the reloaded adapter's endpoint shows up in the API.
+    assert!(
+        poll_until(Duration::from_secs(10), || async {
+            let Ok(resp) = client
+                .get(format!("http://{}/api/endpoints", addr))
+                .send()
+                .await
+            else {
+                return false;
+            };
+            let Ok(endpoints) = resp.json::<Value>().await else {
+                return false;
+            };
+            endpoints
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|e| e["name"].as_str())
+                        .any(|n| n == "new-ep")
+                })
+                .unwrap_or(false)
+        })
+        .await,
+        "config reload: new-ep never appeared in /api/endpoints within 10s"
+    );
 
     // GET /api/endpoints — should now include the new endpoint
     let resp = client
@@ -825,7 +858,11 @@ async fn start_observability_server(
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.ok();
     });
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Wait until the server is accepting connections.
+    assert!(
+        wait_http_ready(&format!("http://{addr}/"), Duration::from_secs(10)).await,
+        "observability server did not become ready within 10s"
+    );
     (addr, store, payloads, handle)
 }
 

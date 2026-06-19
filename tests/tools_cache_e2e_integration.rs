@@ -12,6 +12,7 @@ mod common;
 use common::api_client::ApiClient;
 use common::config::ConfigBuilder;
 use common::harness::RelayHarness;
+use common::wait::poll_until;
 use serde_json::json;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -23,18 +24,6 @@ fn read_count(path: &Path) -> u64 {
         .ok()
         .and_then(|s| s.trim().parse().ok())
         .unwrap_or(0)
-}
-
-/// Poll `predicate` every 20ms until it returns true or `deadline` elapses.
-async fn poll_until<F: FnMut() -> bool>(deadline: Duration, mut predicate: F) -> bool {
-    let stop = Instant::now() + deadline;
-    while Instant::now() < stop {
-        if predicate() {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    predicate()
 }
 
 /// GET `/api/endpoints/<name>/tools` and return the tool name set.
@@ -85,7 +74,10 @@ async fn test_per_adapter_tools_cache_end_to_end() {
         "extra tool should NOT be present before swap, got {names:?}"
     );
     assert!(
-        poll_until(Duration::from_secs(2), || read_count(&count_path) >= 1).await,
+        poll_until(Duration::from_secs(2), || async {
+            read_count(&count_path) >= 1
+        })
+        .await,
         "fixture never recorded the first tools/list call"
     );
     assert_eq!(
@@ -126,7 +118,10 @@ async fn test_per_adapter_tools_cache_end_to_end() {
 
     let _ = fetch_tool_names(api, tools_url).await;
     assert!(
-        poll_until(Duration::from_secs(2), || read_count(&count_path) >= 2).await,
+        poll_until(Duration::from_secs(2), || async {
+            read_count(&count_path) >= 2
+        })
+        .await,
         "lifecycle invalidation: expected upstream count to reach 2, got {}",
         read_count(&count_path)
     );
@@ -217,7 +212,10 @@ async fn test_refresh_endpoint_invalidates_per_endpoint_cache() {
     // 1. First GET primes the cache → upstream count = 1.
     let _ = fetch_tool_names(api, tools_url).await;
     assert!(
-        poll_until(Duration::from_secs(2), || read_count(&count_path) >= 1).await,
+        poll_until(Duration::from_secs(2), || async {
+            read_count(&count_path) >= 1
+        })
+        .await,
         "fixture never recorded the first tools/list call"
     );
     assert_eq!(
@@ -241,7 +239,10 @@ async fn test_refresh_endpoint_invalidates_per_endpoint_cache() {
     let (status, _) = api.post_empty_status(refresh_url).await;
     assert!(status.is_success(), "refresh failed: {status}");
     assert!(
-        poll_until(Duration::from_secs(2), || read_count(&count_path) >= 2).await,
+        poll_until(Duration::from_secs(2), || async {
+            read_count(&count_path) >= 2
+        })
+        .await,
         "refresh: expected upstream count to reach 2, got {}",
         read_count(&count_path)
     );
@@ -311,7 +312,10 @@ async fn test_per_tool_disable_enable_invalidates_catalog_cache() {
         "expected get_status in initial catalog, got {names:?}"
     );
     assert!(
-        poll_until(Duration::from_secs(2), || read_count(&count_path) >= 1).await,
+        poll_until(Duration::from_secs(2), || async {
+            read_count(&count_path) >= 1
+        })
+        .await,
         "fixture never recorded the first tools/list call"
     );
     assert_eq!(
@@ -347,7 +351,10 @@ async fn test_per_tool_disable_enable_invalidates_catalog_cache() {
         "non-disabled tool swap_tools must remain in catalog: {names_after_disable:?}"
     );
     assert!(
-        poll_until(Duration::from_secs(2), || read_count(&count_path) >= 2).await,
+        poll_until(Duration::from_secs(2), || async {
+            read_count(&count_path) >= 2
+        })
+        .await,
         "per-tool disable: expected upstream count to reach 2, got {}",
         read_count(&count_path)
     );
@@ -378,7 +385,7 @@ async fn test_per_tool_disable_enable_invalidates_catalog_cache() {
         "catalog cache was not invalidated on enable: get_status missing: {names_after_enable:?}"
     );
     assert!(
-        poll_until(Duration::from_secs(2), || {
+        poll_until(Duration::from_secs(2), || async {
             read_count(&count_path) > count_after_disable
         })
         .await,
