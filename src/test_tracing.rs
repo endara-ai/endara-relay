@@ -52,6 +52,10 @@ static INIT: OnceLock<()> = OnceLock::new();
 /// from every test; only the first call wins.
 pub(crate) fn init_permissive_tracing() {
     INIT.get_or_init(|| {
-        let _ = tracing::subscriber::set_global_default(PermissiveSubscriber);
+        tracing::subscriber::set_global_default(PermissiveSubscriber).expect(
+            "init_permissive_tracing: a global tracing subscriber was already installed; \
+             the permissive callsite-interest de-poisoning subscriber must be the only \
+             global default during tests",
+        );
     });
 }
