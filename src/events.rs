@@ -815,7 +815,9 @@ mod tests {
     /// both values via [`current_request_context`] — this is the foundation for
     /// per-event `request_uid` plumbing without a `call_tool` trait change.
     #[test]
+    #[serial_test::serial(tracing)]
     fn current_request_context_walks_request_and_mcp_request_spans() {
+        crate::test_tracing::init_permissive_tracing();
         use tracing::Instrument;
         use tracing_subscriber::prelude::*;
 
@@ -849,7 +851,9 @@ mod tests {
     /// running outside an HTTP-routed request (e.g. background init) must
     /// degrade silently.
     #[test]
+    #[serial_test::serial(tracing)]
     fn current_request_context_without_spans_returns_none() {
+        crate::test_tracing::init_permissive_tracing();
         use tracing_subscriber::prelude::*;
         let subscriber = tracing_subscriber::registry().with(SpanFieldCaptureLayer);
         tracing::subscriber::with_default(subscriber, || {
@@ -863,7 +867,9 @@ mod tests {
     /// a typed value so adapter event emitters can populate
     /// [`ToolCallEvent::Started::client`] without re-deriving it.
     #[test]
+    #[serial_test::serial(tracing)]
     fn current_request_context_captures_client_from_request_span() {
+        crate::test_tracing::init_permissive_tracing();
         use tracing::Instrument;
         use tracing_subscriber::prelude::*;
 
@@ -895,7 +901,9 @@ mod tests {
     /// A malformed `client` field on the `request` span must not propagate;
     /// the visitor silently drops the value so dispatch stays resilient.
     #[test]
+    #[serial_test::serial(tracing)]
     fn current_request_context_ignores_malformed_client_field() {
+        crate::test_tracing::init_permissive_tracing();
         use tracing::Instrument;
         use tracing_subscriber::prelude::*;
         let subscriber = tracing_subscriber::registry().with(SpanFieldCaptureLayer);

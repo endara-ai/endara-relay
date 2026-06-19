@@ -2089,7 +2089,9 @@ with open(record_path, "w") as rec:
     /// `#[test]` (not `#[tokio::test]`) because we install the capture layer
     /// via `with_default(...)` and drive an inner current-thread runtime.
     #[test]
+    #[serial_test::serial(tracing)]
     fn call_tool_publishes_request_uid_from_request_span() {
+        crate::test_tracing::init_permissive_tracing();
         use crate::events::{SpanFieldCaptureLayer, ToolCallEvent, ToolCallEventBus};
         use tracing::Instrument;
         use tracing_subscriber::prelude::*;

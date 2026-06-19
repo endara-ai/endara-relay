@@ -2462,7 +2462,9 @@ mod tests {
     /// `mcp_initialize_logged` mints a fresh, non-empty UUID `request_uid` onto
     /// its `request` span (the field `current_request_context()` surfaces).
     #[test]
+    #[serial_test::serial(tracing)]
     fn mcp_initialize_logged_mints_request_uid_span_field() {
+        crate::test_tracing::init_permissive_tracing();
         let uids = request_uids_for(async {
             let state = test_app_state();
             let _ = mcp_initialize_logged(
@@ -2483,7 +2485,9 @@ mod tests {
     /// `mcp_tools_list_logged` mints a fresh, non-empty UUID `request_uid` onto
     /// its `request` span.
     #[test]
+    #[serial_test::serial(tracing)]
     fn mcp_tools_list_logged_mints_request_uid_span_field() {
+        crate::test_tracing::init_permissive_tracing();
         let uids = request_uids_for(async {
             let state = test_app_state();
             let _ = mcp_tools_list_logged(
@@ -2505,7 +2509,9 @@ mod tests {
     /// its `request` span — the route whose inner upstream calls feed
     /// `ToolCallEvent::Started.request_uid`.
     #[test]
+    #[serial_test::serial(tracing)]
     fn mcp_tools_call_logged_mints_request_uid_span_field() {
+        crate::test_tracing::init_permissive_tracing();
         let uids = request_uids_for(async {
             let state = test_app_state();
             let _ = mcp_tools_call_logged(
@@ -2529,7 +2535,9 @@ mod tests {
     /// Each direct-route call mints its own UID, so concurrent direct callers
     /// never collide on the desktop's row/overlay key.
     #[test]
+    #[serial_test::serial(tracing)]
     fn direct_route_request_uids_are_unique_per_call() {
+        crate::test_tracing::init_permissive_tracing();
         let uids = request_uids_for(async {
             for _ in 0..2 {
                 let state = test_app_state();
@@ -5119,7 +5127,9 @@ mod tests {
             // child event's formatted output carries the parent's `profile`
             // field.
             #[tokio::test(flavor = "current_thread")]
+            #[serial_test::serial(tracing)]
             async fn field_present_on_profiled_request() {
+                crate::test_tracing::init_permissive_tracing();
                 let buf = BufWriter::default();
                 let subscriber = ::tracing_subscriber::fmt()
                     .with_writer(buf.clone())
@@ -5159,7 +5169,9 @@ mod tests {
             // accidental insertion (e.g. a stray default span) would break
             // the desktop log filter's per-profile dropdown.
             #[tokio::test(flavor = "current_thread")]
+            #[serial_test::serial(tracing)]
             async fn field_absent_on_global_request() {
+                crate::test_tracing::init_permissive_tracing();
                 let buf = BufWriter::default();
                 let subscriber = ::tracing_subscriber::fmt()
                     .with_writer(buf.clone())

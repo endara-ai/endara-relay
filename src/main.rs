@@ -26,6 +26,8 @@ mod profile_registry;
 mod registry;
 mod server;
 mod shell_env;
+#[cfg(test)]
+mod test_tracing;
 mod toon_convert;
 
 use adapter::oauth::{OAuthAdapter, OAuthAdapterConfig, OAuthAdapterInner};

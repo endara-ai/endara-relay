@@ -2766,7 +2766,9 @@ mod tests {
     /// via `with_default(...)` and drive an inner current-thread runtime so
     /// the dispatcher stays attached across `tokio::spawn`'d tasks.
     #[test]
+    #[serial_test::serial(tracing)]
     fn call_tool_publishes_request_uid_and_profile_from_request_span() {
+        crate::test_tracing::init_permissive_tracing();
         use crate::events::{SpanFieldCaptureLayer, ToolCallEvent, ToolCallEventBus};
         use tracing::Instrument;
         use tracing_subscriber::prelude::*;

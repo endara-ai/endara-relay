@@ -1735,7 +1735,9 @@ mod tests {
     /// overwrites the others. The batch stays correlated via the shared inbound
     /// request span and the per-call `request_uid`s minted by the capture block.
     #[tokio::test]
+    #[serial_test::serial(tracing)]
     async fn batched_inner_calls_get_distinct_request_uids() {
+        crate::test_tracing::init_permissive_tracing();
         use crate::config::ObservabilityConfig;
         use crate::events::SpanFieldCaptureLayer;
         use crate::observability::payloads::PayloadStore;

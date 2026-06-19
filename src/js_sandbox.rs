@@ -3107,7 +3107,9 @@ mod tests {
     /// resolves the aggregating client rather than `None`. This is the exact
     /// failure the task reproduced live before the fix.
     #[test]
+    #[serial_test::serial(tracing)]
     fn sandbox_tool_call_reestablishes_client_context() {
+        crate::test_tracing::init_permissive_tracing();
         use crate::events::{current_request_context, ClientIdentity, SpanFieldCaptureLayer};
         use std::sync::Mutex;
         use tracing_subscriber::prelude::*;
@@ -3204,7 +3206,9 @@ mod tests {
     /// `ToolCallEvent::Started.request_uid` and the desktop's collision-free
     /// row/overlay key) resolves the outer UID rather than `None`.
     #[test]
+    #[serial_test::serial(tracing)]
     fn sandbox_tool_call_reestablishes_request_uid() {
+        crate::test_tracing::init_permissive_tracing();
         use crate::events::{current_request_context, SpanFieldCaptureLayer};
         use std::sync::Mutex;
         use tracing_subscriber::prelude::*;
@@ -3285,7 +3289,9 @@ mod tests {
     /// `current_request_context().client` as `None` rather than fabricating an
     /// empty identity.
     #[test]
+    #[serial_test::serial(tracing)]
     fn sandbox_tool_call_without_client_leaves_context_none() {
+        crate::test_tracing::init_permissive_tracing();
         use crate::events::{current_request_context, ClientIdentity, SpanFieldCaptureLayer};
         use std::sync::Mutex;
         use tracing_subscriber::prelude::*;
