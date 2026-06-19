@@ -202,7 +202,23 @@ fn is_executable(path: &Path) -> bool {
 /// touches the client binary (never the daemon), so it is fast even when the
 /// engine VM is stopped.
 fn cli_version(cli: &Path) -> Option<String> {
-    let output = std::process::Command::new(cli).arg("--version").output();
+    // Spawning a freshly written/copied binary can transiently fail with
+    // ETXTBSY ("text file busy") while another handle still has it open for
+    // writing. Retry a bounded number of times before giving up.
+    const MAX_ATTEMPTS: usize = 10;
+    let mut output = std::process::Command::new(cli).arg("--version").output();
+    for _ in 1..MAX_ATTEMPTS {
+        match &output {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    || e.raw_os_error() == Some(26) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                output = std::process::Command::new(cli).arg("--version").output();
+            }
+            _ => break,
+        }
+    }
     match output {
         Ok(out) if out.status.success() => parse_cli_version(&String::from_utf8_lossy(&out.stdout)),
         Ok(out) => {
