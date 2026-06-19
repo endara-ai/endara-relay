@@ -1945,7 +1945,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial(tracing)]
     async fn adapter_init_warns_when_falling_back_to_toml_secret() {
+        crate::test_tracing::init_permissive_tracing();
         use std::io;
         use std::sync::{Arc, Mutex};
         use tracing_subscriber::fmt::MakeWriter;

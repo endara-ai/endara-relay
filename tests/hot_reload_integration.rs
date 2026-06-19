@@ -3,6 +3,9 @@
 //! Creates a temp config file, starts relay with it,
 //! modifies config to add/remove endpoints, verifies changes are applied.
 
+mod common;
+
+use common::wait::poll_until;
 use endara_relay::adapter::stdio::{StdioAdapter, StdioConfig};
 use endara_relay::adapter::McpAdapter;
 use endara_relay::config;
@@ -176,7 +179,13 @@ async fn test_config_diff_add_endpoint() {
     .await;
 
     // Wait for background initialization to complete
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert!(
+        poll_until(std::time::Duration::from_secs(10), || async {
+            registry.merged_catalog().await.len() > 1
+        })
+        .await,
+        "background initialization never produced more than 1 tool after adding multi-ep"
+    );
 
     // Verify the new endpoint was added
     let catalog = registry.merged_catalog().await;

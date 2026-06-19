@@ -4,6 +4,9 @@
 //! performs initialize/list_tools/call_tool, then shuts down the server
 //! and verifies the adapter detects unhealthy state.
 
+mod common;
+
+use common::wait::wait_http_ready;
 use endara_relay::adapter::sse::{SseAdapter, SseConfig};
 use endara_relay::adapter::{HealthStatus, McpAdapter};
 use serde_json::json;
@@ -29,7 +32,14 @@ async fn start_sse_server() -> (tokio::process::Child, u16) {
         .expect("failed to start fixture-sse-server");
 
     // Wait for server to be ready
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        wait_http_ready(
+            &format!("http://127.0.0.1:{port}/"),
+            Duration::from_secs(10)
+        )
+        .await,
+        "fixture-sse-server did not start accepting connections within 10s on port {port}"
+    );
 
     (child, port)
 }
