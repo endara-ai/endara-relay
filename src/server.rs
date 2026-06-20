@@ -332,6 +332,32 @@ fn identity_from_initialize_params(params: Option<&Value>) -> ClientIdentity {
     }
 }
 
+/// Extract a [`ClientIdentity`] from a 2026 request's
+/// `params._meta["io.modelcontextprotocol/clientInfo"]` object. Because the
+/// 2026 dialect removes the `initialize` handshake, a stateless client attaches
+/// its identity on every request under this reverse-DNS `_meta` key instead of
+/// in an `initialize` body. Mirrors [`identity_from_initialize_params`]: every
+/// field is optional, so a malformed payload degrades to an empty identity
+/// rather than rejecting the request. (`title`, when present, is not stored —
+/// [`ClientIdentity`] carries only `name`/`version`.)
+fn identity_from_meta_client_info(params: Option<&Value>) -> ClientIdentity {
+    let Some(info) = protocol::meta_client_info(params) else {
+        return ClientIdentity::default();
+    };
+    ClientIdentity {
+        name: info
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        version: info
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        user_agent: None,
+        origin: None,
+    }
+}
+
 /// Fold `fallback`'s non-empty fields into `primary` so structured
 /// `clientInfo` (name/version from `initialize`) wins over the per-request
 /// `User-Agent`/`Origin` headers when both are present.
@@ -361,6 +387,44 @@ fn resolve_inbound_identity(state: &AppState, headers: &HeaderMap) -> Option<Cli
         Some(s) => merge_identity(s, header_identity),
         None => header_identity,
     };
+    if merged.is_empty() {
+        None
+    } else {
+        Some(merged)
+    }
+}
+
+/// Resolve the caller's [`ClientIdentity`] for a non-`initialize` inbound
+/// message, branching on the per-request detected dialect (D2/D3).
+///
+/// 2026 clients are stateless — they send no `initialize` handshake and no
+/// `Mcp-Session-Id`, attaching their identity on every request under
+/// `params._meta["io.modelcontextprotocol/clientInfo"]` instead. When the
+/// request is detected as 2026 (an explicit `MCP-Protocol-Version: 2026-07-28`
+/// header, or `_meta` clientInfo present with no handshake), identity is read
+/// from that per-request `_meta` payload — merged with the `User-Agent`/`Origin`
+/// header fallback — rather than from the session cache.
+///
+/// Legacy clients (`2024-11-05` / `2025-03-26`) fall through to
+/// [`resolve_inbound_identity`] unchanged, preserving the session-cache lookup
+/// byte-for-byte.
+fn resolve_inbound_identity_versioned(
+    state: &AppState,
+    headers: &HeaderMap,
+    params: Option<&Value>,
+) -> Option<ClientIdentity> {
+    let dialect = protocol::detect_inbound_dialect(
+        false,
+        header_str(headers, protocol::MCP_PROTOCOL_VERSION_HEADER),
+        params,
+    );
+    if !dialect.is_2026() {
+        return resolve_inbound_identity(state, headers);
+    }
+    let merged = merge_identity(
+        identity_from_meta_client_info(params),
+        identity_from_headers(headers),
+    );
     if merged.is_empty() {
         None
     } else {
@@ -1126,7 +1190,13 @@ fn resolve_identity_for_message(
 ) -> (Option<ClientIdentity>, Option<String>) {
     let is_initialize = msg.get("method").and_then(|v| v.as_str()) == Some("initialize");
     if !is_initialize {
-        return (resolve_inbound_identity(state, headers), None);
+        // Non-`initialize` messages branch on the detected dialect: 2026 clients
+        // are stateless and carry identity in `params._meta` (no session), while
+        // legacy clients keep the session-cache lookup unchanged.
+        return (
+            resolve_inbound_identity_versioned(state, headers, msg.get("params")),
+            None,
+        );
     }
     // `initialize`: issue a fresh session id unconditionally so the
     // client can echo it on follow-ups, even when it sent no
@@ -1719,7 +1789,7 @@ async fn mcp_tools_list_logged(
     headers: HeaderMap,
     body: Json<JsonRpcBody>,
 ) -> Json<Value> {
-    let identity = resolve_inbound_identity(&state.0, &headers);
+    let identity = resolve_inbound_identity_versioned(&state.0, &headers, body.params.as_ref());
     let client_json = identity
         .as_ref()
         .filter(|c| !c.is_empty())
@@ -1773,7 +1843,7 @@ async fn mcp_tools_call_logged(
     headers: HeaderMap,
     body: Json<JsonRpcBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let identity = resolve_inbound_identity(&state.0, &headers);
+    let identity = resolve_inbound_identity_versioned(&state.0, &headers, body.params.as_ref());
     let client_json = identity
         .as_ref()
         .filter(|c| !c.is_empty())
@@ -2276,6 +2346,127 @@ mod tests {
         assert!(session_id.is_some());
         // Empty identities are not cached.
         assert!(state.session_identities.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn identity_from_meta_client_info_extracts_name_and_version() {
+        let params = json!({
+            "_meta": {
+                protocol::META_CLIENT_INFO_KEY: { "name": "claude-ai", "version": "2.0.0" },
+            },
+        });
+        let id = identity_from_meta_client_info(Some(&params));
+        assert_eq!(id.name.as_deref(), Some("claude-ai"));
+        assert_eq!(id.version.as_deref(), Some("2.0.0"));
+        assert!(id.user_agent.is_none());
+        assert!(id.origin.is_none());
+    }
+
+    #[test]
+    fn identity_from_meta_client_info_missing_is_empty() {
+        // No `_meta` at all, and a `_meta` without the clientInfo key, both
+        // degrade to an empty identity rather than panicking.
+        assert!(identity_from_meta_client_info(None).is_empty());
+        assert!(identity_from_meta_client_info(Some(&json!({}))).is_empty());
+        assert!(identity_from_meta_client_info(Some(&json!({ "_meta": {} }))).is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_inbound_identity_versioned_2026_reads_meta_client_info() {
+        // A 2026 client sends no `initialize` and no `Mcp-Session-Id`; identity
+        // comes from per-request `_meta` clientInfo. Seed the session store to
+        // prove the 2026 path does NOT consult it.
+        let state = test_app_state();
+        state
+            .session_identities
+            .lock()
+            .unwrap()
+            .insert("stale".into(), identity("should-not-be-used", "9.9"));
+
+        let params = json!({
+            "_meta": {
+                protocol::META_CLIENT_INFO_KEY: { "name": "stateless-client", "version": "3.1" },
+            },
+        });
+
+        // Detected via the explicit protocol header.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            protocol::MCP_PROTOCOL_VERSION_HEADER,
+            HeaderValue::from_static("2026-07-28"),
+        );
+        let resolved = resolve_inbound_identity_versioned(&state, &headers, Some(&params))
+            .expect("2026 identity must resolve from _meta");
+        assert_eq!(resolved.name.as_deref(), Some("stateless-client"));
+        assert_eq!(resolved.version.as_deref(), Some("3.1"));
+
+        // Detected via `_meta` clientInfo presence alone (no header).
+        let resolved = resolve_inbound_identity_versioned(&state, &HeaderMap::new(), Some(&params))
+            .expect("2026 identity must resolve from _meta without a header");
+        assert_eq!(resolved.name.as_deref(), Some("stateless-client"));
+        assert_eq!(resolved.version.as_deref(), Some("3.1"));
+    }
+
+    #[tokio::test]
+    async fn resolve_inbound_identity_versioned_2026_merges_header_fallback() {
+        // `_meta` clientInfo wins on name/version; `User-Agent`/`Origin`
+        // headers still fill the fields it leaves empty.
+        let state = test_app_state();
+        let params = json!({
+            "_meta": { protocol::META_CLIENT_INFO_KEY: { "name": "stateless-client" } },
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("relay-test/0.1"));
+        headers.insert("origin", HeaderValue::from_static("https://example.test"));
+        let resolved = resolve_inbound_identity_versioned(&state, &headers, Some(&params))
+            .expect("identity must resolve");
+        assert_eq!(resolved.name.as_deref(), Some("stateless-client"));
+        assert_eq!(resolved.user_agent.as_deref(), Some("relay-test/0.1"));
+        assert_eq!(resolved.origin.as_deref(), Some("https://example.test"));
+    }
+
+    #[tokio::test]
+    async fn resolve_inbound_identity_versioned_legacy_uses_session_cache() {
+        // A legacy client (no 2026 header, no `_meta` clientInfo) keeps the
+        // existing session-cache lookup byte-for-byte.
+        let state = test_app_state();
+        let sid = "legacy-session";
+        state
+            .session_identities
+            .lock()
+            .unwrap()
+            .insert(sid.into(), identity("legacy-ai", "1.0.0"));
+        let mut headers = HeaderMap::new();
+        headers.insert(MCP_SESSION_ID_HEADER, HeaderValue::from_static(sid));
+        let resolved = resolve_inbound_identity_versioned(&state, &headers, None)
+            .expect("legacy identity must resolve from the session cache");
+        assert_eq!(resolved.name.as_deref(), Some("legacy-ai"));
+        assert_eq!(resolved.version.as_deref(), Some("1.0.0"));
+    }
+
+    #[tokio::test]
+    async fn resolve_identity_for_message_2026_stateless_uses_meta() {
+        // A `tools/call` with `_meta` clientInfo and no handshake resolves its
+        // identity from `_meta` (not the session cache) and mints no session id.
+        let state = test_app_state();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "id": 7,
+            "params": {
+                "name": "demo",
+                "arguments": {},
+                "_meta": {
+                    protocol::META_CLIENT_INFO_KEY: { "name": "stateless-client", "version": "3.1" },
+                },
+            },
+        });
+        let (identity, session_id) = resolve_identity_for_message(&state, &HeaderMap::new(), &msg);
+        let identity = identity.expect("2026 stateless message should resolve identity");
+        assert_eq!(identity.name.as_deref(), Some("stateless-client"));
+        assert_eq!(identity.version.as_deref(), Some("3.1"));
+        // No session id is minted for non-`initialize` messages.
+        assert!(session_id.is_none());
     }
 
     #[tokio::test]
@@ -3153,6 +3344,65 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["id"], 2);
         assert!(body["result"]["tools"].is_array());
+    }
+
+    #[tokio::test]
+    async fn mcp_unified_2026_stateless_tools_list_without_handshake() {
+        // A 2026 client calls tools/list with no prior initialize/initialized
+        // handshake, conveying its identity via `_meta` clientInfo. The relay
+        // must dispatch it normally.
+        let state = test_app_state();
+        let resp = post_mcp(
+            state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "tools/list",
+                "id": 21,
+                "params": {
+                    "_meta": {
+                        protocol::META_CLIENT_INFO_KEY: { "name": "stateless-client", "version": "3.1" },
+                    },
+                },
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["id"], 21);
+        assert!(body["result"]["tools"].is_array());
+    }
+
+    #[tokio::test]
+    async fn mcp_unified_2026_stateless_tools_call_without_handshake() {
+        // A 2026 client calls tools/call with no handshake. With no upstream
+        // tool registered the call resolves to a JSON-RPC-level result rather
+        // than a transport/handshake error — proving the stateless request was
+        // dispatched without requiring `initialize`.
+        let state = test_app_state();
+        let resp = post_mcp(
+            state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "id": 22,
+                "params": {
+                    "name": "list_tools",
+                    "arguments": {},
+                    "_meta": {
+                        protocol::META_CLIENT_INFO_KEY: { "name": "stateless-client", "version": "3.1" },
+                    },
+                },
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 22);
+        // The dispatcher produced a JSON-RPC envelope (result or error), not a
+        // handshake/method-not-found rejection of the bare request.
+        assert!(body.get("result").is_some() || body.get("error").is_some());
+        assert_ne!(body["error"]["code"], json!(-32601));
     }
 
     #[tokio::test]

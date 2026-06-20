@@ -65,7 +65,6 @@ impl ProtocolVersion {
 
     /// `true` for the `2026-07-28` dialect — the gate every additive 2026
     /// behavior branches on. Consumed by T3–T13.
-    #[allow(dead_code)]
     pub fn is_2026(&self) -> bool {
         matches!(self, ProtocolVersion::V2026_07_28)
     }
