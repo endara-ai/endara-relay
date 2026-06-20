@@ -4499,6 +4499,79 @@ mod tests {
         );
     }
 
+    /// D6 (2026-07-28): the relay must never *originate* the retired `-32002`
+    /// error code. Param-level not-found/invalid conditions map to the standard
+    /// JSON-RPC `-32602` (Invalid Params); method-not-found stays `-32601` and
+    /// malformed requests stay `-32600`. This guard fires the representative
+    /// error-producing requests on both the legacy and 2026 inbound paths and
+    /// asserts none of them come back as `-32002`, and that the param-level
+    /// missing-`name` case maps to `-32602` under the 2026 dialect too.
+    #[tokio::test]
+    async fn relay_never_originates_minus_32002() {
+        // Legacy: missing 'name' (param-level) → -32602, never -32002.
+        let resp = post_mcp(
+            test_app_state(),
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"arguments": {}},
+                "id": 1
+            }),
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+        assert_ne!(body["error"]["code"], json!(-32002));
+
+        // Legacy: unknown tool → JSON-RPC error, never -32002.
+        let resp = post_mcp(
+            test_app_state(),
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "does_not_exist", "arguments": {}},
+                "id": 2
+            }),
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert!(body["error"].is_object());
+        assert_ne!(body["error"]["code"], json!(-32002));
+
+        // Legacy: unknown method → -32601, never -32002.
+        let resp = post_mcp(
+            test_app_state(),
+            &json!({"jsonrpc": "2.0", "method": "no/such/method", "id": 3}),
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert_ne!(body["error"]["code"], json!(-32002));
+
+        // 2026 path (dialect detected via `_meta` clientInfo): missing 'name'
+        // (param-level) → -32602, never -32002.
+        let resp = post_mcp(
+            test_app_state(),
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "id": 4,
+                "params": {
+                    "arguments": {},
+                    "_meta": {
+                        protocol::META_CLIENT_INFO_KEY: { "name": "stateless-client", "version": "3.1" },
+                    },
+                },
+            }),
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["error"]["code"], -32602,
+            "2026 param-level missing-name must map to -32602"
+        );
+        assert_ne!(body["error"]["code"], json!(-32002));
+    }
+
     // --- Alphabetical sorting tests ---
 
     #[tokio::test]
