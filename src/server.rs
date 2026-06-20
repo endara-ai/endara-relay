@@ -3,6 +3,7 @@ use crate::events::ClientIdentity;
 use crate::js_sandbox::MetaToolHandler;
 use crate::oauth::{OAuthFlowManager, OAuthSetupManager};
 use crate::profile_registry::{ProfileContext, ProfileRegistry};
+use crate::protocol::{self, ProtocolVersion};
 use crate::registry::AdapterRegistry;
 use crate::token_manager::TokenManager;
 use crate::OAuthAdapterInners;
@@ -161,9 +162,12 @@ impl MetaToolSchemas {
 pub struct SessionIdentityStore {
     capacity: usize,
     next_seq: u64,
-    /// `session_id → (identity, recency seq)`. The seq is duplicated in
-    /// [`recency`] so the LRU pop is `O(log n)` rather than `O(n)`.
-    entries: HashMap<String, (ClientIdentity, u64)>,
+    /// `session_id → (identity, detected dialect, recency seq)`. The seq is
+    /// duplicated in [`recency`] so the LRU pop is `O(log n)` rather than
+    /// `O(n)`. The dialect is the inbound peer's negotiated
+    /// [`ProtocolVersion`], recorded at `initialize` time and consumed by
+    /// later version-gated dispatch (T3).
+    entries: HashMap<String, (ClientIdentity, ProtocolVersion, u64)>,
     /// `recency seq → session_id`. The smallest key is the least-
     /// recently-used entry; `pop_first` evicts it in `O(log n)`.
     recency: BTreeMap<u64, String>,
@@ -195,18 +199,32 @@ impl SessionIdentityStore {
     /// previously-stored identity for the same session id (typically
     /// `None`; a `Some` value indicates a session-id collision between
     /// two `initialize` calls and is overwritten).
+    #[allow(dead_code)]
     pub fn insert(
         &mut self,
         session_id: String,
         identity: ClientIdentity,
     ) -> Option<ClientIdentity> {
+        self.insert_with_dialect(session_id, identity, ProtocolVersion::default())
+    }
+
+    /// Insert or refresh an entry while recording the inbound peer's detected
+    /// [`ProtocolVersion`]. Eviction semantics match [`insert`]; the returned
+    /// `Option` is the previously-stored identity for the same session id.
+    pub fn insert_with_dialect(
+        &mut self,
+        session_id: String,
+        identity: ClientIdentity,
+        dialect: ProtocolVersion,
+    ) -> Option<ClientIdentity> {
         let new_seq = self.next_seq();
-        let previous = if let Some((prev_id, prev_seq)) = self.entries.remove(&session_id) {
-            self.recency.remove(&prev_seq);
-            Some(prev_id)
-        } else {
-            None
-        };
+        let previous =
+            if let Some((prev_id, _prev_dialect, prev_seq)) = self.entries.remove(&session_id) {
+                self.recency.remove(&prev_seq);
+                Some(prev_id)
+            } else {
+                None
+            };
         while self.entries.len() >= self.capacity {
             let Some((evict_seq, evict_key)) = self.recency.pop_first() else {
                 break;
@@ -217,20 +235,29 @@ impl SessionIdentityStore {
             let _ = evict_seq;
         }
         self.recency.insert(new_seq, session_id.clone());
-        self.entries.insert(session_id, (identity, new_seq));
+        self.entries
+            .insert(session_id, (identity, dialect, new_seq));
         previous
     }
 
     /// Resolve the [`ClientIdentity`] for a session id and mark the entry
     /// as most-recently-used.
     pub fn get(&mut self, session_id: &str) -> Option<ClientIdentity> {
-        let (identity, prev_seq) = self.entries.get(session_id).cloned()?;
+        let (identity, dialect, prev_seq) = self.entries.get(session_id).cloned()?;
         self.recency.remove(&prev_seq);
         let new_seq = self.next_seq();
         self.recency.insert(new_seq, session_id.to_string());
         self.entries
-            .insert(session_id.to_string(), (identity.clone(), new_seq));
+            .insert(session_id.to_string(), (identity.clone(), dialect, new_seq));
         Some(identity)
+    }
+
+    /// Read the inbound dialect recorded for a session id without disturbing
+    /// recency. Returns `None` for an unknown session. Consumed by T3 to gate
+    /// dispatch on the inbound peer's negotiated protocol version.
+    #[allow(dead_code)]
+    pub fn dialect(&self, session_id: &str) -> Option<ProtocolVersion> {
+        self.entries.get(session_id).map(|(_, dialect, _)| *dialect)
     }
 
     /// Number of live entries. Exposed for unit tests that exercise the
@@ -418,7 +445,7 @@ async fn mcp_initialize(
     profile_ctx: Option<&ProfileContext>,
 ) -> Json<Value> {
     let mut result = json!({
-        "protocolVersion": "2025-03-26",
+        "protocolVersion": protocol::VERSION_2025_03_26,
         "capabilities": {
             "tools": { "listChanged": true }
         },
@@ -1110,9 +1137,17 @@ fn resolve_identity_for_message(
     let init_identity = identity_from_initialize_params(msg.get("params"));
     let header_identity = identity_from_headers(headers);
     let session_id = uuid::Uuid::new_v4().to_string();
+    // Detect and record the inbound peer's dialect alongside its identity so
+    // version-gated dispatch (T3) can branch on it. Pure plumbing: storing the
+    // value changes no response or handshake behavior.
+    let dialect = protocol::detect_inbound_dialect(
+        true,
+        header_str(headers, protocol::MCP_PROTOCOL_VERSION_HEADER),
+        msg.get("params"),
+    );
     if !init_identity.is_empty() {
         if let Ok(mut guard) = state.session_identities.lock() {
-            guard.insert(session_id.clone(), init_identity.clone());
+            guard.insert_with_dialect(session_id.clone(), init_identity.clone(), dialect);
         }
     }
     let merged = merge_identity(init_identity, header_identity);

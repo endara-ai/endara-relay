@@ -7,6 +7,7 @@ use crate::events::{
     annotations_from_value, current_request_context, ToolCallEvent, ToolCallEventBus,
 };
 use crate::jsonrpc::{self, JsonRpcResponse};
+use crate::protocol::ProtocolVersion;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -120,6 +121,11 @@ pub struct HttpAdapter {
     /// hand it to the JIT interceptor. Per-host challenges are effectively
     /// constant, so a concurrent overwrite is harmless.
     last_www_authenticate: Arc<RwLock<Option<String>>>,
+    /// Negotiated protocol dialect of the upstream server. Defaults to the
+    /// legacy `2025-03-26` version this adapter advertises in `initialize`;
+    /// real negotiation populates it via [`Self::set_upstream_dialect`] (T7).
+    /// Consumed by the 2026 outbound code paths (T8).
+    upstream_dialect: Arc<RwLock<ProtocolVersion>>,
 }
 
 /// HTTP header name reqwest reads/writes for the MCP session ID. Reqwest's
@@ -190,6 +196,7 @@ impl HttpAdapter {
             session_id: Arc::new(RwLock::new(None)),
             jit_interceptor: None,
             last_www_authenticate: Arc::new(RwLock::new(None)),
+            upstream_dialect: Arc::new(RwLock::new(ProtocolVersion::V2025_03_26)),
         }
     }
 
@@ -238,6 +245,7 @@ impl HttpAdapter {
             session_id: Arc::new(RwLock::new(None)),
             jit_interceptor: None,
             last_www_authenticate: Arc::new(RwLock::new(None)),
+            upstream_dialect: Arc::new(RwLock::new(ProtocolVersion::V2025_03_26)),
         }
     }
 
@@ -254,6 +262,20 @@ impl HttpAdapter {
     #[allow(dead_code)]
     pub(crate) fn set_jit_interceptor(&mut self, interceptor: Arc<JitInterceptor>) {
         self.jit_interceptor = Some(interceptor);
+    }
+
+    /// Record the upstream server's negotiated [`ProtocolVersion`]. Wired by
+    /// T7 once real negotiation is implemented; unused today.
+    #[allow(dead_code)]
+    pub(crate) async fn set_upstream_dialect(&self, dialect: ProtocolVersion) {
+        *self.upstream_dialect.write().await = dialect;
+    }
+
+    /// Read the upstream server's negotiated [`ProtocolVersion`]. Defaults to
+    /// the legacy version this adapter advertises until T7 populates it.
+    #[allow(dead_code)]
+    pub(crate) async fn upstream_dialect(&self) -> ProtocolVersion {
+        *self.upstream_dialect.read().await
     }
 
     /// Apply the JIT 401 interception policy to a tool-call outcome.
@@ -701,7 +723,7 @@ impl McpAdapter for HttpAdapter {
             *self.health.write().await = HealthStatus::Starting;
 
             let params = json!({
-                "protocolVersion": "2025-03-26",
+                "protocolVersion": ProtocolVersion::V2025_03_26.as_str(),
                 "capabilities": {},
                 "clientInfo": {
                     "name": "endara-relay",

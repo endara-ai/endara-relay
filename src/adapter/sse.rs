@@ -6,6 +6,7 @@ use crate::events::{
     annotations_from_value, current_request_context, ToolCallEvent, ToolCallEventBus,
 };
 use crate::jsonrpc::{self, JsonRpcResponse};
+use crate::protocol::ProtocolVersion;
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -163,6 +164,11 @@ pub struct SseAdapter {
     /// `call_tool` can attach hint metadata to the overlay's `started`
     /// event without a second round-trip.
     tool_annotations_cache: Arc<RwLock<HashMap<String, Option<Value>>>>,
+    /// Negotiated protocol dialect of the upstream server. Defaults to the
+    /// legacy `2024-11-05` version this adapter advertises in `initialize`;
+    /// real negotiation populates it via [`Self::set_upstream_dialect`] (T7).
+    /// Consumed by the 2026 outbound code paths (T9).
+    upstream_dialect: Arc<RwLock<ProtocolVersion>>,
 }
 
 impl SseAdapter {
@@ -221,11 +227,26 @@ impl SseAdapter {
             span,
             event_bus: Arc::new(OnceLock::new()),
             tool_annotations_cache: Arc::new(RwLock::new(HashMap::new())),
+            upstream_dialect: Arc::new(RwLock::new(ProtocolVersion::V2024_11_05)),
         }
     }
 
     fn next_id(&self) -> u64 {
         self.request_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Record the upstream server's negotiated [`ProtocolVersion`]. Wired by
+    /// T7/T9 once real negotiation is implemented; unused today.
+    #[allow(dead_code)]
+    pub(crate) async fn set_upstream_dialect(&self, dialect: ProtocolVersion) {
+        *self.upstream_dialect.write().await = dialect;
+    }
+
+    /// Read the upstream server's negotiated [`ProtocolVersion`]. Defaults to
+    /// the legacy version this adapter advertises until T7/T9 populates it.
+    #[allow(dead_code)]
+    pub(crate) async fn upstream_dialect(&self) -> ProtocolVersion {
+        *self.upstream_dialect.read().await
     }
 
     /// Resolve a relative endpoint URL against the SSE base URL.
@@ -586,7 +607,7 @@ impl SseAdapter {
         }
 
         let params = json!({
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": ProtocolVersion::V2024_11_05.as_str(),
             "capabilities": {},
             "clientInfo": {
                 "name": "endara-relay",

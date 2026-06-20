@@ -68,7 +68,7 @@ mod tests {
     fn test_request_serialization_roundtrip() {
         let req = new_request(
             "initialize",
-            Some(json!({"protocolVersion": "2025-03-26"})),
+            Some(json!({"protocolVersion": crate::protocol::VERSION_2025_03_26})),
             1,
         );
         let serialized = serde_json::to_string(&req).unwrap();
