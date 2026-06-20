@@ -7,7 +7,7 @@ use crate::events::{
     annotations_from_value, current_request_context, ToolCallEvent, ToolCallEventBus,
 };
 use crate::jsonrpc::{self, JsonRpcResponse};
-use crate::protocol::{detect_upstream_dialect, ProtocolVersion};
+use crate::protocol::{self, detect_upstream_dialect, ProtocolVersion};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -134,6 +134,18 @@ pub struct HttpAdapter {
 /// per the spec; HTTP header names are case-insensitive on transmit.
 const MCP_SESSION_ID_HEADER: reqwest::header::HeaderName =
     reqwest::header::HeaderName::from_static("mcp-session-id");
+
+/// 2026 Streamable HTTP per-request headers (lowercased for reqwest's
+/// `HeaderMap`). Emitted only to upstreams detected as `2026-07-28`:
+/// `MCP-Protocol-Version` conveys the dialect, `Mcp-Method` mirrors the
+/// JSON-RPC method, and `Mcp-Name` mirrors the `tools/call` tool name —
+/// enabling routing/observability without parsing the body.
+const MCP_PROTOCOL_VERSION_HEADER_NAME: reqwest::header::HeaderName =
+    reqwest::header::HeaderName::from_static(protocol::MCP_PROTOCOL_VERSION_HEADER);
+const MCP_METHOD_HEADER_NAME: reqwest::header::HeaderName =
+    reqwest::header::HeaderName::from_static(protocol::MCP_METHOD_HEADER);
+const MCP_NAME_HEADER_NAME: reqwest::header::HeaderName =
+    reqwest::header::HeaderName::from_static(protocol::MCP_NAME_HEADER);
 
 impl HttpAdapter {
     /// Create a new HttpAdapter with the given configuration.
@@ -335,6 +347,52 @@ impl HttpAdapter {
         self.request_id.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// The relay's own client identity, injected under
+    /// `params._meta["io.modelcontextprotocol/clientInfo"]` on every outbound
+    /// request to a 2026 upstream. The 2026 transport is stateless — there is
+    /// no `initialize` handshake — so identity travels per-request instead.
+    fn relay_client_info() -> Value {
+        json!({
+            "name": "endara-relay",
+            "version": env!("CARGO_PKG_VERSION"),
+        })
+    }
+
+    /// Attach the relay's `clientInfo` under `params._meta` for 2026 upstreams,
+    /// creating an empty params object when the request carried none. Non-object
+    /// params are left untouched (MCP params are always objects or absent).
+    fn inject_client_info(params: Option<Value>) -> Option<Value> {
+        let mut params = params.unwrap_or_else(|| json!({}));
+        if params.is_object() {
+            params["_meta"][protocol::META_CLIENT_INFO_KEY] = Self::relay_client_info();
+        }
+        Some(params)
+    }
+
+    /// Apply the 2026 Streamable HTTP per-request headers to `builder`:
+    /// `MCP-Protocol-Version` (always), `Mcp-Method` (the JSON-RPC method), and
+    /// `Mcp-Name` (the `params.name` tool name, when present). These let a 2026
+    /// upstream route/observe a request without parsing its body.
+    fn apply_2026_headers(
+        builder: reqwest::RequestBuilder,
+        method: &str,
+        params: Option<&Value>,
+    ) -> reqwest::RequestBuilder {
+        let mut builder = builder.header(
+            MCP_PROTOCOL_VERSION_HEADER_NAME.clone(),
+            reqwest::header::HeaderValue::from_static(protocol::VERSION_2026_07_28),
+        );
+        if let Ok(val) = reqwest::header::HeaderValue::from_str(method) {
+            builder = builder.header(MCP_METHOD_HEADER_NAME.clone(), val);
+        }
+        if let Some(name) = params.and_then(|p| p.get("name")).and_then(Value::as_str) {
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(name) {
+                builder = builder.header(MCP_NAME_HEADER_NAME.clone(), val);
+            }
+        }
+        builder
+    }
+
     /// Parse an SSE (text/event-stream) response body and extract the JSON-RPC
     /// response matching the given request `id`.
     ///
@@ -427,18 +485,29 @@ impl HttpAdapter {
         method: &str,
         params: Option<Value>,
     ) -> Result<(), AdapterError> {
+        // 2026 upstreams: attach `_meta` clientInfo + routing headers and omit
+        // `Mcp-Session-Id` (the transport is stateless). Legacy: unchanged.
+        let is_2026 = self.upstream_dialect.read().await.is_2026();
+        let params = if is_2026 {
+            Self::inject_client_info(params)
+        } else {
+            params
+        };
+
         let mut request = json!({
             "jsonrpc": "2.0",
             "method": method,
         });
-        if let Some(p) = params {
-            request["params"] = p;
+        if let Some(ref p) = params {
+            request["params"] = p.clone();
         }
 
         trace!(method = method, url = %self.config.url, "sending HTTP JSON-RPC notification");
 
         let mut builder = self.client.post(&self.config.url).json(&request);
-        if let Some(ref id) = *self.session_id.read().await {
+        if is_2026 {
+            builder = Self::apply_2026_headers(builder, method, params.as_ref());
+        } else if let Some(ref id) = *self.session_id.read().await {
             if let Ok(val) = reqwest::header::HeaderValue::from_str(id) {
                 builder = builder.header(MCP_SESSION_ID_HEADER.clone(), val);
             }
@@ -477,13 +546,25 @@ impl HttpAdapter {
         method: &str,
         params: Option<Value>,
     ) -> Result<Value, AdapterError> {
+        // 2026 upstreams: every request carries the relay's `clientInfo` under
+        // `_meta` (no handshake) plus the 2026 routing headers; the stateless
+        // transport replaces `Mcp-Session-Id` affinity entirely.
+        let is_2026 = self.upstream_dialect.read().await.is_2026();
+        let params = if is_2026 {
+            Self::inject_client_info(params)
+        } else {
+            params
+        };
+
         let id = self.next_id();
         let request = jsonrpc::new_request(method, params, id);
 
         trace!(method = method, id = id, url = %self.config.url, "sending HTTP JSON-RPC request");
 
         let mut builder = self.client.post(&self.config.url).json(&request);
-        if let Some(ref sid) = *self.session_id.read().await {
+        if is_2026 {
+            builder = Self::apply_2026_headers(builder, method, request.params.as_ref());
+        } else if let Some(ref sid) = *self.session_id.read().await {
             if let Ok(val) = reqwest::header::HeaderValue::from_str(sid) {
                 builder = builder.header(MCP_SESSION_ID_HEADER.clone(), val);
             }
@@ -698,6 +779,125 @@ impl HttpAdapter {
             }
         }
     }
+
+    /// Stateless `server/discover` probe used to detect a 2026 upstream before
+    /// the legacy `initialize` handshake. Sent with the 2026 routing headers
+    /// and `_meta` clientInfo and NO `Mcp-Session-Id`. Returns the JSON-RPC
+    /// `result` object on success, or `None` on any failure (transport error,
+    /// non-2xx, JSON-RPC error, missing result) so the caller falls back to the
+    /// legacy handshake. Legacy servers reject `server/discover` (e.g.
+    /// method-not-found) and the relay falls back transparently.
+    async fn try_discover_probe(&self) -> Option<Value> {
+        let id = self.next_id();
+        let params = Self::inject_client_info(None);
+        let request = jsonrpc::new_request("server/discover", params, id);
+        trace!(method = "server/discover", id = id, url = %self.config.url, "probing upstream protocol dialect");
+
+        let builder = self.client.post(&self.config.url).json(&request);
+        let builder = Self::apply_2026_headers(builder, "server/discover", request.params.as_ref());
+        let resp = builder.send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let response: JsonRpcResponse = if content_type.contains("text/event-stream") {
+            let body = resp.text().await.ok()?;
+            Self::parse_sse_response(&body, id, Some(&self.tools_changed_tx)).ok()?
+        } else {
+            resp.json().await.ok()?
+        };
+
+        if response.error.is_some() {
+            return None;
+        }
+        response.result
+    }
+
+    /// Extract, validate, and record the upstream `serverInfo.name` from an
+    /// `initialize` or `server/discover` result. Sets the adapter unhealthy and
+    /// returns `Err` when the name is missing or fails sanitization. Shared by
+    /// the legacy handshake and the 2026 stateless paths so both name the
+    /// endpoint identically.
+    async fn apply_server_identity(&self, result: &Value) -> Result<(), AdapterError> {
+        // Extract serverInfo.name — REQUIRED per MCP spec enforcement
+        let raw_name = match result
+            .get("serverInfo")
+            .and_then(|si| si.get("name"))
+            .and_then(|n| n.as_str())
+        {
+            Some(name) => name,
+            None => {
+                let err = ServerNameError::Missing;
+                let msg = err.to_string();
+                error!(url = %self.config.url, error = %msg, "MCP server did not provide serverInfo.name");
+                *self.health.write().await = HealthStatus::Unhealthy(msg.clone());
+                return Err(AdapterError::ProtocolError(msg));
+            }
+        };
+
+        // Validate and sanitize the server name
+        let sanitized = match sanitize_server_name(raw_name) {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = e.to_string();
+                error!(url = %self.config.url, raw_name = %raw_name, error = %msg, "serverInfo.name validation failed");
+                *self.health.write().await = HealthStatus::Unhealthy(msg.clone());
+                return Err(AdapterError::ProtocolError(msg));
+            }
+        };
+
+        if let Some(ref ov) = self.config.server_type_override {
+            if sanitize_server_name(ov).is_err() {
+                warn!(
+                    override = %ov,
+                    "server_type_override failed sanitization; falling back to upstream-derived name"
+                );
+            }
+        }
+        let effective = effective_server_type(
+            self.config.server_type_override.clone(),
+            Some(sanitized.clone()),
+        );
+        let upstream_stripped = strip_mcp_server_suffix(sanitized.clone());
+
+        info!(url = %self.config.url, raw_name = %raw_name, sanitized = %sanitized, effective = ?effective, "MCP server reported serverInfo.name");
+        if let Some(ref name) = effective {
+            self.span
+                .record("server_type", tracing::field::display(name));
+        }
+        *self.server_type.write().await = effective;
+        *self.upstream_server_name.write().await = Some(upstream_stripped);
+        Ok(())
+    }
+
+    /// Spawn the long-lived `GET <url>` SSE listener for server-initiated
+    /// notifications (notably `notifications/tools/list_changed`). Snapshots the
+    /// current session id at spawn time (always `None` for 2026 stateless
+    /// upstreams). Shared by the legacy and 2026 initialize paths.
+    async fn spawn_get_listener(&self) {
+        let url = self.config.url.clone();
+        let headers = self.config.headers.clone();
+        // Snapshot the session ID at spawn time so the listener doesn't
+        // need to re-read adapter state. Matches how `headers` is passed.
+        let session_id = self.session_id.read().await.clone();
+        let tx = self.tools_changed_tx.clone();
+        let shutdown = self.shutdown_notify.clone();
+        let listener_span = self.span.clone();
+        let handle = tokio::spawn(
+            async move {
+                Self::run_get_listener(url, headers, session_id, tx, shutdown).await;
+            }
+            .instrument(listener_span),
+        );
+        *self.listener_handle.lock().await = Some(handle);
+    }
 }
 
 impl Drop for HttpAdapter {
@@ -721,6 +921,28 @@ impl McpAdapter for HttpAdapter {
     async fn initialize(&mut self) -> Result<(), AdapterError> {
         async {
             *self.health.write().await = HealthStatus::Starting;
+
+            // Discover-first dialect detection (T7/T8): probe `server/discover`
+            // before the legacy handshake. A 2026 upstream answers with a
+            // `protocolVersion` of `2026-07-28`, in which case the relay skips
+            // the `initialize`/`notifications/initialized` handshake and the
+            // `Mcp-Session-Id` machinery entirely — the 2026 transport is
+            // stateless, carrying version + identity on every request instead.
+            // Any other outcome (legacy result, JSON-RPC error, transport
+            // failure) falls through to the unchanged legacy handshake below.
+            let discover_result = self.try_discover_probe().await;
+            if detect_upstream_dialect(discover_result.as_ref(), None).is_2026() {
+                let result = discover_result.as_ref().expect(
+                    "detect_upstream_dialect reports 2026 only when a discover result is present",
+                );
+                self.set_upstream_dialect(ProtocolVersion::V2026_07_28).await;
+                self.apply_server_identity(result).await?;
+                // 2026 is stateless: no notifications/initialized, no session id.
+                self.spawn_get_listener().await;
+                *self.health.write().await = HealthStatus::Healthy;
+                info!(url = %self.config.url, "HTTP MCP adapter initialized (2026 stateless path)");
+                return Ok(());
+            }
 
             let params = json!({
                 "protocolVersion": ProtocolVersion::V2025_03_26.as_str(),
@@ -874,61 +1096,18 @@ impl McpAdapter for HttpAdapter {
                 }
             };
 
-            // Extract serverInfo.name — REQUIRED per MCP spec enforcement
-            let raw_name = match result
-                .get("serverInfo")
-                .and_then(|si| si.get("name"))
-                .and_then(|n| n.as_str())
-            {
-                Some(name) => name,
-                None => {
-                    let err = ServerNameError::Missing;
-                    let msg = err.to_string();
-                    error!(url = %self.config.url, error = %msg, "MCP server did not provide serverInfo.name");
-                    *self.health.write().await = HealthStatus::Unhealthy(msg.clone());
-                    return Err(AdapterError::ProtocolError(msg));
-                }
-            };
+            // Validate + record the upstream serverInfo.name (REQUIRED per MCP
+            // spec enforcement). Shared with the 2026 stateless path above.
+            self.apply_server_identity(&result).await?;
 
-            // Validate and sanitize the server name
-            let sanitized = match sanitize_server_name(raw_name) {
-                Ok(s) => s,
-                Err(e) => {
-                    let msg = e.to_string();
-                    error!(url = %self.config.url, raw_name = %raw_name, error = %msg, "serverInfo.name validation failed");
-                    *self.health.write().await = HealthStatus::Unhealthy(msg.clone());
-                    return Err(AdapterError::ProtocolError(msg));
-                }
-            };
-
-            if let Some(ref ov) = self.config.server_type_override {
-                if sanitize_server_name(ov).is_err() {
-                    warn!(
-                        override = %ov,
-                        "server_type_override failed sanitization; falling back to upstream-derived name"
-                    );
-                }
-            }
-            let effective = effective_server_type(
-                self.config.server_type_override.clone(),
-                Some(sanitized.clone()),
-            );
-            let upstream_stripped = strip_mcp_server_suffix(sanitized.clone());
-
-            info!(url = %self.config.url, raw_name = %raw_name, sanitized = %sanitized, effective = ?effective, "MCP server reported serverInfo.name");
-            if let Some(ref name) = effective {
-                self.span.record("server_type", tracing::field::display(name));
-            }
-            *self.server_type.write().await = effective;
-            *self.upstream_server_name.write().await = Some(upstream_stripped);
-
-            // Detect and record the upstream's negotiated protocol dialect from
-            // the initialize result before any tool calls are proxied (T7). The
-            // live `server/discover` probe (discover-first path) is wired by T8;
-            // here we pass `None` so legacy upstreams behave byte-for-byte as
-            // before.
-            self.set_upstream_dialect(detect_upstream_dialect(None, Some(&result)))
-                .await;
+            // Record the upstream's negotiated dialect. The discover probe ran
+            // above (legacy result or none) and the initialize result carries
+            // the negotiated legacy version; neither is 2026 on this path.
+            self.set_upstream_dialect(detect_upstream_dialect(
+                discover_result.as_ref(),
+                Some(&result),
+            ))
+            .await;
 
             // Per the MCP spec the client MUST send a notifications/initialized
             // notification after a successful initialize exchange.
@@ -945,21 +1124,7 @@ impl McpAdapter for HttpAdapter {
             // that don't support it return 404/405 and the task exits
             // quietly — inline POST notifications still reach the broadcast
             // via `parse_sse_response`.
-            let url = self.config.url.clone();
-            let headers = self.config.headers.clone();
-            // Snapshot the session ID at spawn time so the listener doesn't
-            // need to re-read adapter state. Matches how `headers` is passed.
-            let session_id = self.session_id.read().await.clone();
-            let tx = self.tools_changed_tx.clone();
-            let shutdown = self.shutdown_notify.clone();
-            let listener_span = self.span.clone();
-            let handle = tokio::spawn(
-                async move {
-                    Self::run_get_listener(url, headers, session_id, tx, shutdown).await;
-                }
-                .instrument(listener_span),
-            );
-            *self.listener_handle.lock().await = Some(handle);
+            self.spawn_get_listener().await;
 
             *self.health.write().await = HealthStatus::Healthy;
             info!(url = %self.config.url, "HTTP MCP adapter initialized");
@@ -2051,6 +2216,228 @@ mod tests {
             Err(AdapterError::HttpError { status: 401, .. }) => {}
             other => panic!("expected HttpError {{ 401 }}, got {:?}", other),
         }
+        server.abort();
+    }
+
+    // --- 2026 stateless Streamable HTTP path (T8) ---
+
+    #[test]
+    fn test_inject_client_info_creates_and_preserves_params() {
+        // None params → a fresh object carrying only `_meta` clientInfo.
+        let injected = HttpAdapter::inject_client_info(None).unwrap();
+        let ci = &injected["_meta"][protocol::META_CLIENT_INFO_KEY];
+        assert_eq!(ci["name"], "endara-relay");
+        assert!(ci["version"].is_string());
+
+        // Existing fields are preserved; `_meta` clientInfo is added.
+        let injected =
+            HttpAdapter::inject_client_info(Some(json!({"name": "echo", "arguments": {}})))
+                .unwrap();
+        assert_eq!(injected["name"], "echo");
+        assert_eq!(
+            injected["_meta"][protocol::META_CLIENT_INFO_KEY]["name"],
+            "endara-relay"
+        );
+    }
+
+    /// Per-POST capture for the 2026 fixture below.
+    struct Captured2026 {
+        method: String,
+        protocol_version: Option<String>,
+        mcp_method: Option<String>,
+        mcp_name: Option<String>,
+        had_session_id: bool,
+        meta_client_info: Option<Value>,
+    }
+
+    #[derive(Clone)]
+    struct Server2026State {
+        seen: Arc<Mutex<Vec<Captured2026>>>,
+    }
+
+    async fn dispatch_2026(
+        State(app): State<Server2026State>,
+        req: axum::extract::Request,
+    ) -> axum::response::Response {
+        if req.method() != axum::http::Method::POST {
+            // 2026 fixture does not implement the GET server-initiated stream.
+            return (StatusCode::METHOD_NOT_ALLOWED, "").into_response();
+        }
+        let headers = req.headers().clone();
+        let body_bytes = match axum::body::to_bytes(req.into_body(), 1024 * 1024).await {
+            Ok(b) => b,
+            Err(_) => return (StatusCode::BAD_REQUEST, "bad body").into_response(),
+        };
+        let body: Value = match serde_json::from_slice(&body_bytes) {
+            Ok(v) => v,
+            Err(_) => return (StatusCode::BAD_REQUEST, "bad json").into_response(),
+        };
+        let method = body["method"].as_str().unwrap_or("").to_string();
+        let id = body["id"].as_u64();
+        let header_str = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string())
+        };
+        app.seen.lock().await.push(Captured2026 {
+            method: method.clone(),
+            protocol_version: header_str("mcp-protocol-version"),
+            mcp_method: header_str("mcp-method"),
+            mcp_name: header_str("mcp-name"),
+            had_session_id: headers.get("mcp-session-id").is_some(),
+            meta_client_info: body
+                .get("params")
+                .and_then(|p| p.get("_meta"))
+                .and_then(|m| m.get(protocol::META_CLIENT_INFO_KEY))
+                .cloned(),
+        });
+
+        let result = match method.as_str() {
+            "server/discover" => json!({
+                "protocolVersion": "2026-07-28",
+                "capabilities": {"tools": {"listChanged": true}},
+                "serverInfo": {"name": "stateless-2026", "version": "1.0.0"},
+                "tools": []
+            }),
+            "tools/list" => json!({
+                "tools": [{
+                    "name": "echo",
+                    "description": "Echoes",
+                    "inputSchema": {"type": "object"}
+                }]
+            }),
+            "tools/call" => json!({"content": [{"type": "text", "text": "ok"}]}),
+            _ => {
+                return Json(json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32601, "message": "Method not found"},
+                    "id": id,
+                }))
+                .into_response();
+            }
+        };
+        // 2026 is stateless: the server never emits `Mcp-Session-Id`.
+        if id.is_some() {
+            Json(json!({"jsonrpc": "2.0", "result": result, "id": id})).into_response()
+        } else {
+            (StatusCode::ACCEPTED, "").into_response()
+        }
+    }
+
+    async fn start_fake_2026_http_server() -> (
+        String,
+        Arc<Mutex<Vec<Captured2026>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let state = Server2026State { seen: seen.clone() };
+        let app = Router::new()
+            .route("/mcp", any(dispatch_2026))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}/mcp", addr);
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (url, seen, handle)
+    }
+
+    /// 2026 upstream: the `server/discover` probe detects `2026-07-28`, so the
+    /// adapter skips `initialize`/`notifications/initialized`, captures no
+    /// session id, and every POST carries the 2026 routing headers
+    /// (`MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name` for tool calls) plus
+    /// `_meta` clientInfo and never an `Mcp-Session-Id`.
+    #[tokio::test]
+    async fn test_2026_upstream_stateless_path_headers_and_no_handshake() {
+        let (url, seen, server) = start_fake_2026_http_server().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter
+            .initialize()
+            .await
+            .expect("2026 initialize succeeds");
+
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert!(
+            adapter.upstream_dialect().await.is_2026(),
+            "upstream should be detected as 2026"
+        );
+        assert!(
+            adapter.session_id.read().await.is_none(),
+            "no session id is captured on the 2026 stateless path"
+        );
+
+        let tools = adapter.list_tools().await.expect("list_tools");
+        assert_eq!(tools.len(), 1);
+        let call = adapter
+            .call_tool("echo", json!({"message": "hi"}))
+            .await
+            .expect("call_tool");
+        assert_eq!(call["content"][0]["text"], "ok");
+
+        let seen = seen.lock().await;
+        let methods: Vec<&str> = seen.iter().map(|c| c.method.as_str()).collect();
+        assert!(
+            methods.contains(&"server/discover"),
+            "discover probe must be sent, got {methods:?}"
+        );
+        assert!(
+            !methods.contains(&"initialize"),
+            "2026 path must skip initialize, got {methods:?}"
+        );
+        assert!(
+            !methods.contains(&"notifications/initialized"),
+            "2026 path must skip notifications/initialized, got {methods:?}"
+        );
+
+        for c in seen.iter() {
+            assert_eq!(
+                c.protocol_version.as_deref(),
+                Some("2026-07-28"),
+                "every 2026 POST carries MCP-Protocol-Version ({})",
+                c.method
+            );
+            assert_eq!(
+                c.mcp_method.as_deref(),
+                Some(c.method.as_str()),
+                "Mcp-Method mirrors the JSON-RPC method"
+            );
+            assert!(
+                !c.had_session_id,
+                "2026 POSTs never carry Mcp-Session-Id ({})",
+                c.method
+            );
+            assert_eq!(
+                c.meta_client_info
+                    .as_ref()
+                    .and_then(|v| v.get("name"))
+                    .and_then(|n| n.as_str()),
+                Some("endara-relay"),
+                "every 2026 POST carries _meta clientInfo ({})",
+                c.method
+            );
+        }
+
+        let call_rec = seen
+            .iter()
+            .find(|c| c.method == "tools/call")
+            .expect("tools/call recorded");
+        assert_eq!(
+            call_rec.mcp_name.as_deref(),
+            Some("echo"),
+            "Mcp-Name mirrors the tools/call tool name"
+        );
+        let list_rec = seen
+            .iter()
+            .find(|c| c.method == "tools/list")
+            .expect("tools/list recorded");
+        assert!(
+            list_rec.mcp_name.is_none(),
+            "Mcp-Name is absent for methods without a tool name"
+        );
+
+        drop(seen);
         server.abort();
     }
 }
