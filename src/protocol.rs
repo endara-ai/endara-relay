@@ -23,6 +23,15 @@ pub const VERSION_2026_07_28: &str = "2026-07-28";
 /// per-request protocol version for Streamable HTTP peers.
 pub const MCP_PROTOCOL_VERSION_HEADER: &str = "mcp-protocol-version";
 
+/// HTTP header (lowercased) that mirrors the JSON-RPC `method` of a 2026
+/// Streamable HTTP request, enabling routing/observability without parsing the
+/// body. Required for 2026 clients.
+pub const MCP_METHOD_HEADER: &str = "mcp-method";
+
+/// HTTP header (lowercased) that mirrors the tool name (`params.name`) of a
+/// 2026 `tools/call` request. Absent for methods without a tool name.
+pub const MCP_NAME_HEADER: &str = "mcp-name";
+
 /// Reverse-DNS key under `params._meta` that 2026 clients use to attach their
 /// identity on every request (there is no `initialize` handshake in 2026).
 pub const META_CLIENT_INFO_KEY: &str = "io.modelcontextprotocol/clientInfo";

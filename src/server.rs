@@ -1147,6 +1147,12 @@ async fn mcp_unified_impl(
 
             let mut responses: Vec<Value> = Vec::new();
             for msg in messages {
+                // 2026 HTTP routing headers (Mcp-Method/Mcp-Name) must agree
+                // with each message body; a mismatch is rejected before dispatch.
+                if let Some(err) = validate_2026_routing_headers(&headers, &msg) {
+                    responses.push(err);
+                    continue;
+                }
                 let (identity, new_session) = resolve_identity_for_message(&state, &headers, &msg);
                 if emitted_session_id.is_none() {
                     emitted_session_id = new_session;
@@ -1172,6 +1178,11 @@ async fn mcp_unified_impl(
             }
         }
         Value::Object(_) => {
+            // 2026 HTTP routing headers (Mcp-Method/Mcp-Name) must agree with
+            // the request body; a mismatch is rejected before dispatch.
+            if let Some(err) = validate_2026_routing_headers(&headers, &body) {
+                return json_response(err);
+            }
             let (identity, new_session) = resolve_identity_for_message(&state, &headers, &body);
             emitted_session_id = new_session;
             match handle_single_message(
@@ -1247,35 +1258,97 @@ fn resolve_identity_for_message(
             None,
         );
     }
-    // `initialize`: issue a fresh session id unconditionally so the
-    // client can echo it on follow-ups, even when it sent no
-    // `clientInfo`. Only cache the structured `clientInfo` (name /
-    // version) — the per-request `User-Agent`/`Origin` fallback covers
-    // the empty case on later requests without polluting the LRU with
-    // zero-signal entries.
     let init_identity = identity_from_initialize_params(msg.get("params"));
     let header_identity = identity_from_headers(headers);
-    let session_id = uuid::Uuid::new_v4().to_string();
-    // Detect and record the inbound peer's dialect alongside its identity so
-    // version-gated dispatch (T3) can branch on it. Pure plumbing: storing the
-    // value changes no response or handshake behavior.
+    // Detect the inbound peer's dialect so the session path can branch on it.
     let dialect = protocol::detect_inbound_dialect(
         true,
         header_str(headers, protocol::MCP_PROTOCOL_VERSION_HEADER),
         msg.get("params"),
     );
-    if !init_identity.is_empty() {
-        if let Ok(mut guard) = state.session_identities.lock() {
-            guard.insert_with_dialect(session_id.clone(), init_identity.clone(), dialect);
-        }
-    }
-    let merged = merge_identity(init_identity, header_identity);
+    let merged = merge_identity(init_identity.clone(), header_identity);
     let identity = if merged.is_empty() {
         None
     } else {
         Some(merged)
     };
+    // 2026 clients are stateless: they are not required to send `initialize`
+    // and, when they do, the relay mints/stores/echoes no `Mcp-Session-Id`
+    // (statelessness replaces session affinity — identity travels in `_meta`).
+    if dialect.is_2026() {
+        return (identity, None);
+    }
+    // Legacy `initialize`: issue a fresh session id unconditionally so the
+    // client can echo it on follow-ups, even when it sent no `clientInfo`.
+    // Only cache the structured `clientInfo` (name / version) — the per-request
+    // `User-Agent`/`Origin` fallback covers the empty case on later requests
+    // without polluting the LRU with zero-signal entries.
+    let session_id = uuid::Uuid::new_v4().to_string();
+    if !init_identity.is_empty() {
+        if let Ok(mut guard) = state.session_identities.lock() {
+            guard.insert_with_dialect(session_id.clone(), init_identity, dialect);
+        }
+    }
     (identity, Some(session_id))
+}
+
+/// Validate the 2026 Streamable-HTTP routing headers against a single
+/// JSON-RPC message body. 2026 clients mirror the JSON-RPC `method` in
+/// `Mcp-Method` and (for `tools/call`) the tool name in `Mcp-Name` so proxies
+/// can route/observe without parsing the body. When a header is *present* and
+/// disagrees with the body the request is rejected with `-32600 Invalid
+/// Request` — the relay's existing code for header/body-level malformed
+/// requests (header/body disagreement is fundamentally an Invalid Request, not
+/// a params-validation failure, so `-32600` is used for both headers).
+///
+/// Returns `Some(error envelope)` to reject, or `None` to accept. Absent
+/// headers are accepted: the 2026 stateless path also identifies clients via
+/// `_meta`, and `Mcp-Name` is not applicable to methods without a tool name.
+/// Legacy dialects are never validated (this is a 2026-only, HTTP-only check).
+fn validate_2026_routing_headers(headers: &HeaderMap, msg: &Value) -> Option<Value> {
+    let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    let dialect = protocol::detect_inbound_dialect(
+        method == "initialize",
+        header_str(headers, protocol::MCP_PROTOCOL_VERSION_HEADER),
+        msg.get("params"),
+    );
+    if !dialect.is_2026() {
+        return None;
+    }
+    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+    let invalid_request = |message: String| {
+        Some(json!({
+            "jsonrpc": "2.0",
+            "error": { "code": -32600, "message": message },
+            "id": id,
+        }))
+    };
+    if let Some(hdr_method) = header_str(headers, protocol::MCP_METHOD_HEADER) {
+        if hdr_method != method {
+            return invalid_request(format!(
+                "Invalid Request: Mcp-Method header '{}' does not match body method '{}'",
+                hdr_method, method
+            ));
+        }
+    }
+    if let Some(hdr_name) = header_str(headers, protocol::MCP_NAME_HEADER) {
+        // `Mcp-Name` mirrors the tool name for `tools/call`; methods without a
+        // tool name have nothing to compare against.
+        if method == "tools/call" {
+            let body_name = msg
+                .get("params")
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if hdr_name != body_name {
+                return invalid_request(format!(
+                    "Invalid Request: Mcp-Name header '{}' does not match tool name '{}'",
+                    hdr_name, body_name
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// JSON 404 body returned by profile-scoped routes when the URL `{profile}`
@@ -3358,6 +3431,29 @@ mod tests {
         router.oneshot(request).await.unwrap()
     }
 
+    /// Helper: send a JSON-RPC POST to `/mcp` with extra request headers.
+    async fn post_mcp_with_headers(
+        state: AppState,
+        body: &Value,
+        extra_headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let router = build_router(state);
+        let mut builder = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json");
+        for (k, v) in extra_headers {
+            builder = builder.header(*k, *v);
+        }
+        let request = builder
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap();
+        router.oneshot(request).await.unwrap()
+    }
+
     /// Helper: collect the response body bytes into a `Value`.
     async fn body_json(resp: axum::response::Response) -> Value {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -3452,6 +3548,203 @@ mod tests {
         // handshake/method-not-found rejection of the bare request.
         assert!(body.get("result").is_some() || body.get("error").is_some());
         assert_ne!(body["error"]["code"], json!(-32601));
+    }
+
+    // --- T5: 2026 routing-header validation + session-id gating ---------------
+
+    #[tokio::test]
+    async fn validate_2026_routing_headers_accepts_matching_method_and_name() {
+        // 2026 request (explicit header) with Mcp-Method/Mcp-Name that agree
+        // with the body passes validation.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            protocol::MCP_PROTOCOL_VERSION_HEADER,
+            HeaderValue::from_static("2026-07-28"),
+        );
+        headers.insert(
+            protocol::MCP_METHOD_HEADER,
+            HeaderValue::from_static("tools/call"),
+        );
+        headers.insert(
+            protocol::MCP_NAME_HEADER,
+            HeaderValue::from_static("search_tools"),
+        );
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "id": 1,
+            "params": { "name": "search_tools", "arguments": {} },
+        });
+        assert!(validate_2026_routing_headers(&headers, &msg).is_none());
+    }
+
+    #[tokio::test]
+    async fn validate_2026_routing_headers_rejects_method_mismatch() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            protocol::MCP_PROTOCOL_VERSION_HEADER,
+            HeaderValue::from_static("2026-07-28"),
+        );
+        headers.insert(
+            protocol::MCP_METHOD_HEADER,
+            HeaderValue::from_static("tools/list"),
+        );
+        let msg =
+            json!({ "jsonrpc": "2.0", "method": "tools/call", "id": 2, "params": { "name": "x" } });
+        let err = validate_2026_routing_headers(&headers, &msg)
+            .expect("Mcp-Method/body mismatch must be rejected");
+        assert_eq!(err["error"]["code"], json!(-32600));
+        assert_eq!(err["id"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn validate_2026_routing_headers_rejects_name_mismatch() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            protocol::MCP_PROTOCOL_VERSION_HEADER,
+            HeaderValue::from_static("2026-07-28"),
+        );
+        headers.insert(
+            protocol::MCP_METHOD_HEADER,
+            HeaderValue::from_static("tools/call"),
+        );
+        headers.insert(
+            protocol::MCP_NAME_HEADER,
+            HeaderValue::from_static("wrong_tool"),
+        );
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "id": 3,
+            "params": { "name": "right_tool", "arguments": {} },
+        });
+        let err = validate_2026_routing_headers(&headers, &msg)
+            .expect("Mcp-Name/body mismatch must be rejected");
+        assert_eq!(err["error"]["code"], json!(-32600));
+        assert_eq!(err["id"], json!(3));
+    }
+
+    #[tokio::test]
+    async fn validate_2026_routing_headers_ignores_legacy_dialect() {
+        // A legacy request (no 2026 signal) with a contradictory Mcp-Method is
+        // NOT validated — legacy clients are unaffected by 2026 routing headers.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            protocol::MCP_METHOD_HEADER,
+            HeaderValue::from_static("tools/list"),
+        );
+        let msg =
+            json!({ "jsonrpc": "2.0", "method": "tools/call", "id": 4, "params": { "name": "x" } });
+        assert!(validate_2026_routing_headers(&headers, &msg).is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_unified_rejects_2026_method_header_mismatch() {
+        // End-to-end: a 2026 request whose Mcp-Method disagrees with the body
+        // is rejected with -32600 before dispatch.
+        let state = test_app_state();
+        let resp = post_mcp_with_headers(
+            state,
+            &json!({"jsonrpc":"2.0","method":"tools/list","id":41}),
+            &[
+                (protocol::MCP_PROTOCOL_VERSION_HEADER, "2026-07-28"),
+                (protocol::MCP_METHOD_HEADER, "tools/call"),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], json!(-32600));
+        assert_eq!(body["id"], json!(41));
+    }
+
+    #[tokio::test]
+    async fn mcp_unified_accepts_2026_matching_headers() {
+        // A 2026 request with agreeing Mcp-Method dispatches normally.
+        let state = test_app_state();
+        let resp = post_mcp_with_headers(
+            state,
+            &json!({"jsonrpc":"2.0","method":"tools/list","id":42}),
+            &[
+                (protocol::MCP_PROTOCOL_VERSION_HEADER, "2026-07-28"),
+                (protocol::MCP_METHOD_HEADER, "tools/list"),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert!(body["result"]["tools"].is_array());
+        assert_eq!(body["id"], json!(42));
+    }
+
+    #[tokio::test]
+    async fn mcp_unified_2026_initialize_emits_no_session_id() {
+        // A 2026 `initialize` (explicit header) is stateless: the response
+        // carries no Mcp-Session-Id.
+        let state = test_app_state();
+        let resp = post_mcp_with_headers(
+            state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "initialize",
+                "id": 51,
+                "params": { "clientInfo": { "name": "stateless-ai", "version": "1.0" } },
+            }),
+            &[(protocol::MCP_PROTOCOL_VERSION_HEADER, "2026-07-28")],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get(MCP_SESSION_ID_HEADER).is_none(),
+            "2026 responses must not emit Mcp-Session-Id"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_unified_legacy_initialize_still_emits_session_id() {
+        // Legacy `initialize` keeps the session path: the response echoes a
+        // freshly-minted Mcp-Session-Id.
+        let state = test_app_state();
+        let resp = post_mcp(
+            state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "initialize",
+                "id": 52,
+                "params": { "clientInfo": { "name": "legacy-ai", "version": "1.0" } },
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get(MCP_SESSION_ID_HEADER).is_some(),
+            "legacy responses must emit Mcp-Session-Id"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_identity_for_message_2026_initialize_mints_no_session() {
+        // A 2026 `initialize` mints no session id and stores nothing keyed by
+        // session, even though it carries structured clientInfo.
+        let state = test_app_state();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            protocol::MCP_PROTOCOL_VERSION_HEADER,
+            HeaderValue::from_static("2026-07-28"),
+        );
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "initialize",
+            "id": 53,
+            "params": { "clientInfo": { "name": "stateless-ai", "version": "2.0" } },
+        });
+        let (identity, session_id) = resolve_identity_for_message(&state, &headers, &msg);
+        assert!(
+            session_id.is_none(),
+            "2026 initialize must mint no session id"
+        );
+        let identity = identity.expect("2026 initialize still resolves identity from clientInfo");
+        assert_eq!(identity.name.as_deref(), Some("stateless-ai"));
     }
 
     #[tokio::test]
