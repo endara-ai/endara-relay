@@ -508,6 +508,14 @@ async fn mcp_initialize(
     Json(body): Json<JsonRpcBody>,
     profile_ctx: Option<&ProfileContext>,
 ) -> Json<Value> {
+    let result = build_initialize_result(&state, profile_ctx).await;
+    jsonrpc_response(body.id, result)
+}
+
+/// Build the `InitializeResult` body (`protocolVersion`/`capabilities`/
+/// `serverInfo`/optional `instructions`) shared by `initialize` and
+/// `server/discover`, so both advertise the relay identically.
+async fn build_initialize_result(state: &AppState, profile_ctx: Option<&ProfileContext>) -> Value {
     let mut result = json!({
         "protocolVersion": protocol::VERSION_2025_03_26,
         "capabilities": {
@@ -524,6 +532,44 @@ async fn mcp_initialize(
     };
     if let Some(instructions) = instructions {
         result["instructions"] = Value::String(instructions);
+    }
+    result
+}
+
+/// POST /mcp `server/discover`
+///
+/// 2026-07-28 clients are stateless — they may fetch the relay's server
+/// identity and primitive catalog in a single call without the legacy
+/// `initialize` handshake. The result reuses [`build_initialize_result`] so
+/// `serverInfo`/`capabilities`/`protocolVersion` stay byte-for-byte consistent
+/// with `initialize`, then appends the aggregated primitive summary the relay
+/// exposes — `tools` (mirroring `tools/list`). The relay advertises no prompts
+/// or resources, so only `tools` appears.
+///
+/// Per the coordinator decision (T11 — relay is local/single-user), the result
+/// carries NO `ttlMs` and NO `cacheScope`: 2026 clients treat the absent hint
+/// as immediately stale and rely on `listChanged`, which the relay supports.
+async fn mcp_server_discover(
+    State(state): State<AppState>,
+    Json(body): Json<JsonRpcBody>,
+    profile_ctx: Option<&ProfileContext>,
+) -> Json<Value> {
+    let mut result = build_initialize_result(&state, profile_ctx).await;
+    // Reuse the `tools/list` aggregation verbatim for the primitive summary.
+    let tools_body = JsonRpcBody {
+        jsonrpc: None,
+        method: None,
+        params: None,
+        id: None,
+    };
+    let Json(mut tools_resp) =
+        mcp_tools_list(State(state.clone()), Json(tools_body), profile_ctx).await;
+    if let Some(tools) = tools_resp
+        .get_mut("result")
+        .and_then(|r| r.get_mut("tools"))
+        .map(Value::take)
+    {
+        result["tools"] = tools;
     }
     jsonrpc_response(body.id, result)
 }
@@ -926,6 +972,9 @@ async fn handle_single_message(
 
         let result: Result<Json<Value>, (StatusCode, Json<Value>)> = match method.as_str() {
             "initialize" => Ok(mcp_initialize(State(state.clone()), Json(body), profile_ctx).await),
+            "server/discover" => {
+                Ok(mcp_server_discover(State(state.clone()), Json(body), profile_ctx).await)
+            }
             "tools/list" => Ok(mcp_tools_list(State(state.clone()), Json(body), profile_ctx).await),
             "tools/call" => mcp_tools_call(State(state.clone()), Json(body), profile_ctx).await,
             _ => Err(jsonrpc_error(
@@ -3403,6 +3452,94 @@ mod tests {
         // handshake/method-not-found rejection of the bare request.
         assert!(body.get("result").is_some() || body.get("error").is_some());
         assert_ne!(body["error"]["code"], json!(-32601));
+    }
+
+    #[tokio::test]
+    async fn mcp_unified_server_discover_returns_discovery_result() {
+        // `server/discover` returns the InitializeResult-equivalent identity
+        // (serverInfo/capabilities/protocolVersion) plus the aggregated `tools`
+        // primitive summary, and carries NO caching hints (T11).
+        let state = test_app_state();
+        let resp = post_mcp(
+            state,
+            &json!({"jsonrpc":"2.0","method":"server/discover","id":31}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 31);
+        let result = &body["result"];
+        // serverInfo/capabilities/protocolVersion match what `initialize` emits.
+        assert_eq!(result["protocolVersion"], "2025-03-26");
+        assert_eq!(result["serverInfo"]["name"], "Endara Relay");
+        assert!(!result["serverInfo"]["version"].as_str().unwrap().is_empty());
+        assert_eq!(result["capabilities"]["tools"]["listChanged"], true);
+        // Primitive summary: aggregated tools array (relay exposes tools only).
+        assert!(result["tools"].is_array());
+        // Coordinator decision T11: relay-as-server emits no caching hints.
+        assert!(result.get("ttlMs").is_none());
+        assert!(result.get("cacheScope").is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_unified_server_discover_stateless_without_handshake() {
+        // A 2026 client calls server/discover with no prior initialize and a
+        // `_meta` clientInfo payload — it must be dispatched normally.
+        let state = test_app_state();
+        let resp = post_mcp(
+            state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "server/discover",
+                "id": 32,
+                "params": {
+                    "_meta": {
+                        protocol::META_CLIENT_INFO_KEY: { "name": "stateless-client", "version": "3.1" },
+                    },
+                },
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["id"], 32);
+        assert_eq!(body["result"]["serverInfo"]["name"], "Endara Relay");
+        assert!(body["result"]["tools"].is_array());
+        // Not rejected as method-not-found.
+        assert_ne!(body["error"]["code"], json!(-32601));
+    }
+
+    #[tokio::test]
+    async fn mcp_unified_server_discover_matches_initialize_identity() {
+        // The serverInfo/capabilities/protocolVersion served by server/discover
+        // are byte-for-byte the same fields `initialize` returns (shared
+        // builder), so legacy initialize stays unaffected.
+        let state = test_app_state();
+        let init = body_json(
+            post_mcp(
+                state.clone(),
+                &json!({"jsonrpc":"2.0","method":"initialize","id":1}),
+            )
+            .await,
+        )
+        .await;
+        let discover = body_json(
+            post_mcp(
+                state,
+                &json!({"jsonrpc":"2.0","method":"server/discover","id":2}),
+            )
+            .await,
+        )
+        .await;
+        for field in ["protocolVersion", "capabilities", "serverInfo"] {
+            assert_eq!(
+                init["result"][field], discover["result"][field],
+                "server/discover {field} must match initialize"
+            );
+        }
+        // initialize remains a handshake result with no tools summary.
+        assert!(init["result"].get("tools").is_none());
     }
 
     #[tokio::test]
