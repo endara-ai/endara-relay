@@ -6,7 +6,7 @@ use crate::events::{
     annotations_from_value, current_request_context, ToolCallEvent, ToolCallEventBus,
 };
 use crate::jsonrpc::{self, JsonRpcResponse};
-use crate::protocol::{detect_upstream_dialect, ProtocolVersion};
+use crate::protocol::{self, detect_upstream_dialect, ProtocolVersion};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -249,6 +249,29 @@ impl SseAdapter {
         *self.upstream_dialect.read().await
     }
 
+    /// The relay's own client identity, injected under
+    /// `params._meta["io.modelcontextprotocol/clientInfo"]` on every outbound
+    /// request to a 2026 upstream. The 2026 transport is stateless — there is
+    /// no `initialize` handshake — and the SSE transport carries no per-request
+    /// HTTP headers for identity, so it travels per-request inside `_meta`.
+    fn relay_client_info() -> Value {
+        json!({
+            "name": "endara-relay",
+            "version": env!("CARGO_PKG_VERSION"),
+        })
+    }
+
+    /// Attach the relay's `clientInfo` under `params._meta` for 2026 upstreams,
+    /// creating an empty params object when the request carried none. Non-object
+    /// params are left untouched (MCP params are always objects or absent).
+    fn inject_client_info(params: Option<Value>) -> Option<Value> {
+        let mut params = params.unwrap_or_else(|| json!({}));
+        if params.is_object() {
+            params["_meta"][protocol::META_CLIENT_INFO_KEY] = Self::relay_client_info();
+        }
+        Some(params)
+    }
+
     /// Resolve a relative endpoint URL against the SSE base URL.
     #[allow(dead_code)]
     fn resolve_endpoint(&self, endpoint: &str) -> String {
@@ -481,6 +504,14 @@ impl SseAdapter {
         method: &str,
         params: Option<Value>,
     ) -> Result<(), AdapterError> {
+        // 2026 upstreams: attach `_meta` clientInfo on notifications too, so the
+        // upstream sees the relay's identity per-message. Legacy: unchanged.
+        let params = if self.upstream_dialect.read().await.is_2026() {
+            Self::inject_client_info(params)
+        } else {
+            params
+        };
+
         let endpoint = {
             let guard = self.post_endpoint.read().await;
             guard.clone().ok_or(AdapterError::NotInitialized)?
@@ -534,6 +565,16 @@ impl SseAdapter {
         method: &str,
         params: Option<Value>,
     ) -> Result<Value, AdapterError> {
+        // 2026 upstreams: every request carries the relay's `clientInfo` under
+        // `params._meta` (there is no handshake). SSE carries no per-request
+        // HTTP headers, so version/identity travel entirely in `_meta`.
+        // Legacy: unchanged.
+        let params = if self.upstream_dialect.read().await.is_2026() {
+            Self::inject_client_info(params)
+        } else {
+            params
+        };
+
         let endpoint = {
             let guard = self.post_endpoint.read().await;
             guard.clone().ok_or(AdapterError::NotInitialized)?
@@ -593,59 +634,37 @@ impl SseAdapter {
             .ok_or_else(|| AdapterError::ProtocolError("response has no result".into()))
     }
 
-    /// Connect to the SSE endpoint and perform the MCP initialize handshake.
-    ///
-    /// Used by `initialize()` for the first connection and by the reconnect
-    /// supervisor task to re-establish a healthy connection. On success, sets
-    /// `health = Healthy` and resets the crash tracker. On failure, sets
-    /// `health = Unhealthy(...)` with the underlying error.
-    async fn connect_and_handshake(&self) -> Result<(), AdapterError> {
-        if let Err(e) = self.connect().await {
-            let msg = e.to_string();
-            *self.health.write().await = HealthStatus::Unhealthy(msg);
-            return Err(e);
-        }
+    /// Stateless `server/discover` probe used to detect a 2026 upstream before
+    /// the legacy `initialize` handshake. The request carries the relay's
+    /// `_meta` clientInfo (SSE has no per-request HTTP headers for identity, so
+    /// version/identity travel entirely in `params._meta`). Returns the
+    /// JSON-RPC `result` object on success, or `None` on any failure (JSON-RPC
+    /// error, transport failure, missing result) so the caller falls back to the
+    /// legacy handshake. Legacy servers reject `server/discover` and the relay
+    /// falls back transparently.
+    async fn try_discover_probe(&self) -> Option<Value> {
+        // Build params with `_meta` clientInfo explicitly: the upstream dialect
+        // is still the legacy default here, so `send_request` would not inject
+        // it for us, and a 2026 server expects identity on every request.
+        let params = Self::inject_client_info(None);
+        self.send_request("server/discover", params).await.ok()
+    }
 
-        let params = json!({
-            "protocolVersion": ProtocolVersion::V2024_11_05.as_str(),
-            "capabilities": {},
-            "clientInfo": {
-                "name": "endara-relay",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        });
-
-        let result = match self.send_request("initialize", Some(params)).await {
-            Ok(r) => r,
-            Err(e) => {
-                let msg = e.to_string();
-                *self.health.write().await = HealthStatus::Unhealthy(msg);
-                return Err(e);
-            }
-        };
-
+    /// Extract, validate, and record the upstream `serverInfo.name` from an
+    /// `initialize` or `server/discover` result. Returns `Err` when the name is
+    /// missing or fails sanitization. Shared by the legacy handshake and the
+    /// 2026 stateless path so both name the endpoint identically. Does not touch
+    /// `health`; the caller maps any error onto `HealthStatus::Unhealthy`.
+    async fn apply_server_identity(&self, result: &Value) -> Result<(), AdapterError> {
         // Extract serverInfo.name — REQUIRED per MCP spec enforcement
-        let raw_name = match result
+        let raw_name = result
             .get("serverInfo")
             .and_then(|si| si.get("name"))
             .and_then(|n| n.as_str())
-        {
-            Some(n) => n.to_string(),
-            None => {
-                let msg = ServerNameError::Missing.to_string();
-                *self.health.write().await = HealthStatus::Unhealthy(msg.clone());
-                return Err(AdapterError::ProtocolError(msg));
-            }
-        };
+            .ok_or_else(|| AdapterError::ProtocolError(ServerNameError::Missing.to_string()))?;
 
-        let sanitized = match sanitize_server_name(&raw_name) {
-            Ok(s) => s,
-            Err(e) => {
-                let msg = e.to_string();
-                *self.health.write().await = HealthStatus::Unhealthy(msg.clone());
-                return Err(AdapterError::ProtocolError(msg));
-            }
-        };
+        let sanitized = sanitize_server_name(raw_name)
+            .map_err(|e| AdapterError::ProtocolError(e.to_string()))?;
 
         if let Some(ref ov) = self.config.server_type_override {
             if sanitize_server_name(ov).is_err() {
@@ -668,13 +687,84 @@ impl SseAdapter {
         }
         *self.server_type.write().await = effective;
         *self.upstream_server_name.write().await = Some(upstream_stripped);
+        Ok(())
+    }
 
-        // Detect and record the upstream's negotiated protocol dialect from the
-        // initialize result before any tool calls are proxied (T7). The live
-        // `server/discover` probe (discover-first path) is wired by T9; here we
-        // pass `None` so legacy upstreams behave byte-for-byte as before.
-        self.set_upstream_dialect(detect_upstream_dialect(None, Some(&result)))
-            .await;
+    /// Connect to the SSE endpoint and perform the MCP initialize handshake.
+    ///
+    /// Used by `initialize()` for the first connection and by the reconnect
+    /// supervisor task to re-establish a healthy connection. On success, sets
+    /// `health = Healthy` and resets the crash tracker. On failure, sets
+    /// `health = Unhealthy(...)` with the underlying error.
+    async fn connect_and_handshake(&self) -> Result<(), AdapterError> {
+        if let Err(e) = self.connect().await {
+            let msg = e.to_string();
+            *self.health.write().await = HealthStatus::Unhealthy(msg);
+            return Err(e);
+        }
+
+        // Discover-first dialect detection (T9): probe `server/discover` before
+        // the legacy handshake. A 2026 upstream answers with a `protocolVersion`
+        // of `2026-07-28`, in which case the relay skips the `initialize`/
+        // `notifications/initialized` handshake entirely — the 2026 transport is
+        // stateless, carrying version + identity in `params._meta` on every
+        // request instead. Any other outcome (legacy result, JSON-RPC error,
+        // transport failure) falls through to the unchanged legacy handshake.
+        let discover_result = self.try_discover_probe().await;
+        if detect_upstream_dialect(discover_result.as_ref(), None).is_2026() {
+            let result = discover_result.as_ref().expect(
+                "detect_upstream_dialect reports 2026 only when a discover result is present",
+            );
+            self.set_upstream_dialect(ProtocolVersion::V2026_07_28)
+                .await;
+            if let Err(e) = self.apply_server_identity(result).await {
+                let msg = e.to_string();
+                *self.health.write().await = HealthStatus::Unhealthy(msg);
+                return Err(e);
+            }
+            // 2026 is stateless: no notifications/initialized handshake.
+            *self.health.write().await = HealthStatus::Healthy;
+            self.crash_tracker.lock().await.reset();
+            let _ = self.tools_changed_tx.send(());
+            info!(url = %self.config.url, "MCP initialize skipped (2026 stateless path)");
+            return Ok(());
+        }
+
+        let params = json!({
+            "protocolVersion": ProtocolVersion::V2024_11_05.as_str(),
+            "capabilities": {},
+            "clientInfo": {
+                "name": "endara-relay",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        });
+
+        let result = match self.send_request("initialize", Some(params)).await {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                *self.health.write().await = HealthStatus::Unhealthy(msg);
+                return Err(e);
+            }
+        };
+
+        // Validate + record the upstream serverInfo.name (REQUIRED per MCP spec
+        // enforcement). Shared with the 2026 stateless path above; map any error
+        // onto the adapter's health before returning.
+        if let Err(e) = self.apply_server_identity(&result).await {
+            let msg = e.to_string();
+            *self.health.write().await = HealthStatus::Unhealthy(msg);
+            return Err(e);
+        }
+
+        // Detect and record the upstream's negotiated protocol dialect. The
+        // discover probe ran above (legacy result or none) and the initialize
+        // result carries the negotiated legacy version; neither is 2026 here.
+        self.set_upstream_dialect(detect_upstream_dialect(
+            discover_result.as_ref(),
+            Some(&result),
+        ))
+        .await;
 
         // Per the MCP spec the client MUST send a notifications/initialized
         // notification after a successful initialize exchange. Failure is
@@ -1092,6 +1182,9 @@ mod tests {
             /// When true, /message does NOT broadcast `tools/call` responses
             /// (used to test pending-request error propagation).
             silent_on_tools_call: AtomicBool,
+            /// When true, /message answers `server/discover` with a `2026-07-28`
+            /// result (used to test the 2026 stateless version-gating path).
+            discover_returns_2026: AtomicBool,
             /// Bodies of every POST /message received, in arrival order.
             posts: std::sync::Mutex<Vec<Value>>,
         }
@@ -1186,6 +1279,17 @@ mod tests {
 
             let id = body["id"].as_u64().unwrap_or(0);
             let response = match method.as_str() {
+                "server/discover" if app.fake.discover_returns_2026.load(Ordering::SeqCst) => {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "result": {
+                            "protocolVersion": "2026-07-28",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "fake-sse-2026", "version": "1.0.0"}
+                        },
+                        "id": id,
+                    })
+                }
                 "initialize" => json!({
                     "jsonrpc": "2.0",
                     "result": {
@@ -1193,6 +1297,11 @@ mod tests {
                         "capabilities": {"tools": {}},
                         "serverInfo": {"name": "fake-sse", "version": "0.0.0"}
                     },
+                    "id": id,
+                }),
+                "tools/list" => json!({
+                    "jsonrpc": "2.0",
+                    "result": {"tools": []},
                     "id": id,
                 }),
                 _ => json!({
@@ -1642,6 +1751,117 @@ mod tests {
                 elapsed
             );
             assert_eq!(adapter.health(), HealthStatus::Stopped);
+        }
+
+        #[test]
+        fn test_inject_client_info_creates_and_preserves_params() {
+            // None params → a fresh object carrying only `_meta` clientInfo.
+            let injected = SseAdapter::inject_client_info(None).unwrap();
+            let ci = &injected["_meta"][protocol::META_CLIENT_INFO_KEY];
+            assert_eq!(ci["name"], "endara-relay");
+            assert!(ci["version"].is_string());
+
+            // Existing fields are preserved; `_meta` clientInfo is added.
+            let injected =
+                SseAdapter::inject_client_info(Some(json!({"name": "echo", "arguments": {}})))
+                    .unwrap();
+            assert_eq!(injected["name"], "echo");
+            assert_eq!(
+                injected["_meta"][protocol::META_CLIENT_INFO_KEY]["name"],
+                "endara-relay"
+            );
+        }
+
+        /// 2026 upstream over SSE: the `server/discover` probe detects
+        /// `2026-07-28`, so the adapter skips `initialize`/
+        /// `notifications/initialized` entirely, and every subsequent POST
+        /// carries `_meta` clientInfo (SSE has no per-request identity headers).
+        #[tokio::test]
+        async fn test_sse_2026_path_skips_handshake_and_injects_meta() {
+            let server = start_test_server().await;
+            server
+                .state
+                .discover_returns_2026
+                .store(true, Ordering::SeqCst);
+
+            let mut adapter = build_adapter(&server.url, 3).await;
+            adapter
+                .initialize()
+                .await
+                .expect("2026 initialize succeeds");
+            assert!(
+                adapter.upstream_dialect().await.is_2026(),
+                "upstream should be detected as 2026"
+            );
+            let _ = adapter.list_tools().await.expect("list_tools");
+            adapter.shutdown().await.unwrap();
+
+            let posts = server.state.posts.lock().unwrap().clone();
+            let methods: Vec<&str> = posts.iter().filter_map(|p| p["method"].as_str()).collect();
+            assert!(
+                methods.contains(&"server/discover"),
+                "discover probe must be sent, got {methods:?}"
+            );
+            assert!(
+                !methods.contains(&"initialize"),
+                "2026 path must skip initialize, got {methods:?}"
+            );
+            assert!(
+                !methods.contains(&"notifications/initialized"),
+                "2026 path must skip notifications/initialized, got {methods:?}"
+            );
+            for p in &posts {
+                assert_eq!(
+                    p["params"]["_meta"][protocol::META_CLIENT_INFO_KEY]["name"].as_str(),
+                    Some("endara-relay"),
+                    "every 2026 POST must carry _meta clientInfo, got: {p:?}"
+                );
+            }
+        }
+
+        /// Legacy upstream over SSE: the `server/discover` probe returns a
+        /// non-2026 result, so the full `initialize`/`notifications/initialized`
+        /// handshake runs and the relay injects no `_meta` clientInfo on the
+        /// handshake frames.
+        #[tokio::test]
+        async fn test_sse_legacy_path_runs_handshake_without_meta() {
+            let server = start_test_server().await;
+            let mut adapter = build_adapter(&server.url, 3).await;
+            adapter
+                .initialize()
+                .await
+                .expect("legacy initialize succeeds");
+            assert!(
+                !adapter.upstream_dialect().await.is_2026(),
+                "upstream should be detected as legacy"
+            );
+            adapter.shutdown().await.unwrap();
+
+            let posts = server.state.posts.lock().unwrap().clone();
+            let methods: Vec<&str> = posts.iter().filter_map(|p| p["method"].as_str()).collect();
+            assert!(
+                methods.contains(&"server/discover"),
+                "discover probe must precede the legacy handshake, got {methods:?}"
+            );
+            assert!(
+                methods.contains(&"initialize"),
+                "legacy path must run initialize, got {methods:?}"
+            );
+            assert!(
+                methods.contains(&"notifications/initialized"),
+                "legacy path must send notifications/initialized, got {methods:?}"
+            );
+            // Only the discover probe carries `_meta` (it is sent before the
+            // dialect is known); the legacy handshake frames must not.
+            for p in &posts {
+                if p["method"].as_str() == Some("server/discover") {
+                    continue;
+                }
+                assert!(
+                    p["params"].get("_meta").is_none(),
+                    "legacy frame must not carry _meta, got: {p:?}"
+                );
+            }
         }
     }
 }
