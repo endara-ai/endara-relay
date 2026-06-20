@@ -134,6 +134,46 @@ pub fn detect_inbound_dialect(
     ProtocolVersion::LEGACY_DEFAULT
 }
 
+/// Extract and classify the `protocolVersion` field of a handshake or
+/// discovery result (the `result` object of an `initialize` or
+/// `server/discover` response). Returns `None` when the field is absent or
+/// names a dialect the relay does not model.
+pub fn protocol_version_from_result(result: &Value) -> Option<ProtocolVersion> {
+    result
+        .get("protocolVersion")
+        .and_then(Value::as_str)
+        .and_then(ProtocolVersion::parse)
+}
+
+/// Detect an upstream server's dialect (relay-as-client) using the spec's
+/// discover-first, initialize-fallback strategy:
+///
+/// 1. If a stateless `server/discover` probe returned a result whose
+///    `protocolVersion` is the new `2026-07-28` dialect, the upstream is 2026.
+/// 2. Otherwise fall back to the legacy `initialize` handshake result and use
+///    its negotiated `protocolVersion`.
+/// 3. If neither yields a recognized version, assume the legacy baseline.
+///
+/// Callers pass `discover_result = None` when they did not (or cannot) probe
+/// `server/discover`. The live, transport-specific `server/discover` probe is
+/// wired by T8/T9; today the adapters run their existing legacy handshake and
+/// pass only the `initialize` result, so legacy upstreams behave byte-for-byte
+/// as before.
+pub fn detect_upstream_dialect(
+    discover_result: Option<&Value>,
+    initialize_result: Option<&Value>,
+) -> ProtocolVersion {
+    if let Some(version) = discover_result.and_then(protocol_version_from_result) {
+        if version.is_2026() {
+            return version;
+        }
+    }
+    if let Some(version) = initialize_result.and_then(protocol_version_from_result) {
+        return version;
+    }
+    ProtocolVersion::LEGACY_DEFAULT
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,6 +251,83 @@ mod tests {
         assert_eq!(
             detect_inbound_dialect(false, Some("garbage"), None),
             ProtocolVersion::V2025_03_26
+        );
+    }
+
+    #[test]
+    fn protocol_version_from_result_parses_known_and_rejects_unknown() {
+        assert_eq!(
+            protocol_version_from_result(&json!({ "protocolVersion": "2026-07-28" })),
+            Some(ProtocolVersion::V2026_07_28)
+        );
+        assert_eq!(
+            protocol_version_from_result(&json!({ "protocolVersion": "2024-11-05" })),
+            Some(ProtocolVersion::V2024_11_05)
+        );
+        assert_eq!(
+            protocol_version_from_result(&json!({ "protocolVersion": "2025-06-18" })),
+            None
+        );
+        assert_eq!(protocol_version_from_result(&json!({})), None);
+    }
+
+    #[test]
+    fn detect_upstream_2026_when_discover_succeeds() {
+        // 2026 upstream: server/discover returns a 2026 result → dialect=2026,
+        // regardless of any initialize result.
+        let discover = json!({
+            "protocolVersion": "2026-07-28",
+            "capabilities": {}
+        });
+        assert_eq!(
+            detect_upstream_dialect(Some(&discover), None),
+            ProtocolVersion::V2026_07_28
+        );
+        let init = json!({ "protocolVersion": "2025-03-26" });
+        assert_eq!(
+            detect_upstream_dialect(Some(&discover), Some(&init)),
+            ProtocolVersion::V2026_07_28
+        );
+    }
+
+    #[test]
+    fn detect_upstream_falls_back_to_initialize_when_discover_fails() {
+        // Legacy upstream: server/discover not attempted/rejected (None) → fall
+        // back to the initialize result's negotiated version.
+        let init_2024 = json!({ "protocolVersion": "2024-11-05" });
+        assert_eq!(
+            detect_upstream_dialect(None, Some(&init_2024)),
+            ProtocolVersion::V2024_11_05
+        );
+        let init_2025 = json!({ "protocolVersion": "2025-03-26" });
+        assert_eq!(
+            detect_upstream_dialect(None, Some(&init_2025)),
+            ProtocolVersion::V2025_03_26
+        );
+    }
+
+    #[test]
+    fn detect_upstream_initialize_only_server_not_broken() {
+        // An initialize-only upstream (no server/discover support) that omits or
+        // sends an unmodeled protocolVersion still resolves to a usable legacy
+        // dialect rather than erroring.
+        let init_no_version = json!({ "serverInfo": { "name": "legacy" } });
+        assert_eq!(
+            detect_upstream_dialect(None, Some(&init_no_version)),
+            ProtocolVersion::LEGACY_DEFAULT
+        );
+        // A discover result that is present but not a recognized 2026 version
+        // does not win; we still fall back to initialize.
+        let discover_legacy = json!({ "protocolVersion": "2024-11-05" });
+        let init = json!({ "protocolVersion": "2025-03-26" });
+        assert_eq!(
+            detect_upstream_dialect(Some(&discover_legacy), Some(&init)),
+            ProtocolVersion::V2025_03_26
+        );
+        // Nothing at all → legacy baseline.
+        assert_eq!(
+            detect_upstream_dialect(None, None),
+            ProtocolVersion::LEGACY_DEFAULT
         );
     }
 }

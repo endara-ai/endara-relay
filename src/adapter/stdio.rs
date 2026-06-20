@@ -6,7 +6,7 @@ use crate::events::{
     annotations_from_value, current_request_context, ToolCallEvent, ToolCallEventBus,
 };
 use crate::jsonrpc::{self, JsonRpcResponse};
-use crate::protocol::ProtocolVersion;
+use crate::protocol::{detect_upstream_dialect, ProtocolVersion};
 use crate::shell_env;
 use async_trait::async_trait;
 use serde::Serialize;
@@ -433,9 +433,9 @@ impl StdioAdapter {
         self.request_id.fetch_add(1, Ordering::SeqCst)
     }
 
-    /// Record the upstream server's negotiated [`ProtocolVersion`]. Wired by
-    /// T7/T9 once real negotiation is implemented; unused today.
-    #[allow(dead_code)]
+    /// Record the upstream server's negotiated [`ProtocolVersion`]. Populated
+    /// during the `initialize` handshake (T7); consumed by the 2026 outbound
+    /// code paths (T9).
     pub(crate) async fn set_upstream_dialect(&self, dialect: ProtocolVersion) {
         *self.upstream_dialect.write().await = dialect;
     }
@@ -839,6 +839,13 @@ impl StdioAdapter {
         }
         *self.server_type.write().await = effective;
         *self.upstream_server_name.write().await = Some(upstream_stripped);
+
+        // Detect and record the upstream's negotiated protocol dialect from the
+        // initialize result before any tool calls are proxied (T7). The live
+        // `server/discover` probe (discover-first path) is wired by T9; here we
+        // pass `None` so legacy upstreams behave byte-for-byte as before.
+        self.set_upstream_dialect(detect_upstream_dialect(None, Some(&result)))
+            .await;
 
         // Per the MCP spec the client MUST send a notifications/initialized
         // notification after a successful initialize exchange. Strict servers
