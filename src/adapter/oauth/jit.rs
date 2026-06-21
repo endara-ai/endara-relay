@@ -28,7 +28,7 @@ use crate::adapter::AdapterError;
 use crate::oauth::dcr::{self, ClientRegistrationResponse};
 use crate::oauth::discovery::{self, DiscoveryError, DiscoveryResult};
 use crate::oauth::{OAuthFlowManager, PkceChallenge};
-use crate::token_manager::{DcrCredentials, TokenManager};
+use crate::token_manager::{dcr_issuer_allows_reuse, merge_scopes, DcrCredentials, TokenManager};
 use serde_json::{json, Value};
 
 /// A parsed `WWW-Authenticate: Bearer ...` challenge.
@@ -261,6 +261,7 @@ impl JitInterceptor {
                 client_secret.as_deref(),
                 pkce,
                 &redirect_uri,
+                Some(&disc.issuer),
             )
             .await;
 
@@ -283,11 +284,23 @@ impl JitInterceptor {
             urlencoding(&state_param),
             urlencoding(&code_challenge),
         );
-        if !disc.scopes_supported.is_empty() {
-            authorize_url.push_str(&format!(
-                "&scope={}",
-                urlencoding(&disc.scopes_supported.join(" "))
-            ));
+        // Scope accumulation for step-up authorization: when this endpoint
+        // already has a persisted token with a granted scope, request the
+        // UNION of previously-granted scopes and the scopes we'd request today
+        // so the user never silently loses access they already granted.
+        let prior_scope = if let Some(ref tm) = self.token_manager {
+            tm.load(endpoint_name)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|t| t.scope)
+        } else {
+            None
+        };
+        let requested_scope = disc.scopes_supported.join(" ");
+        let merged_scope = merge_scopes(prior_scope.as_deref(), &requested_scope);
+        if !merged_scope.is_empty() {
+            authorize_url.push_str(&format!("&scope={}", urlencoding(&merged_scope)));
         }
 
         info!(
@@ -312,7 +325,19 @@ impl JitInterceptor {
     ) -> Result<(String, Option<String>), JitError> {
         if let Some(ref tm) = self.token_manager {
             if let Ok(Some(creds)) = tm.load_dcr(endpoint_name).await {
-                return Ok((creds.client_id, creds.client_secret));
+                // Credential-to-issuer binding: only reuse a stored client_id
+                // with the SAME authorization server that issued it. If the AS
+                // issuer changed, discard and re-register (RFC 7591). Legacy
+                // creds with no stored issuer are reused as-is.
+                if dcr_issuer_allows_reuse(creds.issuer.as_deref(), Some(disc.issuer.as_str())) {
+                    return Ok((creds.client_id, creds.client_secret));
+                }
+                info!(
+                    endpoint = %endpoint_name,
+                    stored_issuer = ?creds.issuer,
+                    current_issuer = %disc.issuer,
+                    "DCR credential issuer changed; discarding stored credentials and re-registering"
+                );
             }
         }
 
@@ -334,6 +359,7 @@ impl JitInterceptor {
                 client_secret: resp.client_secret.clone(),
                 client_secret_expires_at: resp.client_secret_expires_at,
                 registered_at: now_secs(),
+                issuer: Some(disc.issuer.clone()),
             };
             if let Err(e) = tm.save_dcr(endpoint_name, &creds).await {
                 warn!(error = %e, "failed to persist JIT-registered DCR credentials");

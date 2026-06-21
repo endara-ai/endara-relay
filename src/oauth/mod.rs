@@ -83,6 +83,11 @@ pub struct PendingFlow {
     pub client_id: String,
     pub client_secret: Option<String>,
     pub redirect_uri: String,
+    /// Expected authorization server issuer (RFC 8414 `issuer`), when known.
+    /// When `Some(_)`, the callback enforces RFC 9207 `iss` validation; when
+    /// `None` (e.g. legacy convention-based config without discovery), the
+    /// `iss` check is skipped to preserve existing behavior.
+    pub issuer: Option<String>,
     pub created_at: Instant,
 }
 
@@ -103,6 +108,7 @@ impl OAuthFlowManager {
     ///
     /// `token_endpoint` should be the fully resolved token endpoint URL
     /// (from discovery or built from config convention).
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_flow(
         &self,
         endpoint_name: &str,
@@ -111,6 +117,7 @@ impl OAuthFlowManager {
         client_secret: Option<&str>,
         pkce: PkceChallenge,
         redirect_uri: &str,
+        issuer: Option<&str>,
     ) -> String {
         let state = generate_state();
         let flow = PendingFlow {
@@ -120,6 +127,7 @@ impl OAuthFlowManager {
             client_id: client_id.to_string(),
             client_secret: client_secret.map(|s| s.to_string()),
             redirect_uri: redirect_uri.to_string(),
+            issuer: issuer.map(|s| s.to_string()),
             created_at: Instant::now(),
         };
         self.pending.write().await.insert(state.clone(), flow);
@@ -189,6 +197,9 @@ pub struct OAuthSetupSession {
     pub registration_endpoint: Option<String>,
     /// OAuth server base URL (if configured or discovered).
     pub oauth_server_url: Option<String>,
+    /// Discovered authorization server issuer (RFC 8414 `issuer`), used for
+    /// RFC 9207 `iss` validation on the callback. `None` when not discovered.
+    pub issuer: Option<String>,
     /// Client ID (from DCR or manual input).
     pub client_id: Option<String>,
     /// Client secret (optional).
@@ -237,6 +248,7 @@ impl OAuthSetupManager {
             token_endpoint: None,
             registration_endpoint: None,
             oauth_server_url: None,
+            issuer: None,
             client_id: None,
             client_secret: None,
             tokens: None,
@@ -360,6 +372,7 @@ mod tests {
                 Some("secret"),
                 pkce,
                 "http://127.0.0.1:9400/oauth/callback",
+                Some("https://auth.example.com"),
             )
             .await;
 
@@ -369,6 +382,28 @@ mod tests {
         assert_eq!(flow.token_endpoint, "https://auth.example.com/token");
         assert_eq!(flow.client_id, "client123");
         assert_eq!(flow.client_secret.as_deref(), Some("secret"));
+        assert_eq!(flow.issuer.as_deref(), Some("https://auth.example.com"));
+    }
+
+    #[tokio::test]
+    async fn flow_manager_stores_none_issuer() {
+        // Legacy/convention-based flows pass `None` for issuer; the stored flow
+        // must reflect that so the callback skips RFC 9207 `iss` validation.
+        let mgr = OAuthFlowManager::new();
+        let pkce = PkceChallenge::generate();
+        let state = mgr
+            .start_flow(
+                "legacy-ep",
+                "https://auth.example.com/token",
+                "cid",
+                None,
+                pkce,
+                "http://127.0.0.1:9400/oauth/callback",
+                None,
+            )
+            .await;
+        let flow = mgr.consume_flow(&state).await.unwrap();
+        assert!(flow.issuer.is_none());
     }
 
     #[tokio::test]
@@ -383,6 +418,7 @@ mod tests {
                 None,
                 pkce,
                 "http://localhost/cb",
+                None,
             )
             .await;
 
@@ -411,6 +447,7 @@ mod tests {
                 None,
                 pkce,
                 "http://localhost/cb",
+                None,
             )
             .await;
 
@@ -440,6 +477,7 @@ mod tests {
                     None,
                     pkce,
                     "http://localhost/cb",
+                    None,
                 )
                 .await;
             let flow = mgr.consume_flow(&state).await.unwrap();

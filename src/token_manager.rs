@@ -51,6 +51,47 @@ pub struct DcrCredentials {
     pub client_secret_expires_at: u64,
     /// Unix timestamp (seconds) when the client was registered.
     pub registered_at: u64,
+    /// Authorization server `issuer` (RFC 8414) these credentials were
+    /// registered against. Bound so a stored DCR `client_id` is only reused
+    /// with the SAME issuing AS; an issuer change triggers re-registration
+    /// (RFC 7591). `None` for legacy credential files saved before this field
+    /// existed (treated as "reuse as-is" for backward compatibility).
+    #[serde(default)]
+    pub issuer: Option<String>,
+}
+
+/// Decide whether persisted DCR credentials may be reused with the current
+/// authorization server, or must be discarded and re-registered (RFC 7591).
+///
+/// Returns `true` to reuse, `false` to re-register. The decision is pure so it
+/// can be unit-tested directly:
+/// - stored issuer `None` (legacy creds) → reuse (backward compatibility)
+/// - current issuer `None` (issuer unknown) → reuse (cannot detect a migration)
+/// - both `Some` and equal → reuse
+/// - both `Some` and differ → re-register (issuer migration)
+pub fn dcr_issuer_allows_reuse(stored: Option<&str>, current: Option<&str>) -> bool {
+    match (stored, current) {
+        (Some(s), Some(c)) => s == c,
+        _ => true,
+    }
+}
+
+/// Compute the set-union of previously-granted scopes and the scopes that would
+/// be requested today, for step-up authorization. Prior scopes are emitted
+/// first (stable order), then any newly-requested scopes not already present;
+/// duplicates are removed. Whitespace-delimited, per the OAuth `scope` syntax.
+pub fn merge_scopes(prior: Option<&str>, requested: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for s in prior
+        .unwrap_or("")
+        .split_whitespace()
+        .chain(requested.split_whitespace())
+    {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out.join(" ")
 }
 
 /// Owns token persistence. One instance shared across all OAuth adapters via `Arc<TokenManager>`.
@@ -310,6 +351,7 @@ mod tests {
             client_secret: Some("dcr-client-secret".to_string()),
             client_secret_expires_at: 0,
             registered_at: 1700000000,
+            issuer: Some("https://auth.example.com".to_string()),
         }
     }
 
@@ -415,12 +457,100 @@ mod tests {
             client_secret: None,
             client_secret_expires_at: 0,
             registered_at: 1700000000,
+            issuer: None,
         };
 
         mgr.save_dcr("public-ep", &creds).await.unwrap();
         let loaded = mgr.load_dcr("public-ep").await.unwrap().unwrap();
         assert_eq!(loaded, creds);
         assert!(loaded.client_secret.is_none());
+    }
+
+    #[tokio::test]
+    async fn dcr_round_trip_preserves_issuer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        let creds = make_dcr_creds();
+        assert_eq!(creds.issuer.as_deref(), Some("https://auth.example.com"));
+
+        mgr.save_dcr("issuer-ep", &creds).await.unwrap();
+        let loaded = mgr.load_dcr("issuer-ep").await.unwrap().unwrap();
+        assert_eq!(loaded.issuer.as_deref(), Some("https://auth.example.com"));
+        assert_eq!(loaded, creds);
+    }
+
+    #[test]
+    fn dcr_legacy_file_without_issuer_loads_as_none() {
+        // Credential files written before the `issuer` field existed must still
+        // deserialize, with issuer = None (no spurious re-registration).
+        let json = r#"{"client_id":"legacy-id","client_secret":"legacy-secret","client_secret_expires_at":0,"registered_at":1700000000}"#;
+        let creds: DcrCredentials = serde_json::from_str(json).unwrap();
+        assert_eq!(creds.client_id, "legacy-id");
+        assert_eq!(creds.issuer, None);
+    }
+
+    // --- dcr_issuer_allows_reuse() decision tests ---
+
+    #[test]
+    fn issuer_reuse_legacy_none_is_reused() {
+        // Stored issuer None (legacy) → reuse regardless of current issuer.
+        assert!(dcr_issuer_allows_reuse(None, Some("https://a.example")));
+        assert!(dcr_issuer_allows_reuse(None, None));
+    }
+
+    #[test]
+    fn issuer_reuse_matching_is_reused() {
+        assert!(dcr_issuer_allows_reuse(
+            Some("https://a.example"),
+            Some("https://a.example")
+        ));
+    }
+
+    #[test]
+    fn issuer_reuse_differing_triggers_reregister() {
+        assert!(!dcr_issuer_allows_reuse(
+            Some("https://a.example"),
+            Some("https://b.example")
+        ));
+    }
+
+    #[test]
+    fn issuer_reuse_unknown_current_is_reused() {
+        // Current issuer unknown (discovery fallback) → cannot detect a
+        // migration, so reuse to avoid spurious re-registration.
+        assert!(dcr_issuer_allows_reuse(Some("https://a.example"), None));
+    }
+
+    // --- merge_scopes() tests ---
+
+    #[test]
+    fn merge_scopes_empty_prior_returns_requested() {
+        assert_eq!(merge_scopes(None, "read write"), "read write");
+        assert_eq!(merge_scopes(Some(""), "read write"), "read write");
+    }
+
+    #[test]
+    fn merge_scopes_overlapping_dedups() {
+        assert_eq!(
+            merge_scopes(Some("read write"), "write delete"),
+            "read write delete"
+        );
+    }
+
+    #[test]
+    fn merge_scopes_disjoint_unions() {
+        assert_eq!(merge_scopes(Some("read"), "write"), "read write");
+    }
+
+    #[test]
+    fn merge_scopes_preserves_prior_first_order() {
+        // Prior scopes are emitted first, then new ones; dedup keeps first seen.
+        assert_eq!(merge_scopes(Some("b a"), "a c b"), "b a c");
+    }
+
+    #[test]
+    fn merge_scopes_empty_requested_keeps_prior() {
+        assert_eq!(merge_scopes(Some("read write"), ""), "read write");
     }
 
     #[cfg(unix)]

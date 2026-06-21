@@ -15,6 +15,9 @@ pub struct ClientRegistrationRequest {
     pub response_types: Vec<String>,
     /// How we authenticate at the token endpoint
     pub token_endpoint_auth_method: String,
+    /// Application type per RFC 7591 / OIDC DCR. The relay uses a loopback
+    /// `127.0.0.1` redirect_uri, which is a native/installed application.
+    pub application_type: String,
     /// Scopes we're requesting (informational for DCR)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
@@ -72,6 +75,7 @@ pub async fn register_client(
         ],
         response_types: vec!["code".to_string()],
         token_endpoint_auth_method: "none".to_string(),
+        application_type: "native".to_string(),
         scope: None,
     };
 
@@ -107,6 +111,7 @@ mod tests {
             ],
             response_types: vec!["code".to_string()],
             token_endpoint_auth_method: "none".to_string(),
+            application_type: "native".to_string(),
             scope: None,
         };
         let json = serde_json::to_value(&req).unwrap();
@@ -119,6 +124,8 @@ mod tests {
         assert_eq!(json["grant_types"][1], "refresh_token");
         assert_eq!(json["response_types"][0], "code");
         assert_eq!(json["token_endpoint_auth_method"], "none");
+        // loopback redirect_uri → native application per RFC 7591 / OIDC DCR
+        assert_eq!(json["application_type"], "native");
         // scope should be absent when None (skip_serializing_if)
         assert!(json.get("scope").is_none());
     }
@@ -131,6 +138,7 @@ mod tests {
             grant_types: vec!["authorization_code".to_string()],
             response_types: vec!["code".to_string()],
             token_endpoint_auth_method: "none".to_string(),
+            application_type: "native".to_string(),
             scope: Some("read write".to_string()),
         };
         let json = serde_json::to_value(&req).unwrap();
