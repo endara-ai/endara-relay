@@ -389,6 +389,11 @@ pub struct StdioAdapter {
     /// real negotiation populates it via [`Self::set_upstream_dialect`] (T7).
     /// Consumed by the 2026 outbound code paths (T9).
     upstream_dialect: Arc<RwLock<ProtocolVersion>>,
+    /// Upstream `ttlMs` freshness hint (SEP-2549) captured from the most recent
+    /// successful `tools/list` result. `Some(ms)` only for 2026 upstreams that
+    /// sent a top-level `ttlMs`; `None` otherwise. Read by the registry cache to
+    /// honor the upstream's freshness window. See [`Self::list_tools_ttl_ms`].
+    list_ttl_ms: Arc<RwLock<Option<u64>>>,
     // Background task handles
     _stderr_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     _stdout_handle: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
@@ -424,6 +429,7 @@ impl StdioAdapter {
             stats_poller_handle: Arc::new(Mutex::new(None)),
             isolation_state: Arc::new(std::sync::RwLock::new(None)),
             upstream_dialect: Arc::new(RwLock::new(ProtocolVersion::V2024_11_05)),
+            list_ttl_ms: Arc::new(RwLock::new(None)),
             _stderr_handle: Arc::new(Mutex::new(None)),
             _stdout_handle: Arc::new(Mutex::new(None)),
         }
@@ -984,6 +990,15 @@ impl McpAdapter for StdioAdapter {
                 .get("tools")
                 .ok_or_else(|| AdapterError::ProtocolError("missing 'tools' field".into()))?;
             let tools: Vec<ToolInfo> = serde_json::from_value(tools_value.clone())?;
+            // Capture the upstream `ttlMs` freshness hint (SEP-2549) only for
+            // 2026 upstreams; legacy upstreams never carry it and keep the
+            // existing event-driven cache behavior. Read by the registry cache.
+            let ttl = if self.upstream_dialect.read().await.is_2026() {
+                protocol::ttl_ms_from_result(&result)
+            } else {
+                None
+            };
+            *self.list_ttl_ms.write().await = ttl;
             // Refresh the per-tool annotations cache used by `call_tool` to
             // join hint metadata onto the overlay's `started` event. Mirrors
             // the registry's tool cache lifecycle: rewritten on every
@@ -1000,6 +1015,10 @@ impl McpAdapter for StdioAdapter {
         }
         .instrument(self.span.clone())
         .await
+    }
+
+    async fn list_tools_ttl_ms(&self) -> Option<u64> {
+        *self.list_ttl_ms.read().await
     }
 
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {

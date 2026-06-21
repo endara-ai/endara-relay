@@ -12,10 +12,34 @@ use serde_json::Value;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
+
+/// A cached `list_tools()` result with an optional freshness deadline.
+///
+/// `expires_at == None` ⇒ no upstream `ttlMs` hint was provided (legacy
+/// upstream, or a 2026 upstream that sent none); the entry is purely
+/// event-driven and never expires by time, preserving the relay's pre-2026
+/// caching behavior byte-for-byte. `Some(deadline)` ⇒ a 2026 upstream supplied
+/// a `ttlMs` freshness window (SEP-2549); the entry is considered stale once
+/// `Instant::now() >= deadline`, at which point `cached_list_tools` refetches.
+pub(crate) struct CachedTools {
+    pub(crate) tools: Vec<ToolInfo>,
+    pub(crate) expires_at: Option<Instant>,
+}
+
+impl CachedTools {
+    /// `true` while the entry may still be served from cache. Entries with no
+    /// upstream TTL hint are always fresh (event-driven invalidation only).
+    fn is_fresh(&self) -> bool {
+        match self.expires_at {
+            None => true,
+            Some(deadline) => Instant::now() < deadline,
+        }
+    }
+}
 
 /// A registered adapter with its metadata.
 pub struct RegisteredAdapter {
@@ -27,9 +51,10 @@ pub struct RegisteredAdapter {
     pub disabled: bool,
     pub disabled_tools: HashSet<String>,
     /// Per-adapter cache of the most recent successful `list_tools()` result.
-    /// Purely event-driven (no TTL); cleared by registry invalidation methods
-    /// or when the adapter is swapped/restarted.
-    pub(crate) tool_cache: RwLock<Option<Vec<ToolInfo>>>,
+    /// Event-driven invalidation (cleared by registry invalidation methods or
+    /// when the adapter is swapped/restarted) plus an optional upstream-provided
+    /// `ttlMs` freshness window honored for 2026 upstreams (see [`CachedTools`]).
+    pub(crate) tool_cache: RwLock<Option<CachedTools>>,
     /// Coalesces concurrent cache misses so only one `list_tools()` call is
     /// in-flight per adapter at a time.
     pub(crate) tool_cache_populate_lock: Mutex<()>,
@@ -59,11 +84,14 @@ impl RegisteredAdapter {
     /// without writing the cache, preserving the invariant that an
     /// unhealthy adapter never poisons the cache.
     pub async fn cached_list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
-        // Fast path: healthy adapter with a populated cache returns
-        // without taking the populate lock or calling the adapter.
+        // Fast path: healthy adapter with a populated, still-fresh cache
+        // returns without taking the populate lock or calling the adapter.
+        // An entry past its upstream `ttlMs` deadline is treated as a miss.
         if matches!(self.adapter.health(), HealthStatus::Healthy) {
             if let Some(cached) = self.tool_cache.read().await.as_ref() {
-                return Ok(cached.clone());
+                if cached.is_fresh() {
+                    return Ok(cached.tools.clone());
+                }
             }
         }
         // Slow path: serialize concurrent callers behind the populate lock
@@ -74,10 +102,16 @@ impl RegisteredAdapter {
         // and populated the cache while we were parked.
         if matches!(self.adapter.health(), HealthStatus::Healthy) {
             if let Some(cached) = self.tool_cache.read().await.as_ref() {
-                return Ok(cached.clone());
+                if cached.is_fresh() {
+                    return Ok(cached.tools.clone());
+                }
             }
             let tools = self.adapter.list_tools().await?;
-            *self.tool_cache.write().await = Some(tools.clone());
+            let expires_at = self.ttl_expiry().await;
+            *self.tool_cache.write().await = Some(CachedTools {
+                tools: tools.clone(),
+                expires_at,
+            });
             return Ok(tools);
         }
         // Still not `Healthy` under the lock: delegate straight to the
@@ -89,9 +123,23 @@ impl RegisteredAdapter {
         // adapter never poisons the cache.
         let tools = self.adapter.list_tools().await?;
         if matches!(self.adapter.health(), HealthStatus::Healthy) {
-            *self.tool_cache.write().await = Some(tools.clone());
+            let expires_at = self.ttl_expiry().await;
+            *self.tool_cache.write().await = Some(CachedTools {
+                tools: tools.clone(),
+                expires_at,
+            });
         }
         Ok(tools)
+    }
+
+    /// Translate the upstream `ttlMs` hint captured by the adapter's most
+    /// recent `list_tools()` into an absolute cache deadline. `None` (no hint /
+    /// legacy upstream) keeps the entry event-driven with no time expiry.
+    async fn ttl_expiry(&self) -> Option<Instant> {
+        self.adapter
+            .list_tools_ttl_ms()
+            .await
+            .map(|ms| Instant::now() + Duration::from_millis(ms))
     }
 }
 
@@ -1911,6 +1959,113 @@ mod tests {
         }
     }
 
+    /// Healthy mock that counts `list_tools()` calls and reports a fixed
+    /// upstream `ttlMs` hint, used to exercise the registry's freshness-window
+    /// honoring in [`RegisteredAdapter::cached_list_tools`].
+    struct TtlCountingAdapter {
+        tools: Vec<ToolInfo>,
+        calls: Arc<AtomicU64>,
+        ttl_ms: Option<u64>,
+    }
+
+    #[async_trait]
+    impl McpAdapter for TtlCountingAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.tools.clone())
+        }
+        async fn list_tools_ttl_ms(&self) -> Option<u64> {
+            self.ttl_ms
+        }
+        async fn call_tool(
+            &self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, AdapterError> {
+            Ok(json!({ "called": name, "args": arguments }))
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    async fn register_ttl_adapter(ttl_ms: Option<u64>) -> (AdapterRegistry, Arc<AtomicU64>) {
+        let registry = AdapterRegistry::new();
+        let calls = Arc::new(AtomicU64::new(0));
+        let adapter = TtlCountingAdapter {
+            tools: vec![make_tool("a")],
+            calls: calls.clone(),
+            ttl_ms,
+        };
+        registry
+            .register(
+                "ep".into(),
+                Box::new(adapter),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+        (registry, calls)
+    }
+
+    #[tokio::test]
+    async fn cached_list_tools_honors_upstream_ttl_while_fresh() {
+        // A generous upstream ttlMs keeps the cached entry fresh: a second
+        // call within the window is served from cache (no extra list_tools).
+        let (registry, calls) = register_ttl_adapter(Some(60_000)).await;
+        let entries = registry.entries().read().await;
+        let entry = entries.get("ep").unwrap();
+        entry.cached_list_tools().await.unwrap();
+        entry.cached_list_tools().await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "fresh entry within ttlMs must be served from cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_list_tools_refetches_after_ttl_expiry() {
+        // A short upstream ttlMs expires between calls: the second call sees a
+        // stale entry and refetches from the upstream.
+        let (registry, calls) = register_ttl_adapter(Some(15)).await;
+        let entries = registry.entries().read().await;
+        let entry = entries.get("ep").unwrap();
+        entry.cached_list_tools().await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        entry.cached_list_tools().await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "entry past its ttlMs deadline must be refetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_list_tools_without_ttl_caches_indefinitely() {
+        // Absent upstream ttlMs (legacy upstream / no hint) preserves the
+        // existing event-driven behavior: the entry never expires by time.
+        let (registry, calls) = register_ttl_adapter(None).await;
+        let entries = registry.entries().read().await;
+        let entry = entries.get("ep").unwrap();
+        entry.cached_list_tools().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        entry.cached_list_tools().await.unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "without a ttlMs hint the cache must remain event-driven"
+        );
+    }
+
     fn make_tool(name: &str) -> ToolInfo {
         ToolInfo {
             name: name.to_string(),
@@ -3580,11 +3735,13 @@ mod tests {
         // still contains the previously-primed entry. (If a future change
         // populates the cache from the bypass branch, the asserted name
         // would flip and force a deliberate review here.)
-        let cached_after = entry.tool_cache.read().await.clone();
-        let cached_after = cached_after.expect("cache must remain populated after bypass");
-        assert_eq!(cached_after.len(), 1);
+        let cache_guard = entry.tool_cache.read().await;
+        let cached_after = cache_guard
+            .as_ref()
+            .expect("cache must remain populated after bypass");
+        assert_eq!(cached_after.tools.len(), 1);
         assert_eq!(
-            cached_after[0].name, "cached_tool",
+            cached_after.tools[0].name, "cached_tool",
             "bypass must not write through to the cache"
         );
     }

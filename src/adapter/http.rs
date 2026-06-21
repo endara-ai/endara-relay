@@ -126,6 +126,11 @@ pub struct HttpAdapter {
     /// real negotiation populates it via [`Self::set_upstream_dialect`] (T7).
     /// Consumed by the 2026 outbound code paths (T8).
     upstream_dialect: Arc<RwLock<ProtocolVersion>>,
+    /// Upstream `ttlMs` freshness hint (SEP-2549) captured from the most recent
+    /// successful `tools/list` result. `Some(ms)` only for 2026 upstreams that
+    /// sent a top-level `ttlMs`; `None` otherwise. Read by the registry cache to
+    /// honor the upstream's freshness window. See [`Self::list_tools_ttl_ms`].
+    list_ttl_ms: Arc<RwLock<Option<u64>>>,
 }
 
 /// HTTP header name reqwest reads/writes for the MCP session ID. Reqwest's
@@ -209,6 +214,7 @@ impl HttpAdapter {
             jit_interceptor: None,
             last_www_authenticate: Arc::new(RwLock::new(None)),
             upstream_dialect: Arc::new(RwLock::new(ProtocolVersion::V2025_03_26)),
+            list_ttl_ms: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -258,6 +264,7 @@ impl HttpAdapter {
             jit_interceptor: None,
             last_www_authenticate: Arc::new(RwLock::new(None)),
             upstream_dialect: Arc::new(RwLock::new(ProtocolVersion::V2025_03_26)),
+            list_ttl_ms: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -1154,6 +1161,15 @@ impl McpAdapter for HttpAdapter {
                 .get("tools")
                 .ok_or_else(|| AdapterError::ProtocolError("missing 'tools' field".into()))?;
             let tools: Vec<ToolInfo> = serde_json::from_value(tools_value.clone())?;
+            // Capture the upstream `ttlMs` freshness hint (SEP-2549) only for
+            // 2026 upstreams; legacy upstreams never carry it and keep the
+            // existing event-driven cache behavior. Read by the registry cache.
+            let ttl = if self.upstream_dialect.read().await.is_2026() {
+                protocol::ttl_ms_from_result(&result)
+            } else {
+                None
+            };
+            *self.list_ttl_ms.write().await = ttl;
             // Refresh the per-tool annotations cache for overlay events.
             let mut cache = self.tool_annotations_cache.write().await;
             cache.clear();
@@ -1165,6 +1181,10 @@ impl McpAdapter for HttpAdapter {
         }
         .instrument(self.span.clone())
         .await
+    }
+
+    async fn list_tools_ttl_ms(&self) -> Option<u64> {
+        *self.list_ttl_ms.read().await
     }
 
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {

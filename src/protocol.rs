@@ -145,6 +145,28 @@ pub fn protocol_version_from_result(result: &Value) -> Option<ProtocolVersion> {
         .and_then(ProtocolVersion::parse)
 }
 
+/// Extract the SEP-2549 `ttlMs` caching hint from a list/read result object
+/// (the top-level `result` of `tools/list`, `prompts/list`, `resources/list`,
+/// `resources/templates/list`, `resources/read`, or `server/discover`).
+///
+/// Returns the freshness window in milliseconds, clamped to `>= 0` — a
+/// negative `ttlMs` means "immediately stale" per spec and is represented as
+/// `0`. Returns `None` when the field is absent or not a JSON number, in which
+/// case the relay falls back to its existing event-driven cache behavior.
+pub fn ttl_ms_from_result(result: &Value) -> Option<u64> {
+    let v = result.get("ttlMs")?;
+    if let Some(n) = v.as_i64() {
+        return Some(n.max(0) as u64);
+    }
+    if let Some(n) = v.as_u64() {
+        return Some(n);
+    }
+    if let Some(f) = v.as_f64() {
+        return Some(if f < 0.0 { 0 } else { f as u64 });
+    }
+    None
+}
+
 /// Detect an upstream server's dialect (relay-as-client) using the spec's
 /// discover-first, initialize-fallback strategy:
 ///
@@ -209,6 +231,21 @@ mod tests {
             assert!(v.is_legacy());
         }
         assert_eq!(ProtocolVersion::default(), ProtocolVersion::V2025_03_26);
+    }
+
+    #[test]
+    fn ttl_ms_parsing() {
+        assert_eq!(ttl_ms_from_result(&json!({ "ttlMs": 60000 })), Some(60000));
+        assert_eq!(ttl_ms_from_result(&json!({ "ttlMs": 0 })), Some(0));
+        // Negative ttlMs means "immediately stale" → clamp to 0.
+        assert_eq!(ttl_ms_from_result(&json!({ "ttlMs": -5 })), Some(0));
+        // Float values are floored after clamping.
+        assert_eq!(ttl_ms_from_result(&json!({ "ttlMs": 1500.9 })), Some(1500));
+        assert_eq!(ttl_ms_from_result(&json!({ "ttlMs": -2.0 })), Some(0));
+        // Absent or non-numeric → None (fall back to event-driven cache).
+        assert_eq!(ttl_ms_from_result(&json!({})), None);
+        assert_eq!(ttl_ms_from_result(&json!({ "ttlMs": "60000" })), None);
+        assert_eq!(ttl_ms_from_result(&json!({ "ttlMs": null })), None);
     }
 
     #[test]

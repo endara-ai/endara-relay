@@ -148,6 +148,23 @@ pub trait McpAdapter: Send + Sync {
     /// List the tools available from the MCP server.
     async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError>;
 
+    /// Upstream-provided `ttlMs` freshness hint (SEP-2549) from the most recent
+    /// successful [`Self::list_tools`] call, in milliseconds.
+    ///
+    /// Returns `Some(ms)` only when the upstream peer negotiated the 2026-07-28
+    /// dialect **and** included a top-level `ttlMs` on its `tools/list` result;
+    /// the relay-as-client honors it as the cache freshness window in
+    /// [`crate::registry::RegisteredAdapter::cached_list_tools`]. Returns `None`
+    /// for legacy upstreams or when no hint was sent, preserving the existing
+    /// purely event-driven cache behavior. Implementors clamp a negative
+    /// upstream `ttlMs` to `0` (immediately stale).
+    ///
+    /// The default impl returns `None` (placeholder / read-only adapters never
+    /// emit a caching hint).
+    async fn list_tools_ttl_ms(&self) -> Option<u64> {
+        None
+    }
+
     /// Call a tool on the MCP server.
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError>;
 
