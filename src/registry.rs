@@ -7,7 +7,7 @@ use crate::prefix;
 use async_trait::async_trait;
 use jsonschema::error::{TypeKind, ValidationErrorKind};
 use jsonschema::paths::{Location, LocationSegment};
-use jsonschema::{ValidationError, Validator};
+use jsonschema::{Retrieve, Uri, ValidationError, Validator};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1155,18 +1155,50 @@ fn schema_keyword_constrains(key: &str, value: &serde_json::Value) -> bool {
     }
 }
 
+/// A [`Retrieve`] that refuses to dereference any external schema resource.
+///
+/// `jsonschema` ships with the `resolve-http` feature on by default, so its
+/// built-in retriever would issue a **blocking network request** for any
+/// external `$ref` URI (e.g. `https://example.com/schema.json`) encountered
+/// while compiling a validator. The relay must never fetch or auto-dereference
+/// external references in an upstream tool's `inputSchema`, so this retriever
+/// is installed on every validator build: external `$ref`s make the build fail
+/// (and the tool falls back to pass-through, validation skipped), while
+/// internal `$ref`/`$defs` (e.g. `#/$defs/Foo`) resolve against the document
+/// itself and never reach the retriever.
+#[derive(Debug)]
+struct NonFetchingRetriever;
+
+impl Retrieve for NonFetchingRetriever {
+    fn retrieve(
+        &self,
+        uri: &Uri<String>,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        Err(format!(
+            "external schema reference '{}' is not dereferenced by the relay",
+            uri.as_str()
+        )
+        .into())
+    }
+}
+
 /// Compile a tool's `inputSchema` into a reusable [`Validator`], or return
 /// `None` to signal pass-through. Degenerate schemas (see
 /// [`schema_is_validatable`]) and schemas the upstream server shipped
 /// malformed both yield `None` — the relay never blocks a call because of a
 /// bad upstream schema; it lets the upstream handle it. `format` is enforced
 /// as an assertion (spec §11.1).
+///
+/// External `$ref` URIs are never fetched: a [`NonFetchingRetriever`] is
+/// installed so any external reference fails compilation (yielding `None` /
+/// pass-through) rather than triggering a blocking network request.
 fn compile_input_schema(prefixed_name: &str, schema: &serde_json::Value) -> Option<Arc<Validator>> {
     if !schema_is_validatable(schema) {
         return None;
     }
     match jsonschema::options()
         .should_validate_formats(true)
+        .with_retriever(NonFetchingRetriever)
         .build(schema)
     {
         Ok(validator) => {
@@ -4172,6 +4204,158 @@ mod tests {
             text
         );
         text
+    }
+
+    /// A representative JSON Schema 2020-12 document exercising the
+    /// combinators (`oneOf`/`anyOf`/`allOf`), internal `$ref`/`$defs`, nested
+    /// combinators, and an **external** `$ref` URI. Used to prove the relay
+    /// passes such schemas through aggregation intact and never dereferences
+    /// the external reference.
+    fn complex_2020_12_schema() -> serde_json::Value {
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "oneOf": [
+                        { "type": "string", "const": "circle" },
+                        { "type": "string", "const": "square" }
+                    ]
+                },
+                "shape": { "$ref": "#/$defs/Shape" },
+                "either": {
+                    "anyOf": [
+                        { "$ref": "#/$defs/Shape" },
+                        { "type": "null" }
+                    ]
+                },
+                "combined": {
+                    "allOf": [
+                        { "type": "object" },
+                        { "$ref": "#/$defs/Shape" }
+                    ]
+                },
+                "remote": { "$ref": "https://example.com/schemas/widget.json#/$defs/Widget" }
+            },
+            "$defs": {
+                "Shape": {
+                    "type": "object",
+                    "properties": {
+                        "sides": { "type": "integer", "minimum": 3 },
+                        "nested": {
+                            "oneOf": [
+                                { "$ref": "#/$defs/Shape" },
+                                { "type": "null" }
+                            ]
+                        }
+                    },
+                    "required": ["sides"]
+                }
+            }
+        })
+    }
+
+    // Complex 2020-12 schemas (oneOf/anyOf/allOf, internal $ref/$defs, nested
+    // combinators, and an external $ref) survive the merged catalog
+    // byte-for-byte, modulo the intentional tool-name prefixing/description
+    // enrichment which never touch `inputSchema`.
+    #[tokio::test]
+    async fn merged_catalog_preserves_complex_2020_12_schema_verbatim() {
+        let schema = complex_2020_12_schema();
+        let registry = registry_with_schema("draw", schema.clone()).await;
+        let catalog = registry.merged_catalog().await;
+        assert_eq!(catalog.len(), 1);
+        // Single-server no-prefix mode keeps the raw tool name…
+        assert_eq!(catalog[0].name, "draw");
+        // …and the schema is passed through completely unchanged.
+        assert_eq!(catalog[0].input_schema, schema);
+        // The external `$ref` URI is preserved verbatim, not resolved/inlined.
+        assert_eq!(
+            catalog[0].input_schema["properties"]["remote"]["$ref"],
+            json!("https://example.com/schemas/widget.json#/$defs/Widget")
+        );
+    }
+
+    // A two-server registry forces prefixing: the tool name gains its
+    // `{prefix}__` segment, but the complex 2020-12 `inputSchema` is still
+    // carried through byte-for-byte.
+    #[tokio::test]
+    async fn merged_catalog_prefixes_name_but_preserves_complex_schema() {
+        let schema = complex_2020_12_schema();
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "a".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool_with_schema(
+                    "draw",
+                    schema.clone(),
+                )])),
+                "stdio".into(),
+                None,
+                Some("a".into()),
+            )
+            .await;
+        registry
+            .register(
+                "b".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("ping")])),
+                "stdio".into(),
+                None,
+                Some("b".into()),
+            )
+            .await;
+
+        let catalog = registry.merged_catalog().await;
+        let drawn = catalog
+            .iter()
+            .find(|t| t.name == "a__draw")
+            .expect("prefixed tool present");
+        assert_eq!(drawn.input_schema, schema);
+    }
+
+    // Internal `$ref`/`$defs` (e.g. `#/$defs/Foo`) resolve against the
+    // document itself, so a schema constrained solely via internal references
+    // compiles into an enforced validator (no pass-through, no fetch).
+    #[test]
+    fn compile_input_schema_resolves_internal_defs() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "shape": { "$ref": "#/$defs/Shape" } },
+            "required": ["shape"],
+            "$defs": {
+                "Shape": {
+                    "type": "object",
+                    "properties": { "sides": { "type": "integer", "minimum": 3 } },
+                    "required": ["sides"]
+                }
+            }
+        });
+        let validator = compile_input_schema("t__draw", &schema)
+            .expect("internal $ref/$defs schema should compile");
+        // Valid instance passes…
+        assert!(validator.is_valid(&json!({ "shape": { "sides": 4 } })));
+        // …and the internal constraint is actually enforced.
+        assert!(!validator.is_valid(&json!({ "shape": { "sides": 2 } })));
+    }
+
+    // External `$ref` URIs are NEVER fetched: the [`NonFetchingRetriever`]
+    // makes compilation fail rather than issue a network request, so the tool
+    // falls back to pass-through (`None`). The fake host below would hang or
+    // error on a real fetch; the test returns instantly because nothing is
+    // retrieved.
+    #[test]
+    fn compile_input_schema_does_not_fetch_external_ref() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "remote": { "$ref": "https://example.invalid/schemas/widget.json" }
+            },
+            "required": ["remote"]
+        });
+        assert!(
+            compile_input_schema("t__draw", &schema).is_none(),
+            "external $ref must yield pass-through (None), never a fetched validator"
+        );
     }
 
     #[tokio::test]

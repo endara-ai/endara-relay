@@ -4595,6 +4595,106 @@ mod tests {
 
     // --- Alphabetical sorting tests ---
 
+    // A full JSON Schema 2020-12 `inputSchema` (oneOf/anyOf/allOf, internal
+    // `$ref`/`$defs`, nested combinators, and an external `$ref` URI) must
+    // survive `tools/list` aggregation byte-for-byte, modulo the intentional
+    // tool-name prefix. The external `$ref` is passed through verbatim and is
+    // never fetched/dereferenced.
+    #[tokio::test]
+    async fn tools_list_passes_through_complex_2020_12_schema_modulo_prefix() {
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "oneOf": [
+                        { "type": "string", "const": "circle" },
+                        { "type": "string", "const": "square" }
+                    ]
+                },
+                "shape": { "$ref": "#/$defs/Shape" },
+                "either": {
+                    "anyOf": [
+                        { "$ref": "#/$defs/Shape" },
+                        { "type": "null" }
+                    ]
+                },
+                "combined": {
+                    "allOf": [
+                        { "type": "object" },
+                        { "$ref": "#/$defs/Shape" }
+                    ]
+                },
+                "remote": { "$ref": "https://example.com/schemas/widget.json#/$defs/Widget" }
+            },
+            "$defs": {
+                "Shape": {
+                    "type": "object",
+                    "properties": {
+                        "sides": { "type": "integer", "minimum": 3 },
+                        "nested": {
+                            "oneOf": [
+                                { "$ref": "#/$defs/Shape" },
+                                { "type": "null" }
+                            ]
+                        }
+                    },
+                    "required": ["sides"]
+                }
+            }
+        });
+        let state = test_app_state();
+        // Two endpoints force prefixing so the tool name gains its `{prefix}__`
+        // segment while the schema body must remain untouched.
+        state
+            .registry
+            .register(
+                "a".into(),
+                Box::new(MockAdapter {
+                    tools: vec![ToolInfo {
+                        name: "draw".into(),
+                        description: Some("draw tool".into()),
+                        input_schema: schema.clone(),
+                        annotations: None,
+                    }],
+                }),
+                "stdio".into(),
+                None,
+                Some("a".into()),
+            )
+            .await;
+        state
+            .registry
+            .register(
+                "b".into(),
+                Box::new(MockAdapter::with_tools(&["ping"])),
+                "stdio".into(),
+                None,
+                Some("b".into()),
+            )
+            .await;
+
+        let body = JsonRpcBody {
+            jsonrpc: Some("2.0".to_string()),
+            method: Some("tools/list".to_string()),
+            params: None,
+            id: Some(json!(1)),
+        };
+        let Json(resp) = mcp_tools_list(State(state), Json(body), None).await;
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let drawn = tools
+            .iter()
+            .find(|t| t["name"] == "a__draw")
+            .expect("prefixed complex tool present in tools/list");
+        // inputSchema passes through completely unchanged.
+        assert_eq!(drawn["inputSchema"], schema);
+        // The external `$ref` URI is preserved verbatim, never resolved.
+        assert_eq!(
+            drawn["inputSchema"]["properties"]["remote"]["$ref"],
+            json!("https://example.com/schemas/widget.json#/$defs/Widget")
+        );
+    }
+
     #[tokio::test]
     async fn test_tools_list_returns_sorted_tools() {
         let state = test_app_state();
