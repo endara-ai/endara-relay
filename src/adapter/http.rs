@@ -378,8 +378,8 @@ impl HttpAdapter {
 
     /// Apply the 2026 Streamable HTTP per-request headers to `builder`:
     /// `MCP-Protocol-Version` (always), `Mcp-Method` (the JSON-RPC method), and
-    /// `Mcp-Name` (the `params.name` tool name, when present). These let a 2026
-    /// upstream route/observe a request without parsing its body.
+    /// `Mcp-Name` (the `params.name` tool name, for `tools/call` only). These let
+    /// a 2026 upstream route/observe a request without parsing its body.
     fn apply_2026_headers(
         builder: reqwest::RequestBuilder,
         method: &str,
@@ -392,9 +392,14 @@ impl HttpAdapter {
         if let Ok(val) = reqwest::header::HeaderValue::from_str(method) {
             builder = builder.header(MCP_METHOD_HEADER_NAME.clone(), val);
         }
-        if let Some(name) = params.and_then(|p| p.get("name")).and_then(Value::as_str) {
-            if let Ok(val) = reqwest::header::HeaderValue::from_str(name) {
-                builder = builder.header(MCP_NAME_HEADER_NAME.clone(), val);
+        // `Mcp-Name` is tied to `tools/call` by the 2026-07-28 spec: only emit it
+        // for that method, even if another method happens to carry a string
+        // `params.name`.
+        if method == "tools/call" {
+            if let Some(name) = params.and_then(|p| p.get("name")).and_then(Value::as_str) {
+                if let Ok(val) = reqwest::header::HeaderValue::from_str(name) {
+                    builder = builder.header(MCP_NAME_HEADER_NAME.clone(), val);
+                }
             }
         }
         builder
@@ -2281,6 +2286,45 @@ mod tests {
         assert_eq!(
             injected["_meta"][protocol::META_CLIENT_INFO_KEY]["name"],
             "endara-relay"
+        );
+    }
+
+    /// The 2026-07-28 spec ties `Mcp-Name` to `tools/call`: it must be emitted
+    /// for that method (mirroring `params.name`) and never for another method
+    /// that happens to carry a string `params.name`.
+    #[test]
+    fn test_2026_mcp_name_header_scoped_to_tools_call() {
+        let client = reqwest::Client::new();
+        let url = "http://localhost/mcp";
+
+        // (a) tools/call with a string `name` still emits `Mcp-Name`.
+        let req = HttpAdapter::apply_2026_headers(
+            client.post(url),
+            "tools/call",
+            Some(&json!({"name": "echo", "arguments": {}})),
+        )
+        .build()
+        .unwrap();
+        assert_eq!(
+            req.headers()
+                .get(protocol::MCP_NAME_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("echo"),
+            "tools/call emits Mcp-Name from params.name"
+        );
+
+        // (b) a non-tools/call method carrying a string `name` param does NOT
+        // emit `Mcp-Name`.
+        let req = HttpAdapter::apply_2026_headers(
+            client.post(url),
+            "tools/list",
+            Some(&json!({"name": "echo"})),
+        )
+        .build()
+        .unwrap();
+        assert!(
+            req.headers().get(protocol::MCP_NAME_HEADER).is_none(),
+            "non-tools/call method does not emit Mcp-Name even with a string name param"
         );
     }
 
