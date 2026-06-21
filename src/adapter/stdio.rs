@@ -1,6 +1,6 @@
 use super::server_name::{sanitize_server_name, ServerNameError};
 use super::server_type_resolution::{effective_server_type, strip_mcp_server_suffix};
-use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
+use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo, DISCOVER_PROBE_TIMEOUT};
 use crate::container_stats::{self, ContainerStats, StatsSlot};
 use crate::events::{
     annotations_from_value, current_request_context, ToolCallEvent, ToolCallEventBus,
@@ -829,7 +829,19 @@ impl StdioAdapter {
         // is still the legacy default here, so `send_request` would not inject
         // it for us, and a 2026 server expects identity on every request.
         let params = Self::inject_client_info(None);
-        self.send_request("server/discover", params).await.ok()
+        // Bound the probe with a short dedicated timeout (instead of inheriting
+        // `send_request`'s 30s default) so a legacy upstream that silently drops
+        // the unknown request falls back to the legacy handshake fast. A timeout
+        // maps to `None`, the same clean legacy fallback as any other failure.
+        match tokio::time::timeout(
+            DISCOVER_PROBE_TIMEOUT,
+            self.send_request("server/discover", params),
+        )
+        .await
+        {
+            Ok(res) => res.ok(),
+            Err(_) => None,
+        }
     }
 
     /// Extract, validate, and record the upstream `serverInfo.name` from an
@@ -2217,6 +2229,121 @@ with open(record_path, "w") as rec:
             frames[3]["params"].get("_meta").is_none(),
             "legacy tools/list frame must not carry _meta, got: {:?}",
             frames[3]
+        );
+    }
+
+    /// Silent-drop upstream over stdio: the legacy server never answers the
+    /// `server/discover` probe (T9) but responds normally to `initialize`. The
+    /// probe must fail fast via [`DISCOVER_PROBE_TIMEOUT`] and the relay must
+    /// fall back to the legacy handshake well within the bound — NOT stall on the
+    /// 30s per-request default. This is the MCP `2026-07-28` "no response within
+    /// a reasonable timeout → legacy" rule.
+    #[tokio::test]
+    async fn test_stdio_silent_discover_falls_back_to_initialize_fast() {
+        // Python mock: record every received line, answer `initialize` and
+        // `tools/list`, but SILENTLY DROP `server/discover` (no response).
+        let script = r#"
+import sys, json, os
+record_path = os.environ["RECORD_PATH"]
+with open(record_path, "w") as rec:
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        rec.write(line + "\n")
+        rec.flush()
+        try:
+            req = json.loads(line)
+        except Exception:
+            continue
+        method = req.get("method")
+        req_id = req.get("id")
+        if req_id is None:
+            continue
+        if method == "server/discover":
+            # Silently drop the unknown probe — emit no response at all.
+            continue
+        if method == "initialize":
+            resp = {
+                "jsonrpc": "2.0",
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "serverInfo": {"name": "test", "version": "0.1"},
+                },
+                "id": req_id,
+            }
+        elif method == "tools/list":
+            resp = {"jsonrpc": "2.0", "result": {"tools": []}, "id": req_id}
+        else:
+            resp = {"jsonrpc": "2.0", "result": {}, "id": req_id}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+"#;
+        let record_path = std::env::temp_dir().join(format!(
+            "endara-stdio-silent-discover-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut env = HashMap::new();
+        env.insert(
+            "RECORD_PATH".to_string(),
+            record_path.to_string_lossy().into_owned(),
+        );
+        let mut adapter = StdioAdapter::new(StdioConfig {
+            command: "python3".to_string(),
+            args: vec!["-u".to_string(), "-c".to_string(), script.to_string()],
+            env,
+            ..Default::default()
+        });
+
+        let start = Instant::now();
+        (&mut adapter as &mut dyn McpAdapter)
+            .initialize()
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        // The probe is bounded by DISCOVER_PROBE_TIMEOUT, then the legacy
+        // handshake runs. The whole thing must complete far below the 30s
+        // per-request default — well under 10s leaves generous CI headroom while
+        // still proving we did not stall on the 30s path.
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "initialize must fall back fast after a silent discover probe, took {:?}",
+            elapsed
+        );
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        adapter.shutdown().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let recorded = std::fs::read_to_string(&record_path)
+            .expect("record file should exist after handshake");
+        let _ = std::fs::remove_file(&record_path);
+        let frames: Vec<Value> = recorded
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| serde_json::from_str(l).expect("each recorded line is valid JSON"))
+            .collect();
+
+        let methods: Vec<&str> = frames.iter().filter_map(|f| f["method"].as_str()).collect();
+        // The probe was still sent (then dropped), and the relay fell back to the
+        // legacy handshake.
+        assert!(
+            methods.contains(&"server/discover"),
+            "discover probe must be sent, got {methods:?}"
+        );
+        assert!(
+            methods.contains(&"initialize"),
+            "must fall back to legacy initialize, got {methods:?}"
+        );
+        assert!(
+            methods.contains(&"notifications/initialized"),
+            "legacy fallback must send notifications/initialized, got {methods:?}"
         );
     }
 

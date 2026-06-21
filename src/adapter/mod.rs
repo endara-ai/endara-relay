@@ -9,6 +9,17 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
+use std::time::Duration;
+
+/// Short, dedicated timeout for the upstream `server/discover` dialect probe.
+///
+/// The probe must fail fast to the legacy `initialize` fallback when an upstream
+/// silently drops the unknown request (per the MCP `2026-07-28` stdio
+/// Backward-Compatibility rule: "any other error, or no response within a
+/// reasonable timeout → legacy"). Without this bound the probe would inherit the
+/// 30s per-request timeout and stall startup. Only the probe is bounded this
+/// short; normal (non-probe) requests keep their full transport timeout.
+pub(crate) const DISCOVER_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Health status of an adapter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

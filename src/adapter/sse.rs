@@ -1,7 +1,7 @@
 use super::server_name::{sanitize_server_name, ServerNameError};
 use super::server_type_resolution::{effective_server_type, strip_mcp_server_suffix};
 use super::stdio::{iso8601_now, RingBuffer};
-use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
+use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo, DISCOVER_PROBE_TIMEOUT};
 use crate::events::{
     annotations_from_value, current_request_context, ToolCallEvent, ToolCallEventBus,
 };
@@ -647,7 +647,20 @@ impl SseAdapter {
         // is still the legacy default here, so `send_request` would not inject
         // it for us, and a 2026 server expects identity on every request.
         let params = Self::inject_client_info(None);
-        self.send_request("server/discover", params).await.ok()
+        // Bound the probe with a short dedicated timeout (below the full
+        // `timeout_secs` transport timeout) so an unresponsive/legacy upstream
+        // that silently drops the unknown request falls back to the legacy
+        // handshake fast. A timeout maps to `None`, the same clean legacy
+        // fallback as any other failure.
+        match tokio::time::timeout(
+            DISCOVER_PROBE_TIMEOUT,
+            self.send_request("server/discover", params),
+        )
+        .await
+        {
+            Ok(res) => res.ok(),
+            Err(_) => None,
+        }
     }
 
     /// Extract, validate, and record the upstream `serverInfo.name` from an

@@ -2,7 +2,7 @@ use super::oauth::jit::{self, JitInterceptor};
 use super::server_name::{sanitize_server_name, ServerNameError};
 use super::server_type_resolution::{effective_server_type, strip_mcp_server_suffix};
 use super::stdio::{iso8601_now, RingBuffer};
-use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
+use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo, DISCOVER_PROBE_TIMEOUT};
 use crate::events::{
     annotations_from_value, current_request_context, ToolCallEvent, ToolCallEventBus,
 };
@@ -793,31 +793,44 @@ impl HttpAdapter {
         let request = jsonrpc::new_request("server/discover", params, id);
         trace!(method = "server/discover", id = id, url = %self.config.url, "probing upstream protocol dialect");
 
-        let builder = self.client.post(&self.config.url).json(&request);
-        let builder = Self::apply_2026_headers(builder, "server/discover", request.params.as_ref());
-        let resp = builder.send().await.ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
+        // Bound the probe with a short dedicated timeout (below the full reqwest
+        // transport timeout) so a legacy/unresponsive upstream that silently
+        // drops the unknown request falls back to the legacy handshake fast. A
+        // timeout maps to `None`, the same clean legacy fallback as any other
+        // failure.
+        let probe = async {
+            let builder = self.client.post(&self.config.url).json(&request);
+            let builder =
+                Self::apply_2026_headers(builder, "server/discover", request.params.as_ref());
+            let resp = builder.send().await.ok()?;
+            if !resp.status().is_success() {
+                return None;
+            }
 
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+            let content_type = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_string();
 
-        let response: JsonRpcResponse = if content_type.contains("text/event-stream") {
-            let body = resp.text().await.ok()?;
-            Self::parse_sse_response(&body, id, Some(&self.tools_changed_tx)).ok()?
-        } else {
-            resp.json().await.ok()?
+            let response: JsonRpcResponse = if content_type.contains("text/event-stream") {
+                let body = resp.text().await.ok()?;
+                Self::parse_sse_response(&body, id, Some(&self.tools_changed_tx)).ok()?
+            } else {
+                resp.json().await.ok()?
+            };
+
+            if response.error.is_some() {
+                return None;
+            }
+            response.result
         };
 
-        if response.error.is_some() {
-            return None;
-        }
-        response.result
+        tokio::time::timeout(DISCOVER_PROBE_TIMEOUT, probe)
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Extract, validate, and record the upstream `serverInfo.name` from an
