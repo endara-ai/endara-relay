@@ -463,4 +463,42 @@ mod tests {
         };
         assert_eq!(err.to_string(), "HTTP error 404: not found");
     }
+
+    /// D13 — forward direction: an inbound `_meta` carrying W3C Trace Context
+    /// (`traceparent`/`tracestate`/`baggage`) is merged onto the outgoing
+    /// `tools/call` params verbatim, so the relay forwards it to the upstream
+    /// unmodified. The relay is intentionally key-agnostic for `_meta` siblings
+    /// — it copies the whole inbound `_meta` rather than enumerating trace keys.
+    #[test]
+    fn merge_request_params_forwards_meta_trace_context() {
+        let mut params = serde_json::json!({ "name": "echo", "arguments": {} });
+        let mut request_params = serde_json::Map::new();
+        request_params.insert(
+            "_meta".to_string(),
+            serde_json::json!({
+                "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+                "tracestate": "vendor=abc",
+                "baggage": "userId=42"
+            }),
+        );
+        merge_request_params(&mut params, request_params);
+        assert_eq!(
+            params["_meta"]["traceparent"],
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+        );
+        assert_eq!(params["_meta"]["tracestate"], "vendor=abc");
+        assert_eq!(params["_meta"]["baggage"], "userId=42");
+        // name/arguments are untouched.
+        assert_eq!(params["name"], "echo");
+    }
+
+    /// D13 — with no inbound siblings, `merge_request_params` is a no-op, so a
+    /// legacy frame that carried no `_meta` stays byte-for-byte unchanged and
+    /// the relay never injects an empty `_meta` of its own.
+    #[test]
+    fn merge_request_params_no_meta_leaves_params_unchanged() {
+        let mut params = serde_json::json!({ "name": "echo", "arguments": {} });
+        merge_request_params(&mut params, serde_json::Map::new());
+        assert!(params.get("_meta").is_none());
+    }
 }

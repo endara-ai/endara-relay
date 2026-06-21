@@ -2587,4 +2587,153 @@ mod tests {
         drop(seen);
         server.abort();
     }
+
+    // --- D13: W3C Trace Context propagation in `_meta` ---
+
+    /// Fixture that records the full inbound `params._meta` of every POST and
+    /// answers a 2026 `server/discover` probe so the adapter takes the stateless
+    /// 2026 path. The `tools/call` result carries its own `_meta` Trace Context
+    /// so the test can assert the response (upstream→client) direction too.
+    #[derive(Clone)]
+    struct TraceServerState {
+        seen_meta: Arc<Mutex<Vec<Value>>>,
+    }
+
+    async fn dispatch_trace_2026(
+        State(app): State<TraceServerState>,
+        Json(body): Json<Value>,
+    ) -> axum::response::Response {
+        let method = body["method"].as_str().unwrap_or("").to_string();
+        let id = body["id"].as_u64();
+        let meta = body
+            .get("params")
+            .and_then(|p| p.get("_meta"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        app.seen_meta.lock().await.push(meta);
+
+        let result = match method.as_str() {
+            "server/discover" => json!({
+                "protocolVersion": "2026-07-28",
+                "capabilities": {"tools": {"listChanged": true}},
+                "serverInfo": {"name": "trace-2026", "version": "1.0.0"},
+                "tools": []
+            }),
+            "tools/list" => json!({
+                "tools": [{
+                    "name": "echo",
+                    "description": "Echoes",
+                    "inputSchema": {"type": "object"}
+                }]
+            }),
+            // Terminal result carries its own W3C Trace Context under `_meta`
+            // so the test can assert the relay surfaces upstream→client trace
+            // fields back to the caller unmodified.
+            "tools/call" => json!({
+                "content": [{"type": "text", "text": "ok"}],
+                "_meta": {
+                    "traceparent": "00-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-cccccccccccccccc-01",
+                    "tracestate": "vendor=resp"
+                }
+            }),
+            _ => {
+                return Json(json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32601, "message": "Method not found"},
+                    "id": id,
+                }))
+                .into_response();
+            }
+        };
+        if id.is_some() {
+            Json(json!({"jsonrpc": "2.0", "result": result, "id": id})).into_response()
+        } else {
+            (StatusCode::ACCEPTED, "").into_response()
+        }
+    }
+
+    async fn start_trace_2026_server() -> (String, Arc<Mutex<Vec<Value>>>, JoinHandle<()>) {
+        let seen_meta = Arc::new(Mutex::new(Vec::new()));
+        let state = TraceServerState {
+            seen_meta: seen_meta.clone(),
+        };
+        let app = Router::new()
+            .route("/mcp", any(dispatch_trace_2026))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}/mcp", addr);
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (url, seen_meta, handle)
+    }
+
+    /// D13 — W3C Trace Context propagation through the relay's `_meta`, BOTH
+    /// directions, on the 2026 HTTP path:
+    /// - forward (client→relay→upstream): inbound `_meta` trace keys
+    ///   (`traceparent`/`tracestate`/`baggage`) are forwarded to the upstream
+    ///   `tools/call` UNMODIFIED, as siblings of the relay's own `_meta`
+    ///   clientInfo — the clientInfo injection must NOT clobber them.
+    /// - response (upstream→relay→client): the upstream result's `_meta` trace
+    ///   keys are surfaced back to the caller verbatim.
+    #[tokio::test]
+    async fn call_tool_propagates_w3c_trace_context_both_directions() {
+        let (url, seen_meta, server) = start_trace_2026_server().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter
+            .initialize()
+            .await
+            .expect("2026 initialize succeeds");
+        assert!(
+            adapter.upstream_dialect().await.is_2026(),
+            "upstream should be detected as 2026"
+        );
+
+        // Inbound client→relay `_meta` carrying W3C Trace Context.
+        let mut request_params = serde_json::Map::new();
+        request_params.insert(
+            "_meta".to_string(),
+            json!({
+                "traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dddddddddddddddd-01",
+                "tracestate": "vendor=req",
+                "baggage": "userId=42"
+            }),
+        );
+
+        let result = adapter
+            .call_tool_with_request_params("echo", json!({"message": "hi"}), request_params)
+            .await
+            .expect("call_tool");
+
+        // Response direction: upstream `_meta` trace fields surface to caller.
+        assert_eq!(
+            result["_meta"]["traceparent"],
+            "00-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-cccccccccccccccc-01"
+        );
+        assert_eq!(result["_meta"]["tracestate"], "vendor=resp");
+
+        // Forward direction: the upstream tools/call request carried the inbound
+        // trace keys UNMODIFIED alongside the relay clientInfo (no clobbering).
+        let seen = seen_meta.lock().await;
+        let call_meta = seen
+            .iter()
+            .rev()
+            .find(|m| m.get("traceparent").is_some())
+            .expect("a tools/call _meta carrying trace context was forwarded");
+        assert_eq!(
+            call_meta["traceparent"],
+            "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-dddddddddddddddd-01"
+        );
+        assert_eq!(call_meta["tracestate"], "vendor=req");
+        assert_eq!(call_meta["baggage"], "userId=42");
+        assert_eq!(
+            call_meta[protocol::META_CLIENT_INFO_KEY]["name"],
+            "endara-relay",
+            "relay clientInfo must coexist with forwarded trace context"
+        );
+
+        drop(seen);
+        server.abort();
+    }
 }

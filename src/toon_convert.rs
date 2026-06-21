@@ -230,6 +230,28 @@ mod tests {
         assert_eq!(out3, weird);
     }
 
+    // D13 — response direction: toonifying a `CallToolResult` must preserve a
+    // sibling `_meta` carrying W3C Trace Context so upstream→client trace
+    // fields survive the TOON pass and reach the inbound client unmodified.
+    #[test]
+    fn toonify_call_result_preserves_meta_trace_context() {
+        let input = json!({
+            "content": [{ "type": "text", "text": "{\"k\":1}" }],
+            "_meta": {
+                "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+                "tracestate": "vendor=abc"
+            }
+        });
+        let out = toonify_call_result(input);
+        assert_eq!(
+            out["_meta"]["traceparent"],
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+        );
+        assert_eq!(out["_meta"]["tracestate"], "vendor=abc");
+        // The text content was still toonified (no longer raw JSON).
+        assert_ne!(out["content"][0]["text"], "{\"k\":1}");
+    }
+
     // §5 row 9: toonify_value converts JSON object to TOON string.
     #[test]
     fn toonify_value_converts_object_to_toon() {
