@@ -136,6 +136,32 @@ impl ProfileRegistryView {
         }
         self.inner.route_tool_call(prefixed_name, arguments).await
     }
+
+    /// Profile-scoped variant of
+    /// [`AdapterRegistry::route_tool_call_with_request_params`]. Applies the
+    /// same allowed-endpoint guard as [`Self::route_tool_call`], then forwards
+    /// the extra top-level `tools/call` params (MCP 2026-07-28 multi round-trip
+    /// `inputResponses`/`requestState`) verbatim to the underlying registry.
+    pub async fn route_tool_call_with_request_params(
+        &self,
+        prefixed_name: &str,
+        arguments: Value,
+        request_params: serde_json::Map<String, Value>,
+    ) -> Result<Value, AdapterError> {
+        let (_, lookup) = self.inner.merged_catalog_with_lookup().await;
+        let (endpoint, _) = lookup.get(prefixed_name).ok_or_else(|| {
+            AdapterError::ProtocolError(format!("no tool '{}' in profile", prefixed_name))
+        })?;
+        if !self.allowed_endpoints.contains(endpoint) {
+            return Err(AdapterError::ProtocolError(format!(
+                "tool '{}' is not available in this profile",
+                prefixed_name
+            )));
+        }
+        self.inner
+            .route_tool_call_with_request_params(prefixed_name, arguments, request_params)
+            .await
+    }
 }
 
 #[async_trait]

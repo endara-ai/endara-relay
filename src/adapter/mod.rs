@@ -21,6 +21,28 @@ use std::time::Duration;
 /// short; normal (non-probe) requests keep their full transport timeout.
 pub(crate) const DISCOVER_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Merge extra top-level `tools/call` params into an outgoing params object,
+/// alongside the `name`/`arguments` the adapter already set. Used by the
+/// transport adapters to transparently forward the MCP 2026-07-28 multi
+/// round-trip fields (`inputResponses`, `requestState`) and any sibling params.
+///
+/// Keys never collide with `name`/`arguments` because the inbound handler
+/// strips those before populating `request_params`. An empty map is a no-op, so
+/// a normal terminal `tools/call` request is forwarded byte-for-byte unchanged.
+pub(crate) fn merge_request_params(
+    params: &mut Value,
+    request_params: serde_json::Map<String, Value>,
+) {
+    if request_params.is_empty() {
+        return;
+    }
+    if let Some(obj) = params.as_object_mut() {
+        for (k, v) in request_params {
+            obj.insert(k, v);
+        }
+    }
+}
+
 /// Health status of an adapter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum HealthStatus {
@@ -128,6 +150,24 @@ pub trait McpAdapter: Send + Sync {
 
     /// Call a tool on the MCP server.
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError>;
+
+    /// Call a tool, forwarding extra top-level `tools/call` params verbatim to
+    /// the upstream alongside `name`/`arguments`. Used to transparently proxy
+    /// the MCP 2026-07-28 multi round-trip fields (`inputResponses`,
+    /// `requestState`) and any other sibling params (e.g. `_meta`) so the relay
+    /// neither interprets nor strips them.
+    ///
+    /// The default implementation ignores the extra params and delegates to
+    /// [`Self::call_tool`]; transports that proxy raw JSON-RPC override it to
+    /// merge `request_params` into the outgoing params object.
+    async fn call_tool_with_request_params(
+        &self,
+        name: &str,
+        arguments: Value,
+        _request_params: serde_json::Map<String, Value>,
+    ) -> Result<Value, AdapterError> {
+        self.call_tool(name, arguments).await
+    }
 
     /// Get the current health status.
     fn health(&self) -> HealthStatus;

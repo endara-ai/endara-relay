@@ -90,6 +90,19 @@ mod tests {
         assert_eq!(decoded, json!({"name": "Alice", "age": 30}));
     }
 
+    // T10: an MCP 2026-07-28 `InputRequiredResult` has no `content` array, so
+    // toonification leaves it byte-for-byte unchanged — the multi round-trip
+    // shape (`inputRequests`/`requestState`) survives the TOON pass intact.
+    #[test]
+    fn leaves_input_required_result_unchanged() {
+        let input = json!({
+            "inputRequests": [{"name": "city", "schema": {"type": "string"}}],
+            "requestState": "state-xyz"
+        });
+        let out = toonify_call_result(input.clone());
+        assert_eq!(out, input);
+    }
+
     // §5 row 2: toonify_call_result converts JSON array in TextContent.text
     // to TOON.
     #[test]

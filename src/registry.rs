@@ -672,6 +672,21 @@ impl AdapterRegistry {
         prefixed_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value, AdapterError> {
+        self.route_tool_call_with_request_params(prefixed_name, arguments, serde_json::Map::new())
+            .await
+    }
+
+    /// Variant of [`Self::route_tool_call`] that forwards extra top-level
+    /// `tools/call` params (the MCP 2026-07-28 multi round-trip
+    /// `inputResponses`/`requestState`, plus any sibling params) verbatim to the
+    /// dispatched adapter. An empty `request_params` map dispatches identically
+    /// to the legacy path, so terminal tool calls are unaffected.
+    pub async fn route_tool_call_with_request_params(
+        &self,
+        prefixed_name: &str,
+        arguments: serde_json::Value,
+        request_params: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<serde_json::Value, AdapterError> {
         let (catalog, lookup) = self.merged_catalog_with_lookup().await;
 
         let (endpoint, tool) = match lookup.get(prefixed_name) {
@@ -789,7 +804,10 @@ impl AdapterRegistry {
         // skipped for internal callers that have no `request_uid`. Enqueue is
         // non-blocking (`try_send`); overflow drops are counted in the handle.
         let Some(obs) = self.observability.as_ref().filter(|o| o.is_enabled()) else {
-            return entry.adapter.call_tool(tool, arguments).await;
+            return entry
+                .adapter
+                .call_tool_with_request_params(tool, arguments, request_params)
+                .await;
         };
         let span_ctx = current_request_context();
         // Gate capture on an inbound request context (skip internal callers),
@@ -800,7 +818,10 @@ impl AdapterRegistry {
         // other's payloads. Batched calls stay correlated via the shared inbound
         // request span and the per-call `request_uid`s minted below.
         if span_ctx.request_uid.is_none() {
-            return entry.adapter.call_tool(tool, arguments).await;
+            return entry
+                .adapter
+                .call_tool_with_request_params(tool, arguments, request_params)
+                .await;
         }
         let request_uid = uuid::Uuid::new_v4().to_string();
 
@@ -825,7 +846,10 @@ impl AdapterRegistry {
 
         let ts_start = chrono::Utc::now().timestamp_millis();
         let started = Instant::now();
-        let result = entry.adapter.call_tool(tool, arguments).await;
+        let result = entry
+            .adapter
+            .call_tool_with_request_params(tool, arguments, request_params)
+            .await;
         let duration_ms = started.elapsed().as_millis() as i64;
         let ts_end = ts_start + duration_ms;
 

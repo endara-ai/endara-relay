@@ -858,13 +858,34 @@ async fn mcp_tools_call(
         ));
     }
 
+    // Transparent MCP 2026-07-28 multi round-trip passthrough: forward every
+    // top-level `tools/call` param other than `name`/`arguments` (e.g.
+    // `inputResponses`, `requestState`, `_meta`) verbatim to the upstream so an
+    // `InputRequiredResult` round-trip survives the relay hop. A normal terminal
+    // call carries no such siblings, so this map is empty and dispatch is
+    // identical to the legacy path.
+    let request_params: serde_json::Map<String, Value> = params
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter(|(k, _)| k.as_str() != "name" && k.as_str() != "arguments")
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let route_result = match profile_ctx {
         Some(ctx) => {
             ctx.registry_view
-                .route_tool_call(tool_name, arguments)
+                .route_tool_call_with_request_params(tool_name, arguments, request_params)
                 .await
         }
-        None => state.registry.route_tool_call(tool_name, arguments).await,
+        None => {
+            state
+                .registry
+                .route_tool_call_with_request_params(tool_name, arguments, request_params)
+                .await
+        }
     };
     match route_result {
         Ok(result) => {

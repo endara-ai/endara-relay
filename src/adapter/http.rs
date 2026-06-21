@@ -1168,6 +1168,16 @@ impl McpAdapter for HttpAdapter {
     }
 
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
+        self.call_tool_with_request_params(name, arguments, serde_json::Map::new())
+            .await
+    }
+
+    async fn call_tool_with_request_params(
+        &self,
+        name: &str,
+        arguments: Value,
+        request_params: serde_json::Map<String, Value>,
+    ) -> Result<Value, AdapterError> {
         // Capture caller span context BEFORE `.instrument(self.span)` re-enters
         // the adapter's own `endpoint` span — endpoint is constructed at
         // adapter init time with no parent linkage to per-request spans, so
@@ -1198,10 +1208,11 @@ impl McpAdapter for HttpAdapter {
                     client: span_ctx.client.clone(),
                 });
             }
-            let params = json!({
+            let mut params = json!({
                 "name": name,
                 "arguments": arguments,
             });
+            crate::adapter::merge_request_params(&mut params, request_params);
             let start = Instant::now();
             let result = self.send_request("tools/call", Some(params)).await;
             // JIT 401 interception: swallow a hard 401 + Bearer challenge and
@@ -2449,6 +2460,109 @@ mod tests {
             list_rec.mcp_name.is_none(),
             "Mcp-Name is absent for methods without a tool name"
         );
+
+        drop(seen);
+        server.abort();
+    }
+
+    // --- Multi round-trip (MRT) passthrough (T10) ---
+
+    #[derive(Clone)]
+    struct MrtState {
+        seen: Arc<Mutex<Vec<Value>>>,
+    }
+
+    /// Fixture for the MRT round-trip: the first `tools/call` (no `requestState`)
+    /// returns an `InputRequiredResult`; a follow-up carrying `requestState`
+    /// returns the terminal `CallToolResult`. Every inbound `params` object is
+    /// recorded so the test can assert what the relay forwarded.
+    async fn dispatch_mrt(
+        State(app): State<MrtState>,
+        Json(body): Json<Value>,
+    ) -> axum::response::Response {
+        let id = body.get("id").cloned().unwrap_or(Value::Null);
+        let params = body.get("params").cloned().unwrap_or(json!({}));
+        app.seen.lock().await.push(params.clone());
+        let result = if params.get("requestState").is_some() {
+            json!({"content": [{"type": "text", "text": "done"}]})
+        } else {
+            json!({
+                "inputRequests": [{"name": "city", "schema": {"type": "string"}}],
+                "requestState": "state-xyz"
+            })
+        };
+        Json(json!({"jsonrpc": "2.0", "result": result, "id": id})).into_response()
+    }
+
+    async fn start_mrt_server() -> (String, Arc<Mutex<Vec<Value>>>, JoinHandle<()>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let state = MrtState { seen: seen.clone() };
+        let app = Router::new()
+            .route("/mcp", any(dispatch_mrt))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{}/mcp", addr);
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (url, seen, handle)
+    }
+
+    /// A full multi round-trip: the relay forwards a terminal-shaped first call
+    /// untouched, returns the upstream `InputRequiredResult` verbatim, and on the
+    /// follow-up forwards `inputResponses`/`requestState` alongside
+    /// `name`/`arguments` so the upstream can complete the call.
+    #[tokio::test]
+    async fn call_tool_round_trips_input_required_and_request_state() {
+        let (url, seen, server) = start_mrt_server().await;
+        let adapter = HttpAdapter::new(HttpConfig::new(url));
+
+        // First call: no MRT siblings. Upstream returns an InputRequiredResult,
+        // which must pass through unchanged (not coerced into a CallToolResult).
+        let first = adapter
+            .call_tool_with_request_params("ask", json!({"q": "?"}), serde_json::Map::new())
+            .await
+            .expect("first call_tool");
+        assert_eq!(first["requestState"], "state-xyz");
+        assert!(
+            first.get("inputRequests").is_some(),
+            "InputRequiredResult passes through unchanged"
+        );
+        assert!(
+            first.get("content").is_none(),
+            "InputRequiredResult must not be mangled into a content result"
+        );
+
+        // Follow-up: client supplies inputResponses + the echoed requestState.
+        let mut request_params = serde_json::Map::new();
+        request_params.insert(
+            "inputResponses".to_string(),
+            json!([{"name": "city", "value": "NYC"}]),
+        );
+        request_params.insert("requestState".to_string(), json!("state-xyz"));
+        let second = adapter
+            .call_tool_with_request_params("ask", json!({"q": "?"}), request_params)
+            .await
+            .expect("follow-up call_tool");
+        assert_eq!(second["content"][0]["text"], "done");
+
+        let seen = seen.lock().await;
+        assert_eq!(seen.len(), 2, "two upstream tools/call requests");
+
+        // First request carries only name/arguments — byte-for-byte legacy shape.
+        let first_params = &seen[0];
+        assert_eq!(first_params["name"], "ask");
+        assert_eq!(first_params["arguments"], json!({"q": "?"}));
+        assert!(first_params.get("requestState").is_none());
+        assert!(first_params.get("inputResponses").is_none());
+
+        // Follow-up request forwards the MRT siblings verbatim.
+        let followup_params = &seen[1];
+        assert_eq!(followup_params["name"], "ask");
+        assert_eq!(followup_params["arguments"], json!({"q": "?"}));
+        assert_eq!(followup_params["requestState"], "state-xyz");
+        assert_eq!(followup_params["inputResponses"][0]["value"], "NYC");
 
         drop(seen);
         server.abort();

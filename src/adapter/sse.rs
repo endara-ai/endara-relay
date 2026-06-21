@@ -900,6 +900,16 @@ impl McpAdapter for SseAdapter {
     }
 
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
+        self.call_tool_with_request_params(name, arguments, serde_json::Map::new())
+            .await
+    }
+
+    async fn call_tool_with_request_params(
+        &self,
+        name: &str,
+        arguments: Value,
+        request_params: serde_json::Map<String, Value>,
+    ) -> Result<Value, AdapterError> {
         // Capture caller span context BEFORE `.instrument(self.span)` re-enters
         // the adapter's own `endpoint` span — endpoint is constructed at
         // adapter init time with no parent linkage to per-request spans, so
@@ -930,10 +940,11 @@ impl McpAdapter for SseAdapter {
                     client: span_ctx.client.clone(),
                 });
             }
-            let params = json!({
+            let mut params = json!({
                 "name": name,
                 "arguments": arguments,
             });
+            crate::adapter::merge_request_params(&mut params, request_params);
             let start = Instant::now();
             let result = self.send_request("tools/call", Some(params)).await;
             let duration_ms = start.elapsed().as_millis();
