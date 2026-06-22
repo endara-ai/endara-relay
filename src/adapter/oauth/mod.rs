@@ -999,7 +999,27 @@ impl McpAdapter for OAuthAdapter {
         .await
     }
 
+    async fn list_tools_ttl_ms(&self) -> Option<u64> {
+        // Delegate to the inner transport adapter, which captured the upstream
+        // `ttlMs` (gated on its own negotiated dialect) during `list_tools`.
+        let guard = self.inner.inner_adapter.read().await;
+        match guard.as_ref() {
+            Some(adapter) => adapter.list_tools_ttl_ms().await,
+            None => None,
+        }
+    }
+
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
+        self.call_tool_with_request_params(name, arguments, serde_json::Map::new())
+            .await
+    }
+
+    async fn call_tool_with_request_params(
+        &self,
+        name: &str,
+        arguments: Value,
+        request_params: serde_json::Map<String, Value>,
+    ) -> Result<Value, AdapterError> {
         // NB: do NOT wrap the inner adapter's `call_tool` invocations in
         // `.instrument(self.inner.span)`. The inner `HttpAdapter::call_tool`
         // captures the caller's per-request span context (`request{request_uid}`,
@@ -1023,7 +1043,10 @@ impl McpAdapter for OAuthAdapter {
             }
         };
 
-        match adapter.call_tool(name, arguments.clone()).await {
+        match adapter
+            .call_tool_with_request_params(name, arguments.clone(), request_params.clone())
+            .await
+        {
             Ok(result) => Ok(result),
             Err(AdapterError::HttpError { status: 401, .. }) => {
                 // Drop the read lock before refreshing
@@ -1047,7 +1070,9 @@ impl McpAdapter for OAuthAdapter {
                                 "Adapter lost during refresh".to_string(),
                             )
                         })?;
-                        adapter.call_tool(name, arguments).await
+                        adapter
+                            .call_tool_with_request_params(name, arguments, request_params)
+                            .await
                     }
                     Err(e) => {
                         async {

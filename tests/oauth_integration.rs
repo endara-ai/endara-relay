@@ -141,13 +141,19 @@ async fn mock_auth_server_metadata(
 }
 
 async fn mock_authorize(
+    State(state): axum::extract::State<Arc<MockOAuthState>>,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl axum::response::IntoResponse {
     // In a real flow the browser would redirect. For tests, we return the
-    // redirect_uri + code so the test can simulate the callback.
+    // redirect_uri + code so the test can simulate the callback. Include the
+    // RFC 9207 `iss` parameter so the relay's issuer validation passes.
     let redirect_uri = params.get("redirect_uri").cloned().unwrap_or_default();
     let state_param = params.get("state").cloned().unwrap_or_default();
-    let location = format!("{}?code=mock-auth-code&state={}", redirect_uri, state_param);
+    let issuer = format!("http://127.0.0.1:{}", state.port);
+    let location = format!(
+        "{}?code=mock-auth-code&state={}&iss={}",
+        redirect_uri, state_param, issuer
+    );
     (
         axum::http::StatusCode::FOUND,
         [(axum::http::header::LOCATION, location)],
@@ -521,8 +527,14 @@ async fn simulate_oauth_login(api: &ApiClient, endpoint_name: &str) -> Value {
     let redirect_uri = query_pairs.get("redirect_uri").expect("no redirect_uri");
     let state_param = query_pairs.get("state").expect("no state param");
 
-    // Step 3: Simulate the callback (as if the browser redirected)
-    let callback_url = format!("{}?code=mock-auth-code&state={}", redirect_uri, state_param);
+    // Step 3: Simulate the callback (as if the browser redirected). Include the
+    // RFC 9207 `iss` parameter matching the mock AS issuer so the relay's
+    // issuer validation passes.
+    let issuer = parsed.origin().ascii_serialization();
+    let callback_url = format!(
+        "{}?code=mock-auth-code&state={}&iss={}",
+        redirect_uri, state_param, issuer
+    );
 
     // Use a client that doesn't follow redirects so we can see the response
     let no_redirect_client = reqwest::Client::builder()
@@ -606,6 +618,66 @@ async fn test_oauth_fresh_login_flow() {
     assert!(
         !auth_requests.is_empty(),
         "Expected upstream MCP requests with Bearer token"
+    );
+}
+
+/// Scope accumulation: after a successful login persists a granted scope,
+/// a subsequent re-authorization (step-up) must request the UNION of the
+/// previously-granted scopes and the scopes requested today, so the user never
+/// silently loses access they already granted.
+#[tokio::test]
+async fn test_oauth_reauth_accumulates_prior_scope() {
+    let (oauth_addr, _oauth_state) = start_mock_oauth(3600, true).await;
+    let (mcp_addr, _mcp_state) = start_mock_mcp("access-token-1").await;
+
+    let oauth_url = format!("http://127.0.0.1:{}", oauth_addr.port());
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_addr.port());
+
+    let config = ConfigBuilder::new()
+        .add_oauth_with_client("test-oauth", &mcp_url, Some(&oauth_url), "test-client")
+        .build();
+
+    let harness = RelayHarness::start(&config).await;
+
+    poll_oauth_status(
+        harness.api(),
+        "test-oauth",
+        "needs_login",
+        Duration::from_secs(10),
+    )
+    .await;
+
+    // First login — the mock token endpoint grants scope "read write", which
+    // the relay persists in the TokenSet.
+    simulate_oauth_login(harness.api(), "test-oauth").await;
+    poll_oauth_status(
+        harness.api(),
+        "test-oauth",
+        "authenticated",
+        Duration::from_secs(15),
+    )
+    .await;
+
+    // Re-authorize: the new authorize URL must carry the previously-granted
+    // scopes in its `scope` parameter.
+    let start_resp = harness
+        .api()
+        .post_empty("/api/endpoints/test-oauth/oauth/start")
+        .await;
+    let authorize_url = start_resp["authorize_url"]
+        .as_str()
+        .expect("no authorize_url on re-auth");
+    let parsed = url::Url::parse(authorize_url).expect("invalid authorize_url");
+    let scope = parsed
+        .query_pairs()
+        .find(|(k, _)| k == "scope")
+        .map(|(_, v)| v.to_string())
+        .expect("re-auth authorize_url must include a scope param");
+    let granted: Vec<&str> = scope.split_whitespace().collect();
+    assert!(
+        granted.contains(&"read") && granted.contains(&"write"),
+        "re-auth scope must accumulate previously-granted scopes, got {:?}",
+        scope
     );
 }
 
@@ -1210,8 +1282,13 @@ async fn test_oauth_server_info_name_enforcement() {
 
     // Step 4c: Simulate the callback (as if the browser redirected)
     // Use a client that doesn't follow redirects, with long timeout since
-    // the relay does work during the callback
-    let callback_url = format!("{}?code=mock-auth-code&state={}", redirect_uri, state_param);
+    // the relay does work during the callback. Include the RFC 9207 `iss`
+    // parameter matching the mock AS issuer so issuer validation passes.
+    let issuer = parsed.origin().ascii_serialization();
+    let callback_url = format!(
+        "{}?code=mock-auth-code&state={}&iss={}",
+        redirect_uri, state_param, issuer
+    );
     let callback_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(30))

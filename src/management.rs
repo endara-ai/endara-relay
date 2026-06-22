@@ -13,7 +13,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tokio::sync::RwLock;
 
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::adapter::http::{HttpAdapter, HttpConfig};
 use crate::adapter::oauth::OAuthState;
@@ -27,7 +27,7 @@ use crate::observability::payloads::StoredPayloads;
 use crate::observability::store::{AggregateBucket, CallRecord, QueryFilter};
 use crate::profile_registry::ProfileRegistry;
 use crate::registry::AdapterRegistry;
-use crate::token_manager::{DcrCredentials, TokenManager};
+use crate::token_manager::{dcr_issuer_allows_reuse, merge_scopes, DcrCredentials, TokenManager};
 use crate::OAuthAdapterInners;
 
 // ---------------------------------------------------------------------------
@@ -1133,6 +1133,7 @@ async fn oauth_start(
         registration_endpoint,
         discovered_scopes,
         auth_server_label,
+        issuer,
     ) = if let Some(ref server_url) = oauth_server_url {
         // Prefer RFC 8414 discovery against the configured AS URL. If it
         // succeeds, use the discovered endpoints (explicit token_endpoint
@@ -1150,6 +1151,7 @@ async fn oauth_start(
                     disc.registration_endpoint,
                     disc.scopes_supported,
                     Some(disc.auth_server_url),
+                    Some(disc.issuer),
                 )
             }
             Err(e) => {
@@ -1168,6 +1170,7 @@ async fn oauth_start(
                     None::<String>,
                     Vec::<String>::new(),
                     None::<String>,
+                    None::<String>,
                 )
             }
         }
@@ -1180,6 +1183,7 @@ async fn oauth_start(
                 disc.registration_endpoint,
                 disc.scopes_supported,
                 Some(disc.auth_server_url),
+                Some(disc.issuer),
             ),
             Err(e) => {
                 return error_response(
@@ -1213,6 +1217,24 @@ async fn oauth_start(
         }
     } else {
         None
+    };
+
+    // Credential-to-issuer binding: if the stored DCR credentials were
+    // registered against a DIFFERENT authorization server issuer than the one
+    // we just discovered, discard them so resolution falls through to dynamic
+    // re-registration (RFC 7591), exactly as if no creds existed. Legacy creds
+    // with no stored issuer are reused as-is (backward compatibility).
+    let persisted_dcr = match persisted_dcr {
+        Some(creds) if !dcr_issuer_allows_reuse(creds.issuer.as_deref(), issuer.as_deref()) => {
+            info!(
+                endpoint = %name,
+                stored_issuer = ?creds.issuer,
+                current_issuer = ?issuer,
+                "DCR credential issuer changed; discarding stored credentials and re-registering"
+            );
+            None
+        }
+        other => other,
     };
 
     let (client_id, client_secret, dcr_used) = if let Some(cid) = config_client_id {
@@ -1249,6 +1271,7 @@ async fn oauth_start(
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
+                        issuer: issuer.clone(),
                     };
                     if let Err(e) = tm.save_dcr(&name, &creds).await {
                         warn!(endpoint = %name, error = %e, "Failed to persist DCR credentials");
@@ -1304,6 +1327,7 @@ async fn oauth_start(
             client_secret.as_deref(),
             pkce,
             &redirect_uri,
+            issuer.as_deref(),
         )
         .await;
 
@@ -1317,11 +1341,20 @@ async fn oauth_start(
         urlencoding(&code_challenge),
     );
 
-    // Prefer config scopes; fall back to discovered scopes
+    // Scope accumulation for step-up authorization: union the scopes we'd
+    // request today (config scopes) with any previously-granted scopes from a
+    // persisted TokenSet, so re-authorizing for more access never drops scopes
+    // the user already granted. First login (no prior token) is unchanged.
     let effective_scopes = scopes.unwrap_or_default();
-    if !effective_scopes.is_empty() {
-        let scope_str = effective_scopes.join(" ");
-        authorize_url.push_str(&format!("&scope={}", urlencoding(&scope_str)));
+    let requested_scope = effective_scopes.join(" ");
+    let prior_scope = if let Some(ref tm) = state.token_manager {
+        tm.load(&name).await.ok().flatten().and_then(|t| t.scope)
+    } else {
+        None
+    };
+    let merged_scope = merge_scopes(prior_scope.as_deref(), &requested_scope);
+    if !merged_scope.is_empty() {
+        authorize_url.push_str(&format!("&scope={}", urlencoding(&merged_scope)));
     }
 
     let discovery_info = auth_server_label.map(|auth_server| OAuthDiscoveryInfo {
@@ -1377,6 +1410,9 @@ async fn oauth_credentials(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
+        // Manually-supplied credentials are user-managed, not bound to a
+        // discovered issuer; leave None so they are always reused as-is.
+        issuer: None,
     };
 
     if let Err(e) = tm.save_dcr(&name, &creds).await {
@@ -1441,6 +1477,9 @@ async fn set_endpoint_credentials(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
+        // Manually-supplied credentials are user-managed, not bound to a
+        // discovered issuer; leave None so they are always reused as-is.
+        issuer: None,
     };
 
     if let Err(e) = tm.save_dcr(&name, &creds).await {
@@ -2019,6 +2058,7 @@ async fn oauth_setup(
     let registration_endpoint = disc.registration_endpoint.clone();
     let discovered_scopes = disc.scopes_supported.clone();
     let auth_server_url = disc.auth_server_url.clone();
+    let issuer = disc.issuer.clone();
 
     setup_mgr
         .get_session_mut(&session_id, |s| {
@@ -2026,6 +2066,7 @@ async fn oauth_setup(
             s.token_endpoint = Some(disc.token_endpoint.clone());
             s.registration_endpoint = disc.registration_endpoint.clone();
             s.oauth_server_url = Some(disc.auth_server_url.clone());
+            s.issuer = Some(disc.issuer.clone());
         })
         .await;
 
@@ -2058,6 +2099,8 @@ async fn oauth_setup(
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs(),
+                // Manually-supplied credentials are user-managed; not issuer-bound.
+                issuer: None,
             };
             if let Err(e) = tm.save_dcr(&body.name, &creds).await {
                 warn!(endpoint = %body.name, error = %e, "Failed to persist manual credentials");
@@ -2084,6 +2127,7 @@ async fn oauth_setup(
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs(),
+                        issuer: Some(issuer.clone()),
                     };
                     if let Err(e) = tm.save_dcr(&body.name, &creds).await {
                         warn!(endpoint = %body.name, error = %e, "Failed to persist DCR credentials");
@@ -2120,6 +2164,7 @@ async fn oauth_setup(
                     client_secret.as_deref(),
                     pkce,
                     &redirect_uri,
+                    Some(issuer.as_str()),
                 )
                 .await;
 
@@ -2132,10 +2177,21 @@ async fn oauth_setup(
                 urlencoding(&code_challenge),
             );
 
-            if let Some(ref scope_str) = scopes_str {
-                if !scope_str.is_empty() {
-                    authorize_url.push_str(&format!("&scope={}", urlencoding(scope_str)));
-                }
+            // Scope accumulation: union any previously-granted scopes (from a
+            // persisted TokenSet for this name) with the requested scopes.
+            let requested_scope = scopes_str.clone().unwrap_or_default();
+            let prior_scope = if let Some(ref tm) = state.token_manager {
+                tm.load(&body.name)
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|t| t.scope)
+            } else {
+                None
+            };
+            let merged_scope = merge_scopes(prior_scope.as_deref(), &requested_scope);
+            if !merged_scope.is_empty() {
+                authorize_url.push_str(&format!("&scope={}", urlencoding(&merged_scope)));
             }
 
             let discovery_info = OAuthDiscoveryInfo {
@@ -2227,11 +2283,13 @@ async fn oauth_setup_credentials(
                 s.token_endpoint.clone(),
                 s.scopes.clone(),
                 s.name.clone(),
+                s.issuer.clone(),
             )
         })
         .await;
 
-    let Some((Some(auth_endpoint), Some(token_endpoint), scopes, name)) = session_data else {
+    let Some((Some(auth_endpoint), Some(token_endpoint), scopes, name, issuer)) = session_data
+    else {
         return error_response(StatusCode::NOT_FOUND, "session not found or expired", None)
             .into_response();
     };
@@ -2246,6 +2304,8 @@ async fn oauth_setup_credentials(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            // Manually-supplied credentials are user-managed; not issuer-bound.
+            issuer: None,
         };
         if let Err(e) = tm.save_dcr(&name, &creds).await {
             warn!(endpoint = %name, error = %e, "Failed to persist manual credentials");
@@ -2264,6 +2324,7 @@ async fn oauth_setup_credentials(
             body.client_secret.as_deref(),
             pkce,
             &redirect_uri,
+            issuer.as_deref(),
         )
         .await;
 
@@ -2276,10 +2337,17 @@ async fn oauth_setup_credentials(
         urlencoding(&code_challenge),
     );
 
-    if let Some(ref scope_str) = scopes {
-        if !scope_str.is_empty() {
-            authorize_url.push_str(&format!("&scope={}", urlencoding(scope_str)));
-        }
+    // Scope accumulation: union previously-granted scopes (from a persisted
+    // TokenSet for this endpoint) with the requested scopes for step-up.
+    let requested_scope = scopes.clone().unwrap_or_default();
+    let prior_scope = if let Some(ref tm) = state.token_manager {
+        tm.load(&name).await.ok().flatten().and_then(|t| t.scope)
+    } else {
+        None
+    };
+    let merged_scope = merge_scopes(prior_scope.as_deref(), &requested_scope);
+    if !merged_scope.is_empty() {
+        authorize_url.push_str(&format!("&scope={}", urlencoding(&merged_scope)));
     }
 
     Json(serde_json::json!({
@@ -7035,6 +7103,7 @@ command = "echo"
                 client_secret: Some("dcr-secret".to_string()),
                 client_secret_expires_at: 0,
                 registered_at: 1_700_000_000,
+                issuer: None,
             },
         )
         .await
@@ -7499,6 +7568,7 @@ command = "echo"
             client_secret: Some("from-dcr".to_string()),
             client_secret_expires_at: 0,
             registered_at: 0,
+            issuer: None,
         };
         token_manager.save_dcr("ep1", &creds).await.unwrap();
 
@@ -7560,6 +7630,7 @@ command = "echo"
             client_secret: Some("stale-dcr-secret".to_string()),
             client_secret_expires_at: 0,
             registered_at: 0,
+            issuer: None,
         };
         token_manager.save_dcr("ep1", &creds).await.unwrap();
 

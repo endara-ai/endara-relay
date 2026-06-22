@@ -3,6 +3,7 @@ use crate::events::ClientIdentity;
 use crate::js_sandbox::MetaToolHandler;
 use crate::oauth::{OAuthFlowManager, OAuthSetupManager};
 use crate::profile_registry::{ProfileContext, ProfileRegistry};
+use crate::protocol::{self, ProtocolVersion};
 use crate::registry::AdapterRegistry;
 use crate::token_manager::TokenManager;
 use crate::OAuthAdapterInners;
@@ -161,9 +162,12 @@ impl MetaToolSchemas {
 pub struct SessionIdentityStore {
     capacity: usize,
     next_seq: u64,
-    /// `session_id → (identity, recency seq)`. The seq is duplicated in
-    /// [`recency`] so the LRU pop is `O(log n)` rather than `O(n)`.
-    entries: HashMap<String, (ClientIdentity, u64)>,
+    /// `session_id → (identity, detected dialect, recency seq)`. The seq is
+    /// duplicated in [`recency`] so the LRU pop is `O(log n)` rather than
+    /// `O(n)`. The dialect is the inbound peer's negotiated
+    /// [`ProtocolVersion`], recorded at `initialize` time and consumed by
+    /// later version-gated dispatch (T3).
+    entries: HashMap<String, (ClientIdentity, ProtocolVersion, u64)>,
     /// `recency seq → session_id`. The smallest key is the least-
     /// recently-used entry; `pop_first` evicts it in `O(log n)`.
     recency: BTreeMap<u64, String>,
@@ -195,18 +199,32 @@ impl SessionIdentityStore {
     /// previously-stored identity for the same session id (typically
     /// `None`; a `Some` value indicates a session-id collision between
     /// two `initialize` calls and is overwritten).
+    #[allow(dead_code)]
     pub fn insert(
         &mut self,
         session_id: String,
         identity: ClientIdentity,
     ) -> Option<ClientIdentity> {
+        self.insert_with_dialect(session_id, identity, ProtocolVersion::default())
+    }
+
+    /// Insert or refresh an entry while recording the inbound peer's detected
+    /// [`ProtocolVersion`]. Eviction semantics match [`insert`]; the returned
+    /// `Option` is the previously-stored identity for the same session id.
+    pub fn insert_with_dialect(
+        &mut self,
+        session_id: String,
+        identity: ClientIdentity,
+        dialect: ProtocolVersion,
+    ) -> Option<ClientIdentity> {
         let new_seq = self.next_seq();
-        let previous = if let Some((prev_id, prev_seq)) = self.entries.remove(&session_id) {
-            self.recency.remove(&prev_seq);
-            Some(prev_id)
-        } else {
-            None
-        };
+        let previous =
+            if let Some((prev_id, _prev_dialect, prev_seq)) = self.entries.remove(&session_id) {
+                self.recency.remove(&prev_seq);
+                Some(prev_id)
+            } else {
+                None
+            };
         while self.entries.len() >= self.capacity {
             let Some((evict_seq, evict_key)) = self.recency.pop_first() else {
                 break;
@@ -217,20 +235,29 @@ impl SessionIdentityStore {
             let _ = evict_seq;
         }
         self.recency.insert(new_seq, session_id.clone());
-        self.entries.insert(session_id, (identity, new_seq));
+        self.entries
+            .insert(session_id, (identity, dialect, new_seq));
         previous
     }
 
     /// Resolve the [`ClientIdentity`] for a session id and mark the entry
     /// as most-recently-used.
     pub fn get(&mut self, session_id: &str) -> Option<ClientIdentity> {
-        let (identity, prev_seq) = self.entries.get(session_id).cloned()?;
+        let (identity, dialect, prev_seq) = self.entries.get(session_id).cloned()?;
         self.recency.remove(&prev_seq);
         let new_seq = self.next_seq();
         self.recency.insert(new_seq, session_id.to_string());
         self.entries
-            .insert(session_id.to_string(), (identity.clone(), new_seq));
+            .insert(session_id.to_string(), (identity.clone(), dialect, new_seq));
         Some(identity)
+    }
+
+    /// Read the inbound dialect recorded for a session id without disturbing
+    /// recency. Returns `None` for an unknown session. Consumed by T3 to gate
+    /// dispatch on the inbound peer's negotiated protocol version.
+    #[allow(dead_code)]
+    pub fn dialect(&self, session_id: &str) -> Option<ProtocolVersion> {
+        self.entries.get(session_id).map(|(_, dialect, _)| *dialect)
     }
 
     /// Number of live entries. Exposed for unit tests that exercise the
@@ -305,6 +332,32 @@ fn identity_from_initialize_params(params: Option<&Value>) -> ClientIdentity {
     }
 }
 
+/// Extract a [`ClientIdentity`] from a 2026 request's
+/// `params._meta["io.modelcontextprotocol/clientInfo"]` object. Because the
+/// 2026 dialect removes the `initialize` handshake, a stateless client attaches
+/// its identity on every request under this reverse-DNS `_meta` key instead of
+/// in an `initialize` body. Mirrors [`identity_from_initialize_params`]: every
+/// field is optional, so a malformed payload degrades to an empty identity
+/// rather than rejecting the request. (`title`, when present, is not stored —
+/// [`ClientIdentity`] carries only `name`/`version`.)
+fn identity_from_meta_client_info(params: Option<&Value>) -> ClientIdentity {
+    let Some(info) = protocol::meta_client_info(params) else {
+        return ClientIdentity::default();
+    };
+    ClientIdentity {
+        name: info
+            .get("name")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        version: info
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        user_agent: None,
+        origin: None,
+    }
+}
+
 /// Fold `fallback`'s non-empty fields into `primary` so structured
 /// `clientInfo` (name/version from `initialize`) wins over the per-request
 /// `User-Agent`/`Origin` headers when both are present.
@@ -334,6 +387,44 @@ fn resolve_inbound_identity(state: &AppState, headers: &HeaderMap) -> Option<Cli
         Some(s) => merge_identity(s, header_identity),
         None => header_identity,
     };
+    if merged.is_empty() {
+        None
+    } else {
+        Some(merged)
+    }
+}
+
+/// Resolve the caller's [`ClientIdentity`] for a non-`initialize` inbound
+/// message, branching on the per-request detected dialect (D2/D3).
+///
+/// 2026 clients are stateless — they send no `initialize` handshake and no
+/// `Mcp-Session-Id`, attaching their identity on every request under
+/// `params._meta["io.modelcontextprotocol/clientInfo"]` instead. When the
+/// request is detected as 2026 (an explicit `MCP-Protocol-Version: 2026-07-28`
+/// header, or `_meta` clientInfo present with no handshake), identity is read
+/// from that per-request `_meta` payload — merged with the `User-Agent`/`Origin`
+/// header fallback — rather than from the session cache.
+///
+/// Legacy clients (`2024-11-05` / `2025-03-26`) fall through to
+/// [`resolve_inbound_identity`] unchanged, preserving the session-cache lookup
+/// byte-for-byte.
+fn resolve_inbound_identity_versioned(
+    state: &AppState,
+    headers: &HeaderMap,
+    params: Option<&Value>,
+) -> Option<ClientIdentity> {
+    let dialect = protocol::detect_inbound_dialect(
+        false,
+        header_str(headers, protocol::MCP_PROTOCOL_VERSION_HEADER),
+        params,
+    );
+    if !dialect.is_2026() {
+        return resolve_inbound_identity(state, headers);
+    }
+    let merged = merge_identity(
+        identity_from_meta_client_info(params),
+        identity_from_headers(headers),
+    );
     if merged.is_empty() {
         None
     } else {
@@ -417,8 +508,16 @@ async fn mcp_initialize(
     Json(body): Json<JsonRpcBody>,
     profile_ctx: Option<&ProfileContext>,
 ) -> Json<Value> {
+    let result = build_initialize_result(&state, profile_ctx).await;
+    jsonrpc_response(body.id, result)
+}
+
+/// Build the `InitializeResult` body (`protocolVersion`/`capabilities`/
+/// `serverInfo`/optional `instructions`) shared by `initialize` and
+/// `server/discover`, so both advertise the relay identically.
+async fn build_initialize_result(state: &AppState, profile_ctx: Option<&ProfileContext>) -> Value {
     let mut result = json!({
-        "protocolVersion": "2025-03-26",
+        "protocolVersion": protocol::VERSION_2025_03_26,
         "capabilities": {
             "tools": { "listChanged": true }
         },
@@ -433,6 +532,44 @@ async fn mcp_initialize(
     };
     if let Some(instructions) = instructions {
         result["instructions"] = Value::String(instructions);
+    }
+    result
+}
+
+/// POST /mcp `server/discover`
+///
+/// 2026-07-28 clients are stateless — they may fetch the relay's server
+/// identity and primitive catalog in a single call without the legacy
+/// `initialize` handshake. The result reuses [`build_initialize_result`] so
+/// `serverInfo`/`capabilities`/`protocolVersion` stay byte-for-byte consistent
+/// with `initialize`, then appends the aggregated primitive summary the relay
+/// exposes — `tools` (mirroring `tools/list`). The relay advertises no prompts
+/// or resources, so only `tools` appears.
+///
+/// Per the coordinator decision (T11 — relay is local/single-user), the result
+/// carries NO `ttlMs` and NO `cacheScope`: 2026 clients treat the absent hint
+/// as immediately stale and rely on `listChanged`, which the relay supports.
+async fn mcp_server_discover(
+    State(state): State<AppState>,
+    Json(body): Json<JsonRpcBody>,
+    profile_ctx: Option<&ProfileContext>,
+) -> Json<Value> {
+    let mut result = build_initialize_result(&state, profile_ctx).await;
+    // Reuse the `tools/list` aggregation verbatim for the primitive summary.
+    let tools_body = JsonRpcBody {
+        jsonrpc: None,
+        method: None,
+        params: None,
+        id: None,
+    };
+    let Json(mut tools_resp) =
+        mcp_tools_list(State(state.clone()), Json(tools_body), profile_ctx).await;
+    if let Some(tools) = tools_resp
+        .get_mut("result")
+        .and_then(|r| r.get_mut("tools"))
+        .map(Value::take)
+    {
+        result["tools"] = tools;
     }
     jsonrpc_response(body.id, result)
 }
@@ -721,13 +858,34 @@ async fn mcp_tools_call(
         ));
     }
 
+    // Transparent MCP 2026-07-28 multi round-trip passthrough: forward every
+    // top-level `tools/call` param other than `name`/`arguments` (e.g.
+    // `inputResponses`, `requestState`, `_meta`) verbatim to the upstream so an
+    // `InputRequiredResult` round-trip survives the relay hop. A normal terminal
+    // call carries no such siblings, so this map is empty and dispatch is
+    // identical to the legacy path.
+    let request_params: serde_json::Map<String, Value> = params
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .filter(|(k, _)| k.as_str() != "name" && k.as_str() != "arguments")
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+
     let route_result = match profile_ctx {
         Some(ctx) => {
             ctx.registry_view
-                .route_tool_call(tool_name, arguments)
+                .route_tool_call_with_request_params(tool_name, arguments, request_params)
                 .await
         }
-        None => state.registry.route_tool_call(tool_name, arguments).await,
+        None => {
+            state
+                .registry
+                .route_tool_call_with_request_params(tool_name, arguments, request_params)
+                .await
+        }
     };
     match route_result {
         Ok(result) => {
@@ -835,6 +993,9 @@ async fn handle_single_message(
 
         let result: Result<Json<Value>, (StatusCode, Json<Value>)> = match method.as_str() {
             "initialize" => Ok(mcp_initialize(State(state.clone()), Json(body), profile_ctx).await),
+            "server/discover" => {
+                Ok(mcp_server_discover(State(state.clone()), Json(body), profile_ctx).await)
+            }
             "tools/list" => Ok(mcp_tools_list(State(state.clone()), Json(body), profile_ctx).await),
             "tools/call" => mcp_tools_call(State(state.clone()), Json(body), profile_ctx).await,
             _ => Err(jsonrpc_error(
@@ -1007,6 +1168,12 @@ async fn mcp_unified_impl(
 
             let mut responses: Vec<Value> = Vec::new();
             for msg in messages {
+                // 2026 HTTP routing headers (Mcp-Method/Mcp-Name) must agree
+                // with each message body; a mismatch is rejected before dispatch.
+                if let Some(err) = validate_2026_routing_headers(&headers, &msg) {
+                    responses.push(err);
+                    continue;
+                }
                 let (identity, new_session) = resolve_identity_for_message(&state, &headers, &msg);
                 if emitted_session_id.is_none() {
                     emitted_session_id = new_session;
@@ -1032,6 +1199,11 @@ async fn mcp_unified_impl(
             }
         }
         Value::Object(_) => {
+            // 2026 HTTP routing headers (Mcp-Method/Mcp-Name) must agree with
+            // the request body; a mismatch is rejected before dispatch.
+            if let Some(err) = validate_2026_routing_headers(&headers, &body) {
+                return json_response(err);
+            }
             let (identity, new_session) = resolve_identity_for_message(&state, &headers, &body);
             emitted_session_id = new_session;
             match handle_single_message(
@@ -1099,29 +1271,105 @@ fn resolve_identity_for_message(
 ) -> (Option<ClientIdentity>, Option<String>) {
     let is_initialize = msg.get("method").and_then(|v| v.as_str()) == Some("initialize");
     if !is_initialize {
-        return (resolve_inbound_identity(state, headers), None);
+        // Non-`initialize` messages branch on the detected dialect: 2026 clients
+        // are stateless and carry identity in `params._meta` (no session), while
+        // legacy clients keep the session-cache lookup unchanged.
+        return (
+            resolve_inbound_identity_versioned(state, headers, msg.get("params")),
+            None,
+        );
     }
-    // `initialize`: issue a fresh session id unconditionally so the
-    // client can echo it on follow-ups, even when it sent no
-    // `clientInfo`. Only cache the structured `clientInfo` (name /
-    // version) — the per-request `User-Agent`/`Origin` fallback covers
-    // the empty case on later requests without polluting the LRU with
-    // zero-signal entries.
     let init_identity = identity_from_initialize_params(msg.get("params"));
     let header_identity = identity_from_headers(headers);
-    let session_id = uuid::Uuid::new_v4().to_string();
-    if !init_identity.is_empty() {
-        if let Ok(mut guard) = state.session_identities.lock() {
-            guard.insert(session_id.clone(), init_identity.clone());
-        }
-    }
-    let merged = merge_identity(init_identity, header_identity);
+    // Detect the inbound peer's dialect so the session path can branch on it.
+    let dialect = protocol::detect_inbound_dialect(
+        true,
+        header_str(headers, protocol::MCP_PROTOCOL_VERSION_HEADER),
+        msg.get("params"),
+    );
+    let merged = merge_identity(init_identity.clone(), header_identity);
     let identity = if merged.is_empty() {
         None
     } else {
         Some(merged)
     };
+    // 2026 clients are stateless: they are not required to send `initialize`
+    // and, when they do, the relay mints/stores/echoes no `Mcp-Session-Id`
+    // (statelessness replaces session affinity — identity travels in `_meta`).
+    if dialect.is_2026() {
+        return (identity, None);
+    }
+    // Legacy `initialize`: issue a fresh session id unconditionally so the
+    // client can echo it on follow-ups, even when it sent no `clientInfo`.
+    // Only cache the structured `clientInfo` (name / version) — the per-request
+    // `User-Agent`/`Origin` fallback covers the empty case on later requests
+    // without polluting the LRU with zero-signal entries.
+    let session_id = uuid::Uuid::new_v4().to_string();
+    if !init_identity.is_empty() {
+        if let Ok(mut guard) = state.session_identities.lock() {
+            guard.insert_with_dialect(session_id.clone(), init_identity, dialect);
+        }
+    }
     (identity, Some(session_id))
+}
+
+/// Validate the 2026 Streamable-HTTP routing headers against a single
+/// JSON-RPC message body. 2026 clients mirror the JSON-RPC `method` in
+/// `Mcp-Method` and (for `tools/call`) the tool name in `Mcp-Name` so proxies
+/// can route/observe without parsing the body. When a header is *present* and
+/// disagrees with the body the request is rejected with `-32600 Invalid
+/// Request` — the relay's existing code for header/body-level malformed
+/// requests (header/body disagreement is fundamentally an Invalid Request, not
+/// a params-validation failure, so `-32600` is used for both headers).
+///
+/// Returns `Some(error envelope)` to reject, or `None` to accept. Absent
+/// headers are accepted: the 2026 stateless path also identifies clients via
+/// `_meta`, and `Mcp-Name` is not applicable to methods without a tool name.
+/// Legacy dialects are never validated (this is a 2026-only, HTTP-only check).
+fn validate_2026_routing_headers(headers: &HeaderMap, msg: &Value) -> Option<Value> {
+    let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    let dialect = protocol::detect_inbound_dialect(
+        method == "initialize",
+        header_str(headers, protocol::MCP_PROTOCOL_VERSION_HEADER),
+        msg.get("params"),
+    );
+    if !dialect.is_2026() {
+        return None;
+    }
+    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+    let invalid_request = |message: String| {
+        Some(json!({
+            "jsonrpc": "2.0",
+            "error": { "code": -32600, "message": message },
+            "id": id,
+        }))
+    };
+    if let Some(hdr_method) = header_str(headers, protocol::MCP_METHOD_HEADER) {
+        if hdr_method != method {
+            return invalid_request(format!(
+                "Invalid Request: Mcp-Method header '{}' does not match body method '{}'",
+                hdr_method, method
+            ));
+        }
+    }
+    if let Some(hdr_name) = header_str(headers, protocol::MCP_NAME_HEADER) {
+        // `Mcp-Name` mirrors the tool name for `tools/call`; methods without a
+        // tool name have nothing to compare against.
+        if method == "tools/call" {
+            let body_name = msg
+                .get("params")
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if hdr_name != body_name {
+                return invalid_request(format!(
+                    "Invalid Request: Mcp-Name header '{}' does not match tool name '{}'",
+                    hdr_name, body_name
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// JSON 404 body returned by profile-scoped routes when the URL `{profile}`
@@ -1367,6 +1615,23 @@ struct OAuthCallbackParams {
     code: Option<String>,
     state: Option<String>,
     error: Option<String>,
+    /// RFC 9207 issuer identifier of the authorization server that produced
+    /// this response. Validated against the discovered issuer when known.
+    iss: Option<String>,
+}
+
+/// Validate the RFC 9207 `iss` authorization-response parameter against the
+/// issuer recorded for the pending flow (mix-up defense).
+///
+/// When `expected` is `Some(_)` (issuer was discovered), the callback `iss`
+/// must be present and an exact match. When `expected` is `None` (e.g. legacy
+/// convention-based config without RFC 8414 discovery), validation is skipped
+/// so existing flows keep working unchanged.
+fn validate_callback_iss(expected: Option<&str>, provided: Option<&str>) -> bool {
+    match expected {
+        Some(exp) => provided == Some(exp),
+        None => true,
+    }
 }
 
 /// Escape a string for safe interpolation into an HTML text node or quoted attribute.
@@ -1474,6 +1739,26 @@ async fn oauth_callback(
             );
         }
     };
+
+    // RFC 9207 issuer (`iss`) validation: when we discovered the authorization
+    // server's issuer, the callback MUST carry a matching `iss` (mix-up
+    // defense). When no issuer was recorded (legacy convention-based config),
+    // validation is skipped to preserve existing behavior.
+    if let Some(ref expected_issuer) = flow.issuer {
+        if !validate_callback_iss(Some(expected_issuer), params.iss.as_deref()) {
+            warn!(
+                endpoint = %flow.endpoint_name,
+                expected = %expected_issuer,
+                received = %params.iss.as_deref().unwrap_or("<missing>"),
+                "OAuth callback `iss` missing or does not match discovered issuer; rejecting"
+            );
+            return oauth_html_response(format!(
+                "<html><body><h1>OAuth Error</h1><p>Authorization response issuer mismatch (expected {}, got {}).</p><p>You can close this window.</p></body></html>",
+                html_escape(expected_issuer),
+                html_escape(params.iss.as_deref().unwrap_or("<missing>"))
+            ));
+        }
+    }
 
     // Exchange authorization code for tokens
     let client = reqwest::Client::new();
@@ -1684,7 +1969,7 @@ async fn mcp_tools_list_logged(
     headers: HeaderMap,
     body: Json<JsonRpcBody>,
 ) -> Json<Value> {
-    let identity = resolve_inbound_identity(&state.0, &headers);
+    let identity = resolve_inbound_identity_versioned(&state.0, &headers, body.params.as_ref());
     let client_json = identity
         .as_ref()
         .filter(|c| !c.is_empty())
@@ -1738,7 +2023,7 @@ async fn mcp_tools_call_logged(
     headers: HeaderMap,
     body: Json<JsonRpcBody>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let identity = resolve_inbound_identity(&state.0, &headers);
+    let identity = resolve_inbound_identity_versioned(&state.0, &headers, body.params.as_ref());
     let client_json = identity
         .as_ref()
         .filter(|c| !c.is_empty())
@@ -2241,6 +2526,127 @@ mod tests {
         assert!(session_id.is_some());
         // Empty identities are not cached.
         assert!(state.session_identities.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn identity_from_meta_client_info_extracts_name_and_version() {
+        let params = json!({
+            "_meta": {
+                protocol::META_CLIENT_INFO_KEY: { "name": "claude-ai", "version": "2.0.0" },
+            },
+        });
+        let id = identity_from_meta_client_info(Some(&params));
+        assert_eq!(id.name.as_deref(), Some("claude-ai"));
+        assert_eq!(id.version.as_deref(), Some("2.0.0"));
+        assert!(id.user_agent.is_none());
+        assert!(id.origin.is_none());
+    }
+
+    #[test]
+    fn identity_from_meta_client_info_missing_is_empty() {
+        // No `_meta` at all, and a `_meta` without the clientInfo key, both
+        // degrade to an empty identity rather than panicking.
+        assert!(identity_from_meta_client_info(None).is_empty());
+        assert!(identity_from_meta_client_info(Some(&json!({}))).is_empty());
+        assert!(identity_from_meta_client_info(Some(&json!({ "_meta": {} }))).is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_inbound_identity_versioned_2026_reads_meta_client_info() {
+        // A 2026 client sends no `initialize` and no `Mcp-Session-Id`; identity
+        // comes from per-request `_meta` clientInfo. Seed the session store to
+        // prove the 2026 path does NOT consult it.
+        let state = test_app_state();
+        state
+            .session_identities
+            .lock()
+            .unwrap()
+            .insert("stale".into(), identity("should-not-be-used", "9.9"));
+
+        let params = json!({
+            "_meta": {
+                protocol::META_CLIENT_INFO_KEY: { "name": "stateless-client", "version": "3.1" },
+            },
+        });
+
+        // Detected via the explicit protocol header.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            protocol::MCP_PROTOCOL_VERSION_HEADER,
+            HeaderValue::from_static("2026-07-28"),
+        );
+        let resolved = resolve_inbound_identity_versioned(&state, &headers, Some(&params))
+            .expect("2026 identity must resolve from _meta");
+        assert_eq!(resolved.name.as_deref(), Some("stateless-client"));
+        assert_eq!(resolved.version.as_deref(), Some("3.1"));
+
+        // Detected via `_meta` clientInfo presence alone (no header).
+        let resolved = resolve_inbound_identity_versioned(&state, &HeaderMap::new(), Some(&params))
+            .expect("2026 identity must resolve from _meta without a header");
+        assert_eq!(resolved.name.as_deref(), Some("stateless-client"));
+        assert_eq!(resolved.version.as_deref(), Some("3.1"));
+    }
+
+    #[tokio::test]
+    async fn resolve_inbound_identity_versioned_2026_merges_header_fallback() {
+        // `_meta` clientInfo wins on name/version; `User-Agent`/`Origin`
+        // headers still fill the fields it leaves empty.
+        let state = test_app_state();
+        let params = json!({
+            "_meta": { protocol::META_CLIENT_INFO_KEY: { "name": "stateless-client" } },
+        });
+        let mut headers = HeaderMap::new();
+        headers.insert("user-agent", HeaderValue::from_static("relay-test/0.1"));
+        headers.insert("origin", HeaderValue::from_static("https://example.test"));
+        let resolved = resolve_inbound_identity_versioned(&state, &headers, Some(&params))
+            .expect("identity must resolve");
+        assert_eq!(resolved.name.as_deref(), Some("stateless-client"));
+        assert_eq!(resolved.user_agent.as_deref(), Some("relay-test/0.1"));
+        assert_eq!(resolved.origin.as_deref(), Some("https://example.test"));
+    }
+
+    #[tokio::test]
+    async fn resolve_inbound_identity_versioned_legacy_uses_session_cache() {
+        // A legacy client (no 2026 header, no `_meta` clientInfo) keeps the
+        // existing session-cache lookup byte-for-byte.
+        let state = test_app_state();
+        let sid = "legacy-session";
+        state
+            .session_identities
+            .lock()
+            .unwrap()
+            .insert(sid.into(), identity("legacy-ai", "1.0.0"));
+        let mut headers = HeaderMap::new();
+        headers.insert(MCP_SESSION_ID_HEADER, HeaderValue::from_static(sid));
+        let resolved = resolve_inbound_identity_versioned(&state, &headers, None)
+            .expect("legacy identity must resolve from the session cache");
+        assert_eq!(resolved.name.as_deref(), Some("legacy-ai"));
+        assert_eq!(resolved.version.as_deref(), Some("1.0.0"));
+    }
+
+    #[tokio::test]
+    async fn resolve_identity_for_message_2026_stateless_uses_meta() {
+        // A `tools/call` with `_meta` clientInfo and no handshake resolves its
+        // identity from `_meta` (not the session cache) and mints no session id.
+        let state = test_app_state();
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "id": 7,
+            "params": {
+                "name": "demo",
+                "arguments": {},
+                "_meta": {
+                    protocol::META_CLIENT_INFO_KEY: { "name": "stateless-client", "version": "3.1" },
+                },
+            },
+        });
+        let (identity, session_id) = resolve_identity_for_message(&state, &HeaderMap::new(), &msg);
+        let identity = identity.expect("2026 stateless message should resolve identity");
+        assert_eq!(identity.name.as_deref(), Some("stateless-client"));
+        assert_eq!(identity.version.as_deref(), Some("3.1"));
+        // No session id is minted for non-`initialize` messages.
+        assert!(session_id.is_none());
     }
 
     #[tokio::test]
@@ -3083,6 +3489,29 @@ mod tests {
         router.oneshot(request).await.unwrap()
     }
 
+    /// Helper: send a JSON-RPC POST to `/mcp` with extra request headers.
+    async fn post_mcp_with_headers(
+        state: AppState,
+        body: &Value,
+        extra_headers: &[(&str, &str)],
+    ) -> axum::response::Response {
+        use axum::body::Body;
+        use tower::ServiceExt;
+
+        let router = build_router(state);
+        let mut builder = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json");
+        for (k, v) in extra_headers {
+            builder = builder.header(*k, *v);
+        }
+        let request = builder
+            .body(Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap();
+        router.oneshot(request).await.unwrap()
+    }
+
     /// Helper: collect the response body bytes into a `Value`.
     async fn body_json(resp: axum::response::Response) -> Value {
         let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
@@ -3118,6 +3547,350 @@ mod tests {
         let body = body_json(resp).await;
         assert_eq!(body["id"], 2);
         assert!(body["result"]["tools"].is_array());
+    }
+
+    #[tokio::test]
+    async fn mcp_unified_2026_stateless_tools_list_without_handshake() {
+        // A 2026 client calls tools/list with no prior initialize/initialized
+        // handshake, conveying its identity via `_meta` clientInfo. The relay
+        // must dispatch it normally.
+        let state = test_app_state();
+        let resp = post_mcp(
+            state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "tools/list",
+                "id": 21,
+                "params": {
+                    "_meta": {
+                        protocol::META_CLIENT_INFO_KEY: { "name": "stateless-client", "version": "3.1" },
+                    },
+                },
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["id"], 21);
+        assert!(body["result"]["tools"].is_array());
+    }
+
+    #[tokio::test]
+    async fn mcp_unified_2026_stateless_tools_call_without_handshake() {
+        // A 2026 client calls tools/call with no handshake. With no upstream
+        // tool registered the call resolves to a JSON-RPC-level result rather
+        // than a transport/handshake error — proving the stateless request was
+        // dispatched without requiring `initialize`.
+        let state = test_app_state();
+        let resp = post_mcp(
+            state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "id": 22,
+                "params": {
+                    "name": "list_tools",
+                    "arguments": {},
+                    "_meta": {
+                        protocol::META_CLIENT_INFO_KEY: { "name": "stateless-client", "version": "3.1" },
+                    },
+                },
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 22);
+        // The dispatcher produced a JSON-RPC envelope (result or error), not a
+        // handshake/method-not-found rejection of the bare request.
+        assert!(body.get("result").is_some() || body.get("error").is_some());
+        assert_ne!(body["error"]["code"], json!(-32601));
+    }
+
+    // --- T5: 2026 routing-header validation + session-id gating ---------------
+
+    #[tokio::test]
+    async fn validate_2026_routing_headers_accepts_matching_method_and_name() {
+        // 2026 request (explicit header) with Mcp-Method/Mcp-Name that agree
+        // with the body passes validation.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            protocol::MCP_PROTOCOL_VERSION_HEADER,
+            HeaderValue::from_static("2026-07-28"),
+        );
+        headers.insert(
+            protocol::MCP_METHOD_HEADER,
+            HeaderValue::from_static("tools/call"),
+        );
+        headers.insert(
+            protocol::MCP_NAME_HEADER,
+            HeaderValue::from_static("search_tools"),
+        );
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "id": 1,
+            "params": { "name": "search_tools", "arguments": {} },
+        });
+        assert!(validate_2026_routing_headers(&headers, &msg).is_none());
+    }
+
+    #[tokio::test]
+    async fn validate_2026_routing_headers_rejects_method_mismatch() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            protocol::MCP_PROTOCOL_VERSION_HEADER,
+            HeaderValue::from_static("2026-07-28"),
+        );
+        headers.insert(
+            protocol::MCP_METHOD_HEADER,
+            HeaderValue::from_static("tools/list"),
+        );
+        let msg =
+            json!({ "jsonrpc": "2.0", "method": "tools/call", "id": 2, "params": { "name": "x" } });
+        let err = validate_2026_routing_headers(&headers, &msg)
+            .expect("Mcp-Method/body mismatch must be rejected");
+        assert_eq!(err["error"]["code"], json!(-32600));
+        assert_eq!(err["id"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn validate_2026_routing_headers_rejects_name_mismatch() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            protocol::MCP_PROTOCOL_VERSION_HEADER,
+            HeaderValue::from_static("2026-07-28"),
+        );
+        headers.insert(
+            protocol::MCP_METHOD_HEADER,
+            HeaderValue::from_static("tools/call"),
+        );
+        headers.insert(
+            protocol::MCP_NAME_HEADER,
+            HeaderValue::from_static("wrong_tool"),
+        );
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "id": 3,
+            "params": { "name": "right_tool", "arguments": {} },
+        });
+        let err = validate_2026_routing_headers(&headers, &msg)
+            .expect("Mcp-Name/body mismatch must be rejected");
+        assert_eq!(err["error"]["code"], json!(-32600));
+        assert_eq!(err["id"], json!(3));
+    }
+
+    #[tokio::test]
+    async fn validate_2026_routing_headers_ignores_legacy_dialect() {
+        // A legacy request (no 2026 signal) with a contradictory Mcp-Method is
+        // NOT validated — legacy clients are unaffected by 2026 routing headers.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            protocol::MCP_METHOD_HEADER,
+            HeaderValue::from_static("tools/list"),
+        );
+        let msg =
+            json!({ "jsonrpc": "2.0", "method": "tools/call", "id": 4, "params": { "name": "x" } });
+        assert!(validate_2026_routing_headers(&headers, &msg).is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_unified_rejects_2026_method_header_mismatch() {
+        // End-to-end: a 2026 request whose Mcp-Method disagrees with the body
+        // is rejected with -32600 before dispatch.
+        let state = test_app_state();
+        let resp = post_mcp_with_headers(
+            state,
+            &json!({"jsonrpc":"2.0","method":"tools/list","id":41}),
+            &[
+                (protocol::MCP_PROTOCOL_VERSION_HEADER, "2026-07-28"),
+                (protocol::MCP_METHOD_HEADER, "tools/call"),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], json!(-32600));
+        assert_eq!(body["id"], json!(41));
+    }
+
+    #[tokio::test]
+    async fn mcp_unified_accepts_2026_matching_headers() {
+        // A 2026 request with agreeing Mcp-Method dispatches normally.
+        let state = test_app_state();
+        let resp = post_mcp_with_headers(
+            state,
+            &json!({"jsonrpc":"2.0","method":"tools/list","id":42}),
+            &[
+                (protocol::MCP_PROTOCOL_VERSION_HEADER, "2026-07-28"),
+                (protocol::MCP_METHOD_HEADER, "tools/list"),
+            ],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert!(body["result"]["tools"].is_array());
+        assert_eq!(body["id"], json!(42));
+    }
+
+    #[tokio::test]
+    async fn mcp_unified_2026_initialize_emits_no_session_id() {
+        // A 2026 `initialize` (explicit header) is stateless: the response
+        // carries no Mcp-Session-Id.
+        let state = test_app_state();
+        let resp = post_mcp_with_headers(
+            state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "initialize",
+                "id": 51,
+                "params": { "clientInfo": { "name": "stateless-ai", "version": "1.0" } },
+            }),
+            &[(protocol::MCP_PROTOCOL_VERSION_HEADER, "2026-07-28")],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get(MCP_SESSION_ID_HEADER).is_none(),
+            "2026 responses must not emit Mcp-Session-Id"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_unified_legacy_initialize_still_emits_session_id() {
+        // Legacy `initialize` keeps the session path: the response echoes a
+        // freshly-minted Mcp-Session-Id.
+        let state = test_app_state();
+        let resp = post_mcp(
+            state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "initialize",
+                "id": 52,
+                "params": { "clientInfo": { "name": "legacy-ai", "version": "1.0" } },
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().get(MCP_SESSION_ID_HEADER).is_some(),
+            "legacy responses must emit Mcp-Session-Id"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_identity_for_message_2026_initialize_mints_no_session() {
+        // A 2026 `initialize` mints no session id and stores nothing keyed by
+        // session, even though it carries structured clientInfo.
+        let state = test_app_state();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            protocol::MCP_PROTOCOL_VERSION_HEADER,
+            HeaderValue::from_static("2026-07-28"),
+        );
+        let msg = json!({
+            "jsonrpc": "2.0",
+            "method": "initialize",
+            "id": 53,
+            "params": { "clientInfo": { "name": "stateless-ai", "version": "2.0" } },
+        });
+        let (identity, session_id) = resolve_identity_for_message(&state, &headers, &msg);
+        assert!(
+            session_id.is_none(),
+            "2026 initialize must mint no session id"
+        );
+        let identity = identity.expect("2026 initialize still resolves identity from clientInfo");
+        assert_eq!(identity.name.as_deref(), Some("stateless-ai"));
+    }
+
+    #[tokio::test]
+    async fn mcp_unified_server_discover_returns_discovery_result() {
+        // `server/discover` returns the InitializeResult-equivalent identity
+        // (serverInfo/capabilities/protocolVersion) plus the aggregated `tools`
+        // primitive summary, and carries NO caching hints (T11).
+        let state = test_app_state();
+        let resp = post_mcp(
+            state,
+            &json!({"jsonrpc":"2.0","method":"server/discover","id":31}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["jsonrpc"], "2.0");
+        assert_eq!(body["id"], 31);
+        let result = &body["result"];
+        // serverInfo/capabilities/protocolVersion match what `initialize` emits.
+        assert_eq!(result["protocolVersion"], "2025-03-26");
+        assert_eq!(result["serverInfo"]["name"], "Endara Relay");
+        assert!(!result["serverInfo"]["version"].as_str().unwrap().is_empty());
+        assert_eq!(result["capabilities"]["tools"]["listChanged"], true);
+        // Primitive summary: aggregated tools array (relay exposes tools only).
+        assert!(result["tools"].is_array());
+        // Coordinator decision T11: relay-as-server emits no caching hints.
+        assert!(result.get("ttlMs").is_none());
+        assert!(result.get("cacheScope").is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_unified_server_discover_stateless_without_handshake() {
+        // A 2026 client calls server/discover with no prior initialize and a
+        // `_meta` clientInfo payload — it must be dispatched normally.
+        let state = test_app_state();
+        let resp = post_mcp(
+            state,
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "server/discover",
+                "id": 32,
+                "params": {
+                    "_meta": {
+                        protocol::META_CLIENT_INFO_KEY: { "name": "stateless-client", "version": "3.1" },
+                    },
+                },
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["id"], 32);
+        assert_eq!(body["result"]["serverInfo"]["name"], "Endara Relay");
+        assert!(body["result"]["tools"].is_array());
+        // Not rejected as method-not-found.
+        assert_ne!(body["error"]["code"], json!(-32601));
+    }
+
+    #[tokio::test]
+    async fn mcp_unified_server_discover_matches_initialize_identity() {
+        // The serverInfo/capabilities/protocolVersion served by server/discover
+        // are byte-for-byte the same fields `initialize` returns (shared
+        // builder), so legacy initialize stays unaffected.
+        let state = test_app_state();
+        let init = body_json(
+            post_mcp(
+                state.clone(),
+                &json!({"jsonrpc":"2.0","method":"initialize","id":1}),
+            )
+            .await,
+        )
+        .await;
+        let discover = body_json(
+            post_mcp(
+                state,
+                &json!({"jsonrpc":"2.0","method":"server/discover","id":2}),
+            )
+            .await,
+        )
+        .await;
+        for field in ["protocolVersion", "capabilities", "serverInfo"] {
+            assert_eq!(
+                init["result"][field], discover["result"][field],
+                "server/discover {field} must match initialize"
+            );
+        }
+        // initialize remains a handshake result with no tools summary.
+        assert!(init["result"].get("tools").is_none());
     }
 
     #[tokio::test]
@@ -3784,7 +4557,180 @@ mod tests {
         );
     }
 
+    /// D6 (2026-07-28): the relay must never *originate* the retired `-32002`
+    /// error code. Param-level not-found/invalid conditions map to the standard
+    /// JSON-RPC `-32602` (Invalid Params); method-not-found stays `-32601` and
+    /// malformed requests stay `-32600`. This guard fires the representative
+    /// error-producing requests on both the legacy and 2026 inbound paths and
+    /// asserts none of them come back as `-32002`, and that the param-level
+    /// missing-`name` case maps to `-32602` under the 2026 dialect too.
+    #[tokio::test]
+    async fn relay_never_originates_minus_32002() {
+        // Legacy: missing 'name' (param-level) → -32602, never -32002.
+        let resp = post_mcp(
+            test_app_state(),
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"arguments": {}},
+                "id": 1
+            }),
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert_eq!(body["error"]["code"], -32602);
+        assert_ne!(body["error"]["code"], json!(-32002));
+
+        // Legacy: unknown tool → JSON-RPC error, never -32002.
+        let resp = post_mcp(
+            test_app_state(),
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {"name": "does_not_exist", "arguments": {}},
+                "id": 2
+            }),
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert!(body["error"].is_object());
+        assert_ne!(body["error"]["code"], json!(-32002));
+
+        // Legacy: unknown method → -32601, never -32002.
+        let resp = post_mcp(
+            test_app_state(),
+            &json!({"jsonrpc": "2.0", "method": "no/such/method", "id": 3}),
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert_ne!(body["error"]["code"], json!(-32002));
+
+        // 2026 path (dialect detected via `_meta` clientInfo): missing 'name'
+        // (param-level) → -32602, never -32002.
+        let resp = post_mcp(
+            test_app_state(),
+            &json!({
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "id": 4,
+                "params": {
+                    "arguments": {},
+                    "_meta": {
+                        protocol::META_CLIENT_INFO_KEY: { "name": "stateless-client", "version": "3.1" },
+                    },
+                },
+            }),
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["error"]["code"], -32602,
+            "2026 param-level missing-name must map to -32602"
+        );
+        assert_ne!(body["error"]["code"], json!(-32002));
+    }
+
     // --- Alphabetical sorting tests ---
+
+    // A full JSON Schema 2020-12 `inputSchema` (oneOf/anyOf/allOf, internal
+    // `$ref`/`$defs`, nested combinators, and an external `$ref` URI) must
+    // survive `tools/list` aggregation byte-for-byte, modulo the intentional
+    // tool-name prefix. The external `$ref` is passed through verbatim and is
+    // never fetched/dereferenced.
+    #[tokio::test]
+    async fn tools_list_passes_through_complex_2020_12_schema_modulo_prefix() {
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "kind": {
+                    "oneOf": [
+                        { "type": "string", "const": "circle" },
+                        { "type": "string", "const": "square" }
+                    ]
+                },
+                "shape": { "$ref": "#/$defs/Shape" },
+                "either": {
+                    "anyOf": [
+                        { "$ref": "#/$defs/Shape" },
+                        { "type": "null" }
+                    ]
+                },
+                "combined": {
+                    "allOf": [
+                        { "type": "object" },
+                        { "$ref": "#/$defs/Shape" }
+                    ]
+                },
+                "remote": { "$ref": "https://example.com/schemas/widget.json#/$defs/Widget" }
+            },
+            "$defs": {
+                "Shape": {
+                    "type": "object",
+                    "properties": {
+                        "sides": { "type": "integer", "minimum": 3 },
+                        "nested": {
+                            "oneOf": [
+                                { "$ref": "#/$defs/Shape" },
+                                { "type": "null" }
+                            ]
+                        }
+                    },
+                    "required": ["sides"]
+                }
+            }
+        });
+        let state = test_app_state();
+        // Two endpoints force prefixing so the tool name gains its `{prefix}__`
+        // segment while the schema body must remain untouched.
+        state
+            .registry
+            .register(
+                "a".into(),
+                Box::new(MockAdapter {
+                    tools: vec![ToolInfo {
+                        name: "draw".into(),
+                        description: Some("draw tool".into()),
+                        input_schema: schema.clone(),
+                        annotations: None,
+                    }],
+                }),
+                "stdio".into(),
+                None,
+                Some("a".into()),
+            )
+            .await;
+        state
+            .registry
+            .register(
+                "b".into(),
+                Box::new(MockAdapter::with_tools(&["ping"])),
+                "stdio".into(),
+                None,
+                Some("b".into()),
+            )
+            .await;
+
+        let body = JsonRpcBody {
+            jsonrpc: Some("2.0".to_string()),
+            method: Some("tools/list".to_string()),
+            params: None,
+            id: Some(json!(1)),
+        };
+        let Json(resp) = mcp_tools_list(State(state), Json(body), None).await;
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        let drawn = tools
+            .iter()
+            .find(|t| t["name"] == "a__draw")
+            .expect("prefixed complex tool present in tools/list");
+        // inputSchema passes through completely unchanged.
+        assert_eq!(drawn["inputSchema"], schema);
+        // The external `$ref` URI is preserved verbatim, never resolved.
+        assert_eq!(
+            drawn["inputSchema"]["properties"]["remote"]["$ref"],
+            json!("https://example.com/schemas/widget.json#/$defs/Widget")
+        );
+    }
 
     #[tokio::test]
     async fn test_tools_list_returns_sorted_tools() {
@@ -3879,6 +4825,7 @@ mod tests {
             error: Some(
                 "<script>fetch('/api/test-connection',{method:'POST'})</script>".to_string(),
             ),
+            iss: None,
         };
         let resp = oauth_callback(State(state), Query(params)).await;
         let csp = resp
@@ -3893,6 +4840,101 @@ mod tests {
         let body_str = String::from_utf8(body.to_vec()).unwrap();
         assert!(body_str.contains("&lt;script&gt;"), "body = {body_str}");
         assert!(!body_str.contains("<script>"));
+    }
+
+    // --- RFC 9207 `iss` validation -----------------------------------------
+
+    #[test]
+    fn test_validate_callback_iss_matching_passes() {
+        // (a) Known issuer + matching `iss` → valid.
+        assert!(validate_callback_iss(
+            Some("https://auth.example.com"),
+            Some("https://auth.example.com")
+        ));
+    }
+
+    #[test]
+    fn test_validate_callback_iss_mismatch_rejected() {
+        // (b) Known issuer + different `iss` → rejected.
+        assert!(!validate_callback_iss(
+            Some("https://auth.example.com"),
+            Some("https://evil.example.com")
+        ));
+    }
+
+    #[test]
+    fn test_validate_callback_iss_missing_rejected_when_known() {
+        // (c) Known issuer + missing `iss` → rejected.
+        assert!(!validate_callback_iss(
+            Some("https://auth.example.com"),
+            None
+        ));
+    }
+
+    #[test]
+    fn test_validate_callback_iss_none_skips_validation() {
+        // (d) No recorded issuer → validation skipped regardless of `iss`.
+        assert!(validate_callback_iss(None, None));
+        assert!(validate_callback_iss(
+            None,
+            Some("https://anything.example.com")
+        ));
+    }
+
+    /// Helper: build an `AppState` whose flow manager already holds a pending
+    /// flow with the given issuer, returning the state and the flow's `state`
+    /// param. Used to exercise the callback's RFC 9207 rejection paths without
+    /// reaching the token-exchange HTTP call.
+    async fn state_with_pending_flow(issuer: Option<&str>) -> (AppState, String) {
+        let mut app_state = test_app_state();
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let pkce = crate::oauth::PkceChallenge::generate();
+        let state_param = flow_mgr
+            .start_flow(
+                "iss-test",
+                "https://auth.example.com/token",
+                "client123",
+                None,
+                pkce,
+                "http://127.0.0.1:9400/oauth/callback",
+                issuer,
+            )
+            .await;
+        app_state.oauth_flow_manager = Some(flow_mgr);
+        (app_state, state_param)
+    }
+
+    #[tokio::test]
+    async fn test_oauth_callback_rejects_mismatched_iss() {
+        use axum::body::to_bytes;
+        let (state, state_param) = state_with_pending_flow(Some("https://auth.example.com")).await;
+        let params = OAuthCallbackParams {
+            code: Some("authcode".to_string()),
+            state: Some(state_param),
+            error: None,
+            iss: Some("https://evil.example.com".to_string()),
+        };
+        let resp = oauth_callback(State(state), Query(params)).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("issuer mismatch"), "body = {body_str}");
+    }
+
+    #[tokio::test]
+    async fn test_oauth_callback_rejects_missing_iss_when_issuer_known() {
+        use axum::body::to_bytes;
+        let (state, state_param) = state_with_pending_flow(Some("https://auth.example.com")).await;
+        let params = OAuthCallbackParams {
+            code: Some("authcode".to_string()),
+            state: Some(state_param),
+            error: None,
+            iss: None,
+        };
+        let resp = oauth_callback(State(state), Query(params)).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body_str.contains("issuer mismatch"), "body = {body_str}");
+        assert!(body_str.contains("&lt;missing&gt;"), "body = {body_str}");
     }
 
     // --- /mcp/sse + initialize tools.listChanged capability ---

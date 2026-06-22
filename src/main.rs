@@ -23,6 +23,7 @@ mod container_stats;
 mod jsonrpc;
 mod prefix;
 mod profile_registry;
+mod protocol;
 mod registry;
 mod server;
 mod shell_env;

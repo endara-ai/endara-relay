@@ -27,7 +27,6 @@ pub struct ProtectedResourceMetadata {
 /// Returned by `{auth_server_url}/.well-known/oauth-authorization-server`.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct AuthorizationServerMetadata {
-    #[allow(dead_code)]
     pub issuer: String,
     pub authorization_endpoint: String,
     pub token_endpoint: String,
@@ -53,6 +52,9 @@ pub struct AuthorizationServerMetadata {
 /// Resolved OAuth server discovery result.
 pub struct DiscoveryResult {
     pub auth_server_url: String,
+    /// The authorization server's issuer identifier (RFC 8414 `issuer`).
+    /// Used for RFC 9207 `iss` validation on the authorization response.
+    pub issuer: String,
     pub authorization_endpoint: String,
     pub token_endpoint: String,
     pub registration_endpoint: Option<String>,
@@ -97,6 +99,11 @@ pub enum DiscoveryError {
 ///   → `https://auth.example.com/.well-known/oauth-authorization-server`
 /// - `https://github.com/login/oauth` + `oauth-authorization-server`
 ///   → `https://github.com/.well-known/oauth-authorization-server/login/oauth`
+///
+/// This path-aware suffix placement matches the 2026-07-28 spec clarification
+/// for BOTH `oauth-protected-resource` (RFC 9728) and `oauth-authorization-server`
+/// (RFC 8414): the suffix is inserted directly after the origin, ahead of the
+/// resource/issuer path, with a root-only fallback handled by the callers.
 fn build_well_known_url(base_url: &str, well_known_suffix: &str) -> Result<String, DiscoveryError> {
     let parsed = Url::parse(base_url).map_err(|_| DiscoveryError::MetadataNotFound {
         url: base_url.to_string(),
@@ -278,6 +285,7 @@ pub async fn discover_authorization_server(
 
     Ok(DiscoveryResult {
         auth_server_url: auth_server_url.to_string(),
+        issuer: as_meta.issuer,
         authorization_endpoint: as_meta.authorization_endpoint,
         token_endpoint: as_meta.token_endpoint,
         registration_endpoint: as_meta.registration_endpoint,

@@ -12,6 +12,7 @@ pub mod oauth;
 pub mod observability;
 pub mod prefix;
 pub mod profile_registry;
+pub mod protocol;
 pub mod registry;
 pub mod server;
 pub mod shell_env;

@@ -1911,6 +1911,7 @@ mod tests {
                 client_secret: Some("dcr-secret".to_string()),
                 client_secret_expires_at: 0,
                 registered_at: 1_700_000_000,
+                issuer: None,
             },
         )
         .await

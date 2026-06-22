@@ -90,6 +90,19 @@ mod tests {
         assert_eq!(decoded, json!({"name": "Alice", "age": 30}));
     }
 
+    // T10: an MCP 2026-07-28 `InputRequiredResult` has no `content` array, so
+    // toonification leaves it byte-for-byte unchanged — the multi round-trip
+    // shape (`inputRequests`/`requestState`) survives the TOON pass intact.
+    #[test]
+    fn leaves_input_required_result_unchanged() {
+        let input = json!({
+            "inputRequests": [{"name": "city", "schema": {"type": "string"}}],
+            "requestState": "state-xyz"
+        });
+        let out = toonify_call_result(input.clone());
+        assert_eq!(out, input);
+    }
+
     // §5 row 2: toonify_call_result converts JSON array in TextContent.text
     // to TOON.
     #[test]
@@ -215,6 +228,28 @@ mod tests {
         let weird = json!({ "content": "not-an-array" });
         let out3 = toonify_call_result(weird.clone());
         assert_eq!(out3, weird);
+    }
+
+    // D13 — response direction: toonifying a `CallToolResult` must preserve a
+    // sibling `_meta` carrying W3C Trace Context so upstream→client trace
+    // fields survive the TOON pass and reach the inbound client unmodified.
+    #[test]
+    fn toonify_call_result_preserves_meta_trace_context() {
+        let input = json!({
+            "content": [{ "type": "text", "text": "{\"k\":1}" }],
+            "_meta": {
+                "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+                "tracestate": "vendor=abc"
+            }
+        });
+        let out = toonify_call_result(input);
+        assert_eq!(
+            out["_meta"]["traceparent"],
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+        );
+        assert_eq!(out["_meta"]["tracestate"], "vendor=abc");
+        // The text content was still toonified (no longer raw JSON).
+        assert_ne!(out["content"][0]["text"], "{\"k\":1}");
     }
 
     // §5 row 9: toonify_value converts JSON object to TOON string.

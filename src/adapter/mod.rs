@@ -9,6 +9,39 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
+use std::time::Duration;
+
+/// Short, dedicated timeout for the upstream `server/discover` dialect probe.
+///
+/// The probe must fail fast to the legacy `initialize` fallback when an upstream
+/// silently drops the unknown request (per the MCP `2026-07-28` stdio
+/// Backward-Compatibility rule: "any other error, or no response within a
+/// reasonable timeout → legacy"). Without this bound the probe would inherit the
+/// 30s per-request timeout and stall startup. Only the probe is bounded this
+/// short; normal (non-probe) requests keep their full transport timeout.
+pub(crate) const DISCOVER_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Merge extra top-level `tools/call` params into an outgoing params object,
+/// alongside the `name`/`arguments` the adapter already set. Used by the
+/// transport adapters to transparently forward the MCP 2026-07-28 multi
+/// round-trip fields (`inputResponses`, `requestState`) and any sibling params.
+///
+/// Keys never collide with `name`/`arguments` because the inbound handler
+/// strips those before populating `request_params`. An empty map is a no-op, so
+/// a normal terminal `tools/call` request is forwarded byte-for-byte unchanged.
+pub(crate) fn merge_request_params(
+    params: &mut Value,
+    request_params: serde_json::Map<String, Value>,
+) {
+    if request_params.is_empty() {
+        return;
+    }
+    if let Some(obj) = params.as_object_mut() {
+        for (k, v) in request_params {
+            obj.insert(k, v);
+        }
+    }
+}
 
 /// Health status of an adapter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -115,8 +148,43 @@ pub trait McpAdapter: Send + Sync {
     /// List the tools available from the MCP server.
     async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError>;
 
+    /// Upstream-provided `ttlMs` freshness hint (SEP-2549) from the most recent
+    /// successful [`Self::list_tools`] call, in milliseconds.
+    ///
+    /// Returns `Some(ms)` only when the upstream peer negotiated the 2026-07-28
+    /// dialect **and** included a top-level `ttlMs` on its `tools/list` result;
+    /// the relay-as-client honors it as the cache freshness window in
+    /// [`crate::registry::RegisteredAdapter::cached_list_tools`]. Returns `None`
+    /// for legacy upstreams or when no hint was sent, preserving the existing
+    /// purely event-driven cache behavior. Implementors clamp a negative
+    /// upstream `ttlMs` to `0` (immediately stale).
+    ///
+    /// The default impl returns `None` (placeholder / read-only adapters never
+    /// emit a caching hint).
+    async fn list_tools_ttl_ms(&self) -> Option<u64> {
+        None
+    }
+
     /// Call a tool on the MCP server.
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError>;
+
+    /// Call a tool, forwarding extra top-level `tools/call` params verbatim to
+    /// the upstream alongside `name`/`arguments`. Used to transparently proxy
+    /// the MCP 2026-07-28 multi round-trip fields (`inputResponses`,
+    /// `requestState`) and any other sibling params (e.g. `_meta`) so the relay
+    /// neither interprets nor strips them.
+    ///
+    /// The default implementation ignores the extra params and delegates to
+    /// [`Self::call_tool`]; transports that proxy raw JSON-RPC override it to
+    /// merge `request_params` into the outgoing params object.
+    async fn call_tool_with_request_params(
+        &self,
+        name: &str,
+        arguments: Value,
+        _request_params: serde_json::Map<String, Value>,
+    ) -> Result<Value, AdapterError> {
+        self.call_tool(name, arguments).await
+    }
 
     /// Get the current health status.
     fn health(&self) -> HealthStatus;
@@ -394,5 +462,43 @@ mod tests {
             body: "not found".to_string(),
         };
         assert_eq!(err.to_string(), "HTTP error 404: not found");
+    }
+
+    /// D13 — forward direction: an inbound `_meta` carrying W3C Trace Context
+    /// (`traceparent`/`tracestate`/`baggage`) is merged onto the outgoing
+    /// `tools/call` params verbatim, so the relay forwards it to the upstream
+    /// unmodified. The relay is intentionally key-agnostic for `_meta` siblings
+    /// — it copies the whole inbound `_meta` rather than enumerating trace keys.
+    #[test]
+    fn merge_request_params_forwards_meta_trace_context() {
+        let mut params = serde_json::json!({ "name": "echo", "arguments": {} });
+        let mut request_params = serde_json::Map::new();
+        request_params.insert(
+            "_meta".to_string(),
+            serde_json::json!({
+                "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+                "tracestate": "vendor=abc",
+                "baggage": "userId=42"
+            }),
+        );
+        merge_request_params(&mut params, request_params);
+        assert_eq!(
+            params["_meta"]["traceparent"],
+            "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+        );
+        assert_eq!(params["_meta"]["tracestate"], "vendor=abc");
+        assert_eq!(params["_meta"]["baggage"], "userId=42");
+        // name/arguments are untouched.
+        assert_eq!(params["name"], "echo");
+    }
+
+    /// D13 — with no inbound siblings, `merge_request_params` is a no-op, so a
+    /// legacy frame that carried no `_meta` stays byte-for-byte unchanged and
+    /// the relay never injects an empty `_meta` of its own.
+    #[test]
+    fn merge_request_params_no_meta_leaves_params_unchanged() {
+        let mut params = serde_json::json!({ "name": "echo", "arguments": {} });
+        merge_request_params(&mut params, serde_json::Map::new());
+        assert!(params.get("_meta").is_none());
     }
 }

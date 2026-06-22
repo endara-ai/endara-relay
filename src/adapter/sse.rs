@@ -1,11 +1,12 @@
 use super::server_name::{sanitize_server_name, ServerNameError};
 use super::server_type_resolution::{effective_server_type, strip_mcp_server_suffix};
 use super::stdio::{iso8601_now, RingBuffer};
-use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
+use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo, DISCOVER_PROBE_TIMEOUT};
 use crate::events::{
     annotations_from_value, current_request_context, ToolCallEvent, ToolCallEventBus,
 };
 use crate::jsonrpc::{self, JsonRpcResponse};
+use crate::protocol::{self, detect_upstream_dialect, ProtocolVersion};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
@@ -163,6 +164,16 @@ pub struct SseAdapter {
     /// `call_tool` can attach hint metadata to the overlay's `started`
     /// event without a second round-trip.
     tool_annotations_cache: Arc<RwLock<HashMap<String, Option<Value>>>>,
+    /// Negotiated protocol dialect of the upstream server. Defaults to the
+    /// legacy `2024-11-05` version this adapter advertises in `initialize`;
+    /// real negotiation populates it via [`Self::set_upstream_dialect`] (T7).
+    /// Consumed by the 2026 outbound code paths (T9).
+    upstream_dialect: Arc<RwLock<ProtocolVersion>>,
+    /// Upstream `ttlMs` freshness hint (SEP-2549) captured from the most recent
+    /// successful `tools/list` result. `Some(ms)` only for 2026 upstreams that
+    /// sent a top-level `ttlMs`; `None` otherwise. Read by the registry cache to
+    /// honor the upstream's freshness window. See [`Self::list_tools_ttl_ms`].
+    list_ttl_ms: Arc<RwLock<Option<u64>>>,
 }
 
 impl SseAdapter {
@@ -221,11 +232,60 @@ impl SseAdapter {
             span,
             event_bus: Arc::new(OnceLock::new()),
             tool_annotations_cache: Arc::new(RwLock::new(HashMap::new())),
+            upstream_dialect: Arc::new(RwLock::new(ProtocolVersion::V2024_11_05)),
+            list_ttl_ms: Arc::new(RwLock::new(None)),
         }
     }
 
     fn next_id(&self) -> u64 {
         self.request_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Record the upstream server's negotiated [`ProtocolVersion`]. Populated
+    /// during the connect/handshake path (T7); consumed by the 2026 outbound
+    /// code paths (T9).
+    pub(crate) async fn set_upstream_dialect(&self, dialect: ProtocolVersion) {
+        *self.upstream_dialect.write().await = dialect;
+    }
+
+    /// Read the upstream server's negotiated [`ProtocolVersion`]. Defaults to
+    /// the legacy version this adapter advertises until T7/T9 populates it.
+    #[allow(dead_code)]
+    pub(crate) async fn upstream_dialect(&self) -> ProtocolVersion {
+        *self.upstream_dialect.read().await
+    }
+
+    /// The relay's own client identity, injected under
+    /// `params._meta["io.modelcontextprotocol/clientInfo"]` on every outbound
+    /// request to a 2026 upstream. The 2026 transport is stateless — there is
+    /// no `initialize` handshake — and the SSE transport carries no per-request
+    /// HTTP headers for identity, so it travels per-request inside `_meta`.
+    fn relay_client_info() -> Value {
+        json!({
+            "name": "endara-relay",
+            "version": env!("CARGO_PKG_VERSION"),
+        })
+    }
+
+    /// Attach the relay's `clientInfo` under `params._meta` for 2026 upstreams,
+    /// creating an empty params object when the request carried none. Non-object
+    /// params are left untouched (MCP params are always objects or absent).
+    fn inject_client_info(params: Option<Value>) -> Option<Value> {
+        let mut params = params.unwrap_or_else(|| json!({}));
+        if params.is_object() {
+            // Normalize `_meta` to a JSON object before the nested assignment:
+            // serde_json's `IndexMut` panics on `value[key] = ...` when the
+            // existing value is a non-object/non-null (e.g. an inbound 2026
+            // request that already carries `params._meta` as a String/Array/
+            // number/bool). Replace only a missing/null or non-object `_meta`;
+            // a pre-existing object `_meta` (W3C Trace Context siblings) is
+            // preserved so the clientInfo key is added alongside them.
+            if !params["_meta"].is_object() {
+                params["_meta"] = json!({});
+            }
+            params["_meta"][protocol::META_CLIENT_INFO_KEY] = Self::relay_client_info();
+        }
+        Some(params)
     }
 
     /// Resolve a relative endpoint URL against the SSE base URL.
@@ -460,6 +520,14 @@ impl SseAdapter {
         method: &str,
         params: Option<Value>,
     ) -> Result<(), AdapterError> {
+        // 2026 upstreams: attach `_meta` clientInfo on notifications too, so the
+        // upstream sees the relay's identity per-message. Legacy: unchanged.
+        let params = if self.upstream_dialect.read().await.is_2026() {
+            Self::inject_client_info(params)
+        } else {
+            params
+        };
+
         let endpoint = {
             let guard = self.post_endpoint.read().await;
             guard.clone().ok_or(AdapterError::NotInitialized)?
@@ -513,6 +581,16 @@ impl SseAdapter {
         method: &str,
         params: Option<Value>,
     ) -> Result<Value, AdapterError> {
+        // 2026 upstreams: every request carries the relay's `clientInfo` under
+        // `params._meta` (there is no handshake). SSE carries no per-request
+        // HTTP headers, so version/identity travel entirely in `_meta`.
+        // Legacy: unchanged.
+        let params = if self.upstream_dialect.read().await.is_2026() {
+            Self::inject_client_info(params)
+        } else {
+            params
+        };
+
         let endpoint = {
             let guard = self.post_endpoint.read().await;
             guard.clone().ok_or(AdapterError::NotInitialized)?
@@ -572,59 +650,50 @@ impl SseAdapter {
             .ok_or_else(|| AdapterError::ProtocolError("response has no result".into()))
     }
 
-    /// Connect to the SSE endpoint and perform the MCP initialize handshake.
-    ///
-    /// Used by `initialize()` for the first connection and by the reconnect
-    /// supervisor task to re-establish a healthy connection. On success, sets
-    /// `health = Healthy` and resets the crash tracker. On failure, sets
-    /// `health = Unhealthy(...)` with the underlying error.
-    async fn connect_and_handshake(&self) -> Result<(), AdapterError> {
-        if let Err(e) = self.connect().await {
-            let msg = e.to_string();
-            *self.health.write().await = HealthStatus::Unhealthy(msg);
-            return Err(e);
+    /// Stateless `server/discover` probe used to detect a 2026 upstream before
+    /// the legacy `initialize` handshake. The request carries the relay's
+    /// `_meta` clientInfo (SSE has no per-request HTTP headers for identity, so
+    /// version/identity travel entirely in `params._meta`). Returns the
+    /// JSON-RPC `result` object on success, or `None` on any failure (JSON-RPC
+    /// error, transport failure, missing result) so the caller falls back to the
+    /// legacy handshake. Legacy servers reject `server/discover` and the relay
+    /// falls back transparently.
+    async fn try_discover_probe(&self) -> Option<Value> {
+        // Build params with `_meta` clientInfo explicitly: the upstream dialect
+        // is still the legacy default here, so `send_request` would not inject
+        // it for us, and a 2026 server expects identity on every request.
+        let params = Self::inject_client_info(None);
+        // Bound the probe with a short dedicated timeout (below the full
+        // `timeout_secs` transport timeout) so an unresponsive/legacy upstream
+        // that silently drops the unknown request falls back to the legacy
+        // handshake fast. A timeout maps to `None`, the same clean legacy
+        // fallback as any other failure.
+        match tokio::time::timeout(
+            DISCOVER_PROBE_TIMEOUT,
+            self.send_request("server/discover", params),
+        )
+        .await
+        {
+            Ok(res) => res.ok(),
+            Err(_) => None,
         }
+    }
 
-        let params = json!({
-            "protocolVersion": "2024-11-05",
-            "capabilities": {},
-            "clientInfo": {
-                "name": "endara-relay",
-                "version": env!("CARGO_PKG_VERSION")
-            }
-        });
-
-        let result = match self.send_request("initialize", Some(params)).await {
-            Ok(r) => r,
-            Err(e) => {
-                let msg = e.to_string();
-                *self.health.write().await = HealthStatus::Unhealthy(msg);
-                return Err(e);
-            }
-        };
-
+    /// Extract, validate, and record the upstream `serverInfo.name` from an
+    /// `initialize` or `server/discover` result. Returns `Err` when the name is
+    /// missing or fails sanitization. Shared by the legacy handshake and the
+    /// 2026 stateless path so both name the endpoint identically. Does not touch
+    /// `health`; the caller maps any error onto `HealthStatus::Unhealthy`.
+    async fn apply_server_identity(&self, result: &Value) -> Result<(), AdapterError> {
         // Extract serverInfo.name — REQUIRED per MCP spec enforcement
-        let raw_name = match result
+        let raw_name = result
             .get("serverInfo")
             .and_then(|si| si.get("name"))
             .and_then(|n| n.as_str())
-        {
-            Some(n) => n.to_string(),
-            None => {
-                let msg = ServerNameError::Missing.to_string();
-                *self.health.write().await = HealthStatus::Unhealthy(msg.clone());
-                return Err(AdapterError::ProtocolError(msg));
-            }
-        };
+            .ok_or_else(|| AdapterError::ProtocolError(ServerNameError::Missing.to_string()))?;
 
-        let sanitized = match sanitize_server_name(&raw_name) {
-            Ok(s) => s,
-            Err(e) => {
-                let msg = e.to_string();
-                *self.health.write().await = HealthStatus::Unhealthy(msg.clone());
-                return Err(AdapterError::ProtocolError(msg));
-            }
-        };
+        let sanitized = sanitize_server_name(raw_name)
+            .map_err(|e| AdapterError::ProtocolError(e.to_string()))?;
 
         if let Some(ref ov) = self.config.server_type_override {
             if sanitize_server_name(ov).is_err() {
@@ -647,6 +716,84 @@ impl SseAdapter {
         }
         *self.server_type.write().await = effective;
         *self.upstream_server_name.write().await = Some(upstream_stripped);
+        Ok(())
+    }
+
+    /// Connect to the SSE endpoint and perform the MCP initialize handshake.
+    ///
+    /// Used by `initialize()` for the first connection and by the reconnect
+    /// supervisor task to re-establish a healthy connection. On success, sets
+    /// `health = Healthy` and resets the crash tracker. On failure, sets
+    /// `health = Unhealthy(...)` with the underlying error.
+    async fn connect_and_handshake(&self) -> Result<(), AdapterError> {
+        if let Err(e) = self.connect().await {
+            let msg = e.to_string();
+            *self.health.write().await = HealthStatus::Unhealthy(msg);
+            return Err(e);
+        }
+
+        // Discover-first dialect detection (T9): probe `server/discover` before
+        // the legacy handshake. A 2026 upstream answers with a `protocolVersion`
+        // of `2026-07-28`, in which case the relay skips the `initialize`/
+        // `notifications/initialized` handshake entirely — the 2026 transport is
+        // stateless, carrying version + identity in `params._meta` on every
+        // request instead. Any other outcome (legacy result, JSON-RPC error,
+        // transport failure) falls through to the unchanged legacy handshake.
+        let discover_result = self.try_discover_probe().await;
+        if detect_upstream_dialect(discover_result.as_ref(), None).is_2026() {
+            let result = discover_result.as_ref().expect(
+                "detect_upstream_dialect reports 2026 only when a discover result is present",
+            );
+            self.set_upstream_dialect(ProtocolVersion::V2026_07_28)
+                .await;
+            if let Err(e) = self.apply_server_identity(result).await {
+                let msg = e.to_string();
+                *self.health.write().await = HealthStatus::Unhealthy(msg);
+                return Err(e);
+            }
+            // 2026 is stateless: no notifications/initialized handshake.
+            *self.health.write().await = HealthStatus::Healthy;
+            self.crash_tracker.lock().await.reset();
+            let _ = self.tools_changed_tx.send(());
+            info!(url = %self.config.url, "MCP initialize skipped (2026 stateless path)");
+            return Ok(());
+        }
+
+        let params = json!({
+            "protocolVersion": ProtocolVersion::V2024_11_05.as_str(),
+            "capabilities": {},
+            "clientInfo": {
+                "name": "endara-relay",
+                "version": env!("CARGO_PKG_VERSION")
+            }
+        });
+
+        let result = match self.send_request("initialize", Some(params)).await {
+            Ok(r) => r,
+            Err(e) => {
+                let msg = e.to_string();
+                *self.health.write().await = HealthStatus::Unhealthy(msg);
+                return Err(e);
+            }
+        };
+
+        // Validate + record the upstream serverInfo.name (REQUIRED per MCP spec
+        // enforcement). Shared with the 2026 stateless path above; map any error
+        // onto the adapter's health before returning.
+        if let Err(e) = self.apply_server_identity(&result).await {
+            let msg = e.to_string();
+            *self.health.write().await = HealthStatus::Unhealthy(msg);
+            return Err(e);
+        }
+
+        // Detect and record the upstream's negotiated protocol dialect. The
+        // discover probe ran above (legacy result or none) and the initialize
+        // result carries the negotiated legacy version; neither is 2026 here.
+        self.set_upstream_dialect(detect_upstream_dialect(
+            discover_result.as_ref(),
+            Some(&result),
+        ))
+        .await;
 
         // Per the MCP spec the client MUST send a notifications/initialized
         // notification after a successful initialize exchange. Failure is
@@ -755,6 +902,15 @@ impl McpAdapter for SseAdapter {
                 .get("tools")
                 .ok_or_else(|| AdapterError::ProtocolError("missing 'tools' field".into()))?;
             let tools: Vec<ToolInfo> = serde_json::from_value(tools_value.clone())?;
+            // Capture the upstream `ttlMs` freshness hint (SEP-2549) only for
+            // 2026 upstreams; legacy upstreams never carry it and keep the
+            // existing event-driven cache behavior. Read by the registry cache.
+            let ttl = if self.upstream_dialect.read().await.is_2026() {
+                protocol::ttl_ms_from_result(&result)
+            } else {
+                None
+            };
+            *self.list_ttl_ms.write().await = ttl;
             // Refresh the per-tool annotations cache for overlay events.
             let mut cache = self.tool_annotations_cache.write().await;
             cache.clear();
@@ -768,7 +924,21 @@ impl McpAdapter for SseAdapter {
         .await
     }
 
+    async fn list_tools_ttl_ms(&self) -> Option<u64> {
+        *self.list_ttl_ms.read().await
+    }
+
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
+        self.call_tool_with_request_params(name, arguments, serde_json::Map::new())
+            .await
+    }
+
+    async fn call_tool_with_request_params(
+        &self,
+        name: &str,
+        arguments: Value,
+        request_params: serde_json::Map<String, Value>,
+    ) -> Result<Value, AdapterError> {
         // Capture caller span context BEFORE `.instrument(self.span)` re-enters
         // the adapter's own `endpoint` span — endpoint is constructed at
         // adapter init time with no parent linkage to per-request spans, so
@@ -799,10 +969,11 @@ impl McpAdapter for SseAdapter {
                     client: span_ctx.client.clone(),
                 });
             }
-            let params = json!({
+            let mut params = json!({
                 "name": name,
                 "arguments": arguments,
             });
+            crate::adapter::merge_request_params(&mut params, request_params);
             let start = Instant::now();
             let result = self.send_request("tools/call", Some(params)).await;
             let duration_ms = start.elapsed().as_millis();
@@ -1064,6 +1235,9 @@ mod tests {
             /// When true, /message does NOT broadcast `tools/call` responses
             /// (used to test pending-request error propagation).
             silent_on_tools_call: AtomicBool,
+            /// When true, /message answers `server/discover` with a `2026-07-28`
+            /// result (used to test the 2026 stateless version-gating path).
+            discover_returns_2026: AtomicBool,
             /// Bodies of every POST /message received, in arrival order.
             posts: std::sync::Mutex<Vec<Value>>,
         }
@@ -1158,6 +1332,17 @@ mod tests {
 
             let id = body["id"].as_u64().unwrap_or(0);
             let response = match method.as_str() {
+                "server/discover" if app.fake.discover_returns_2026.load(Ordering::SeqCst) => {
+                    json!({
+                        "jsonrpc": "2.0",
+                        "result": {
+                            "protocolVersion": "2026-07-28",
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "fake-sse-2026", "version": "1.0.0"}
+                        },
+                        "id": id,
+                    })
+                }
                 "initialize" => json!({
                     "jsonrpc": "2.0",
                     "result": {
@@ -1165,6 +1350,11 @@ mod tests {
                         "capabilities": {"tools": {}},
                         "serverInfo": {"name": "fake-sse", "version": "0.0.0"}
                     },
+                    "id": id,
+                }),
+                "tools/list" => json!({
+                    "jsonrpc": "2.0",
+                    "result": {"tools": []},
                     "id": id,
                 }),
                 _ => json!({
@@ -1614,6 +1804,143 @@ mod tests {
                 elapsed
             );
             assert_eq!(adapter.health(), HealthStatus::Stopped);
+        }
+
+        #[test]
+        fn test_inject_client_info_creates_and_preserves_params() {
+            // None params → a fresh object carrying only `_meta` clientInfo.
+            let injected = SseAdapter::inject_client_info(None).unwrap();
+            let ci = &injected["_meta"][protocol::META_CLIENT_INFO_KEY];
+            assert_eq!(ci["name"], "endara-relay");
+            assert!(ci["version"].is_string());
+
+            // Existing fields are preserved; `_meta` clientInfo is added.
+            let injected =
+                SseAdapter::inject_client_info(Some(json!({"name": "echo", "arguments": {}})))
+                    .unwrap();
+            assert_eq!(injected["name"], "echo");
+            assert_eq!(
+                injected["_meta"][protocol::META_CLIENT_INFO_KEY]["name"],
+                "endara-relay"
+            );
+
+            // A pre-existing OBJECT `_meta` with sibling keys (e.g. W3C Trace
+            // Context) is preserved; clientInfo is added alongside the siblings.
+            let injected = SseAdapter::inject_client_info(Some(json!({
+                "name": "echo",
+                "_meta": {"traceparent": "tp", "tracestate": "ts"}
+            })))
+            .unwrap();
+            assert_eq!(injected["_meta"]["traceparent"], "tp");
+            assert_eq!(injected["_meta"]["tracestate"], "ts");
+            assert_eq!(
+                injected["_meta"][protocol::META_CLIENT_INFO_KEY]["name"],
+                "endara-relay"
+            );
+
+            // A pre-existing NON-OBJECT `_meta` (here a String) must NOT panic:
+            // it is normalized to an object and clientInfo is still injected.
+            let injected = SseAdapter::inject_client_info(Some(
+                json!({"name": "echo", "_meta": "not-an-object"}),
+            ))
+            .unwrap();
+            assert!(injected["_meta"].is_object());
+            assert_eq!(
+                injected["_meta"][protocol::META_CLIENT_INFO_KEY]["name"],
+                "endara-relay"
+            );
+        }
+
+        /// 2026 upstream over SSE: the `server/discover` probe detects
+        /// `2026-07-28`, so the adapter skips `initialize`/
+        /// `notifications/initialized` entirely, and every subsequent POST
+        /// carries `_meta` clientInfo (SSE has no per-request identity headers).
+        #[tokio::test]
+        async fn test_sse_2026_path_skips_handshake_and_injects_meta() {
+            let server = start_test_server().await;
+            server
+                .state
+                .discover_returns_2026
+                .store(true, Ordering::SeqCst);
+
+            let mut adapter = build_adapter(&server.url, 3).await;
+            adapter
+                .initialize()
+                .await
+                .expect("2026 initialize succeeds");
+            assert!(
+                adapter.upstream_dialect().await.is_2026(),
+                "upstream should be detected as 2026"
+            );
+            let _ = adapter.list_tools().await.expect("list_tools");
+            adapter.shutdown().await.unwrap();
+
+            let posts = server.state.posts.lock().unwrap().clone();
+            let methods: Vec<&str> = posts.iter().filter_map(|p| p["method"].as_str()).collect();
+            assert!(
+                methods.contains(&"server/discover"),
+                "discover probe must be sent, got {methods:?}"
+            );
+            assert!(
+                !methods.contains(&"initialize"),
+                "2026 path must skip initialize, got {methods:?}"
+            );
+            assert!(
+                !methods.contains(&"notifications/initialized"),
+                "2026 path must skip notifications/initialized, got {methods:?}"
+            );
+            for p in &posts {
+                assert_eq!(
+                    p["params"]["_meta"][protocol::META_CLIENT_INFO_KEY]["name"].as_str(),
+                    Some("endara-relay"),
+                    "every 2026 POST must carry _meta clientInfo, got: {p:?}"
+                );
+            }
+        }
+
+        /// Legacy upstream over SSE: the `server/discover` probe returns a
+        /// non-2026 result, so the full `initialize`/`notifications/initialized`
+        /// handshake runs and the relay injects no `_meta` clientInfo on the
+        /// handshake frames.
+        #[tokio::test]
+        async fn test_sse_legacy_path_runs_handshake_without_meta() {
+            let server = start_test_server().await;
+            let mut adapter = build_adapter(&server.url, 3).await;
+            adapter
+                .initialize()
+                .await
+                .expect("legacy initialize succeeds");
+            assert!(
+                !adapter.upstream_dialect().await.is_2026(),
+                "upstream should be detected as legacy"
+            );
+            adapter.shutdown().await.unwrap();
+
+            let posts = server.state.posts.lock().unwrap().clone();
+            let methods: Vec<&str> = posts.iter().filter_map(|p| p["method"].as_str()).collect();
+            assert!(
+                methods.contains(&"server/discover"),
+                "discover probe must precede the legacy handshake, got {methods:?}"
+            );
+            assert!(
+                methods.contains(&"initialize"),
+                "legacy path must run initialize, got {methods:?}"
+            );
+            assert!(
+                methods.contains(&"notifications/initialized"),
+                "legacy path must send notifications/initialized, got {methods:?}"
+            );
+            // Only the discover probe carries `_meta` (it is sent before the
+            // dialect is known); the legacy handshake frames must not.
+            for p in &posts {
+                if p["method"].as_str() == Some("server/discover") {
+                    continue;
+                }
+                assert!(
+                    p["params"].get("_meta").is_none(),
+                    "legacy frame must not carry _meta, got: {p:?}"
+                );
+            }
         }
     }
 }
