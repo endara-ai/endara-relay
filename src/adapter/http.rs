@@ -371,6 +371,16 @@ impl HttpAdapter {
     fn inject_client_info(params: Option<Value>) -> Option<Value> {
         let mut params = params.unwrap_or_else(|| json!({}));
         if params.is_object() {
+            // Normalize `_meta` to a JSON object before the nested assignment:
+            // serde_json's `IndexMut` panics on `value[key] = ...` when the
+            // existing value is a non-object/non-null (e.g. an inbound 2026
+            // request that already carries `params._meta` as a String/Array/
+            // number/bool). Replace only a missing/null or non-object `_meta`;
+            // a pre-existing object `_meta` (W3C Trace Context siblings) is
+            // preserved so the clientInfo key is added alongside them.
+            if !params["_meta"].is_object() {
+                params["_meta"] = json!({});
+            }
             params["_meta"][protocol::META_CLIENT_INFO_KEY] = Self::relay_client_info();
         }
         Some(params)
@@ -2283,6 +2293,32 @@ mod tests {
             HttpAdapter::inject_client_info(Some(json!({"name": "echo", "arguments": {}})))
                 .unwrap();
         assert_eq!(injected["name"], "echo");
+        assert_eq!(
+            injected["_meta"][protocol::META_CLIENT_INFO_KEY]["name"],
+            "endara-relay"
+        );
+
+        // A pre-existing OBJECT `_meta` with sibling keys (e.g. W3C Trace
+        // Context) is preserved; clientInfo is added alongside the siblings.
+        let injected = HttpAdapter::inject_client_info(Some(json!({
+            "name": "echo",
+            "_meta": {"traceparent": "tp", "tracestate": "ts"}
+        })))
+        .unwrap();
+        assert_eq!(injected["_meta"]["traceparent"], "tp");
+        assert_eq!(injected["_meta"]["tracestate"], "ts");
+        assert_eq!(
+            injected["_meta"][protocol::META_CLIENT_INFO_KEY]["name"],
+            "endara-relay"
+        );
+
+        // A pre-existing NON-OBJECT `_meta` (here a String) must NOT panic:
+        // it is normalized to an object and clientInfo is still injected.
+        let injected = HttpAdapter::inject_client_info(Some(
+            json!({"name": "echo", "_meta": "not-an-object"}),
+        ))
+        .unwrap();
+        assert!(injected["_meta"].is_object());
         assert_eq!(
             injected["_meta"][protocol::META_CLIENT_INFO_KEY]["name"],
             "endara-relay"

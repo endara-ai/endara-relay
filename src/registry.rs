@@ -136,10 +136,16 @@ impl RegisteredAdapter {
     /// recent `list_tools()` into an absolute cache deadline. `None` (no hint /
     /// legacy upstream) keeps the entry event-driven with no time expiry.
     async fn ttl_expiry(&self) -> Option<Instant> {
+        // `ms` comes from untrusted upstream `ttlMs` (already clamped >= 0 by
+        // `ttl_ms_from_result`). A huge value would overflow
+        // `Instant::now() + Duration::from_millis(ms)` and panic, so use
+        // `checked_add` and fall back to `None` on overflow — treated as no
+        // time expiry / event-driven, consistent with the `None` semantics
+        // documented above.
         self.adapter
             .list_tools_ttl_ms()
             .await
-            .map(|ms| Instant::now() + Duration::from_millis(ms))
+            .and_then(|ms| Instant::now().checked_add(Duration::from_millis(ms)))
     }
 }
 
@@ -2095,6 +2101,33 @@ mod tests {
             calls.load(Ordering::SeqCst),
             1,
             "without a ttlMs hint the cache must remain event-driven"
+        );
+    }
+
+    #[tokio::test]
+    async fn ttl_expiry_handles_overflow_without_panic() {
+        // `Instant::now() + Duration::from_millis(u64::MAX)` panics on overflow
+        // (platform-dependent: it overflows where `Instant`'s representation is
+        // narrow, e.g. Linux). `ttl_expiry` uses `checked_add`, so a huge
+        // upstream `ttlMs` must be handled gracefully — completing the call here
+        // without unwinding proves the panic is gone. When the add overflows it
+        // falls back to `None` (no time expiry / event-driven) per the doc
+        // comment; on platforms where it does not overflow it yields `Some`.
+        let (registry, _calls) = register_ttl_adapter(Some(u64::MAX)).await;
+        {
+            let entries = registry.entries().read().await;
+            let entry = entries.get("ep").unwrap();
+            // The call returning at all is the assertion: the old `+` panicked.
+            let _expiry = entry.ttl_expiry().await;
+        }
+
+        // A normal ttlMs still yields a concrete deadline.
+        let (registry, _calls) = register_ttl_adapter(Some(60_000)).await;
+        let entries = registry.entries().read().await;
+        let entry = entries.get("ep").unwrap();
+        assert!(
+            entry.ttl_expiry().await.is_some(),
+            "a normal ttlMs must yield a concrete deadline"
         );
     }
 
