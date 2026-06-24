@@ -182,6 +182,13 @@ fn has_path(base_url: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Normalize an issuer/URL for comparison per RFC 8414 §3.3: tolerate a single
+/// trailing-slash difference. Comparison is otherwise exact on scheme, host,
+/// port, and path.
+fn normalize_issuer(issuer: &str) -> &str {
+    issuer.strip_suffix('/').unwrap_or(issuer)
+}
+
 /// Discover OAuth server metadata for a protected resource using RFC 9728.
 ///
 /// 1. Fetches `{origin}/.well-known/oauth-protected-resource{path}`
@@ -280,8 +287,13 @@ pub async fn discover_oauth_server_from_metadata(
 /// 4. `{origin}/.well-known/openid-configuration` (OIDC Discovery root)
 ///
 /// Candidates that collapse to an already-probed URL (e.g. when
-/// `auth_server_url` has no path) are skipped. S256 PKCE support is then
-/// validated.
+/// `auth_server_url` has no path) are skipped. Each candidate's metadata
+/// `issuer` is validated against the expected issuer identifier for that
+/// candidate form (the origin for the root well-known forms, the full input
+/// URL for the path-insert / end-append forms) per RFC 8414 §3.3; metadata
+/// advertising a mismatching issuer is rejected and probing continues, so we
+/// never accept metadata for a different AS sharing the same origin. S256 PKCE
+/// support is then validated.
 ///
 /// All candidates share the same origin, so a single per-host pinned client —
 /// validated through [`url_guard`] against the first URL before any HTTP
@@ -298,38 +310,60 @@ pub async fn discover_authorization_server(
         url: auth_server_url.to_string(),
     };
 
-    // Build the ordered probe list. All candidates share the same origin.
-    let mut candidates: Vec<String> = Vec::new();
+    // Expected issuer identifiers per RFC 8414 §3.3 / OIDC Discovery: the
+    // origin for the root well-known forms, and the full (normalized) input
+    // URL for the path-insert / end-append forms.
+    let parsed = Url::parse(auth_server_url).map_err(|_| map_err())?;
+    let origin = parsed.origin().ascii_serialization();
+    let input_path = parsed.path().trim_end_matches('/');
+    let input_issuer = if input_path.is_empty() {
+        origin.clone()
+    } else {
+        format!("{origin}{input_path}")
+    };
+
+    // Build the ordered probe list. All candidates share the same origin. Each
+    // entry pairs a candidate URL with the issuer we expect its metadata to
+    // advertise, so we never accept metadata for a different AS on the origin.
+    let mut candidates: Vec<(String, String)> = Vec::new();
     let as_path_insert = build_well_known_url(auth_server_url, "oauth-authorization-server")
         .map_err(|_| map_err())?;
-    candidates.push(as_path_insert.clone());
+    candidates.push((as_path_insert.clone(), input_issuer.clone()));
 
     let as_root = build_well_known_url_root(auth_server_url, "oauth-authorization-server")
         .map_err(|_| map_err())?;
-    if !candidates.contains(&as_root) {
-        candidates.push(as_root);
+    if !candidates.iter().any(|(url, _)| url == &as_root) {
+        candidates.push((as_root, origin.clone()));
     }
 
     let oidc_append = build_openid_configuration_url(auth_server_url).map_err(|_| map_err())?;
-    if !candidates.contains(&oidc_append) {
-        candidates.push(oidc_append);
+    if !candidates.iter().any(|(url, _)| url == &oidc_append) {
+        candidates.push((oidc_append, input_issuer.clone()));
     }
 
     let oidc_root = build_well_known_url_root(auth_server_url, "openid-configuration")
         .map_err(|_| map_err())?;
-    if !candidates.contains(&oidc_root) {
-        candidates.push(oidc_root);
+    if !candidates.iter().any(|(url, _)| url == &oidc_root) {
+        candidates.push((oidc_root, origin.clone()));
     }
 
     let as_client = url_guard::validated_client(&as_path_insert, allow_insecure).await?;
 
-    // Probe each candidate, falling through only on MetadataNotFound (404).
+    // Probe each candidate, falling through on MetadataNotFound (404) or on an
+    // issuer mismatch (RFC 8414 §3.3): metadata whose `issuer` does not match
+    // the expected identifier for that candidate form is rejected and treated
+    // like a miss so we keep probing the remaining candidates.
     let mut as_meta: Option<AuthorizationServerMetadata> = None;
     let mut last_not_found: Option<String> = None;
-    for candidate in &candidates {
+    for (candidate, expected_issuer) in &candidates {
         match fetch_well_known(&as_client, candidate).await {
             Ok(resp) => {
-                as_meta = Some(resp.json().await?);
+                let meta: AuthorizationServerMetadata = resp.json().await?;
+                if normalize_issuer(&meta.issuer) != normalize_issuer(expected_issuer) {
+                    last_not_found = Some(candidate.clone());
+                    continue;
+                }
+                as_meta = Some(meta);
                 break;
             }
             Err(DiscoveryError::MetadataNotFound { url }) => {
@@ -810,19 +844,28 @@ mod tests {
 
     /// Spawn an axum server on `127.0.0.1:0` that serves AS metadata. Returns
     /// `(base_url, handle)`. The `path_status` controls what the path-shaped
-    /// `oauth-authorization-server` well-known URL returns; the root
-    /// `oauth-authorization-server` URL serves `root_body` when provided.
+    /// `oauth-authorization-server` well-known URL returns.
     ///
-    /// `oidc_root_body` is served at `/.well-known/openid-configuration`, and
-    /// `oidc_append_body` is served at any URL ending in
-    /// `/.well-known/openid-configuration` (the OIDC end-append form). Each
-    /// serves 404 when `None`.
+    /// `build_bodies` is invoked with the bound base URL (so fixtures can embed
+    /// the dynamic origin/port in their `issuer` fields) and returns
+    /// `(root_body, path_body, oidc_root_body, oidc_append_body)`:
+    /// - `root_body` is served at `/.well-known/oauth-authorization-server`,
+    /// - `path_body` at the path-shaped `oauth-authorization-server` URL,
+    /// - `oidc_root_body` at `/.well-known/openid-configuration`, and
+    /// - `oidc_append_body` at any URL ending in
+    ///   `/.well-known/openid-configuration` (the OIDC end-append form).
+    ///
+    /// Each serves 404 when its `Option` is `None`.
     async fn spawn_as_fixture(
         path_status: axum::http::StatusCode,
-        root_body: Option<serde_json::Value>,
-        path_body: Option<serde_json::Value>,
-        oidc_root_body: Option<serde_json::Value>,
-        oidc_append_body: Option<serde_json::Value>,
+        build_bodies: impl FnOnce(
+            &str,
+        ) -> (
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+            Option<serde_json::Value>,
+        ),
     ) -> (String, tokio::task::JoinHandle<()>) {
         use axum::extract::{Path as AxPath, State};
         use axum::http::{StatusCode, Uri};
@@ -875,6 +918,11 @@ mod tests {
             }
         }
 
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let (root_body, path_body, oidc_root_body, oidc_append_body) = build_bodies(&base);
+
         let fx = Fx {
             path_status,
             root_body: std::sync::Arc::new(root_body),
@@ -893,34 +941,29 @@ mod tests {
             .fallback(oidc_append_fallback)
             .with_state(fx);
 
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
             axum::serve(listener, router).await.ok();
         });
         // Tiny delay so the server is accepting connections.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        (format!("http://127.0.0.1:{}", addr.port()), handle)
+        (base, handle)
     }
 
     /// 3a. URL has a path → path-shaped well-known 404 → root-only fallback
-    /// returns the parsed metadata.
+    /// returns the parsed metadata. The root form's issuer must match the
+    /// origin per RFC 8414 §3.3.
     #[tokio::test]
     async fn discover_authorization_server_path_404_falls_back_to_root() {
         use serde_json::json;
-        let root_meta = json!({
-            "issuer": "https://example.com",
-            "authorization_endpoint": "https://example.com/authorize",
-            "token_endpoint": "https://example.com/token",
-            "code_challenge_methods_supported": ["S256"],
-        });
-        let (base, server) = spawn_as_fixture(
-            axum::http::StatusCode::NOT_FOUND,
-            Some(root_meta.clone()),
-            None,
-            None,
-            None,
-        )
+        let (base, server) = spawn_as_fixture(axum::http::StatusCode::NOT_FOUND, |base| {
+            let root_meta = json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{base}/authorize"),
+                "token_endpoint": format!("{base}/token"),
+                "code_challenge_methods_supported": ["S256"],
+            });
+            (Some(root_meta), None, None, None)
+        })
         .await;
 
         // Input URL has a path so build_well_known_url emits the path variant
@@ -929,11 +972,8 @@ mod tests {
         let result = discover_authorization_server(&url, true)
             .await
             .expect("root fallback must succeed");
-        assert_eq!(
-            result.authorization_endpoint,
-            "https://example.com/authorize"
-        );
-        assert_eq!(result.token_endpoint, "https://example.com/token");
+        assert_eq!(result.authorization_endpoint, format!("{base}/authorize"));
+        assert_eq!(result.token_endpoint, format!("{base}/token"));
         assert_eq!(result.auth_server_url, url);
 
         server.abort();
@@ -943,21 +983,17 @@ mod tests {
     #[tokio::test]
     async fn discover_authorization_server_rejects_when_s256_missing() {
         use serde_json::json;
-        let root_meta = json!({
-            "issuer": "https://example.com",
-            "authorization_endpoint": "https://example.com/authorize",
-            "token_endpoint": "https://example.com/token",
-            "code_challenge_methods_supported": ["plain"],
-        });
         // URL has no path so the first fetch hits the root well-known route;
-        // serve the metadata there.
-        let (base, server) = spawn_as_fixture(
-            axum::http::StatusCode::OK,
-            Some(root_meta),
-            None,
-            None,
-            None,
-        )
+        // serve the metadata there with an origin-matching issuer.
+        let (base, server) = spawn_as_fixture(axum::http::StatusCode::OK, |base| {
+            let root_meta = json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{base}/authorize"),
+                "token_endpoint": format!("{base}/token"),
+                "code_challenge_methods_supported": ["plain"],
+            });
+            (Some(root_meta), None, None, None)
+        })
         .await;
 
         let result = discover_authorization_server(&base, true).await;
@@ -1033,25 +1069,21 @@ mod tests {
     // --- openid-configuration fallback discovery tests -----------------------
 
     /// oauth-as path 404 + oauth-as root 404 → openid-configuration end-append
-    /// succeeds.
+    /// succeeds. The end-append form's issuer must match the full input URL.
     #[tokio::test]
     async fn discover_authorization_server_falls_back_to_openid_configuration() {
         use serde_json::json;
-        let oidc_meta = json!({
-            "issuer": "https://issuer.example.com",
-            "authorization_endpoint": "https://issuer.example.com/authorize",
-            "token_endpoint": "https://issuer.example.com/token",
-            "code_challenge_methods_supported": ["S256"],
-        });
         // oauth-as path 404 (path_status), oauth-as root 404 (root_body None),
-        // openid-configuration end-append served.
-        let (base, server) = spawn_as_fixture(
-            axum::http::StatusCode::NOT_FOUND,
-            None,
-            None,
-            None,
-            Some(oidc_meta),
-        )
+        // openid-configuration end-append served with an input-matching issuer.
+        let (base, server) = spawn_as_fixture(axum::http::StatusCode::NOT_FOUND, |base| {
+            let oidc_meta = json!({
+                "issuer": format!("{base}/oauth2/default"),
+                "authorization_endpoint": format!("{base}/oauth2/default/authorize"),
+                "token_endpoint": format!("{base}/oauth2/default/token"),
+                "code_challenge_methods_supported": ["S256"],
+            });
+            (None, None, None, Some(oidc_meta))
+        })
         .await;
 
         let url = format!("{}/oauth2/default", base);
@@ -1060,44 +1092,41 @@ mod tests {
             .expect("openid-configuration end-append must succeed");
         assert_eq!(
             result.authorization_endpoint,
-            "https://issuer.example.com/authorize"
+            format!("{base}/oauth2/default/authorize")
         );
-        assert_eq!(result.token_endpoint, "https://issuer.example.com/token");
+        assert_eq!(
+            result.token_endpoint,
+            format!("{base}/oauth2/default/token")
+        );
         assert_eq!(result.auth_server_url, url);
 
         server.abort();
     }
 
     /// oauth-as path 404 + oauth-as root 404 + openid-configuration end-append
-    /// 404 → openid-configuration root fallback succeeds.
+    /// 404 → openid-configuration root fallback succeeds. The root form's
+    /// issuer must match the origin.
     #[tokio::test]
     async fn discover_authorization_server_falls_back_to_openid_configuration_root() {
         use serde_json::json;
-        let oidc_meta = json!({
-            "issuer": "https://issuer.example.com",
-            "authorization_endpoint": "https://issuer.example.com/authorize",
-            "token_endpoint": "https://issuer.example.com/token",
-            "code_challenge_methods_supported": ["S256"],
-        });
         // Only the openid-configuration root URL serves metadata.
-        let (base, server) = spawn_as_fixture(
-            axum::http::StatusCode::NOT_FOUND,
-            None,
-            None,
-            Some(oidc_meta),
-            None,
-        )
+        let (base, server) = spawn_as_fixture(axum::http::StatusCode::NOT_FOUND, |base| {
+            let oidc_meta = json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{base}/authorize"),
+                "token_endpoint": format!("{base}/token"),
+                "code_challenge_methods_supported": ["S256"],
+            });
+            (None, None, Some(oidc_meta), None)
+        })
         .await;
 
         let url = format!("{}/oauth2/default", base);
         let result = discover_authorization_server(&url, true)
             .await
             .expect("openid-configuration root fallback must succeed");
-        assert_eq!(
-            result.authorization_endpoint,
-            "https://issuer.example.com/authorize"
-        );
-        assert_eq!(result.token_endpoint, "https://issuer.example.com/token");
+        assert_eq!(result.authorization_endpoint, format!("{base}/authorize"));
+        assert_eq!(result.token_endpoint, format!("{base}/token"));
 
         server.abort();
     }
@@ -1137,26 +1166,106 @@ mod tests {
     #[tokio::test]
     async fn discover_authorization_server_surfaces_cimd_flag() {
         use serde_json::json;
-        let root_meta = json!({
-            "issuer": "https://example.com",
-            "authorization_endpoint": "https://example.com/authorize",
-            "token_endpoint": "https://example.com/token",
-            "code_challenge_methods_supported": ["S256"],
-            "client_id_metadata_document_supported": true,
-        });
-        let (base, server) = spawn_as_fixture(
-            axum::http::StatusCode::OK,
-            Some(root_meta),
-            None,
-            None,
-            None,
-        )
+        let (base, server) = spawn_as_fixture(axum::http::StatusCode::OK, |base| {
+            let root_meta = json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{base}/authorize"),
+                "token_endpoint": format!("{base}/token"),
+                "code_challenge_methods_supported": ["S256"],
+                "client_id_metadata_document_supported": true,
+            });
+            (Some(root_meta), None, None, None)
+        })
         .await;
 
         let result = discover_authorization_server(&base, true)
             .await
             .expect("discovery must succeed");
         assert!(result.client_id_metadata_document_supported);
+
+        server.abort();
+    }
+
+    // --- RFC 8414 §3.3 issuer-validation tests -------------------------------
+
+    /// Metadata served on the same origin but advertising a DIFFERENT issuer
+    /// than expected must be rejected — discovery must not accept metadata for a
+    /// different AS sharing the origin, and falls through to not-found.
+    #[tokio::test]
+    async fn discover_authorization_server_rejects_issuer_mismatch() {
+        use serde_json::json;
+        // openid-configuration root serves metadata whose issuer points at a
+        // wholly different authorization server. All other candidates 404.
+        let (base, server) = spawn_as_fixture(axum::http::StatusCode::NOT_FOUND, |_base| {
+            let oidc_meta = json!({
+                "issuer": "https://evil.example.com",
+                "authorization_endpoint": "https://evil.example.com/authorize",
+                "token_endpoint": "https://evil.example.com/token",
+                "code_challenge_methods_supported": ["S256"],
+            });
+            (None, None, Some(oidc_meta), None)
+        })
+        .await;
+
+        let result = discover_authorization_server(&base, true).await;
+        assert!(
+            matches!(
+                result,
+                Err(DiscoveryError::AuthServerMetadataNotFound { .. })
+            ),
+            "expected AuthServerMetadataNotFound on issuer mismatch, got {:?}",
+            result.err()
+        );
+
+        server.abort();
+    }
+
+    /// Regression: an `oauth-authorization-server` path-form AS whose issuer
+    /// matches the full input URL is accepted.
+    #[tokio::test]
+    async fn discover_authorization_server_accepts_matching_issuer_path_as() {
+        use serde_json::json;
+        let (base, server) = spawn_as_fixture(axum::http::StatusCode::OK, |base| {
+            let path_meta = json!({
+                "issuer": format!("{base}/login/oauth"),
+                "authorization_endpoint": format!("{base}/login/oauth/authorize"),
+                "token_endpoint": format!("{base}/login/oauth/token"),
+                "code_challenge_methods_supported": ["S256"],
+            });
+            (None, Some(path_meta), None, None)
+        })
+        .await;
+
+        let url = format!("{}/login/oauth", base);
+        let result = discover_authorization_server(&url, true)
+            .await
+            .expect("matching path-form AS must succeed");
+        assert_eq!(result.issuer, format!("{base}/login/oauth"));
+
+        server.abort();
+    }
+
+    /// Regression: an OpenID Connect end-append AS whose issuer matches the full
+    /// input URL is accepted.
+    #[tokio::test]
+    async fn discover_authorization_server_accepts_matching_issuer_oidc_as() {
+        use serde_json::json;
+        let (base, server) = spawn_as_fixture(axum::http::StatusCode::NOT_FOUND, |base| {
+            let oidc_meta = json!({
+                "issuer": format!("{base}/oauth2/default"),
+                "authorization_endpoint": format!("{base}/oauth2/default/authorize"),
+                "token_endpoint": format!("{base}/oauth2/default/token"),
+                "code_challenge_methods_supported": ["S256"],
+            });
+            (None, None, None, Some(oidc_meta))
+        })
+        .await;
+
+        let url = format!("{}/oauth2/default", base);
+        let result = discover_authorization_server(&url, true)
+            .await
+            .expect("matching end-append OIDC AS must succeed");
+        assert_eq!(result.issuer, format!("{base}/oauth2/default"));
 
         server.abort();
     }
