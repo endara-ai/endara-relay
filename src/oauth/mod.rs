@@ -1,3 +1,4 @@
+pub mod client;
 pub mod dcr;
 pub mod discovery;
 pub mod url_guard;
