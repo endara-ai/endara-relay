@@ -7194,6 +7194,18 @@ command = "echo"
         (format!("http://127.0.0.1:{}", addr.port()), handle)
     }
 
+    /// Build the AS metadata `issuer` from the request `Host` header so a mock
+    /// AS advertises an issuer matching its own origin, exactly like a real AS
+    /// (RFC 8414 §2/§3.3). Discovery validates the advertised issuer against the
+    /// probe origin, so hardcoding a foreign issuer would be (correctly) rejected.
+    fn mock_issuer(headers: &axum::http::HeaderMap) -> String {
+        let host = headers
+            .get(axum::http::header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("127.0.0.1");
+        format!("http://{host}")
+    }
+
     /// Build a ManagementState wired for `oauth_start` against a mock AS.
     fn test_state_oauth_start(
         name: &str,
@@ -7362,9 +7374,9 @@ command = "echo"
         // Mock AS: serve real-looking endpoints at /.well-known/oauth-authorization-server.
         // Discovered URLs intentionally differ from the convention `{base}/authorize`
         // and `{base}/token`.
-        async fn well_known() -> Json<Value> {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
             Json(serde_json::json!({
-                "issuer": "http://example.test",
+                "issuer": mock_issuer(&headers),
                 "authorization_endpoint": "http://example.test/discovered-auth",
                 "token_endpoint": "http://example.test/discovered-token",
                 "code_challenge_methods_supported": ["S256"],
@@ -7435,9 +7447,9 @@ command = "echo"
         // Mock AS: discovery succeeds but advertises a token_endpoint that
         // differs from the operator-configured explicit override. The
         // override must win.
-        async fn well_known() -> Json<Value> {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
             Json(serde_json::json!({
-                "issuer": "http://example.test",
+                "issuer": mock_issuer(&headers),
                 "authorization_endpoint": "http://example.test/discovered-auth",
                 "token_endpoint": "http://example.test/discovered-token",
                 "code_challenge_methods_supported": ["S256"],
@@ -7493,12 +7505,12 @@ command = "echo"
         let wk = well_known_hits.clone();
         let bad = bad_double_slash_hits.clone();
 
-        let well_known_handler = move || {
+        let well_known_handler = move |headers: axum::http::HeaderMap| {
             let wk = wk.clone();
             async move {
                 wk.fetch_add(1, Ordering::SeqCst);
                 Json(serde_json::json!({
-                    "issuer": "http://example.test",
+                    "issuer": mock_issuer(&headers),
                     "authorization_endpoint": "http://example.test/discovered-auth",
                     "token_endpoint": "http://example.test/discovered-token",
                     "code_challenge_methods_supported": ["S256"],
@@ -7572,9 +7584,9 @@ command = "echo"
 
     #[tokio::test]
     async fn oauth_start_prefers_dcr_client_secret_when_toml_only_has_client_id() {
-        async fn well_known() -> Json<Value> {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
             Json(serde_json::json!({
-                "issuer": "http://example.test",
+                "issuer": mock_issuer(&headers),
                 "authorization_endpoint": "http://example.test/authorize",
                 "token_endpoint": "http://example.test/token",
                 "code_challenge_methods_supported": ["S256"],
@@ -7636,9 +7648,9 @@ command = "echo"
 
     #[tokio::test]
     async fn oauth_start_falls_back_to_config_when_dcr_client_id_mismatches() {
-        async fn well_known() -> Json<Value> {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
             Json(serde_json::json!({
-                "issuer": "http://example.test",
+                "issuer": mock_issuer(&headers),
                 "authorization_endpoint": "http://example.test/authorize",
                 "token_endpoint": "http://example.test/token",
                 "code_challenge_methods_supported": ["S256"],
