@@ -1134,6 +1134,7 @@ async fn oauth_start(
         discovered_scopes,
         auth_server_label,
         issuer,
+        iss_supported,
     ) = if let Some(ref server_url) = oauth_server_url {
         // Prefer RFC 8414 discovery against the configured AS URL. If it
         // succeeds, use the discovered endpoints (explicit token_endpoint
@@ -1152,6 +1153,7 @@ async fn oauth_start(
                     disc.scopes_supported,
                     Some(disc.auth_server_url),
                     Some(disc.issuer),
+                    disc.authorization_response_iss_parameter_supported,
                 )
             }
             Err(e) => {
@@ -1171,6 +1173,7 @@ async fn oauth_start(
                     Vec::<String>::new(),
                     None::<String>,
                     None::<String>,
+                    false,
                 )
             }
         }
@@ -1184,6 +1187,7 @@ async fn oauth_start(
                 disc.scopes_supported,
                 Some(disc.auth_server_url),
                 Some(disc.issuer),
+                disc.authorization_response_iss_parameter_supported,
             ),
             Err(e) => {
                 return error_response(
@@ -1328,6 +1332,7 @@ async fn oauth_start(
             pkce,
             &redirect_uri,
             issuer.as_deref(),
+            iss_supported,
         )
         .await;
 
@@ -2165,6 +2170,7 @@ async fn oauth_setup(
                     pkce,
                     &redirect_uri,
                     Some(issuer.as_str()),
+                    disc.authorization_response_iss_parameter_supported,
                 )
                 .await;
 
@@ -2325,6 +2331,9 @@ async fn oauth_setup_credentials(
             pkce,
             &redirect_uri,
             issuer.as_deref(),
+            // Manual-credential path: no RFC 9207 advertisement was threaded
+            // through the setup session, so tolerate a missing callback `iss`.
+            false,
         )
         .await;
 

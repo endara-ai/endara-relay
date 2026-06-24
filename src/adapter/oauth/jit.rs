@@ -262,6 +262,7 @@ impl JitInterceptor {
                 pkce,
                 &redirect_uri,
                 Some(&disc.issuer),
+                disc.authorization_response_iss_parameter_supported,
             )
             .await;
 

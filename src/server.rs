@@ -1623,14 +1623,25 @@ struct OAuthCallbackParams {
 /// Validate the RFC 9207 `iss` authorization-response parameter against the
 /// issuer recorded for the pending flow (mix-up defense).
 ///
-/// When `expected` is `Some(_)` (issuer was discovered), the callback `iss`
-/// must be present and an exact match. When `expected` is `None` (e.g. legacy
-/// convention-based config without RFC 8414 discovery), validation is skipped
-/// so existing flows keep working unchanged.
-fn validate_callback_iss(expected: Option<&str>, provided: Option<&str>) -> bool {
+/// Rules:
+/// - `expected == None` (no discovered issuer, e.g. legacy convention-based
+///   config without RFC 8414 discovery): validation is skipped — returns `true`.
+/// - `provided == Some(p)`: always validate `p == exp` when the server actually
+///   sent `iss`, preserving mix-up defense regardless of advertised support.
+/// - `provided == None`: allow the missing `iss` UNLESS the server advertised
+///   `authorization_response_iss_parameter_supported: true` (`iss_supported`),
+///   in which case a missing `iss` is still a failure.
+fn validate_callback_iss(
+    expected: Option<&str>,
+    provided: Option<&str>,
+    iss_supported: bool,
+) -> bool {
     match expected {
-        Some(exp) => provided == Some(exp),
         None => true,
+        Some(exp) => match provided {
+            Some(p) => p == exp,
+            None => !iss_supported,
+        },
     }
 }
 
@@ -1745,7 +1756,11 @@ async fn oauth_callback(
     // defense). When no issuer was recorded (legacy convention-based config),
     // validation is skipped to preserve existing behavior.
     if let Some(ref expected_issuer) = flow.issuer {
-        if !validate_callback_iss(Some(expected_issuer), params.iss.as_deref()) {
+        if !validate_callback_iss(
+            Some(expected_issuer),
+            params.iss.as_deref(),
+            flow.iss_parameter_supported,
+        ) {
             warn!(
                 endpoint = %flow.endpoint_name,
                 expected = %expected_issuer,
@@ -4846,38 +4861,69 @@ mod tests {
 
     #[test]
     fn test_validate_callback_iss_matching_passes() {
-        // (a) Known issuer + matching `iss` → valid.
+        // (a) Known issuer + matching `iss` → valid (regardless of advertised support).
         assert!(validate_callback_iss(
             Some("https://auth.example.com"),
-            Some("https://auth.example.com")
+            Some("https://auth.example.com"),
+            true
+        ));
+        assert!(validate_callback_iss(
+            Some("https://auth.example.com"),
+            Some("https://auth.example.com"),
+            false
         ));
     }
 
     #[test]
     fn test_validate_callback_iss_mismatch_rejected() {
-        // (b) Known issuer + different `iss` → rejected.
+        // (b) Known issuer + different `iss` → rejected regardless of the flag.
         assert!(!validate_callback_iss(
             Some("https://auth.example.com"),
-            Some("https://evil.example.com")
+            Some("https://evil.example.com"),
+            false
+        ));
+        assert!(!validate_callback_iss(
+            Some("https://auth.example.com"),
+            Some("https://evil.example.com"),
+            true
         ));
     }
 
     #[test]
-    fn test_validate_callback_iss_missing_rejected_when_known() {
-        // (c) Known issuer + missing `iss` → rejected.
+    fn test_validate_callback_iss_missing_allowed_when_not_advertised() {
+        // (c) Known issuer + missing `iss` + server did NOT advertise support →
+        // allowed. This is the awardtravelfinder.com regression case.
+        assert!(validate_callback_iss(
+            Some("https://auth.example.com"),
+            None,
+            false
+        ));
+    }
+
+    #[test]
+    fn test_validate_callback_iss_missing_rejected_when_advertised() {
+        // (c') Known issuer + missing `iss` + server advertised support → rejected.
         assert!(!validate_callback_iss(
             Some("https://auth.example.com"),
-            None
+            None,
+            true
         ));
     }
 
     #[test]
     fn test_validate_callback_iss_none_skips_validation() {
-        // (d) No recorded issuer → validation skipped regardless of `iss`.
-        assert!(validate_callback_iss(None, None));
+        // (d) No recorded issuer → validation skipped regardless of `iss`/flag.
+        assert!(validate_callback_iss(None, None, false));
+        assert!(validate_callback_iss(None, None, true));
         assert!(validate_callback_iss(
             None,
-            Some("https://anything.example.com")
+            Some("https://anything.example.com"),
+            false
+        ));
+        assert!(validate_callback_iss(
+            None,
+            Some("https://anything.example.com"),
+            true
         ));
     }
 
@@ -4885,7 +4931,10 @@ mod tests {
     /// flow with the given issuer, returning the state and the flow's `state`
     /// param. Used to exercise the callback's RFC 9207 rejection paths without
     /// reaching the token-exchange HTTP call.
-    async fn state_with_pending_flow(issuer: Option<&str>) -> (AppState, String) {
+    async fn state_with_pending_flow(
+        issuer: Option<&str>,
+        iss_supported: bool,
+    ) -> (AppState, String) {
         let mut app_state = test_app_state();
         let flow_mgr = Arc::new(OAuthFlowManager::new());
         let pkce = crate::oauth::PkceChallenge::generate();
@@ -4898,6 +4947,7 @@ mod tests {
                 pkce,
                 "http://127.0.0.1:9400/oauth/callback",
                 issuer,
+                iss_supported,
             )
             .await;
         app_state.oauth_flow_manager = Some(flow_mgr);
@@ -4907,7 +4957,8 @@ mod tests {
     #[tokio::test]
     async fn test_oauth_callback_rejects_mismatched_iss() {
         use axum::body::to_bytes;
-        let (state, state_param) = state_with_pending_flow(Some("https://auth.example.com")).await;
+        let (state, state_param) =
+            state_with_pending_flow(Some("https://auth.example.com"), false).await;
         let params = OAuthCallbackParams {
             code: Some("authcode".to_string()),
             state: Some(state_param),
@@ -4921,9 +4972,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_oauth_callback_rejects_missing_iss_when_issuer_known() {
+    async fn test_oauth_callback_rejects_missing_iss_when_advertised() {
         use axum::body::to_bytes;
-        let (state, state_param) = state_with_pending_flow(Some("https://auth.example.com")).await;
+        // Server advertised RFC 9207 support → a missing `iss` is still rejected.
+        let (state, state_param) =
+            state_with_pending_flow(Some("https://auth.example.com"), true).await;
         let params = OAuthCallbackParams {
             code: Some("authcode".to_string()),
             state: Some(state_param),
@@ -4935,6 +4988,31 @@ mod tests {
         let body_str = String::from_utf8(body.to_vec()).unwrap();
         assert!(body_str.contains("issuer mismatch"), "body = {body_str}");
         assert!(body_str.contains("&lt;missing&gt;"), "body = {body_str}");
+    }
+
+    #[tokio::test]
+    async fn test_oauth_callback_allows_missing_iss_when_not_advertised() {
+        use axum::body::to_bytes;
+        // awardtravelfinder.com regression case: issuer discovered, server did
+        // NOT advertise `authorization_response_iss_parameter_supported`, and the
+        // callback omits `iss`. The `iss` check must NOT reject; the flow proceeds
+        // to token exchange (which fails against the unreachable test endpoint, so
+        // the response is not the issuer-mismatch page).
+        let (state, state_param) =
+            state_with_pending_flow(Some("https://auth.example.com"), false).await;
+        let params = OAuthCallbackParams {
+            code: Some("authcode".to_string()),
+            state: Some(state_param),
+            error: None,
+            iss: None,
+        };
+        let resp = oauth_callback(State(state), Query(params)).await;
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            !body_str.contains("issuer mismatch"),
+            "missing iss must be tolerated when support is not advertised; body = {body_str}"
+        );
     }
 
     // --- /mcp/sse + initialize tools.listChanged capability ---
