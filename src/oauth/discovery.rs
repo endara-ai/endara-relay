@@ -52,6 +52,11 @@ pub struct AuthorizationServerMetadata {
     /// must not be treated as an error.
     #[serde(default)]
     pub authorization_response_iss_parameter_supported: bool,
+    /// Whether the authorization server advertises support for Client ID Metadata
+    /// Documents (CIMD). When false/absent, CIMD-based client identification is
+    /// unavailable.
+    #[serde(default)]
+    pub client_id_metadata_document_supported: bool,
 }
 
 /// Resolved OAuth server discovery result.
@@ -73,6 +78,10 @@ pub struct DiscoveryResult {
     /// RFC 9207: whether the authorization server advertises support for the
     /// authorization-response `iss` parameter.
     pub authorization_response_iss_parameter_supported: bool,
+    /// Whether the authorization server advertises support for Client ID
+    /// Metadata Documents (CIMD).
+    #[allow(dead_code)]
+    pub client_id_metadata_document_supported: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -139,6 +148,31 @@ fn build_well_known_url_root(
     })?;
     let origin = parsed.origin().ascii_serialization();
     Ok(format!("{origin}/.well-known/{well_known_suffix}"))
+}
+
+/// Build an OpenID Connect Discovery 1.0 URL (§4).
+///
+/// Unlike RFC 8414 / RFC 5785 (which insert `.well-known` directly after the
+/// origin — see [`build_well_known_url`]), OIDC Discovery appends
+/// `/.well-known/openid-configuration` to the END of the issuer's full path:
+/// - `https://issuer.example.com/oauth2/default`
+///   → `https://issuer.example.com/oauth2/default/.well-known/openid-configuration`
+/// - `https://issuer.example.com` (or with a trailing slash)
+///   → `https://issuer.example.com/.well-known/openid-configuration`
+fn build_openid_configuration_url(base_url: &str) -> Result<String, DiscoveryError> {
+    let parsed = Url::parse(base_url).map_err(|_| DiscoveryError::MetadataNotFound {
+        url: base_url.to_string(),
+    })?;
+    let original_path = parsed.path().trim_matches('/');
+    let origin = parsed.origin().ascii_serialization();
+
+    if original_path.is_empty() {
+        Ok(format!("{origin}/.well-known/openid-configuration"))
+    } else {
+        Ok(format!(
+            "{origin}/{original_path}/.well-known/openid-configuration"
+        ))
+    }
 }
 
 /// Returns true if the base URL has a non-empty path component.
@@ -233,19 +267,26 @@ pub async fn discover_oauth_server_from_metadata(
     discover_authorization_server(&auth_server_url, allow_insecure).await
 }
 
-/// Discover OAuth authorization server metadata directly (RFC 8414 only).
+/// Discover OAuth authorization server metadata directly (RFC 8414 + OIDC).
 ///
 /// Unlike [`discover_oauth_server`], this skips the RFC 9728 protected
 /// resource step and fetches the AS metadata against `auth_server_url`
-/// itself:
+/// itself, probing the following locations in order and falling through ONLY
+/// on a 404 / [`DiscoveryError::MetadataNotFound`]:
 ///
-/// 1. `{origin}/.well-known/oauth-authorization-server{path}`
-///    - Falls back to `{origin}/.well-known/oauth-authorization-server`
-///      if 404 and `auth_server_url` has a path component.
-/// 2. Validates S256 PKCE support.
+/// 1. `{origin}/.well-known/oauth-authorization-server{path}` (RFC 8414 path-insert)
+/// 2. `{origin}/.well-known/oauth-authorization-server` (RFC 8414 root)
+/// 3. `{origin}{path}/.well-known/openid-configuration` (OIDC Discovery end-append)
+/// 4. `{origin}/.well-known/openid-configuration` (OIDC Discovery root)
 ///
-/// The input URL is validated through [`url_guard`] before any HTTP
-/// request is sent, and the request uses a per-host pinned client.
+/// Candidates that collapse to an already-probed URL (e.g. when
+/// `auth_server_url` has no path) are skipped. S256 PKCE support is then
+/// validated.
+///
+/// All candidates share the same origin, so a single per-host pinned client —
+/// validated through [`url_guard`] against the first URL before any HTTP
+/// request is sent — is reused, preserving the SSRF guard and DNS-rebinding
+/// protections.
 ///
 /// The returned `DiscoveryResult.auth_server_url` is set to the input
 /// `auth_server_url` so callers can label discovery output consistently.
@@ -253,33 +294,59 @@ pub async fn discover_authorization_server(
     auth_server_url: &str,
     allow_insecure: bool,
 ) -> Result<DiscoveryResult, DiscoveryError> {
-    let as_well_known = build_well_known_url(auth_server_url, "oauth-authorization-server")
-        .map_err(|_| DiscoveryError::AuthServerMetadataNotFound {
-            url: auth_server_url.to_string(),
-        })?;
-    let as_client = url_guard::validated_client(&as_well_known, allow_insecure).await?;
+    let map_err = || DiscoveryError::AuthServerMetadataNotFound {
+        url: auth_server_url.to_string(),
+    };
 
-    let as_meta: AuthorizationServerMetadata = match fetch_well_known(&as_client, &as_well_known)
-        .await
-    {
-        Ok(resp) => resp.json().await?,
-        Err(DiscoveryError::MetadataNotFound { .. }) if has_path(auth_server_url) => {
-            let root_url = build_well_known_url_root(auth_server_url, "oauth-authorization-server")
-                .map_err(|_| DiscoveryError::AuthServerMetadataNotFound {
-                    url: auth_server_url.to_string(),
-                })?;
-            fetch_well_known(&as_client, &root_url)
-                .await
-                .map_err(|_| DiscoveryError::AuthServerMetadataNotFound {
-                    url: as_well_known.clone(),
-                })?
-                .json()
-                .await?
+    // Build the ordered probe list. All candidates share the same origin.
+    let mut candidates: Vec<String> = Vec::new();
+    let as_path_insert = build_well_known_url(auth_server_url, "oauth-authorization-server")
+        .map_err(|_| map_err())?;
+    candidates.push(as_path_insert.clone());
+
+    let as_root = build_well_known_url_root(auth_server_url, "oauth-authorization-server")
+        .map_err(|_| map_err())?;
+    if !candidates.contains(&as_root) {
+        candidates.push(as_root);
+    }
+
+    let oidc_append = build_openid_configuration_url(auth_server_url).map_err(|_| map_err())?;
+    if !candidates.contains(&oidc_append) {
+        candidates.push(oidc_append);
+    }
+
+    let oidc_root = build_well_known_url_root(auth_server_url, "openid-configuration")
+        .map_err(|_| map_err())?;
+    if !candidates.contains(&oidc_root) {
+        candidates.push(oidc_root);
+    }
+
+    let as_client = url_guard::validated_client(&as_path_insert, allow_insecure).await?;
+
+    // Probe each candidate, falling through only on MetadataNotFound (404).
+    let mut as_meta: Option<AuthorizationServerMetadata> = None;
+    let mut last_not_found: Option<String> = None;
+    for candidate in &candidates {
+        match fetch_well_known(&as_client, candidate).await {
+            Ok(resp) => {
+                as_meta = Some(resp.json().await?);
+                break;
+            }
+            Err(DiscoveryError::MetadataNotFound { url }) => {
+                last_not_found = Some(url);
+                continue;
+            }
+            Err(e) => return Err(e),
         }
-        Err(DiscoveryError::MetadataNotFound { url }) => {
-            return Err(DiscoveryError::AuthServerMetadataNotFound { url });
+    }
+
+    let as_meta = match as_meta {
+        Some(meta) => meta,
+        None => {
+            return Err(DiscoveryError::AuthServerMetadataNotFound {
+                url: last_not_found.unwrap_or(as_path_insert),
+            });
         }
-        Err(e) => return Err(e),
     };
 
     // Validate S256 is supported (required for PKCE)
@@ -303,6 +370,7 @@ pub async fn discover_authorization_server(
         revocation_endpoint: as_meta.revocation_endpoint,
         authorization_response_iss_parameter_supported: as_meta
             .authorization_response_iss_parameter_supported,
+        client_id_metadata_document_supported: as_meta.client_id_metadata_document_supported,
     })
 }
 
@@ -742,15 +810,22 @@ mod tests {
 
     /// Spawn an axum server on `127.0.0.1:0` that serves AS metadata. Returns
     /// `(base_url, handle)`. The `path_status` controls what the path-shaped
-    /// well-known URL returns; the root well-known URL always serves
-    /// `root_body` when provided.
+    /// `oauth-authorization-server` well-known URL returns; the root
+    /// `oauth-authorization-server` URL serves `root_body` when provided.
+    ///
+    /// `oidc_root_body` is served at `/.well-known/openid-configuration`, and
+    /// `oidc_append_body` is served at any URL ending in
+    /// `/.well-known/openid-configuration` (the OIDC end-append form). Each
+    /// serves 404 when `None`.
     async fn spawn_as_fixture(
         path_status: axum::http::StatusCode,
         root_body: Option<serde_json::Value>,
         path_body: Option<serde_json::Value>,
+        oidc_root_body: Option<serde_json::Value>,
+        oidc_append_body: Option<serde_json::Value>,
     ) -> (String, tokio::task::JoinHandle<()>) {
         use axum::extract::{Path as AxPath, State};
-        use axum::http::StatusCode;
+        use axum::http::{StatusCode, Uri};
         use axum::{response::IntoResponse, routing::get, Json, Router};
 
         #[derive(Clone)]
@@ -758,6 +833,8 @@ mod tests {
             path_status: StatusCode,
             root_body: std::sync::Arc<Option<serde_json::Value>>,
             path_body: std::sync::Arc<Option<serde_json::Value>>,
+            oidc_root_body: std::sync::Arc<Option<serde_json::Value>>,
+            oidc_append_body: std::sync::Arc<Option<serde_json::Value>>,
         }
 
         async fn root(State(fx): State<Fx>) -> axum::response::Response {
@@ -779,11 +856,31 @@ mod tests {
                 (fx.path_status, "not found").into_response()
             }
         }
+        async fn oidc_root(State(fx): State<Fx>) -> axum::response::Response {
+            match fx.oidc_root_body.as_ref() {
+                Some(v) => (StatusCode::OK, Json(v.clone())).into_response(),
+                None => (StatusCode::NOT_FOUND, "not found").into_response(),
+            }
+        }
+        // Catch-all: serves the OIDC end-append body for any URL ending in
+        // `/.well-known/openid-configuration`; 404 otherwise.
+        async fn oidc_append_fallback(State(fx): State<Fx>, uri: Uri) -> axum::response::Response {
+            if uri.path().ends_with("/.well-known/openid-configuration") {
+                match fx.oidc_append_body.as_ref() {
+                    Some(v) => (StatusCode::OK, Json(v.clone())).into_response(),
+                    None => (StatusCode::NOT_FOUND, "not found").into_response(),
+                }
+            } else {
+                (StatusCode::NOT_FOUND, "not found").into_response()
+            }
+        }
 
         let fx = Fx {
             path_status,
             root_body: std::sync::Arc::new(root_body),
             path_body: std::sync::Arc::new(path_body),
+            oidc_root_body: std::sync::Arc::new(oidc_root_body),
+            oidc_append_body: std::sync::Arc::new(oidc_append_body),
         };
 
         let router = Router::new()
@@ -792,6 +889,8 @@ mod tests {
                 "/.well-known/oauth-authorization-server/{*tail}",
                 get(path_handler),
             )
+            .route("/.well-known/openid-configuration", get(oidc_root))
+            .fallback(oidc_append_fallback)
             .with_state(fx);
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -818,6 +917,8 @@ mod tests {
         let (base, server) = spawn_as_fixture(
             axum::http::StatusCode::NOT_FOUND,
             Some(root_meta.clone()),
+            None,
+            None,
             None,
         )
         .await;
@@ -850,8 +951,14 @@ mod tests {
         });
         // URL has no path so the first fetch hits the root well-known route;
         // serve the metadata there.
-        let (base, server) =
-            spawn_as_fixture(axum::http::StatusCode::OK, Some(root_meta), None).await;
+        let (base, server) = spawn_as_fixture(
+            axum::http::StatusCode::OK,
+            Some(root_meta),
+            None,
+            None,
+            None,
+        )
+        .await;
 
         let result = discover_authorization_server(&base, true).await;
         assert!(
@@ -874,5 +981,183 @@ mod tests {
             Err(other) => panic!("expected DiscoveryError::UrlGuard, got {:?}", other),
             Ok(_) => panic!("expected DiscoveryError::UrlGuard, got Ok(_)"),
         }
+    }
+
+    // --- build_openid_configuration_url tests --------------------------------
+
+    #[test]
+    fn test_build_openid_configuration_url_no_path() {
+        let url = build_openid_configuration_url("https://issuer.example.com").unwrap();
+        assert_eq!(
+            url,
+            "https://issuer.example.com/.well-known/openid-configuration"
+        );
+    }
+
+    #[test]
+    fn test_build_openid_configuration_url_with_path() {
+        let url =
+            build_openid_configuration_url("https://issuer.example.com/oauth2/default").unwrap();
+        assert_eq!(
+            url,
+            "https://issuer.example.com/oauth2/default/.well-known/openid-configuration"
+        );
+    }
+
+    #[test]
+    fn test_build_openid_configuration_url_trailing_slash() {
+        // Root + trailing slash collapses to the root form.
+        let url = build_openid_configuration_url("https://issuer.example.com/").unwrap();
+        assert_eq!(
+            url,
+            "https://issuer.example.com/.well-known/openid-configuration"
+        );
+        // Path + trailing slash collapses the trailing slash too.
+        let url =
+            build_openid_configuration_url("https://issuer.example.com/oauth2/default/").unwrap();
+        assert_eq!(
+            url,
+            "https://issuer.example.com/oauth2/default/.well-known/openid-configuration"
+        );
+    }
+
+    #[test]
+    fn test_build_openid_configuration_url_with_port() {
+        let url = build_openid_configuration_url("https://localhost:8080/api/auth").unwrap();
+        assert_eq!(
+            url,
+            "https://localhost:8080/api/auth/.well-known/openid-configuration"
+        );
+    }
+
+    // --- openid-configuration fallback discovery tests -----------------------
+
+    /// oauth-as path 404 + oauth-as root 404 → openid-configuration end-append
+    /// succeeds.
+    #[tokio::test]
+    async fn discover_authorization_server_falls_back_to_openid_configuration() {
+        use serde_json::json;
+        let oidc_meta = json!({
+            "issuer": "https://issuer.example.com",
+            "authorization_endpoint": "https://issuer.example.com/authorize",
+            "token_endpoint": "https://issuer.example.com/token",
+            "code_challenge_methods_supported": ["S256"],
+        });
+        // oauth-as path 404 (path_status), oauth-as root 404 (root_body None),
+        // openid-configuration end-append served.
+        let (base, server) = spawn_as_fixture(
+            axum::http::StatusCode::NOT_FOUND,
+            None,
+            None,
+            None,
+            Some(oidc_meta),
+        )
+        .await;
+
+        let url = format!("{}/oauth2/default", base);
+        let result = discover_authorization_server(&url, true)
+            .await
+            .expect("openid-configuration end-append must succeed");
+        assert_eq!(
+            result.authorization_endpoint,
+            "https://issuer.example.com/authorize"
+        );
+        assert_eq!(result.token_endpoint, "https://issuer.example.com/token");
+        assert_eq!(result.auth_server_url, url);
+
+        server.abort();
+    }
+
+    /// oauth-as path 404 + oauth-as root 404 + openid-configuration end-append
+    /// 404 → openid-configuration root fallback succeeds.
+    #[tokio::test]
+    async fn discover_authorization_server_falls_back_to_openid_configuration_root() {
+        use serde_json::json;
+        let oidc_meta = json!({
+            "issuer": "https://issuer.example.com",
+            "authorization_endpoint": "https://issuer.example.com/authorize",
+            "token_endpoint": "https://issuer.example.com/token",
+            "code_challenge_methods_supported": ["S256"],
+        });
+        // Only the openid-configuration root URL serves metadata.
+        let (base, server) = spawn_as_fixture(
+            axum::http::StatusCode::NOT_FOUND,
+            None,
+            None,
+            Some(oidc_meta),
+            None,
+        )
+        .await;
+
+        let url = format!("{}/oauth2/default", base);
+        let result = discover_authorization_server(&url, true)
+            .await
+            .expect("openid-configuration root fallback must succeed");
+        assert_eq!(
+            result.authorization_endpoint,
+            "https://issuer.example.com/authorize"
+        );
+        assert_eq!(result.token_endpoint, "https://issuer.example.com/token");
+
+        server.abort();
+    }
+
+    // --- client_id_metadata_document_supported parsing + threading -----------
+
+    #[test]
+    fn test_cimd_parses_true_false_absent() {
+        let with_true = r#"{
+            "issuer": "https://auth.example.com",
+            "authorization_endpoint": "https://auth.example.com/authorize",
+            "token_endpoint": "https://auth.example.com/token",
+            "client_id_metadata_document_supported": true
+        }"#;
+        let meta: AuthorizationServerMetadata = serde_json::from_str(with_true).unwrap();
+        assert!(meta.client_id_metadata_document_supported);
+
+        let with_false = r#"{
+            "issuer": "https://auth.example.com",
+            "authorization_endpoint": "https://auth.example.com/authorize",
+            "token_endpoint": "https://auth.example.com/token",
+            "client_id_metadata_document_supported": false
+        }"#;
+        let meta: AuthorizationServerMetadata = serde_json::from_str(with_false).unwrap();
+        assert!(!meta.client_id_metadata_document_supported);
+
+        let absent = r#"{
+            "issuer": "https://auth.example.com",
+            "authorization_endpoint": "https://auth.example.com/authorize",
+            "token_endpoint": "https://auth.example.com/token"
+        }"#;
+        let meta: AuthorizationServerMetadata = serde_json::from_str(absent).unwrap();
+        assert!(!meta.client_id_metadata_document_supported);
+    }
+
+    /// `client_id_metadata_document_supported` is threaded onto `DiscoveryResult`.
+    #[tokio::test]
+    async fn discover_authorization_server_surfaces_cimd_flag() {
+        use serde_json::json;
+        let root_meta = json!({
+            "issuer": "https://example.com",
+            "authorization_endpoint": "https://example.com/authorize",
+            "token_endpoint": "https://example.com/token",
+            "code_challenge_methods_supported": ["S256"],
+            "client_id_metadata_document_supported": true,
+        });
+        let (base, server) = spawn_as_fixture(
+            axum::http::StatusCode::OK,
+            Some(root_meta),
+            None,
+            None,
+            None,
+        )
+        .await;
+
+        let result = discover_authorization_server(&base, true)
+            .await
+            .expect("discovery must succeed");
+        assert!(result.client_id_metadata_document_supported);
+
+        server.abort();
     }
 }
