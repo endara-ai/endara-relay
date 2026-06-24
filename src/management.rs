@@ -22,6 +22,7 @@ use crate::adapter::stdio::{StdioAdapter, StdioConfig};
 use crate::adapter::{FailedAdapter, HealthStatus, McpAdapter, StartingAdapter};
 use crate::config::{Config, ObservabilityConfig};
 use crate::events::ToolCallEventBus;
+use crate::oauth::client::{self, ClientRegistration};
 use crate::oauth::{OAuthFlowManager, OAuthSetupManager, PkceChallenge};
 use crate::observability::payloads::StoredPayloads;
 use crate::observability::store::{AggregateBucket, CallRecord, QueryFilter};
@@ -2089,65 +2090,77 @@ async fn oauth_setup(
         .as_ref()
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let used_dcr = manual_client_id.is_none();
-
-    let dcr_result: Result<(String, Option<String>), String> = if let Some(client_id) =
-        manual_client_id
-    {
-        // Persist manual credentials so future re-auth can find them
-        if let Some(ref tm) = state.token_manager {
-            let creds = DcrCredentials {
-                client_id: client_id.clone(),
-                client_secret: manual_client_secret.clone(),
-                client_secret_expires_at: 0,
-                registered_at: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-                // Manually-supplied credentials are user-managed; not issuer-bound.
-                issuer: None,
-            };
-            if let Err(e) = tm.save_dcr(&body.name, &creds).await {
-                warn!(endpoint = %body.name, error = %e, "Failed to persist manual credentials");
-            }
+    // Resolve client credentials through the shared fallback chain:
+    // explicit manual → pre-registered → CIMD → DCR. The Add Server flow does
+    // not consult stored credentials (always a fresh setup), so `preregistered`
+    // is `None`; an explicit pasted client_id wins, otherwise a CIMD-advertising
+    // AS yields a zero-config public client and DCR is the final fallback.
+    let manual = manual_client_id
+        .clone()
+        .map(|id| (id, manual_client_secret.clone()));
+    let dcr_redirect_uri = redirect_uri.clone();
+    let dcr_endpoint_name = body.name.clone();
+    let resolve_result = client::resolve_client(
+        client::ClientInputs {
+            explicit_manual: manual,
+            preregistered: None,
+            cimd_supported: disc.client_id_metadata_document_supported,
+            registration_endpoint: registration_endpoint.clone(),
+        },
+        |reg_endpoint| async move {
+            let resp = dcr::register_client(
+                &reg_endpoint,
+                &dcr_redirect_uri,
+                &dcr_endpoint_name,
+                allow_insecure_oauth,
+            )
+            .await?;
+            Ok::<_, dcr::DcrError>(client::DcrOutcome {
+                client_id: resp.client_id,
+                client_secret: resp.client_secret,
+                client_secret_expires_at: resp.client_secret_expires_at,
+            })
+        },
+    )
+    .await
+    .map_err(|e| match e {
+        client::ClientResolveError::Dcr(e) => format!("{e}"),
+        client::ClientResolveError::NoCredentials => {
+            "No registration endpoint available".to_string()
         }
-        Ok((client_id, manual_client_secret))
-    } else if let Some(ref reg_endpoint) = registration_endpoint {
-        match dcr::register_client(
-            reg_endpoint,
-            &redirect_uri,
-            &body.name,
-            allow_insecure_oauth,
-        )
-        .await
-        {
-            Ok(resp) => {
-                // Persist DCR credentials for future re-auth
-                if let Some(ref tm) = state.token_manager {
-                    let creds = DcrCredentials {
-                        client_id: resp.client_id.clone(),
-                        client_secret: resp.client_secret.clone(),
-                        client_secret_expires_at: resp.client_secret_expires_at,
-                        registered_at: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                        issuer: Some(issuer.clone()),
-                    };
-                    if let Err(e) = tm.save_dcr(&body.name, &creds).await {
-                        warn!(endpoint = %body.name, error = %e, "Failed to persist DCR credentials");
-                    }
+    });
+
+    match resolve_result {
+        Ok(resolved) => {
+            let client_id = resolved.client_id;
+            let client_secret = resolved.client_secret;
+            let client_registration = resolved.registration;
+            // Only true DCR registration counts as DCR for the response flag;
+            // CIMD and manual paths do not.
+            let used_dcr = matches!(client_registration, ClientRegistration::Dcr);
+
+            // Persist resolved credentials so future re-auth can find them.
+            // Manual creds are user-managed (not issuer-bound); DCR/CIMD creds
+            // are bound to the discovered issuer.
+            if let Some(ref tm) = state.token_manager {
+                let creds = DcrCredentials {
+                    client_id: client_id.clone(),
+                    client_secret: client_secret.clone(),
+                    client_secret_expires_at: resolved.client_secret_expires_at,
+                    registered_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    issuer: match client_registration {
+                        ClientRegistration::Manual => None,
+                        _ => Some(issuer.clone()),
+                    },
+                };
+                if let Err(e) = tm.save_dcr(&body.name, &creds).await {
+                    warn!(endpoint = %body.name, error = %e, "Failed to persist client credentials");
                 }
-                Ok((resp.client_id, resp.client_secret))
             }
-            Err(e) => Err(format!("{e}")),
-        }
-    } else {
-        Err("No registration endpoint available".to_string())
-    };
 
-    match dcr_result {
-        Ok((client_id, client_secret)) => {
             // Store credentials in session
             setup_mgr
                 .get_session_mut(&session_id, |s| {
@@ -2199,6 +2212,12 @@ async fn oauth_setup(
             if !merged_scope.is_empty() {
                 authorize_url.push_str(&format!("&scope={}", urlencoding(&merged_scope)));
             }
+
+            info!(
+                endpoint = %body.name,
+                client_registration = client_registration.as_str(),
+                "OAuth setup: authorize URL composed"
+            );
 
             let discovery_info = OAuthDiscoveryInfo {
                 auth_server: auth_server_url,

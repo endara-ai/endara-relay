@@ -25,6 +25,7 @@ use url::Url;
 
 use super::state::OAuthState;
 use crate::adapter::AdapterError;
+use crate::oauth::client::{self, ClientRegistration, ResolvedClient};
 use crate::oauth::dcr::{self, ClientRegistrationResponse};
 use crate::oauth::discovery::{self, DiscoveryError, DiscoveryResult};
 use crate::oauth::{OAuthFlowManager, PkceChallenge};
@@ -246,9 +247,12 @@ impl JitInterceptor {
 
         let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", self.relay_port);
 
-        let (client_id, client_secret) = self
+        let resolved = self
             .resolve_client(&disc, &redirect_uri, endpoint_name)
             .await?;
+        let client_id = resolved.client_id;
+        let client_secret = resolved.client_secret;
+        let client_registration = resolved.registration;
 
         let pkce = PkceChallenge::generate();
         let code_challenge = pkce.code_challenge.clone();
@@ -306,6 +310,7 @@ impl JitInterceptor {
 
         info!(
             endpoint = %endpoint_name,
+            client_registration = client_registration.as_str(),
             "JIT OAuth self-initiated on upstream 401; authorize URL composed"
         );
         *self.state.write().await = OAuthState::NeedsLogin;
@@ -313,61 +318,97 @@ impl JitInterceptor {
         Ok(authorize_url)
     }
 
-    /// Resolve `(client_id, client_secret)` for the flow: reuse persisted DCR
-    /// credentials when present, otherwise dynamically register. The RETURNED
-    /// auth method/secret is honored (some servers issue a `client_secret`
-    /// even when `none` was requested), and freshly registered credentials are
-    /// persisted when a token manager is available.
+    /// Resolve client credentials for the flow following the shared fallback
+    /// chain **pre-registered → CIMD → DCR** (JIT never supplies a manual
+    /// client_id). Pre-registered creds are reused only when issuer-bound to the
+    /// current AS; when the AS advertises a Client ID Metadata Document, the
+    /// relay authenticates as a zero-config public client (no secret, no DCR).
+    /// Freshly resolved DCR/CIMD credentials are persisted when a token manager
+    /// is available so future refresh / re-auth can find them.
     async fn resolve_client(
         &self,
         disc: &DiscoveryResult,
         redirect_uri: &str,
         endpoint_name: &str,
-    ) -> Result<(String, Option<String>), JitError> {
-        if let Some(ref tm) = self.token_manager {
-            if let Ok(Some(creds)) = tm.load_dcr(endpoint_name).await {
-                // Credential-to-issuer binding: only reuse a stored client_id
-                // with the SAME authorization server that issued it. If the AS
-                // issuer changed, discard and re-register (RFC 7591). Legacy
-                // creds with no stored issuer are reused as-is.
-                if dcr_issuer_allows_reuse(creds.issuer.as_deref(), Some(disc.issuer.as_str())) {
-                    return Ok((creds.client_id, creds.client_secret));
+    ) -> Result<ResolvedClient, JitError> {
+        // Pre-registered (issuer-bound) stored credentials, validated for reuse.
+        let preregistered = if let Some(ref tm) = self.token_manager {
+            match tm.load_dcr(endpoint_name).await {
+                Ok(Some(creds)) => {
+                    // Credential-to-issuer binding: only reuse a stored client_id
+                    // with the SAME authorization server that issued it. If the
+                    // AS issuer changed, discard and fall through (CIMD/DCR).
+                    // Legacy creds with no stored issuer are reused as-is.
+                    if dcr_issuer_allows_reuse(creds.issuer.as_deref(), Some(disc.issuer.as_str()))
+                    {
+                        Some((creds.client_id, creds.client_secret))
+                    } else {
+                        info!(
+                            endpoint = %endpoint_name,
+                            stored_issuer = ?creds.issuer,
+                            current_issuer = %disc.issuer,
+                            "DCR credential issuer changed; discarding stored credentials and re-registering"
+                        );
+                        None
+                    }
                 }
-                info!(
-                    endpoint = %endpoint_name,
-                    stored_issuer = ?creds.issuer,
-                    current_issuer = %disc.issuer,
-                    "DCR credential issuer changed; discarding stored credentials and re-registering"
-                );
+                _ => None,
             }
-        }
-
-        let Some(ref reg_endpoint) = disc.registration_endpoint else {
-            return Err(JitError::NoClientCredentials);
+        } else {
+            None
         };
 
-        let resp: ClientRegistrationResponse = dcr::register_client(
-            reg_endpoint,
-            redirect_uri,
-            endpoint_name,
-            self.allow_insecure_oauth,
+        let allow_insecure = self.allow_insecure_oauth;
+        let resolved = client::resolve_client(
+            client::ClientInputs {
+                explicit_manual: None,
+                preregistered,
+                cimd_supported: disc.client_id_metadata_document_supported,
+                registration_endpoint: disc.registration_endpoint.clone(),
+            },
+            |reg_endpoint| async move {
+                let resp: ClientRegistrationResponse = dcr::register_client(
+                    &reg_endpoint,
+                    redirect_uri,
+                    endpoint_name,
+                    allow_insecure,
+                )
+                .await?;
+                Ok::<_, dcr::DcrError>(client::DcrOutcome {
+                    client_id: resp.client_id,
+                    client_secret: resp.client_secret,
+                    client_secret_expires_at: resp.client_secret_expires_at,
+                })
+            },
         )
-        .await?;
+        .await
+        .map_err(|e| match e {
+            client::ClientResolveError::Dcr(e) => JitError::Dcr(e),
+            client::ClientResolveError::NoCredentials => JitError::NoClientCredentials,
+        })?;
 
-        if let Some(ref tm) = self.token_manager {
-            let creds = DcrCredentials {
-                client_id: resp.client_id.clone(),
-                client_secret: resp.client_secret.clone(),
-                client_secret_expires_at: resp.client_secret_expires_at,
-                registered_at: now_secs(),
-                issuer: Some(disc.issuer.clone()),
-            };
-            if let Err(e) = tm.save_dcr(endpoint_name, &creds).await {
-                warn!(error = %e, "failed to persist JIT-registered DCR credentials");
+        // Persist freshly-resolved credentials (DCR or CIMD) so future refresh /
+        // re-auth can find the client_id. Pre-registered creds are already
+        // stored; CIMD persists the constant client_id as a public client.
+        if matches!(
+            resolved.registration,
+            ClientRegistration::Dcr | ClientRegistration::Cimd
+        ) {
+            if let Some(ref tm) = self.token_manager {
+                let creds = DcrCredentials {
+                    client_id: resolved.client_id.clone(),
+                    client_secret: resolved.client_secret.clone(),
+                    client_secret_expires_at: resolved.client_secret_expires_at,
+                    registered_at: now_secs(),
+                    issuer: Some(disc.issuer.clone()),
+                };
+                if let Err(e) = tm.save_dcr(endpoint_name, &creds).await {
+                    warn!(error = %e, "failed to persist JIT client credentials");
+                }
             }
         }
 
-        Ok((resp.client_id, resp.client_secret))
+        Ok(resolved)
     }
 }
 
@@ -752,6 +793,98 @@ mod tests {
         );
         assert!(q.contains_key("code_challenge"));
         assert!(q.contains_key("scope"));
+
+        server.abort();
+    }
+
+    /// Spawn an OAuth fixture whose AS advertises a Client ID Metadata Document
+    /// (`client_id_metadata_document_supported: true`) and serves NO
+    /// registration endpoint — so any DCR attempt would 404. This makes the
+    /// CIMD path the only way to succeed.
+    async fn spawn_oauth_fixture_cimd() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::extract::State;
+        use axum::routing::get;
+        use axum::{Json, Router};
+
+        async fn protected_resource(State(base): State<String>) -> Json<Value> {
+            Json(json!({
+                "resource": base,
+                "authorization_servers": [base],
+                "bearer_methods_supported": ["header"],
+            }))
+        }
+        async fn auth_server(State(base): State<String>) -> Json<Value> {
+            Json(json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{}/authorize", base),
+                "token_endpoint": format!("{}/token", base),
+                "code_challenge_methods_supported": ["S256"],
+                "scopes_supported": ["read", "write"],
+                "client_id_metadata_document_supported": true,
+            }))
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let router = Router::new()
+            .route(
+                "/.well-known/oauth-protected-resource",
+                get(protected_resource),
+            )
+            .route("/.well-known/oauth-authorization-server", get(auth_server))
+            .with_state(base.clone());
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        (base, handle)
+    }
+
+    /// When the AS advertises CIMD and there is no pre-registered client, the
+    /// authorize URL's `client_id` is the Endara CIMD URL — no DCR is attempted
+    /// (the fixture serves no `/register`), and the pending flow carries no
+    /// client_secret (public client).
+    #[tokio::test]
+    async fn intercept_uses_cimd_client_id_when_advertised() {
+        let (base, server) = spawn_oauth_fixture_cimd().await;
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let interceptor = JitInterceptor::new(9400, flow_mgr.clone(), None, true);
+
+        let www_authenticate = format!(
+            "Bearer resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
+            base
+        );
+        let resource_url = format!("{}/mcp", base);
+
+        let authorize_url = interceptor
+            .intercept(&resource_url, &www_authenticate, "cimd-ep")
+            .await
+            .expect("intercept should self-initiate via CIMD");
+
+        assert_eq!(interceptor.state().await, OAuthState::NeedsLogin);
+
+        let url = Url::parse(&authorize_url).unwrap();
+        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            q.get("client_id").map(String::as_str),
+            Some(client::ENDARA_CLIENT_METADATA_URL)
+        );
+        // The URL-encoded CIMD URL must appear verbatim in the raw query string.
+        assert!(
+            authorize_url
+                .contains("client_id=https%3A%2F%2Fendara.ai%2Foauth%2Fclient-metadata.json"),
+            "got: {}",
+            authorize_url
+        );
+
+        let state_param = q.get("state").expect("state param present").clone();
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending flow registered");
+        assert_eq!(flow.client_id, client::ENDARA_CLIENT_METADATA_URL);
+        assert!(flow.client_secret.is_none(), "CIMD is a public client");
 
         server.abort();
     }
