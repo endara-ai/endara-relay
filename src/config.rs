@@ -954,6 +954,9 @@ pub struct ConfigDiff {
     /// Endpoints present in both but with different settings (name, new config).
     pub changed: Vec<(String, EndpointConfig)>,
     /// Names of endpoints that are identical in both configs.
+    /// Retained for tests (e.g. `tests/hot_reload_integration.rs`); no
+    /// production reader remains after the watcher's unchanged-loop removal.
+    #[allow(dead_code)]
     pub unchanged: Vec<String>,
 }
 

@@ -408,13 +408,6 @@ pub async fn apply_diff(
             .instrument(init_span),
         );
     }
-
-    // Log unchanged
-    for name in &diff.unchanged {
-        let span = tracing::info_span!("endpoint", endpoint = %name);
-        let _g = span.enter();
-        info!("Endpoint unchanged, keeping running");
-    }
 }
 
 /// Like [`apply_diff`] but also handles per-endpoint validation warnings.
@@ -644,13 +637,6 @@ pub async fn apply_diff_graceful(
             }
             .instrument(init_span),
         );
-    }
-
-    // Log unchanged
-    for name in &diff.unchanged {
-        let span = tracing::info_span!("endpoint", endpoint = %name);
-        let _g = span.enter();
-        info!("Endpoint unchanged, keeping running");
     }
 }
 

@@ -963,19 +963,6 @@ async fn handle_single_message(
 
         // Notifications (no `id` field) get 202 Accepted with no body per MCP spec.
         if is_notification {
-            let elapsed_ms = start.elapsed().as_millis() as u64;
-            info!(
-                method = %method,
-                request_uid = %request_uid,
-                elapsed_ms = elapsed_ms,
-                req_bytes = req_bytes,
-                resp_bytes = 0,
-                status = 202,
-                headers = %headers_str,
-                client_name = ?client_name,
-                client_version = ?client_version,
-                "MCP notification"
-            );
             return None;
         }
 
@@ -1109,7 +1096,7 @@ async fn mcp_unified(
 ///
 /// The dispatch is wrapped in an `info_span!("mcp_request", profile = ...)`
 /// so every event emitted while handling the request — including the inner
-/// `request` span's `MCP request` / `MCP notification` lines and any
+/// `request` span's `MCP request` lines and any
 /// adapter-side child spans — inherits the `profile` field. The field key
 /// `profile` is an immutable cross-stack contract with the desktop log
 /// parser (locked decision Cross-stack #1 / engineering-spec §7.1).
