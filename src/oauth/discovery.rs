@@ -47,6 +47,11 @@ pub struct AuthorizationServerMetadata {
     pub token_endpoint_auth_methods_supported: Vec<String>,
     #[serde(default)]
     pub revocation_endpoint: Option<String>,
+    /// Whether the authorization server advertises RFC 9207 authorization-response
+    /// `iss` parameter support. When false/absent, a missing `iss` on the callback
+    /// must not be treated as an error.
+    #[serde(default)]
+    pub authorization_response_iss_parameter_supported: bool,
 }
 
 /// Resolved OAuth server discovery result.
@@ -65,6 +70,9 @@ pub struct DiscoveryResult {
     pub token_endpoint_auth_methods: Vec<String>,
     #[allow(dead_code)]
     pub revocation_endpoint: Option<String>,
+    /// RFC 9207: whether the authorization server advertises support for the
+    /// authorization-response `iss` parameter.
+    pub authorization_response_iss_parameter_supported: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -293,6 +301,8 @@ pub async fn discover_authorization_server(
         code_challenge_methods_supported: as_meta.code_challenge_methods_supported,
         token_endpoint_auth_methods: as_meta.token_endpoint_auth_methods_supported,
         revocation_endpoint: as_meta.revocation_endpoint,
+        authorization_response_iss_parameter_supported: as_meta
+            .authorization_response_iss_parameter_supported,
     })
 }
 

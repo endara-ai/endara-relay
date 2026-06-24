@@ -88,6 +88,10 @@ pub struct PendingFlow {
     /// `None` (e.g. legacy convention-based config without discovery), the
     /// `iss` check is skipped to preserve existing behavior.
     pub issuer: Option<String>,
+    /// RFC 9207: whether the authorization server advertised support for the
+    /// authorization-response `iss` parameter. When `true`, a missing `iss` on
+    /// the callback is rejected; when `false`, a missing `iss` is tolerated.
+    pub iss_parameter_supported: bool,
     pub created_at: Instant,
 }
 
@@ -118,6 +122,7 @@ impl OAuthFlowManager {
         pkce: PkceChallenge,
         redirect_uri: &str,
         issuer: Option<&str>,
+        iss_parameter_supported: bool,
     ) -> String {
         let state = generate_state();
         let flow = PendingFlow {
@@ -128,6 +133,7 @@ impl OAuthFlowManager {
             client_secret: client_secret.map(|s| s.to_string()),
             redirect_uri: redirect_uri.to_string(),
             issuer: issuer.map(|s| s.to_string()),
+            iss_parameter_supported,
             created_at: Instant::now(),
         };
         self.pending.write().await.insert(state.clone(), flow);
@@ -373,6 +379,7 @@ mod tests {
                 pkce,
                 "http://127.0.0.1:9400/oauth/callback",
                 Some("https://auth.example.com"),
+                true,
             )
             .await;
 
@@ -383,6 +390,7 @@ mod tests {
         assert_eq!(flow.client_id, "client123");
         assert_eq!(flow.client_secret.as_deref(), Some("secret"));
         assert_eq!(flow.issuer.as_deref(), Some("https://auth.example.com"));
+        assert!(flow.iss_parameter_supported);
     }
 
     #[tokio::test]
@@ -400,10 +408,12 @@ mod tests {
                 pkce,
                 "http://127.0.0.1:9400/oauth/callback",
                 None,
+                false,
             )
             .await;
         let flow = mgr.consume_flow(&state).await.unwrap();
         assert!(flow.issuer.is_none());
+        assert!(!flow.iss_parameter_supported);
     }
 
     #[tokio::test]
@@ -419,6 +429,7 @@ mod tests {
                 pkce,
                 "http://localhost/cb",
                 None,
+                false,
             )
             .await;
 
@@ -448,6 +459,7 @@ mod tests {
                 pkce,
                 "http://localhost/cb",
                 None,
+                false,
             )
             .await;
 
@@ -478,6 +490,7 @@ mod tests {
                     pkce,
                     "http://localhost/cb",
                     None,
+                    false,
                 )
                 .await;
             let flow = mgr.consume_flow(&state).await.unwrap();
