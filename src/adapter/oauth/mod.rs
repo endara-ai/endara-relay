@@ -1865,6 +1865,35 @@ mod tests {
         }
     }
 
+    /// Wait until the transition history contains a record with `reason`.
+    /// Mirrors `wait_for_calls`: drives virtual time forward in tiny steps
+    /// and yields so the spawned proactive task can record its final
+    /// transition, with a real-time deadline guarding against an actual hang.
+    async fn wait_for_transition_reason(inner: &OAuthAdapterInner, reason: &str) {
+        let real_start = std::time::Instant::now();
+        loop {
+            {
+                let history = inner.transition_history.read().await;
+                if history.iter().any(|r| r.reason == reason) {
+                    return;
+                }
+            }
+            if real_start.elapsed() > std::time::Duration::from_secs(10) {
+                let history = inner.transition_history.read().await;
+                panic!(
+                    "timed out waiting for transition reason {:?}; got: {:?}",
+                    reason,
+                    history
+                        .iter()
+                        .map(|r| (r.from.clone(), r.to.clone(), r.reason.clone()))
+                        .collect::<Vec<_>>()
+                );
+            }
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Spawn an axum token endpoint that always responds 500 and bumps a
     /// shared counter on every request. Used to drive the proactive-refresh
     /// retry path (1st failure + 2nd failure) in
@@ -2093,11 +2122,10 @@ mod tests {
         // Wait for the 2nd refresh attempt.
         wait_for_calls(&calls, 2).await;
 
-        // Yield enough times for the retry block to run its defensive
-        // `transition_to(...)` call after the 2nd Err returns.
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-        }
+        // Deterministically wait for the retry block to run its defensive
+        // `transition_to(...)` call after the 2nd Err returns, instead of a
+        // fixed yield count that races CI scheduling under paused time.
+        wait_for_transition_reason(&adapter.inner, "proactive refresh retry failed").await;
 
         // Both refresh attempts must have actually hit the fake endpoint —
         // not just one. This pins the off-by-one the audit flagged.
