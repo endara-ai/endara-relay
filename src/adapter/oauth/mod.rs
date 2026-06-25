@@ -2084,6 +2084,14 @@ mod tests {
         // 30 s timeout.
         config.url = "http://127.0.0.1:19999/mcp".to_string();
         config.token_endpoint_url = url;
+        // Neutralize the heartbeat for this test: with a 30 s interval the
+        // 61 s virtual-time advance below would tick the heartbeat, which can
+        // attempt recovery from ConnectionFailed via `do_token_refresh` and
+        // add extra hits to the fake 500 endpoint, breaking the `calls == 2`
+        // assertion. A 1 h interval never elapses inside the test's window.
+        // (Avoid u64::MAX: `Duration::from_secs(u64::MAX)` can overflow
+        // tokio's interval.)
+        config.heartbeat_interval_secs = 3600;
         let mut adapter = make_adapter(config);
         adapter.initialize().await.unwrap();
 
