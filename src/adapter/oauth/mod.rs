@@ -2084,16 +2084,18 @@ mod tests {
         // 30 s timeout.
         config.url = "http://127.0.0.1:19999/mcp".to_string();
         config.token_endpoint_url = url;
-        // Neutralize the heartbeat for this test: with a 30 s interval the
-        // 61 s virtual-time advance below would tick the heartbeat, which can
-        // attempt recovery from ConnectionFailed via `do_token_refresh` and
-        // add extra hits to the fake 500 endpoint, breaking the `calls == 2`
-        // assertion. A 1 h interval never elapses inside the test's window.
-        // (Avoid u64::MAX: `Duration::from_secs(u64::MAX)` can overflow
-        // tokio's interval.)
-        config.heartbeat_interval_secs = 3600;
         let mut adapter = make_adapter(config);
         adapter.initialize().await.unwrap();
+
+        // Abort the heartbeat so its recovery-from-ConnectionFailed branch
+        // cannot fire extra do_token_refresh calls and perturb the proactive
+        // refresh call count. (tokio interval's first tick is immediate, so an
+        // interval bump can't isolate this.) Stopping the task keeps the call
+        // count purely from proactive refresh, so the exact == 2 assertion is
+        // valid and can't be masked by a heartbeat-supplied call.
+        if let Some(h) = adapter.inner.heartbeat_task_handle.lock().await.take() {
+            h.abort();
+        }
 
         // Pause time *after* the server is up so the 60 s retry sleep in
         // the proactive task is virtual (we drive it forward with
