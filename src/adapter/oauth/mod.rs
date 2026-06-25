@@ -1865,6 +1865,35 @@ mod tests {
         }
     }
 
+    /// Wait until the transition history contains a record with `reason`.
+    /// Mirrors `wait_for_calls`: drives virtual time forward in tiny steps
+    /// and yields so the spawned proactive task can record its final
+    /// transition, with a real-time deadline guarding against an actual hang.
+    async fn wait_for_transition_reason(inner: &OAuthAdapterInner, reason: &str) {
+        let real_start = std::time::Instant::now();
+        loop {
+            {
+                let history = inner.transition_history.read().await;
+                if history.iter().any(|r| r.reason == reason) {
+                    return;
+                }
+            }
+            if real_start.elapsed() > std::time::Duration::from_secs(10) {
+                let history = inner.transition_history.read().await;
+                panic!(
+                    "timed out waiting for transition reason {:?}; got: {:?}",
+                    reason,
+                    history
+                        .iter()
+                        .map(|r| (r.from.clone(), r.to.clone(), r.reason.clone()))
+                        .collect::<Vec<_>>()
+                );
+            }
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Spawn an axum token endpoint that always responds 500 and bumps a
     /// shared counter on every request. Used to drive the proactive-refresh
     /// retry path (1st failure + 2nd failure) in
@@ -2058,6 +2087,16 @@ mod tests {
         let mut adapter = make_adapter(config);
         adapter.initialize().await.unwrap();
 
+        // Abort the heartbeat so its recovery-from-ConnectionFailed branch
+        // cannot fire extra do_token_refresh calls and perturb the proactive
+        // refresh call count. (tokio interval's first tick is immediate, so an
+        // interval bump can't isolate this.) Stopping the task keeps the call
+        // count purely from proactive refresh, so the exact == 2 assertion is
+        // valid and can't be masked by a heartbeat-supplied call.
+        if let Some(h) = adapter.inner.heartbeat_task_handle.lock().await.take() {
+            h.abort();
+        }
+
         // Pause time *after* the server is up so the 60 s retry sleep in
         // the proactive task is virtual (we drive it forward with
         // `tokio::time::advance`). Setup before this point — TCP listener
@@ -2093,11 +2132,10 @@ mod tests {
         // Wait for the 2nd refresh attempt.
         wait_for_calls(&calls, 2).await;
 
-        // Yield enough times for the retry block to run its defensive
-        // `transition_to(...)` call after the 2nd Err returns.
-        for _ in 0..100 {
-            tokio::task::yield_now().await;
-        }
+        // Deterministically wait for the retry block to run its defensive
+        // `transition_to(...)` call after the 2nd Err returns, instead of a
+        // fixed yield count that races CI scheduling under paused time.
+        wait_for_transition_reason(&adapter.inner, "proactive refresh retry failed").await;
 
         // Both refresh attempts must have actually hit the fake endpoint —
         // not just one. This pins the off-by-one the audit flagged.
