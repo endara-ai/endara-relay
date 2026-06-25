@@ -8,7 +8,7 @@
 use super::super::{AdapterError, HealthStatus, McpAdapter};
 use super::state::OAuthState;
 use super::OAuthAdapterInner;
-use std::sync::Weak;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, trace, warn};
@@ -69,6 +69,57 @@ fn classify_probe_result(
     }
 }
 
+/// What the heartbeat loop should do on a given tick, decided purely from
+/// the current `OAuthState`.
+///
+/// Factored out of `heartbeat_loop` so the per-state dispatch is unit
+/// testable without a real timer (mirrors `classify_probe_result`).
+#[derive(Debug, PartialEq, Eq)]
+enum TickAction {
+    /// `Authenticated`: run the upstream probe + hysteresis.
+    Probe,
+    /// `ConnectionFailed`: attempt a recovery token refresh.
+    Recover,
+    /// `Refreshing` (a refresh is already in flight) or a genuine-auth
+    /// terminal state (`AuthRequired`, `NeedsLogin`, `Disconnected`): do
+    /// nothing this tick.
+    Skip,
+}
+
+/// Decide what the heartbeat loop should do based on the current OAuth state.
+fn classify_tick_action(state: &OAuthState) -> TickAction {
+    match state {
+        OAuthState::Authenticated => TickAction::Probe,
+        OAuthState::ConnectionFailed => TickAction::Recover,
+        OAuthState::Refreshing
+        | OAuthState::AuthRequired
+        | OAuthState::NeedsLogin
+        | OAuthState::Disconnected => TickAction::Skip,
+    }
+}
+
+/// Attempt to recover from `ConnectionFailed` by driving a token refresh.
+///
+/// On success, `apply_tokens` re-initializes the inner adapter, transitions
+/// back to `Authenticated`, and re-arms the proactive-refresh timer. On
+/// failure, `do_token_refresh` has already set the appropriate terminal
+/// state (`ConnectionFailed` / `AuthRequired`), so we do nothing extra and
+/// let the next heartbeat tick try again. The recovery cadence is gated by
+/// the heartbeat interval, so there is no tight retry loop here.
+async fn attempt_recovery(adapter: &Arc<OAuthAdapterInner>) {
+    match adapter.do_token_refresh().await {
+        Ok(tokens) => {
+            adapter.apply_tokens(tokens).await;
+        }
+        Err(e) => {
+            debug!(
+                error = %e,
+                "heartbeat recovery refresh failed; will retry next tick"
+            );
+        }
+    }
+}
+
 /// Probe the inner adapter by sending a `tools/list` JSON-RPC request
 /// with a configurable timeout.
 async fn probe_inner(inner: &OAuthAdapterInner) -> Result<(), ProbeError> {
@@ -113,14 +164,18 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
             return;
         };
 
-        if !matches!(*adapter.state.read().await, OAuthState::Authenticated) {
-            continue;
-        }
-
         let oauth_state = adapter.state.read().await.clone();
-        let result = probe_inner(&adapter).await;
-        let action = classify_probe_result(result, &mut consecutive_failures, threshold);
-        apply_probe_action(&adapter, action, threshold, &oauth_state).await;
+        match classify_tick_action(&oauth_state) {
+            TickAction::Skip => continue,
+            TickAction::Probe => {
+                let result = probe_inner(&adapter).await;
+                let action = classify_probe_result(result, &mut consecutive_failures, threshold);
+                apply_probe_action(&adapter, action, threshold, &oauth_state).await;
+            }
+            TickAction::Recover => {
+                attempt_recovery(&adapter).await;
+            }
+        }
     }
 }
 
@@ -283,6 +338,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn classify_tick_action_maps_each_state() {
+        // Authenticated → probe (existing hysteresis path).
+        assert_eq!(
+            classify_tick_action(&OAuthState::Authenticated),
+            TickAction::Probe
+        );
+        // ConnectionFailed → recovery refresh.
+        assert_eq!(
+            classify_tick_action(&OAuthState::ConnectionFailed),
+            TickAction::Recover
+        );
+        // Refresh in flight and genuine-auth terminal states are skipped:
+        // recovery must NOT be attempted for any of these.
+        for state in [
+            OAuthState::Refreshing,
+            OAuthState::AuthRequired,
+            OAuthState::NeedsLogin,
+            OAuthState::Disconnected,
+        ] {
+            assert_eq!(
+                classify_tick_action(&state),
+                TickAction::Skip,
+                "state {:?} must be skipped (no recovery)",
+                state
+            );
+        }
+    }
+
     // -- End-to-end harness -------------------------------------------------
     //
     // The tests below drive `classify_probe_result` + `apply_probe_action` on
@@ -293,7 +377,7 @@ mod tests {
 
     use crate::adapter::oauth::{OAuthAdapter, OAuthAdapterConfig};
     use crate::adapter::HealthStatus;
-    use crate::token_manager::TokenManager;
+    use crate::token_manager::{TokenManager, TokenSet};
     use std::sync::Arc;
 
     fn make_test_config(threshold: u32) -> OAuthAdapterConfig {
@@ -432,5 +516,136 @@ mod tests {
                 i
             );
         }
+    }
+
+    // -- Recovery-from-ConnectionFailed harness -----------------------------
+    //
+    // These drive `attempt_recovery` (the heartbeat's `TickAction::Recover`
+    // branch) on a real `OAuthAdapterInner` so we observe the live
+    // `do_token_refresh` + `apply_tokens` state transitions, again without a
+    // real timer.
+
+    /// Spawn a token endpoint that always returns a valid refreshed token set.
+    async fn spawn_token_server_success() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handler() -> Json<Value> {
+            Json(json!({
+                "access_token": "recovered-access-token",
+                "token_type": "Bearer",
+                "expires_in": 3600u64,
+                "refresh_token": "recovered-refresh-token",
+            }))
+        }
+
+        let router = Router::new().route("/token", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}/token", addr.port()), handle)
+    }
+
+    /// Spawn a minimal MCP server so `apply_tokens` can re-init the inner
+    /// adapter and reach `Authenticated`.
+    async fn spawn_minimal_mcp_server() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handle(Json(body): Json<Value>) -> Json<Value> {
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            if method == "initialize" {
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "serverInfo": {"name": "test-server", "version": "0.0.1"},
+                    },
+                }))
+            } else {
+                Json(json!({"jsonrpc": "2.0", "id": id, "result": {}}))
+            }
+        }
+
+        let router = Router::new().route("/mcp", post(handle));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}/mcp", addr.port()), handle)
+    }
+
+    /// Build an inner pinned in `ConnectionFailed` with a refresh token, the
+    /// state the heartbeat recovery branch starts from.
+    async fn make_recovery_inner(mcp_url: String, token_url: String) -> Arc<OAuthAdapterInner> {
+        let tmp = tempfile::tempdir().unwrap().keep();
+        let tm = Arc::new(TokenManager::new(tmp));
+        let mut config = make_test_config(3);
+        config.url = mcp_url;
+        config.token_endpoint_url = token_url;
+        let adapter = OAuthAdapter::new(config, tm);
+        let inner = adapter.shared_inner();
+        *inner.tokens.write().await = Some(TokenSet {
+            access_token: "stale-access".to_string(),
+            refresh_token: Some("stale-refresh".to_string()),
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        });
+        *inner.state.write().await = OAuthState::ConnectionFailed;
+        inner
+    }
+
+    #[tokio::test]
+    async fn recovery_refresh_success_returns_to_authenticated() {
+        let (mcp_url, mcp_srv) = spawn_minimal_mcp_server().await;
+        let (token_url, token_srv) = spawn_token_server_success().await;
+        let inner = make_recovery_inner(mcp_url, token_url).await;
+
+        assert_eq!(*inner.state.read().await, OAuthState::ConnectionFailed);
+        attempt_recovery(&inner).await;
+        assert_eq!(
+            *inner.state.read().await,
+            OAuthState::Authenticated,
+            "successful recovery refresh must restore Authenticated via apply_tokens"
+        );
+
+        mcp_srv.abort();
+        token_srv.abort();
+    }
+
+    #[tokio::test]
+    async fn recovery_refresh_failure_stays_connection_failed() {
+        // Unreachable token endpoint (reserved port 1) → network error, so
+        // do_token_refresh transitions back to ConnectionFailed.
+        let inner = make_recovery_inner(
+            "http://127.0.0.1:19997/mcp".to_string(),
+            "http://127.0.0.1:1/token".to_string(),
+        )
+        .await;
+
+        attempt_recovery(&inner).await;
+        assert_eq!(
+            *inner.state.read().await,
+            OAuthState::ConnectionFailed,
+            "failed recovery refresh must remain ConnectionFailed for the next tick"
+        );
+
+        // A subsequent tick must not panic or wedge the loop.
+        attempt_recovery(&inner).await;
+        assert_eq!(
+            *inner.state.read().await,
+            OAuthState::ConnectionFailed,
+            "recovery must keep retrying without wedging"
+        );
     }
 }
