@@ -1684,6 +1684,55 @@ fn oauth_html_response(body: String) -> Response {
         .into_response()
 }
 
+/// Best-effort extraction of the OIDC ID Token expiry (seconds since the Unix
+/// epoch) for an EMA Step-1 capture. Prefers the ID Token's own `exp` claim
+/// (decoded without signature verification — the downstream AS verifies it,
+/// D4/S1), falling back to the token response's `expires_in` relative to
+/// `now_secs`. Returns `None` when neither is available.
+fn idp_id_token_expiry(id_token: &str, token_json: &Value, now_secs: u64) -> Option<u64> {
+    let exp_from_jwt = {
+        let mut parts = id_token.split('.');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some(_header), Some(payload), Some(_sig)) => {
+                use base64::Engine;
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(payload.trim_end_matches('='))
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .and_then(|claims| claims["exp"].as_u64())
+            }
+            _ => None,
+        }
+    };
+    exp_from_jwt.or_else(|| {
+        token_json["expires_in"]
+            .as_u64()
+            .map(|secs| now_secs + secs)
+    })
+}
+
+/// Build an [`IdpCredentials`](crate::token_manager::IdpCredentials) record from
+/// a successful IdP token-endpoint response (EMA Step 1, END-18). Returns `None`
+/// when the response carries no `id_token` — the ID Token is required, so a
+/// missing one is not an IdP SSO the relay can persist.
+fn build_idp_credentials(
+    idp_issuer: &str,
+    token_json: &Value,
+    now_secs: u64,
+) -> Option<crate::token_manager::IdpCredentials> {
+    let id_token = token_json["id_token"].as_str().unwrap_or_default();
+    if id_token.is_empty() {
+        return None;
+    }
+    Some(crate::token_manager::IdpCredentials {
+        idp_issuer: idp_issuer.to_string(),
+        id_token: id_token.to_string(),
+        refresh_token: token_json["refresh_token"].as_str().map(|s| s.to_string()),
+        id_token_expires_at: idp_id_token_expiry(id_token, token_json, now_secs),
+        obtained_at: now_secs,
+    })
+}
+
 /// GET /oauth/callback
 ///
 /// The OAuth authorization server redirects the user's browser here after login.
@@ -1846,6 +1895,34 @@ async fn oauth_callback(
         scope: token_json["scope"].as_str().map(|s| s.to_string()),
         issued_at: Some(now_secs),
     };
+
+    // EMA Step 1 (END-18): when this authorization-code flow was an IdP SSO for
+    // an EMA endpoint, capture the ID Token (plus the IdP refresh token and
+    // ID-Token expiry) and persist it as `IdpCredentials` keyed by the IdP
+    // issuer. Ordinary resource OAuth flows leave `idp_issuer` unset and are
+    // byte-for-byte unaffected by this block.
+    if let Some(ref idp_issuer) = flow.idp_issuer {
+        match build_idp_credentials(idp_issuer, &token_json, now_secs) {
+            Some(creds) => {
+                if let Some(ref tm) = state.token_manager {
+                    if let Err(e) = tm.save_idp(idp_issuer, &creds).await {
+                        error!(idp_issuer = %idp_issuer, error = %e, "Failed to persist IdP credentials");
+                    } else {
+                        info!(
+                            idp_issuer = %idp_issuer,
+                            "Captured and persisted IdP credentials (EMA Step 1)"
+                        );
+                    }
+                }
+            }
+            None => {
+                warn!(
+                    idp_issuer = %idp_issuer,
+                    "IdP token response carried no id_token; skipping IdpCredentials persistence"
+                );
+            }
+        }
+    }
 
     // Check if this is a setup session callback (preflight flow)
     if let Some(session_id_str) = flow.endpoint_name.strip_prefix("setup:") {
@@ -5000,6 +5077,193 @@ mod tests {
             !body_str.contains("issuer mismatch"),
             "missing iss must be tolerated when support is not advertised; body = {body_str}"
         );
+    }
+
+    // --- EMA Step 1 (END-18): ID Token capture & persistence -----------------
+
+    /// Build a compact-JWS ID Token whose claims segment carries the given
+    /// `exp`. Header/signature are placeholders (no signature verification in
+    /// v1 per D4/S1); only the base64url claims payload is decoded.
+    fn id_token_with_exp(exp: u64) -> String {
+        use base64::Engine;
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(format!("{{\"sub\":\"user-1\",\"exp\":{exp}}}"));
+        format!("hdr.{payload}.sig")
+    }
+
+    #[test]
+    fn build_idp_credentials_surfaces_id_token_refresh_and_jwt_exp() {
+        let id_token = id_token_with_exp(1_700_010_000);
+        let token_json = json!({
+            "access_token": "ignored-access",
+            "id_token": id_token,
+            "refresh_token": "idp-refresh",
+            "expires_in": 3600u64,
+        });
+        let creds = build_idp_credentials("https://acme.okta.com", &token_json, 1_700_000_000)
+            .expect("id_token present → credentials built");
+        assert_eq!(creds.idp_issuer, "https://acme.okta.com");
+        assert_eq!(creds.id_token, id_token);
+        assert_eq!(creds.refresh_token.as_deref(), Some("idp-refresh"));
+        // JWT `exp` claim is preferred over `expires_in`.
+        assert_eq!(creds.id_token_expires_at, Some(1_700_010_000));
+        assert_eq!(creds.obtained_at, 1_700_000_000);
+    }
+
+    #[test]
+    fn build_idp_credentials_falls_back_to_expires_in_without_jwt_exp() {
+        // An opaque (non-JWT) id_token has no decodable `exp`; expiry derives
+        // from `expires_in` relative to `now_secs`.
+        let token_json = json!({
+            "id_token": "opaque-id-token",
+            "expires_in": 3600u64,
+        });
+        let creds = build_idp_credentials("https://acme.okta.com", &token_json, 1_700_000_000)
+            .expect("id_token present → credentials built");
+        assert_eq!(creds.id_token_expires_at, Some(1_700_003_600));
+        assert!(creds.refresh_token.is_none());
+    }
+
+    #[test]
+    fn build_idp_credentials_returns_none_without_id_token() {
+        let token_json = json!({
+            "access_token": "only-access",
+            "refresh_token": "r",
+            "expires_in": 3600u64,
+        });
+        assert!(build_idp_credentials("https://acme.okta.com", &token_json, 1).is_none());
+    }
+
+    /// Spawn a mock IdP token endpoint that always returns `body` (a JSON
+    /// string) with HTTP 200, mirroring the OAuth fixtures elsewhere.
+    async fn spawn_idp_token_endpoint(body: String) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Router};
+        let router = Router::new().route(
+            "/token",
+            post(move || {
+                let b = body.clone();
+                async move { b }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}/token", addr.port()), handle)
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_ema_flow_persists_idp_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+
+        let id_token = id_token_with_exp(1_900_000_000);
+        let body = json!({
+            "access_token": "as-access",
+            "id_token": id_token,
+            "refresh_token": "idp-refresh",
+            "token_type": "Bearer",
+            "expires_in": 3600u64,
+        })
+        .to_string();
+        let (token_endpoint, _server) = spawn_idp_token_endpoint(body).await;
+
+        let pkce = crate::oauth::PkceChallenge::generate();
+        let idp_issuer = "https://acme.okta.com";
+        let state_param = flow_mgr
+            .start_idp_flow(
+                "github-acme",
+                &token_endpoint,
+                "client123",
+                None,
+                pkce,
+                "http://127.0.0.1:9400/oauth/callback",
+                None,
+                false,
+                idp_issuer,
+            )
+            .await;
+
+        let mut app_state = test_app_state();
+        app_state.oauth_flow_manager = Some(flow_mgr);
+        app_state.token_manager = Some(tm.clone());
+
+        let params = OAuthCallbackParams {
+            code: Some("authcode".to_string()),
+            state: Some(state_param),
+            error: None,
+            iss: None,
+        };
+        let resp = oauth_callback(State(app_state), Query(params)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let creds = tm
+            .load_idp(idp_issuer)
+            .await
+            .unwrap()
+            .expect("EMA SSO must persist IdpCredentials");
+        assert_eq!(creds.idp_issuer, idp_issuer);
+        assert_eq!(creds.id_token, id_token);
+        assert_eq!(creds.refresh_token.as_deref(), Some("idp-refresh"));
+        assert_eq!(creds.id_token_expires_at, Some(1_900_000_000));
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_non_ema_flow_writes_no_idp_credentials() {
+        // A regular resource OAuth flow (`start_flow`, no idp marker) must NOT
+        // create any IdP-credential file — non-EMA flows are unaffected.
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+
+        let body = json!({
+            "access_token": "as-access",
+            "id_token": "should-be-ignored",
+            "refresh_token": "resource-refresh",
+            "token_type": "Bearer",
+            "expires_in": 3600u64,
+        })
+        .to_string();
+        let (token_endpoint, _server) = spawn_idp_token_endpoint(body).await;
+
+        let pkce = crate::oauth::PkceChallenge::generate();
+        let state_param = flow_mgr
+            .start_flow(
+                "regular-ep",
+                &token_endpoint,
+                "client123",
+                None,
+                pkce,
+                "http://127.0.0.1:9400/oauth/callback",
+                None,
+                false,
+            )
+            .await;
+
+        let mut app_state = test_app_state();
+        app_state.oauth_flow_manager = Some(flow_mgr);
+        app_state.token_manager = Some(tm.clone());
+
+        let params = OAuthCallbackParams {
+            code: Some("authcode".to_string()),
+            state: Some(state_param),
+            error: None,
+            iss: None,
+        };
+        let resp = oauth_callback(State(app_state), Query(params)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // No IdP credentials were keyed off the (ignored) id_token issuer.
+        assert!(tm
+            .load_idp("https://acme.okta.com")
+            .await
+            .unwrap()
+            .is_none());
+        // But the ordinary access token was still saved for the endpoint.
+        assert!(tm.load("regular-ep").await.unwrap().is_some());
     }
 
     // --- /mcp/sse + initialize tools.listChanged capability ---
