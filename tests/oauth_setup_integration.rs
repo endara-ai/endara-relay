@@ -55,6 +55,7 @@ fn empty_config() -> Config {
             auth: None,
         }],
         profiles: None,
+        organizations: Vec::new(),
     }
 }
 

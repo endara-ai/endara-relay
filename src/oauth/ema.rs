@@ -106,23 +106,27 @@ fn build_id_jag_exchange_form(id_token: &str, resource_as_issuer: &str, resource
 
 /// Build the RFC 7523 jwt-bearer form body for the ID-JAG → access-token leg
 /// (M7). No client secret is sent: the relay is a public client identified by
-/// its CIMD `client_id`.
-fn build_jwt_bearer_form(id_jag: &str) -> String {
+/// `client_id` — the org's pre-registered id when present, else the hosted CIMD
+/// `client_id` ([`ENDARA_CLIENT_METADATA_URL`]) when `None`.
+fn build_jwt_bearer_form(id_jag: &str, client_id: Option<&str>) -> String {
+    let client_id = client_id.unwrap_or(ENDARA_CLIENT_METADATA_URL);
     url::form_urlencoded::Serializer::new(String::new())
         .append_pair("grant_type", GRANT_TYPE_JWT_BEARER)
         .append_pair("assertion", id_jag)
-        .append_pair("client_id", ENDARA_CLIENT_METADATA_URL)
+        .append_pair("client_id", client_id)
         .finish()
 }
 
 /// Build the OIDC `refresh_token` grant body used to mint a fresh ID Token at
-/// the IdP (M9). The relay is a public client identified by its CIMD
-/// `client_id`; no secret is sent.
-fn build_refresh_token_form(refresh_token: &str) -> String {
+/// the IdP (M9). The relay is a public client identified by `client_id` — the
+/// org's pre-registered id when present, else the hosted CIMD `client_id`
+/// ([`ENDARA_CLIENT_METADATA_URL`]) when `None`; no secret is sent.
+fn build_refresh_token_form(refresh_token: &str, client_id: Option<&str>) -> String {
+    let client_id = client_id.unwrap_or(ENDARA_CLIENT_METADATA_URL);
     url::form_urlencoded::Serializer::new(String::new())
         .append_pair("grant_type", GRANT_TYPE_REFRESH_TOKEN)
         .append_pair("refresh_token", refresh_token)
-        .append_pair("client_id", ENDARA_CLIENT_METADATA_URL)
+        .append_pair("client_id", client_id)
         .append_pair("scope", REFRESH_SCOPE)
         .finish()
 }
@@ -218,9 +222,10 @@ pub async fn redeem_id_jag(
     as_token_endpoint: &str,
     id_jag: &str,
     allow_insecure: bool,
+    client_id: Option<&str>,
 ) -> Result<TokenSet, EmaError> {
     let client = url_guard::validated_client(as_token_endpoint, allow_insecure).await?;
-    let form_body = build_jwt_bearer_form(id_jag);
+    let form_body = build_jwt_bearer_form(id_jag, client_id);
 
     let resp = client
         .post(as_token_endpoint)
@@ -382,9 +387,10 @@ async fn refresh_idp_token(
     idp_token_endpoint: &str,
     refresh_token: &str,
     allow_insecure: bool,
+    client_id: Option<&str>,
 ) -> Result<RefreshedIdToken, EmaError> {
     let client = url_guard::validated_client(idp_token_endpoint, allow_insecure).await?;
-    let form_body = build_refresh_token_form(refresh_token);
+    let form_body = build_refresh_token_form(refresh_token, client_id);
 
     let resp = client
         .post(idp_token_endpoint)
@@ -457,6 +463,7 @@ async fn refresh_and_persist_idp_token(
     idp_key: &str,
     creds: &IdpCredentials,
     allow_insecure: bool,
+    client_id: Option<&str>,
 ) -> Result<String, EmaError> {
     let refresh_token = creds
         .refresh_token
@@ -465,7 +472,7 @@ async fn refresh_and_persist_idp_token(
             reason: "ID Token expired and no IdP refresh token is stored".to_string(),
         })?;
 
-    let refreshed = refresh_idp_token(idp_token_endpoint, refresh_token, allow_insecure)
+    let refreshed = refresh_idp_token(idp_token_endpoint, refresh_token, allow_insecure, client_id)
         .await
         .map_err(|e| EmaError::ReauthRequired {
             reason: format!("IdP refresh-token grant failed: {e}"),
@@ -517,6 +524,7 @@ pub async fn ensure_access_token(
     as_token_endpoint: &str,
     resource: &str,
     allow_insecure: bool,
+    client_id: Option<&str>,
 ) -> Result<TokenSet, EmaError> {
     // Fast path: a still-valid persisted token needs neither lock nor network.
     if let Some(ts) = load_token(token_manager, endpoint).await? {
@@ -554,6 +562,7 @@ pub async fn ensure_access_token(
             idp_key,
             &creds,
             allow_insecure,
+            client_id,
         )
         .await?;
         refreshed = true;
@@ -578,6 +587,7 @@ pub async fn ensure_access_token(
                 idp_key,
                 &creds,
                 allow_insecure,
+                client_id,
             )
             .await?;
             exchange_for_id_jag(
@@ -594,7 +604,7 @@ pub async fn ensure_access_token(
 
     // M6 claim validation, then Step 3 (RFC 7523) → access token.
     validate_id_jag(&id_jag, &idp_issuer, as_issuer, resource)?;
-    let token_set = redeem_id_jag(as_token_endpoint, &id_jag, allow_insecure).await?;
+    let token_set = redeem_id_jag(as_token_endpoint, &id_jag, allow_insecure, client_id).await?;
     token_manager
         .save(endpoint, &token_set)
         .await
@@ -667,7 +677,7 @@ mod tests {
 
     #[test]
     fn jwt_bearer_form_has_exact_rfc7523_params_and_no_secret() {
-        let body = build_jwt_bearer_form("the-id-jag");
+        let body = build_jwt_bearer_form("the-id-jag", None);
         let f = parse_form(&body);
         assert_eq!(
             f.get("grant_type").map(String::as_str),
@@ -683,6 +693,59 @@ mod tests {
             "public client must not send a secret"
         );
         assert_eq!(f.len(), 3, "exactly three params, no extras");
+    }
+
+    /// An explicit org `client_id` is sent verbatim on the Step 3 jwt-bearer
+    /// form; `None` keeps the hosted CIMD `client_id`.
+    #[test]
+    fn jwt_bearer_form_client_id_some_vs_none() {
+        let with_explicit = build_jwt_bearer_form("the-id-jag", Some("org-okta-client"));
+        let f = parse_form(&with_explicit);
+        assert_eq!(
+            f.get("client_id").map(String::as_str),
+            Some("org-okta-client")
+        );
+        assert!(!f.contains_key("client_secret"));
+        assert_eq!(f.len(), 3, "exactly three params, no extras");
+
+        let with_none = build_jwt_bearer_form("the-id-jag", None);
+        let f = parse_form(&with_none);
+        assert_eq!(
+            f.get("client_id").map(String::as_str),
+            Some(ENDARA_CLIENT_METADATA_URL)
+        );
+    }
+
+    /// An explicit org `client_id` is sent verbatim on the IdP refresh form;
+    /// `None` keeps the hosted CIMD `client_id`. `scope` and absence of a secret
+    /// are preserved in both cases.
+    #[test]
+    fn refresh_token_form_client_id_some_vs_none() {
+        let with_explicit = build_refresh_token_form("the-refresh", Some("org-okta-client"));
+        let f = parse_form(&with_explicit);
+        assert_eq!(
+            f.get("grant_type").map(String::as_str),
+            Some("refresh_token")
+        );
+        assert_eq!(
+            f.get("refresh_token").map(String::as_str),
+            Some("the-refresh")
+        );
+        assert_eq!(
+            f.get("client_id").map(String::as_str),
+            Some("org-okta-client")
+        );
+        assert_eq!(f.get("scope").map(String::as_str), Some(REFRESH_SCOPE));
+        assert!(!f.contains_key("client_secret"));
+        assert_eq!(f.len(), 4, "exactly four params, no extras");
+
+        let with_none = build_refresh_token_form("the-refresh", None);
+        let f = parse_form(&with_none);
+        assert_eq!(
+            f.get("client_id").map(String::as_str),
+            Some(ENDARA_CLIENT_METADATA_URL)
+        );
+        assert_eq!(f.get("scope").map(String::as_str), Some(REFRESH_SCOPE));
     }
 
     // ---- M6: ID-JAG validation -----------------------------------------------
@@ -1002,6 +1065,7 @@ mod tests {
             "http://127.0.0.1:1/as/token",
             RESOURCE,
             true,
+            None,
         )
         .await
         .expect("valid cached token must be returned");
@@ -1026,7 +1090,7 @@ mod tests {
         let lock = Mutex::new(());
 
         let ts = ensure_access_token(
-            &mgr, &lock, "ep", IDP_ISS, &idp_ep, AS_ISS, &as_ep, RESOURCE, true,
+            &mgr, &lock, "ep", IDP_ISS, &idp_ep, AS_ISS, &as_ep, RESOURCE, true, None,
         )
         .await
         .expect("chain must succeed");
@@ -1065,7 +1129,7 @@ mod tests {
         let lock = Mutex::new(());
 
         let ts = ensure_access_token(
-            &mgr, &lock, "ep", IDP_ISS, &idp_ep, AS_ISS, &as_ep, RESOURCE, true,
+            &mgr, &lock, "ep", IDP_ISS, &idp_ep, AS_ISS, &as_ep, RESOURCE, true, None,
         )
         .await
         .expect("refresh then chain must succeed");
@@ -1110,7 +1174,7 @@ mod tests {
         let lock = Mutex::new(());
 
         let ts = ensure_access_token(
-            &mgr, &lock, "ep", IDP_ISS, &idp_ep, AS_ISS, &as_ep, RESOURCE, true,
+            &mgr, &lock, "ep", IDP_ISS, &idp_ep, AS_ISS, &as_ep, RESOURCE, true, None,
         )
         .await
         .expect("reactive refresh then retry must succeed");
@@ -1143,7 +1207,7 @@ mod tests {
         let lock = Mutex::new(());
 
         let err = ensure_access_token(
-            &mgr, &lock, "ep", IDP_ISS, &idp_ep, AS_ISS, &as_ep, RESOURCE, true,
+            &mgr, &lock, "ep", IDP_ISS, &idp_ep, AS_ISS, &as_ep, RESOURCE, true, None,
         )
         .await
         .unwrap_err();
@@ -1175,6 +1239,7 @@ mod tests {
             "http://127.0.0.1:1/as/token",
             RESOURCE,
             true,
+            None,
         )
         .await
         .unwrap_err();
@@ -1201,6 +1266,7 @@ mod tests {
             "http://127.0.0.1:1/as/token",
             RESOURCE,
             true,
+            None,
         )
         .await
         .unwrap_err();
@@ -1234,7 +1300,7 @@ mod tests {
             let as_ep = as_ep.clone();
             handles.push(tokio::spawn(async move {
                 ensure_access_token(
-                    &mgr, &lock, "ep", IDP_ISS, &idp_ep, AS_ISS, &as_ep, RESOURCE, true,
+                    &mgr, &lock, "ep", IDP_ISS, &idp_ep, AS_ISS, &as_ep, RESOURCE, true, None,
                 )
                 .await
             }));

@@ -21,13 +21,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use axum::extract::State;
 use axum::http::{header::AUTHORIZATION, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use serde_json::{json, Value};
 
 use endara_relay::adapter::oauth::{EmaConfig, OAuthAdapter, OAuthAdapterConfig, OAuthState};
 use endara_relay::adapter::McpAdapter;
+use endara_relay::config::{Config, ConfigOrganization, RelayConfig};
+use endara_relay::management::{management_routes, ManagementState};
+use endara_relay::registry::AdapterRegistry;
 use endara_relay::token_manager::{IdpCredentials, TokenManager, TokenSet};
 
 /// Logical IdP issuer (also the IdP-credential store key in v1).
@@ -276,6 +279,7 @@ fn ema_config(urls: &FxUrls) -> OAuthAdapterConfig {
             as_issuer: AS_ISS.to_string(),
             as_token_endpoint: urls.as_token_endpoint.clone(),
             resource: RESOURCE.to_string(),
+            client_id: None,
         }),
     }
 }
@@ -572,4 +576,402 @@ async fn concurrent_refreshes_coalesce_into_single_exchange() {
     assert_eq!(c.redeem, 1, "coalesced: exactly one Step 3");
     drop(c);
     server.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Wave 2 (END-19) credential pooling: two EMA endpoints that reference the same
+// org share ONE pooled IdP credential, keyed by the org name (`idp_key`) rather
+// than the issuer. A single `.idp.json` drives both adapters' EMA chains; each
+// persists its OWN resource `TokenSet` under its own endpoint name.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn org_pool_two_endpoints_share_one_idp_credential() {
+    const ORG_KEY: &str = "Acme Corp";
+
+    let state = fx(RefreshOutcome::Fail, "good-id-token");
+    let (urls, server) = spawn_ema_fixture(state.clone()).await;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+
+    // ONE IdP credential, saved under the ORG key (not the raw issuer). Its
+    // `idp_issuer` remains the real issuer URL the EMA chain validates against.
+    tm.save_idp(
+        ORG_KEY,
+        &idp_creds("good-id-token", Some(now_unix() + 3600), None),
+    )
+    .await
+    .unwrap();
+
+    // Two endpoints in the same org: distinct endpoint names, same pooled key.
+    let mut cfg_a = ema_config(&urls);
+    cfg_a.endpoint_name = "github-acme".to_string();
+    cfg_a.ema.as_mut().unwrap().idp_key = ORG_KEY.to_string();
+    let mut cfg_b = ema_config(&urls);
+    cfg_b.endpoint_name = "jira-acme".to_string();
+    cfg_b.ema.as_mut().unwrap().idp_key = ORG_KEY.to_string();
+
+    let mut adapter_a = OAuthAdapter::new(cfg_a, tm.clone());
+    let mut adapter_b = OAuthAdapter::new(cfg_b, tm.clone());
+    adapter_a.initialize().await.unwrap();
+    adapter_b.initialize().await.unwrap();
+
+    assert_eq!(
+        *adapter_a.shared_inner().state.read().await,
+        OAuthState::Authenticated
+    );
+    assert_eq!(
+        *adapter_b.shared_inner().state.read().await,
+        OAuthState::Authenticated
+    );
+
+    // Each endpoint persisted its OWN resource TokenSet from the shared cred...
+    let tok_a = tm
+        .load("github-acme")
+        .await
+        .unwrap()
+        .expect("endpoint A token");
+    let tok_b = tm
+        .load("jira-acme")
+        .await
+        .unwrap()
+        .expect("endpoint B token");
+    assert!(tok_a.is_valid() && tok_b.is_valid());
+    assert_ne!(
+        tok_a.access_token, tok_b.access_token,
+        "two endpoints mint distinct resource access tokens"
+    );
+
+    // ...from the SINGLE pooled IdP credential: exactly one `.idp.json` on disk,
+    // resolvable by the org key.
+    let idp_file_count = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".idp.json"))
+        .count();
+    assert_eq!(
+        idp_file_count, 1,
+        "org pool must use exactly one IdP credential file"
+    );
+    assert!(
+        tm.load_idp(ORG_KEY).await.unwrap().is_some(),
+        "the pooled credential resolves by org key"
+    );
+
+    server.abort();
+}
+
+// ---------------------------------------------------------------------------
+// Wave 4 (END-19): EMA capability-probe API.
+//
+// `POST /api/organizations/{org}/probe` runs, per desktop-supplied resource,
+// RFC 9728 → 8414 discovery + an RFC 8693 ID-JAG exchange against the org IdP
+// and maps the outcome to accessible / denied / unreachable. These tests drive
+// the real management router (served over TCP, exercised with `reqwest`) against
+// a combined discovery + IdP-token mock, and pin the "persist nothing" rule.
+// ---------------------------------------------------------------------------
+
+/// Mock state for the probe fixture: counts ID-JAG exchange hits and selects a
+/// granting vs. denying IdP token endpoint.
+#[derive(Clone)]
+struct ProbeFx {
+    /// Number of RFC 8693 token-exchange (ID-JAG) hits on `/token`.
+    exchange: Arc<AtomicU64>,
+    /// When true, `/token` returns HTTP 400 `access_denied` (→ denied).
+    deny: bool,
+}
+
+/// Build a mock origin issuer from the request `Host` header so the AS metadata
+/// advertises an issuer matching its own origin (RFC 8414 §3.3), exactly like
+/// the management-layer org mocks.
+fn probe_mock_issuer(headers: &HeaderMap) -> String {
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("127.0.0.1");
+    format!("http://{host}")
+}
+
+/// Spawn a single-origin mock that serves RFC 9728 protected-resource metadata,
+/// RFC 8414 AS metadata (used for BOTH the resource AS and the org IdP issuer),
+/// and the IdP token-exchange endpoint. Returns its base URL and task handle.
+async fn spawn_probe_fixture(fx: ProbeFx) -> (String, tokio::task::JoinHandle<()>) {
+    async fn protected_resource(headers: HeaderMap) -> Response {
+        let issuer = probe_mock_issuer(&headers);
+        Json(json!({
+            "resource": issuer,
+            "authorization_servers": [issuer],
+        }))
+        .into_response()
+    }
+    async fn auth_server(headers: HeaderMap) -> Response {
+        let issuer = probe_mock_issuer(&headers);
+        Json(json!({
+            "issuer": issuer,
+            "authorization_endpoint": format!("{issuer}/authorize"),
+            "token_endpoint": format!("{issuer}/token"),
+            "code_challenge_methods_supported": ["S256"],
+        }))
+        .into_response()
+    }
+    async fn token(State(fx): State<ProbeFx>, _body: String) -> Response {
+        fx.exchange.fetch_add(1, Ordering::SeqCst);
+        if fx.deny {
+            return (
+                StatusCode::BAD_REQUEST,
+                r#"{"error":"access_denied","error_description":"group not entitled"}"#,
+            )
+                .into_response();
+        }
+        // The probe discards the ID-JAG, so any structural token works.
+        Json(json!({ "access_token": make_jwt(json!({"sub": "u"})) })).into_response()
+    }
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let router = Router::new()
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(protected_resource),
+        )
+        .route("/.well-known/oauth-authorization-server", get(auth_server))
+        .route("/token", post(token))
+        .with_state(fx);
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, router).await.ok();
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (base, handle)
+}
+
+/// Build a `ManagementState` with one organization (`Acme`, IdP issuer
+/// `idp_issuer`) and a token manager rooted at `token_dir`, with insecure
+/// (loopback) OAuth permitted so the mock fixtures pass the SSRF guard.
+fn probe_management_state(
+    idp_issuer: &str,
+    token_dir: std::path::PathBuf,
+) -> (ManagementState, Arc<TokenManager>) {
+    let tm = Arc::new(TokenManager::new(token_dir));
+    let cfg = Config {
+        relay: RelayConfig {
+            allow_insecure_oauth: Some(true),
+            ..Default::default()
+        },
+        endpoints: Vec::new(),
+        profiles: None,
+        organizations: vec![ConfigOrganization {
+            name: "Acme".to_string(),
+            provider: "custom".to_string(),
+            idp: idp_issuer.to_string(),
+            client_id: None,
+        }],
+    };
+    let state = ManagementState {
+        registry: Arc::new(AdapterRegistry::new()),
+        config: Arc::new(tokio::sync::RwLock::new(cfg)),
+        start_time: std::time::Instant::now(),
+        config_path: None,
+        oauth_flow_manager: None,
+        relay_port: 9400,
+        oauth_adapter_inners: None,
+        token_manager: Some(tm.clone()),
+        setup_manager: None,
+        profile_registry: None,
+        event_bus: None,
+    };
+    (state, tm)
+}
+
+/// Serve `management_routes` over an ephemeral TCP port and return its base URL.
+async fn serve_management(state: ManagementState) -> (String, tokio::task::JoinHandle<()>) {
+    let app = management_routes(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (base, handle)
+}
+
+/// Seed the org-keyed pooled IdP credential (Wave 2) the probe loads.
+async fn seed_org_idp(tm: &TokenManager, idp_issuer: &str) {
+    tm.save_idp(
+        "Acme",
+        &IdpCredentials {
+            idp_issuer: idp_issuer.to_string(),
+            id_token: "good-id-token".to_string(),
+            refresh_token: None,
+            id_token_expires_at: Some(now_unix() + 3600),
+            obtained_at: now_unix(),
+        },
+    )
+    .await
+    .unwrap();
+}
+
+/// POST a probe request and return the parsed JSON body.
+async fn post_probe(mgmt_base: &str, resources: &[&str]) -> Value {
+    let resp = reqwest::Client::new()
+        .post(format!("{mgmt_base}/api/organizations/Acme/probe"))
+        .json(&json!({ "resources": resources }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "probe must return 200"
+    );
+    resp.json().await.unwrap()
+}
+
+#[tokio::test]
+async fn ema_probe_accessible_when_idp_grants() {
+    let fx = ProbeFx {
+        exchange: Arc::new(AtomicU64::new(0)),
+        deny: false,
+    };
+    let (base, fixture) = spawn_probe_fixture(fx).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, tm) = probe_management_state(&base, tmp.path().to_path_buf());
+    seed_org_idp(&tm, &base).await;
+    let (mgmt, server) = serve_management(state).await;
+
+    let body = post_probe(&mgmt, &[&base]).await;
+    let results = body["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["resource"], base);
+    assert_eq!(results[0]["status"], "accessible");
+    assert_eq!(results[0]["server_as_issuer"], base);
+
+    server.abort();
+    fixture.abort();
+}
+
+#[tokio::test]
+async fn ema_probe_denied_on_access_denied() {
+    let fx = ProbeFx {
+        exchange: Arc::new(AtomicU64::new(0)),
+        deny: true,
+    };
+    let (base, fixture) = spawn_probe_fixture(fx).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, tm) = probe_management_state(&base, tmp.path().to_path_buf());
+    seed_org_idp(&tm, &base).await;
+    let (mgmt, server) = serve_management(state).await;
+
+    let body = post_probe(&mgmt, &[&base]).await;
+    let results = body["results"].as_array().expect("results array");
+    assert_eq!(results[0]["status"], "denied");
+    // Discovery succeeded, so the resource AS issuer is still reported.
+    assert_eq!(results[0]["server_as_issuer"], base);
+
+    server.abort();
+    fixture.abort();
+}
+
+#[tokio::test]
+async fn ema_probe_unreachable_on_discovery_failure() {
+    // The org IdP fixture is reachable (so IdP discovery resolves), but the
+    // probed resource points at a dead loopback port: discovery fails.
+    let fx = ProbeFx {
+        exchange: Arc::new(AtomicU64::new(0)),
+        deny: false,
+    };
+    let (base, fixture) = spawn_probe_fixture(fx.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, tm) = probe_management_state(&base, tmp.path().to_path_buf());
+    seed_org_idp(&tm, &base).await;
+    let (mgmt, server) = serve_management(state).await;
+
+    let body = post_probe(&mgmt, &["http://127.0.0.1:1/mcp"]).await;
+    let results = body["results"].as_array().expect("results array");
+    assert_eq!(results[0]["status"], "unreachable");
+    assert!(
+        results[0].get("server_as_issuer").is_none(),
+        "discovery failed, so no AS issuer is known"
+    );
+    assert_eq!(
+        fx.exchange.load(Ordering::SeqCst),
+        0,
+        "a discovery failure must never reach the ID-JAG exchange"
+    );
+
+    server.abort();
+    fixture.abort();
+}
+
+#[tokio::test]
+async fn ema_probe_persists_no_token_files() {
+    let fx = ProbeFx {
+        exchange: Arc::new(AtomicU64::new(0)),
+        deny: false,
+    };
+    let (base, fixture) = spawn_probe_fixture(fx).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, tm) = probe_management_state(&base, tmp.path().to_path_buf());
+    seed_org_idp(&tm, &base).await;
+    let (mgmt, server) = serve_management(state).await;
+
+    let body = post_probe(&mgmt, &[&base]).await;
+    assert_eq!(body["results"][0]["status"], "accessible");
+
+    // A probe mints an ID-JAG then discards it: NO access-token files are
+    // written, and the only credential file is the seeded org `.idp.json`.
+    let entries: Vec<String> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    let token_files = entries
+        .iter()
+        .filter(|n| n.ends_with(".token.json"))
+        .count();
+    let idp_files = entries.iter().filter(|n| n.ends_with(".idp.json")).count();
+    assert_eq!(
+        token_files, 0,
+        "a probe must not persist any resource access-token files, found: {entries:?}"
+    );
+    assert_eq!(
+        idp_files, 1,
+        "only the pre-seeded org IdP credential should exist, found: {entries:?}"
+    );
+
+    server.abort();
+    fixture.abort();
+}
+
+#[tokio::test]
+async fn ema_probe_cache_hit_skips_second_exchange() {
+    let fx = ProbeFx {
+        exchange: Arc::new(AtomicU64::new(0)),
+        deny: false,
+    };
+    let (base, fixture) = spawn_probe_fixture(fx.clone()).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let (state, tm) = probe_management_state(&base, tmp.path().to_path_buf());
+    seed_org_idp(&tm, &base).await;
+    let (mgmt, server) = serve_management(state).await;
+
+    let first = post_probe(&mgmt, &[&base]).await;
+    assert_eq!(first["results"][0]["status"], "accessible");
+    assert_eq!(
+        fx.exchange.load(Ordering::SeqCst),
+        1,
+        "first probe runs exactly one ID-JAG exchange"
+    );
+
+    // Second probe of the same (org, resource) within the TTL is served from
+    // cache: the ID-JAG exchange is NOT re-run.
+    let second = post_probe(&mgmt, &[&base]).await;
+    assert_eq!(second["results"][0]["status"], "accessible");
+    assert_eq!(
+        fx.exchange.load(Ordering::SeqCst),
+        1,
+        "cache hit within TTL must skip the re-exchange"
+    );
+
+    server.abort();
+    fixture.abort();
 }

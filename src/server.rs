@@ -1902,14 +1902,24 @@ async fn oauth_callback(
     // issuer. Ordinary resource OAuth flows leave `idp_issuer` unset and are
     // byte-for-byte unaffected by this block.
     if let Some(ref idp_issuer) = flow.idp_issuer {
+        // Wave 2: persist under the credential-pool key (org name for END-19, or
+        // the issuer URL for bare END-18 endpoints), so all of an org's EMA
+        // endpoints share one ID token. The credentials still carry the real
+        // `idp_issuer` (used for discovery + ID-JAG validation). Older flows
+        // without a key fall back to the issuer to preserve existing behavior.
+        let credential_key = flow
+            .idp_credential_key
+            .as_deref()
+            .unwrap_or(idp_issuer.as_str());
         match build_idp_credentials(idp_issuer, &token_json, now_secs) {
             Some(creds) => {
                 if let Some(ref tm) = state.token_manager {
-                    if let Err(e) = tm.save_idp(idp_issuer, &creds).await {
-                        error!(idp_issuer = %idp_issuer, error = %e, "Failed to persist IdP credentials");
+                    if let Err(e) = tm.save_idp(credential_key, &creds).await {
+                        error!(idp_issuer = %idp_issuer, credential_key = %credential_key, error = %e, "Failed to persist IdP credentials");
                     } else {
                         info!(
                             idp_issuer = %idp_issuer,
+                            credential_key = %credential_key,
                             "Captured and persisted IdP credentials (EMA Step 1)"
                         );
                     }
@@ -5196,6 +5206,7 @@ mod tests {
                 None,
                 false,
                 idp_issuer,
+                idp_issuer,
             )
             .await;
 
@@ -5257,6 +5268,7 @@ mod tests {
                 "http://127.0.0.1:9400/oauth/callback",
                 None,
                 false,
+                idp_issuer,
                 idp_issuer,
             )
             .await;

@@ -160,6 +160,31 @@ pub struct EndpointInfo {
     /// endpoints. Omitted for non-stdio transports and before the first spawn.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub isolation_state: Option<crate::adapter::stdio::IsolationState>,
+    /// EMA org-binding summary for endpoints authenticated via Enterprise-Managed
+    /// Authorization (`[endpoints.auth] type = "ema"`). Lets the desktop detect
+    /// already-installed org-bound servers. Omitted for ordinary endpoints,
+    /// keeping their serialization byte-for-byte unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auth: Option<EmaAuthSummary>,
+}
+
+/// EMA org-binding summary surfaced on an endpoint listing entry.
+///
+/// Populated from the endpoint's `[endpoints.auth]` block when `type = "ema"`.
+/// Carries no credentials — only the org reference and the MCP server URL the
+/// minted access token is scoped to.
+#[derive(Serialize, Clone)]
+pub struct EmaAuthSummary {
+    /// Auth scheme discriminator; currently always `"ema"`.
+    #[serde(rename = "type")]
+    pub auth_type: String,
+    /// Name of the `[[organizations]]` entry this endpoint binds to. Omitted for
+    /// END-18 bare-`idp` endpoints with no organization reference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
+    /// MCP server URL the EMA access token is minted for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -268,6 +293,30 @@ async fn get_status(State(state): State<ManagementState>) -> Json<StatusResponse
 
 /// GET /api/endpoints
 async fn get_endpoints(State(state): State<ManagementState>) -> Json<Vec<EndpointInfo>> {
+    // Snapshot EMA org bindings from config, keyed by endpoint name. Only
+    // `type = "ema"` endpoints get an entry; ordinary endpoints are absent so
+    // their listing serialization stays byte-for-byte unchanged.
+    let auth_by_name: HashMap<String, EmaAuthSummary> = {
+        let config = state.config.read().await;
+        config
+            .endpoints
+            .iter()
+            .filter_map(|ep| {
+                let auth = ep.auth.as_ref()?;
+                if auth.auth_type != "ema" {
+                    return None;
+                }
+                Some((
+                    ep.name.clone(),
+                    EmaAuthSummary {
+                        auth_type: auth.auth_type.clone(),
+                        organization: auth.organization.clone(),
+                        resource: auth.resource.clone(),
+                    },
+                ))
+            })
+            .collect()
+    };
     let entries = state.registry.entries().read().await;
     let now = Instant::now();
     let mut endpoints: Vec<EndpointInfo> = Vec::new();
@@ -321,6 +370,7 @@ async fn get_endpoints(State(state): State<ManagementState>) -> Json<Vec<Endpoin
             lifecycle,
             container_stats: entry.adapter.container_stats(),
             isolation_state: entry.adapter.isolation_state(),
+            auth: auth_by_name.get(name).cloned(),
         });
     }
     endpoints.sort_by(|a, b| a.name.cmp(&b.name));
@@ -410,7 +460,7 @@ async fn restart_endpoint(
         }
 
         // Look up the endpoint config to decide between rebuild and re-init.
-        let (ep_config, allow_insecure_oauth) = {
+        let (ep_config, allow_insecure_oauth, organizations) = {
             let cfg = config.read().await;
             (
                 cfg.endpoints
@@ -418,6 +468,7 @@ async fn restart_endpoint(
                     .find(|ep| ep.name == task_name)
                     .cloned(),
                 cfg.relay.allow_insecure_oauth.unwrap_or(false),
+                cfg.organizations.clone(),
             )
         };
 
@@ -441,6 +492,7 @@ async fn restart_endpoint(
                 allow_insecure_oauth,
                 event_bus.as_ref(),
                 jit.as_ref(),
+                &organizations,
             )
             .await
         } else {
@@ -665,6 +717,7 @@ async fn reload_config(State(state): State<ManagementState>) -> Json<ActionRespo
         new_config.relay.allow_insecure_oauth.unwrap_or(false),
         state.event_bus.as_ref(),
         jit.as_ref(),
+        &new_config.organizations,
     )
     .await;
 
@@ -1924,6 +1977,276 @@ async fn oauth_probe(
 }
 
 // ---------------------------------------------------------------------------
+// EMA capability probe (per-organization "which MCP servers can I reach?")
+// ---------------------------------------------------------------------------
+
+/// Concurrency bound for per-resource probes within a single batch.
+const ORG_PROBE_CONCURRENCY: usize = 8;
+
+/// Per-probe wall-clock cap (discovery + token exchange). Bounds a slow or
+/// unreachable resource so it can never stall the whole batch.
+const ORG_PROBE_TIMEOUT_SECS: u64 = 15;
+
+/// TTL for cached probe outcomes keyed by `(org, resource)`. A cache hit within
+/// this window skips re-running discovery + the ID-JAG exchange.
+const ORG_PROBE_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Process-global short-TTL cache of probe outcomes keyed by `(org, resource)`.
+/// A static keeps `ManagementState` (and its many constructors) untouched; the
+/// TTL bounds staleness and entries are uniquely keyed by the desktop-supplied
+/// resource URL.
+static ORG_PROBE_CACHE: std::sync::LazyLock<
+    std::sync::RwLock<HashMap<(String, String), OrgProbeCacheEntry>>,
+> = std::sync::LazyLock::new(|| std::sync::RwLock::new(HashMap::new()));
+
+/// One cached probe outcome plus its insertion time (for TTL expiry).
+struct OrgProbeCacheEntry {
+    status: OrgProbeStatus,
+    server_as_issuer: Option<String>,
+    inserted: Instant,
+}
+
+/// Reachability of a single MCP resource for the requesting organization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum OrgProbeStatus {
+    /// The IdP minted an ID-JAG for this resource (the ID-JAG is discarded —
+    /// the probe persists nothing).
+    Accessible,
+    /// The IdP refused the exchange with a terminal authorization denial.
+    Denied,
+    /// Discovery failed, the exchange hit a transport/expiry error, or the
+    /// per-probe timeout elapsed.
+    Unreachable,
+}
+
+/// Request body for `POST /api/organizations/{org}/probe`.
+#[derive(Deserialize)]
+struct OrgProbeRequest {
+    /// Desktop-supplied candidate MCP server URLs. The relay stays
+    /// catalog-agnostic and only probes exactly these candidates.
+    #[serde(default)]
+    resources: Vec<String>,
+}
+
+/// One probe outcome for a single resource.
+#[derive(Serialize)]
+struct OrgProbeResult {
+    resource: String,
+    status: OrgProbeStatus,
+    /// The resource AS issuer (RFC 8414 `issuer`) discovered for this resource,
+    /// present whenever discovery succeeded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_as_issuer: Option<String>,
+}
+
+/// Response body for `POST /api/organizations/{org}/probe`.
+#[derive(Serialize)]
+struct OrgProbeResponse {
+    results: Vec<OrgProbeResult>,
+}
+
+/// Run the discovery → ID-JAG-exchange chain for a single resource and map the
+/// outcome to an [`OrgProbeStatus`]. Persists nothing: a successful exchange's
+/// ID-JAG is discarded and Step 3 (redemption) is never run.
+async fn run_org_probe_chain(
+    resource: &str,
+    idp_token_endpoint: &str,
+    id_token: &str,
+    allow_insecure: bool,
+) -> (OrgProbeStatus, Option<String>) {
+    let resource = resource.trim();
+    let chain = async {
+        let disc =
+            match crate::oauth::discovery::discover_oauth_server(resource, allow_insecure).await {
+                Ok(d) => d,
+                // Discovery failed (no metadata, 404, transport, SSRF guard).
+                Err(_) => return (OrgProbeStatus::Unreachable, None),
+            };
+        let as_issuer = disc.issuer;
+        match crate::oauth::ema::exchange_for_id_jag(
+            idp_token_endpoint,
+            id_token,
+            &as_issuer,
+            resource,
+            allow_insecure,
+        )
+        .await
+        {
+            // Accessible: discard the ID-JAG, persist nothing.
+            Ok(_id_jag) => (OrgProbeStatus::Accessible, Some(as_issuer)),
+            Err(crate::oauth::ema::EmaError::AuthorizationDenied { .. }) => {
+                (OrgProbeStatus::Denied, Some(as_issuer))
+            }
+            // Transport/expiry/validation errors are treated as unreachable; the
+            // AS issuer is still known since discovery succeeded.
+            Err(_) => (OrgProbeStatus::Unreachable, Some(as_issuer)),
+        }
+    };
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(ORG_PROBE_TIMEOUT_SECS),
+        chain,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        // Per-probe timeout elapsed.
+        Err(_) => (OrgProbeStatus::Unreachable, None),
+    }
+}
+
+/// Probe one resource, consulting (and populating) the short-TTL cache.
+async fn probe_one_resource(
+    org: String,
+    resource: String,
+    idp_token_endpoint: String,
+    id_token: String,
+    allow_insecure: bool,
+) -> OrgProbeResult {
+    let key = (org, resource.clone());
+
+    // Cache hit within TTL: skip re-discovery + re-exchange.
+    if let Ok(cache) = ORG_PROBE_CACHE.read() {
+        if let Some(entry) = cache.get(&key) {
+            if entry.inserted.elapsed() < ORG_PROBE_CACHE_TTL {
+                return OrgProbeResult {
+                    resource,
+                    status: entry.status,
+                    server_as_issuer: entry.server_as_issuer.clone(),
+                };
+            }
+        }
+    }
+
+    let (status, server_as_issuer) =
+        run_org_probe_chain(&resource, &idp_token_endpoint, &id_token, allow_insecure).await;
+
+    if let Ok(mut cache) = ORG_PROBE_CACHE.write() {
+        cache.insert(
+            key,
+            OrgProbeCacheEntry {
+                status,
+                server_as_issuer: server_as_issuer.clone(),
+                inserted: Instant::now(),
+            },
+        );
+    }
+
+    OrgProbeResult {
+        resource,
+        status,
+        server_as_issuer,
+    }
+}
+
+/// POST /api/organizations/{org}/probe
+///
+/// The "Detecting available MCP servers…" engine. For each desktop-supplied
+/// candidate `resource`, runs RFC 9728 → RFC 8414 discovery and an RFC 8693
+/// ID-JAG token exchange against the org's IdP, mapping the outcome to
+/// `accessible` / `denied` / `unreachable`. Probes run with bounded parallelism
+/// and a per-probe timeout, results are cached briefly per `(org, resource)`,
+/// and the probe persists **nothing** (the ID-JAG is discarded; no token files
+/// are written).
+///
+/// JSON contract:
+///   Request:  `{ "resources": ["<mcp url>", ...] }`
+///   Response: `{ "results": [{ "resource", "status", "server_as_issuer"? }] }`
+async fn probe_organization(
+    State(state): State<ManagementState>,
+    Path(org): Path<String>,
+    Json(body): Json<OrgProbeRequest>,
+) -> impl IntoResponse {
+    // Resolve the org's IdP issuer (and the insecure-loopback policy) from config.
+    let (idp_issuer, allow_insecure) = {
+        let config = state.config.read().await;
+        let Some(found) = config.organizations.iter().find(|o| o.name == org) else {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "organization not found",
+                Some(&format!("No organization named '{org}'.")),
+            )
+            .into_response();
+        };
+        (
+            found.idp.clone(),
+            config.relay.allow_insecure_oauth.unwrap_or(false),
+        )
+    };
+
+    let Some(token_manager) = state.token_manager.clone() else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "token manager not available",
+            None,
+        )
+        .into_response();
+    };
+
+    // Org-keyed pooled IdP credentials (Wave 2). Absence ⇒ the org has not
+    // completed IdP SSO, so no probe can run.
+    let creds = match token_manager.load_idp(&org).await {
+        Ok(Some(c)) => c,
+        Ok(None) => {
+            return error_response(
+                StatusCode::CONFLICT,
+                "organization not authenticated",
+                Some(&format!(
+                    "No IdP credentials stored for organization '{org}'. Authenticate it first."
+                )),
+            )
+            .into_response();
+        }
+        Err(e) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credential store error",
+                Some(&e.to_string()),
+            )
+            .into_response();
+        }
+    };
+
+    // Resolve the IdP token endpoint once for the whole batch (RFC 8414 / OIDC).
+    let idp_token_endpoint =
+        match crate::oauth::discovery::discover_authorization_server(&idp_issuer, allow_insecure)
+            .await
+        {
+            Ok(disc) => disc.token_endpoint,
+            Err(e) => {
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "idp discovery failed",
+                    Some(&format!(
+                        "Could not resolve IdP token endpoint for '{idp_issuer}': {e}"
+                    )),
+                )
+                .into_response();
+            }
+        };
+
+    let id_token = creds.id_token;
+
+    use futures_util::stream::StreamExt;
+    let results: Vec<OrgProbeResult> =
+        futures_util::stream::iter(body.resources.into_iter().map(|resource| {
+            let org = org.clone();
+            let idp_token_endpoint = idp_token_endpoint.clone();
+            let id_token = id_token.clone();
+            async move {
+                probe_one_resource(org, resource, idp_token_endpoint, id_token, allow_insecure)
+                    .await
+            }
+        }))
+        .buffered(ORG_PROBE_CONCURRENCY)
+        .collect()
+        .await;
+
+    Json(OrgProbeResponse { results }).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // OAuth setup (preflight) route handlers
 // ---------------------------------------------------------------------------
 
@@ -3121,6 +3444,11 @@ pub struct EndpointRequest {
     /// stdio endpoints.
     #[serde(default)]
     pub mounts: Option<Vec<String>>,
+    /// Non-default auth binding for the endpoint (currently `type = "ema"`).
+    /// Threaded into the persisted `[endpoints.auth]` sub-table so onboarding
+    /// can create EMA endpoints via the management API.
+    #[serde(default)]
+    pub auth: Option<crate::config::EndpointAuthConfig>,
     // Forbidden fields — present so we can return a precise 400 instead of
     // silently dropping the value when a client mistakenly includes them.
     #[serde(default)]
@@ -3349,8 +3677,18 @@ fn validate_endpoint_request(
         isolation,
         container_image: req.container_image.clone(),
         mounts: req.mounts.clone(),
-        auth: None,
+        auth: req.auth.clone(),
     };
+
+    // Validate the `[endpoints.auth]` block (currently `type = "ema"`) using
+    // the same rules the config loader applies, so an EMA body is rejected
+    // unless it has a `resource` AND (`organization` OR `idp`).
+    if let Err(msg) = crate::config::validate_endpoint_auth(&new_ep) {
+        return Err(bad_request(
+            "invalid auth",
+            format!("Endpoint '{}': {}", req.name, msg),
+        ));
+    }
 
     Ok(new_ep)
 }
@@ -3444,6 +3782,20 @@ fn endpoint_to_toml_table(
                 .collect();
             t.insert("mounts".into(), toml::Value::Array(arr));
         }
+    }
+    if let Some(ref auth) = ep.auth {
+        let mut auth_table = toml::map::Map::new();
+        auth_table.insert("type".into(), toml::Value::String(auth.auth_type.clone()));
+        if let Some(ref org) = auth.organization {
+            auth_table.insert("organization".into(), toml::Value::String(org.clone()));
+        }
+        if let Some(ref idp) = auth.idp {
+            auth_table.insert("idp".into(), toml::Value::String(idp.clone()));
+        }
+        if let Some(ref resource) = auth.resource {
+            auth_table.insert("resource".into(), toml::Value::String(resource.clone()));
+        }
+        t.insert("auth".into(), toml::Value::Table(auth_table));
     }
     t
 }
@@ -3608,6 +3960,7 @@ async fn apply_endpoint_change(
         relay: old_cfg.relay.clone(),
         endpoints: new_endpoints.clone(),
         profiles: old_cfg.profiles.clone(),
+        organizations: old_cfg.organizations.clone(),
     };
     let diff = crate::config::diff_configs(&old_cfg, &new_cfg);
     let token_manager = state.token_manager.clone().unwrap_or_else(|| {
@@ -3636,6 +3989,7 @@ async fn apply_endpoint_change(
         new_cfg.relay.allow_insecure_oauth.unwrap_or(false),
         state.event_bus.as_ref(),
         jit.as_ref(),
+        &new_cfg.organizations,
     )
     .await;
 
@@ -4333,10 +4687,583 @@ pub fn management_routes(state: ManagementState) -> Router {
             get(get_observability_config).put(update_observability_config),
         )
         .route("/api/observability/events", get(tool_call_events_sse))
+        // END-19 Wave 3: provider templates + organization lifecycle.
+        .route("/api/idp-providers", get(list_idp_providers))
+        .route(
+            "/api/organizations",
+            get(list_organizations).post(create_organization),
+        )
+        .route("/api/organizations/{org}", delete(delete_organization))
+        .route(
+            "/api/organizations/{org}/reauthenticate",
+            post(reauthenticate_organization),
+        )
+        // EMA capability probe: which desktop-supplied MCP servers can this org reach?
+        .route("/api/organizations/{org}/probe", post(probe_organization))
         // No CORS layer: this router is served exclusively over a Unix-domain
         // socket / Windows named pipe (see `management_listener`), which is not
         // reachable from a browser and has no cross-origin attack surface.
         .with_state(state)
+}
+
+// ---------------------------------------------------------------------------
+// END-19 Wave 3: provider templates + organization lifecycle
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /api/organizations`.
+#[derive(Deserialize)]
+struct CreateOrganizationRequest {
+    /// Display name / stable key (e.g. "Acme Corp"); also the credential-pool key.
+    name: String,
+    /// Provider template id: `okta`, `entra`, `google`, `ping`, or `custom`.
+    provider: String,
+    /// Slug for templated providers (Okta subdomain, Entra tenant, Ping env id).
+    #[serde(default)]
+    slug: Option<String>,
+    /// Full issuer URL for `provider = "custom"` (pasted by the user).
+    #[serde(default)]
+    idp: Option<String>,
+    /// Optional pre-registered OAuth `client_id` for this org's IdP (e.g. an
+    /// Okta/Entra app registration). When provided it wins the resolution chain
+    /// and is persisted on the org; when omitted the relay falls back to CIMD/DCR.
+    #[serde(default)]
+    client_id: Option<String>,
+}
+
+/// One organization entry returned by `GET /api/organizations`.
+#[derive(Serialize)]
+struct OrganizationResponse {
+    name: String,
+    provider: String,
+    idp: String,
+    /// Whether the credential pool holds usable IdP credentials for this org
+    /// (a non-expired ID token or a refresh token to silently re-mint one).
+    authenticated: bool,
+}
+
+/// Response carrying a freshly-composed IdP SSO authorize URL.
+#[derive(Serialize)]
+struct OrganizationSsoResponse {
+    name: String,
+    provider: String,
+    idp: String,
+    authorize_url: String,
+}
+
+/// GET /api/idp-providers
+///
+/// Returns the static provider template table — the single source of truth the
+/// desktop "Add organization" UI renders and `POST /api/organizations` resolves
+/// issuer URLs from.
+async fn list_idp_providers() -> impl IntoResponse {
+    Json(crate::oauth::idp_providers::IDP_PROVIDERS)
+}
+
+/// Validate an IdP issuer via RFC 8414 / OIDC discovery before persisting an
+/// organization. Returns the discovered metadata (used to compose the SSO URL)
+/// or a ready-to-return `400` response. The SSRF guard inside discovery rejects
+/// internal/loopback hosts unless `allow_insecure` is set.
+async fn validate_org_issuer(
+    issuer: &str,
+    allow_insecure: bool,
+) -> Result<crate::oauth::discovery::DiscoveryResult, axum::response::Response> {
+    crate::oauth::discovery::discover_authorization_server(issuer, allow_insecure)
+        .await
+        .map_err(|e| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_issuer",
+                Some(&format!("Could not validate IdP issuer '{issuer}': {e}")),
+            )
+            .into_response()
+        })
+}
+
+/// Resolve the OAuth `client_id` for an organization's IdP via the shared
+/// fallback chain (explicit org `client_id` → CIMD when the AS advertises it →
+/// DCR when a registration endpoint exists), returning the resolved id and which
+/// path produced it. A `422 client_id_required` response is returned when the
+/// IdP supports neither CIMD nor DCR and no explicit `client_id` was supplied.
+async fn resolve_org_client(
+    org_client_id: Option<&str>,
+    disc: &crate::oauth::discovery::DiscoveryResult,
+    redirect_uri: &str,
+    org_name: &str,
+    allow_insecure: bool,
+) -> Result<(String, ClientRegistration), axum::response::Response> {
+    let explicit = org_client_id
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| (s.to_string(), None));
+    let dcr_redirect_uri = redirect_uri.to_string();
+    let dcr_org_name = org_name.to_string();
+    let resolved = client::resolve_client(
+        client::ClientInputs {
+            explicit_manual: explicit,
+            preregistered: None,
+            cimd_supported: disc.client_id_metadata_document_supported,
+            registration_endpoint: disc.registration_endpoint.clone(),
+        },
+        |reg_endpoint| async move {
+            let resp = crate::oauth::dcr::register_client(
+                &reg_endpoint,
+                &dcr_redirect_uri,
+                &dcr_org_name,
+                allow_insecure,
+            )
+            .await?;
+            Ok::<_, crate::oauth::dcr::DcrError>(client::DcrOutcome {
+                client_id: resp.client_id,
+                client_secret: resp.client_secret,
+                client_secret_expires_at: resp.client_secret_expires_at,
+            })
+        },
+    )
+    .await;
+
+    match resolved {
+        Ok(r) => Ok((r.client_id, r.registration)),
+        Err(client::ClientResolveError::NoCredentials) => Err(error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "client_id_required",
+            Some(
+                "This IdP advertises neither CIMD nor Dynamic Client Registration; \
+                 provide a pre-registered 'client_id' for the organization.",
+            ),
+        )
+        .into_response()),
+        Err(client::ClientResolveError::Dcr(e)) => Err(error_response(
+            StatusCode::BAD_GATEWAY,
+            "dcr_failed",
+            Some(&format!("Dynamic Client Registration failed: {e}")),
+        )
+        .into_response()),
+    }
+}
+
+/// Compose the IdP SSO authorize URL for an organization and register the
+/// pending IdP flow via [`OAuthFlowManager::start_idp_flow`], mirroring the EMA
+/// adapter's `compose_idp_authorize_url`. The captured ID token is keyed by the
+/// org `name` so every EMA endpoint in the org shares one credential. The
+/// requested scope is `openid offline_access` (M1) so the IdP returns a refresh
+/// token. The configured `issuer` (not the discovered canonical form) is stored
+/// in the flow so the credentials match the issuer the EMA chain re-discovers.
+/// The `client_id` is the value resolved by [`resolve_org_client`] (explicit /
+/// CIMD / DCR) and is presented identically in the URL and the pending flow.
+async fn compose_org_sso_url(
+    flow_mgr: &OAuthFlowManager,
+    relay_port: u16,
+    org_name: &str,
+    issuer: &str,
+    disc: &crate::oauth::discovery::DiscoveryResult,
+    client_id: &str,
+) -> String {
+    let pkce = PkceChallenge::generate();
+    let code_challenge = pkce.code_challenge.clone();
+    let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", relay_port);
+
+    let state_param = flow_mgr
+        .start_idp_flow(
+            org_name,
+            &disc.token_endpoint,
+            client_id,
+            None,
+            pkce,
+            &redirect_uri,
+            Some(issuer),
+            false,
+            issuer,
+            org_name,
+        )
+        .await;
+
+    let sep = if disc.authorization_endpoint.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
+    format!(
+        "{}{}response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256&scope={}",
+        disc.authorization_endpoint,
+        sep,
+        urlencoding(client_id),
+        urlencoding(&redirect_uri),
+        urlencoding(&state_param),
+        urlencoding(&code_challenge),
+        urlencoding("openid offline_access"),
+    )
+}
+
+/// Persist the updated organization list back to `config.toml`, preserving the
+/// rest of the document. Mirrors [`write_profiles_to_disk`]. Tokens are never
+/// written here — only `name`/`provider`/`idp` round-trip through `config.toml`.
+fn write_organizations_to_disk(
+    config_path: &std::path::Path,
+    organizations: &[crate::config::ConfigOrganization],
+) -> Result<(), (StatusCode, &'static str, String)> {
+    let contents = std::fs::read_to_string(config_path).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to read config file",
+            e.to_string(),
+        )
+    })?;
+    let mut parsed: toml::Table = contents.parse().map_err(|e: toml::de::Error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to parse config file",
+            e.to_string(),
+        )
+    })?;
+
+    if organizations.is_empty() {
+        parsed.remove("organizations");
+    } else {
+        let arr: Vec<toml::Value> = organizations
+            .iter()
+            .map(|o| {
+                toml::Value::try_from(o)
+                    .expect("ConfigOrganization is Serialize and round-trips through toml::Value")
+            })
+            .collect();
+        parsed.insert("organizations".into(), toml::Value::Array(arr));
+    }
+
+    let new_contents = toml::to_string_pretty(&parsed).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to serialize config",
+            e.to_string(),
+        )
+    })?;
+    crate::config::write_config_file(config_path, &new_contents).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to write config file",
+            e.to_string(),
+        )
+    })?;
+    Ok(())
+}
+
+/// POST /api/organizations
+///
+/// Builds the IdP issuer from a provider template (`{provider, slug}`) or takes
+/// a pasted custom issuer (`{provider: "custom", idp}`), validates it via
+/// discovery **before** persisting, writes the org to `config.toml`, and returns
+/// an SSO authorize URL (reusing `start_idp_flow` + `/oauth/callback`).
+async fn create_organization(
+    State(state): State<ManagementState>,
+    Json(body): Json<CreateOrganizationRequest>,
+) -> impl IntoResponse {
+    let Some(ref flow_mgr) = state.oauth_flow_manager else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "OAuth not configured",
+            None,
+        )
+        .into_response();
+    };
+    let Some(ref config_path) = state.config_path else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_path not configured",
+            None,
+        )
+        .into_response();
+    };
+
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_name",
+            Some("Organization name must not be empty."),
+        )
+        .into_response();
+    }
+
+    // Snapshot the SSRF opt-out and reject duplicate org names.
+    let allow_insecure = {
+        let config = state.config.read().await;
+        if config.organizations.iter().any(|o| o.name == name) {
+            return error_response(
+                StatusCode::CONFLICT,
+                "organization_exists",
+                Some(&format!(
+                    "An organization named '{name}' already exists. Use a different name."
+                )),
+            )
+            .into_response();
+        }
+        config.relay.allow_insecure_oauth.unwrap_or(false)
+    };
+
+    // Resolve the issuer: a pasted custom URL, or built from a provider template.
+    let issuer = if body.provider == "custom" {
+        match body
+            .idp
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            Some(idp) => idp.to_string(),
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "missing_idp",
+                    Some("provider 'custom' requires a full 'idp' issuer URL."),
+                )
+                .into_response();
+            }
+        }
+    } else {
+        let Some(provider) = crate::oauth::idp_providers::find_provider(&body.provider) else {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "unknown_provider",
+                Some(&format!(
+                    "Unknown provider '{}'. Use GET /api/idp-providers to list templates.",
+                    body.provider
+                )),
+            )
+            .into_response();
+        };
+        match provider.build_issuer(body.slug.as_deref()) {
+            Ok(issuer) => issuer,
+            Err(e) => {
+                return error_response(StatusCode::BAD_REQUEST, "invalid_slug", Some(&e))
+                    .into_response();
+            }
+        }
+    };
+
+    // Validate the issuer via discovery BEFORE persisting (DoD: bad issuer
+    // rejected pre-save; custom paste validated via discovery).
+    let disc = match validate_org_issuer(&issuer, allow_insecure).await {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+
+    // Resolve the org's OAuth client_id via the shared fallback chain BEFORE
+    // persisting (explicit org client_id → CIMD → DCR → 422). The resolved id is
+    // used verbatim for the authorize URL and every later EMA token leg.
+    let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", state.relay_port);
+    let (resolved_client_id, registration) = match resolve_org_client(
+        body.client_id.as_deref(),
+        &disc,
+        &redirect_uri,
+        &name,
+        allow_insecure,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    // CIMD resolves to the hosted CIMD URL (the runtime default), so persist
+    // `None` to keep the org config round-tripping unchanged and the legs on
+    // their byte-for-byte CIMD behavior. An explicit or DCR-registered id is
+    // persisted so every leg reuses the same client_id.
+    let persisted_client_id = match registration {
+        ClientRegistration::Cimd => None,
+        _ => Some(resolved_client_id.clone()),
+    };
+
+    // Persist the org to config.toml, then mirror into the in-memory config.
+    let new_org = crate::config::ConfigOrganization {
+        name: name.clone(),
+        provider: body.provider.clone(),
+        idp: issuer.clone(),
+        client_id: persisted_client_id,
+    };
+    let mut orgs = { state.config.read().await.organizations.clone() };
+    orgs.push(new_org.clone());
+    let resolved = crate::config::expand_tilde(config_path);
+    if let Err((status, msg, detail)) = write_organizations_to_disk(&resolved, &orgs) {
+        return error_response(status, msg, Some(&detail)).into_response();
+    }
+    state.config.write().await.organizations = orgs;
+
+    let authorize_url = compose_org_sso_url(
+        flow_mgr,
+        state.relay_port,
+        &name,
+        &issuer,
+        &disc,
+        &resolved_client_id,
+    )
+    .await;
+
+    info!(organization = %name, provider = %body.provider, "Organization created; SSO authorize URL composed");
+
+    (
+        StatusCode::CREATED,
+        Json(OrganizationSsoResponse {
+            name,
+            provider: body.provider,
+            idp: issuer,
+            authorize_url,
+        }),
+    )
+        .into_response()
+}
+
+/// GET /api/organizations
+///
+/// Lists configured organizations with their authentication status, read from
+/// the credential pool (`TokenManager::load_idp`, keyed by org name).
+async fn list_organizations(State(state): State<ManagementState>) -> impl IntoResponse {
+    let orgs = { state.config.read().await.organizations.clone() };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut out = Vec::with_capacity(orgs.len());
+    for org in orgs {
+        let authenticated = if let Some(ref tm) = state.token_manager {
+            match tm.load_idp(&org.name).await {
+                Ok(Some(creds)) => {
+                    let id_valid = creds.id_token_expires_at.map(|e| e > now).unwrap_or(true);
+                    id_valid || creds.refresh_token.is_some()
+                }
+                _ => false,
+            }
+        } else {
+            false
+        };
+        out.push(OrganizationResponse {
+            name: org.name,
+            provider: org.provider,
+            idp: org.idp,
+            authenticated,
+        });
+    }
+    Json(out).into_response()
+}
+
+/// DELETE /api/organizations/{org}
+///
+/// Removes the organization from `config.toml` and purges its credential-pool
+/// entry (`TokenManager::delete_idp`, keyed by org name).
+async fn delete_organization(
+    State(state): State<ManagementState>,
+    Path(org): Path<String>,
+) -> impl IntoResponse {
+    let Some(ref config_path) = state.config_path else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_path not configured",
+            None,
+        )
+        .into_response();
+    };
+
+    let mut orgs = { state.config.read().await.organizations.clone() };
+    let before = orgs.len();
+    orgs.retain(|o| o.name != org);
+    if orgs.len() == before {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "organization not found",
+            Some(&format!("No organization named '{org}'.")),
+        )
+        .into_response();
+    }
+
+    let resolved = crate::config::expand_tilde(config_path);
+    if let Err((status, msg, detail)) = write_organizations_to_disk(&resolved, &orgs) {
+        return error_response(status, msg, Some(&detail)).into_response();
+    }
+    state.config.write().await.organizations = orgs;
+
+    // Purge the pooled IdP credentials (no-op if none were captured).
+    if let Some(ref tm) = state.token_manager {
+        if let Err(e) = tm.delete_idp(&org).await {
+            warn!(organization = %org, error = %e, "Failed to purge IdP credentials on org delete");
+        }
+    }
+
+    info!(organization = %org, "Organization deleted and credentials purged");
+    Json(serde_json::json!({ "ok": true, "name": org })).into_response()
+}
+
+/// POST /api/organizations/{org}/reauthenticate
+///
+/// Re-discovers the org's IdP issuer (endpoints are not stored in config) and
+/// returns a fresh SSO authorize URL for re-running the IdP sign-in.
+async fn reauthenticate_organization(
+    State(state): State<ManagementState>,
+    Path(org): Path<String>,
+) -> impl IntoResponse {
+    let Some(ref flow_mgr) = state.oauth_flow_manager else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "OAuth not configured",
+            None,
+        )
+        .into_response();
+    };
+
+    let (issuer, provider, org_client_id, allow_insecure) = {
+        let config = state.config.read().await;
+        let Some(found) = config.organizations.iter().find(|o| o.name == org) else {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "organization not found",
+                Some(&format!("No organization named '{org}'.")),
+            )
+            .into_response();
+        };
+        (
+            found.idp.clone(),
+            found.provider.clone(),
+            found.client_id.clone(),
+            config.relay.allow_insecure_oauth.unwrap_or(false),
+        )
+    };
+
+    let disc = match validate_org_issuer(&issuer, allow_insecure).await {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+
+    // Resolve the client_id via the same chain so re-auth uses the org's
+    // pre-registered/CIMD/DCR client consistently with creation.
+    let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", state.relay_port);
+    let (resolved_client_id, _registration) = match resolve_org_client(
+        org_client_id.as_deref(),
+        &disc,
+        &redirect_uri,
+        &org,
+        allow_insecure,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    let authorize_url = compose_org_sso_url(
+        flow_mgr,
+        state.relay_port,
+        &org,
+        &issuer,
+        &disc,
+        &resolved_client_id,
+    )
+    .await;
+
+    info!(organization = %org, "Organization re-authentication SSO authorize URL composed");
+
+    Json(OrganizationSsoResponse {
+        name: org,
+        provider,
+        idp: issuer,
+        authorize_url,
+    })
+    .into_response()
 }
 
 /// GET /api/endpoints/:name/tools
@@ -4697,6 +5624,7 @@ mod tests {
                 auth: None,
             }],
             profiles: None,
+            organizations: Vec::new(),
         }
     }
 
@@ -4830,6 +5758,97 @@ mod tests {
         assert_eq!(arr[1]["health"], "offline");
         assert_eq!(arr[1]["error"], "down");
         assert_eq!(arr[1]["tool_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn management_endpoints_list_surfaces_ema_auth_binding() {
+        let state = test_state(vec![
+            ("github-acme", MockAdapter::healthy_with_tools(vec![])),
+            ("plain", MockAdapter::healthy_with_tools(vec![])),
+        ])
+        .await;
+        // Replace the seeded config so the listing has a matching EMA endpoint
+        // and an ordinary one to compare against.
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints = vec![
+                EndpointConfig {
+                    name: "github-acme".to_string(),
+                    description: None,
+                    tool_prefix: None,
+                    transport: Transport::Http,
+                    command: None,
+                    args: None,
+                    url: Some("https://api.githubcopilot.com/mcp/".to_string()),
+                    env: None,
+                    headers: None,
+                    disabled: false,
+                    disabled_tools: Vec::new(),
+                    oauth_server_url: None,
+                    client_id: None,
+                    client_secret: None,
+                    scopes: None,
+                    token_endpoint: None,
+                    server_type_override: None,
+                    isolation: None,
+                    container_image: None,
+                    mounts: None,
+                    auth: Some(crate::config::EndpointAuthConfig {
+                        auth_type: "ema".to_string(),
+                        organization: Some("Acme Corp".to_string()),
+                        idp: None,
+                        resource: Some("https://api.githubcopilot.com/mcp/".to_string()),
+                    }),
+                },
+                EndpointConfig {
+                    name: "plain".to_string(),
+                    description: None,
+                    tool_prefix: None,
+                    transport: Transport::Stdio,
+                    command: Some("echo".to_string()),
+                    args: None,
+                    url: None,
+                    env: None,
+                    headers: None,
+                    disabled: false,
+                    disabled_tools: Vec::new(),
+                    oauth_server_url: None,
+                    client_id: None,
+                    client_secret: None,
+                    scopes: None,
+                    token_endpoint: None,
+                    server_type_override: None,
+                    isolation: None,
+                    container_image: None,
+                    mounts: None,
+                    auth: None,
+                },
+            ];
+        }
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(Request::get("/api/endpoints").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let arr = body.as_array().unwrap();
+        assert_eq!(arr.len(), 2);
+        // Sorted by name: github-acme, plain.
+        assert_eq!(arr[0]["name"], "github-acme");
+        assert_eq!(arr[0]["auth"]["type"], "ema");
+        assert_eq!(arr[0]["auth"]["organization"], "Acme Corp");
+        assert_eq!(
+            arr[0]["auth"]["resource"],
+            "https://api.githubcopilot.com/mcp/"
+        );
+        // Ordinary endpoint serializes with no `auth` key at all.
+        assert_eq!(arr[1]["name"], "plain");
+        assert!(
+            arr[1].get("auth").is_none(),
+            "non-EMA endpoint must not carry an auth summary, got {:?}",
+            arr[1]
+        );
     }
 
     #[tokio::test]
@@ -7032,6 +8051,7 @@ command = "echo"
                 auth: None,
             }],
             profiles: None,
+            organizations: Vec::new(),
         };
         let state = ManagementState {
             registry: Arc::new(AdapterRegistry::new()),
@@ -7253,6 +8273,7 @@ command = "echo"
                 auth: None,
             }],
             profiles: None,
+            organizations: Vec::new(),
         };
         let state = ManagementState {
             registry: Arc::new(AdapterRegistry::new()),
@@ -7771,6 +8792,7 @@ command = "echo"
                 auth: None,
             }],
             profiles: None,
+            organizations: Vec::new(),
         }
     }
 
@@ -7873,6 +8895,7 @@ client_id = "client123"
             },
             endpoints: vec![],
             profiles: None,
+            organizations: Vec::new(),
         };
         let state = ManagementState {
             registry: Arc::new(AdapterRegistry::new()),
@@ -7962,6 +8985,7 @@ client_id = "client123"
                 })
                 .collect(),
             profiles: None,
+            organizations: Vec::new(),
         }
     }
 
@@ -8520,6 +9544,7 @@ client_id = "client123"
                 auth: None,
             }],
             profiles: None,
+            organizations: Vec::new(),
         };
         let toml_str = toml::to_string_pretty(&cfg).unwrap();
         std::fs::write(config_file, toml_str).unwrap();
@@ -8703,6 +9728,213 @@ client_id = "client123"
         assert_eq!(
             before, after,
             "rejected creates must not write to config.toml"
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_create_with_ema_auth_persists_and_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let state = endpoints_test_state(&config_file).await;
+        let app = management_routes(state.clone());
+
+        let body = serde_json::json!({
+            "name": "github-acme",
+            "transport": "http",
+            "url": "https://api.githubcopilot.com/mcp/",
+            "auth": {
+                "type": "ema",
+                "organization": "Acme Corp",
+                "resource": "https://api.githubcopilot.com/mcp/",
+            },
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/endpoints")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // The `[endpoints.auth]` sub-table is written to config.toml.
+        let on_disk = std::fs::read_to_string(&config_file).unwrap();
+        assert!(
+            on_disk.contains("[endpoints.auth]") || on_disk.contains("[[endpoints]]"),
+            "config.toml should contain the new endpoint: {}",
+            on_disk
+        );
+
+        // Re-parse from disk: the auth binding survives so the watcher /
+        // adapter rebuild path sees it as an EMA endpoint.
+        let reparsed = crate::config::load_config(&config_file).unwrap();
+        let ep = reparsed
+            .endpoints
+            .iter()
+            .find(|e| e.name == "github-acme")
+            .expect("created EMA endpoint should be present on disk");
+        let auth = ep.auth.as_ref().expect("auth binding must round-trip");
+        assert_eq!(auth.auth_type, "ema");
+        assert_eq!(auth.organization.as_deref(), Some("Acme Corp"));
+        assert_eq!(
+            auth.resource.as_deref(),
+            Some("https://api.githubcopilot.com/mcp/")
+        );
+
+        // In-memory config (post-rebuild) also reflects the auth binding.
+        let cfg = state.config.read().await;
+        let mem_ep = cfg
+            .endpoints
+            .iter()
+            .find(|e| e.name == "github-acme")
+            .unwrap();
+        assert_eq!(
+            mem_ep.auth.as_ref().map(|a| a.auth_type.as_str()),
+            Some("ema")
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_create_rejects_invalid_ema_auth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let state = endpoints_test_state(&config_file).await;
+        let before = std::fs::read_to_string(&config_file).unwrap();
+        let app = management_routes(state);
+
+        let cases: Vec<(&str, serde_json::Value)> = vec![
+            (
+                "ema missing resource",
+                serde_json::json!({
+                    "name": "bad-ema-1",
+                    "transport": "http",
+                    "url": "https://api.githubcopilot.com/mcp/",
+                    "auth": { "type": "ema", "organization": "Acme Corp" },
+                }),
+            ),
+            (
+                "ema missing organization and idp",
+                serde_json::json!({
+                    "name": "bad-ema-2",
+                    "transport": "http",
+                    "url": "https://api.githubcopilot.com/mcp/",
+                    "auth": { "type": "ema", "resource": "https://api.githubcopilot.com/mcp/" },
+                }),
+            ),
+            (
+                "unknown auth type",
+                serde_json::json!({
+                    "name": "bad-ema-3",
+                    "transport": "http",
+                    "url": "https://api.githubcopilot.com/mcp/",
+                    "auth": { "type": "saml", "resource": "https://api.githubcopilot.com/mcp/" },
+                }),
+            ),
+        ];
+
+        for (label, body) in cases {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/endpoints")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(
+                resp.status().is_client_error(),
+                "case '{}' should reject with a 4xx, got {}",
+                label,
+                resp.status()
+            );
+        }
+        let after = std::fs::read_to_string(&config_file).unwrap();
+        assert_eq!(
+            before, after,
+            "rejected EMA creates must not write to config.toml"
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_create_without_auth_omits_auth_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let state = endpoints_test_state(&config_file).await;
+        let app = management_routes(state);
+
+        let body = serde_json::json!({
+            "name": "plainstdio",
+            "transport": "stdio",
+            "command": "echo",
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let reparsed = crate::config::load_config(&config_file).unwrap();
+        let ep = reparsed
+            .endpoints
+            .iter()
+            .find(|e| e.name == "plainstdio")
+            .unwrap();
+        assert!(
+            ep.auth.is_none(),
+            "no-auth create must not persist an auth binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn endpoint_update_round_trips_ema_auth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let state = endpoints_test_state(&config_file).await;
+        let app = management_routes(state);
+
+        let body = serde_json::json!({
+            "name": "existing",
+            "transport": "http",
+            "url": "https://api.githubcopilot.com/mcp/",
+            "auth": {
+                "type": "ema",
+                "idp": "https://acme.okta.com",
+                "resource": "https://api.githubcopilot.com/mcp/",
+            },
+        });
+        let resp = app
+            .oneshot(
+                Request::put("/api/endpoints/existing")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let reparsed = crate::config::load_config(&config_file).unwrap();
+        let ep = reparsed
+            .endpoints
+            .iter()
+            .find(|e| e.name == "existing")
+            .unwrap();
+        let auth = ep.auth.as_ref().expect("updated auth must round-trip");
+        assert_eq!(auth.auth_type, "ema");
+        assert_eq!(auth.idp.as_deref(), Some("https://acme.okta.com"));
+        assert_eq!(
+            auth.resource.as_deref(),
+            Some("https://api.githubcopilot.com/mcp/")
         );
     }
 
@@ -8939,6 +10171,552 @@ client_id = "client123"
             text.contains("\"request_id\":\"rid-1\""),
             "expected request_id in SSE body, got: {}",
             text
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // END-19 Wave 3: provider templates + organization lifecycle
+    // -----------------------------------------------------------------------
+
+    /// Build a ManagementState wired for organization CRUD: a real config.toml
+    /// on disk, a token manager (credential pool), and an OAuth flow manager.
+    async fn test_state_orgs(tmp: &std::path::Path, allow_insecure: bool) -> ManagementState {
+        let config_path = tmp.join("config.toml");
+        std::fs::write(&config_path, "[relay]\nmachine_name = \"test-machine\"\n").unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.to_path_buf()));
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let mut cfg = test_config();
+        cfg.relay.allow_insecure_oauth = Some(allow_insecure);
+        cfg.organizations = Vec::new();
+        ManagementState {
+            registry: Arc::new(AdapterRegistry::new()),
+            config: Arc::new(RwLock::new(cfg)),
+            start_time: Instant::now(),
+            config_path: Some(config_path),
+            oauth_flow_manager: Some(flow_mgr),
+            relay_port: 9400,
+            oauth_adapter_inners: None,
+            token_manager: Some(token_manager),
+            setup_manager: None,
+            profile_registry: None,
+            event_bus: None,
+        }
+    }
+
+    /// Mock AS serving RFC 8414 metadata whose issuer matches its own origin.
+    /// Advertises CIMD so an org created without an explicit `client_id` resolves
+    /// to the hosted CIMD `client_id` (the zero-config public-client default).
+    fn org_well_known_router() -> Router {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "code_challenge_methods_supported": ["S256"],
+                "client_id_metadata_document_supported": true,
+            }))
+        }
+        Router::new().route("/.well-known/oauth-authorization-server", get(well_known))
+    }
+
+    /// Mock AS advertising a `registration_endpoint` (DCR) but NOT CIMD, plus a
+    /// `/register` handler returning a fixed dynamically-registered `client_id`.
+    fn org_well_known_router_with_dcr() -> Router {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "registration_endpoint": format!("{issuer}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        async fn register() -> Json<Value> {
+            Json(serde_json::json!({ "client_id": "dcr-registered-client" }))
+        }
+        Router::new()
+            .route("/.well-known/oauth-authorization-server", get(well_known))
+            .route("/register", axum::routing::post(register))
+    }
+
+    /// Mock AS advertising NEITHER CIMD nor DCR: an org created here without an
+    /// explicit `client_id` cannot resolve one and must return `422`.
+    fn org_well_known_router_no_client() -> Router {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        Router::new().route("/.well-known/oauth-authorization-server", get(well_known))
+    }
+
+    #[tokio::test]
+    async fn idp_providers_endpoint_returns_table() {
+        let state = test_state(vec![]).await;
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::get("/api/idp-providers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let arr = body.as_array().expect("providers array");
+        let ids: Vec<&str> = arr.iter().filter_map(|p| p["id"].as_str()).collect();
+        for expected in ["okta", "entra", "google", "ping", "custom"] {
+            assert!(
+                ids.contains(&expected),
+                "missing provider '{expected}' in {ids:?}"
+            );
+        }
+        // Templated providers carry an issuer_pattern; custom does not.
+        let okta = arr.iter().find(|p| p["id"] == "okta").unwrap();
+        assert_eq!(okta["issuer_pattern"], "https://{slug}.okta.com");
+        let custom = arr.iter().find(|p| p["id"] == "custom").unwrap();
+        assert!(custom.get("issuer_pattern").is_none());
+    }
+
+    #[tokio::test]
+    async fn create_organization_custom_validates_and_returns_sso_url() {
+        let (base_url, _server) = spawn_mock_as(org_well_known_router()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let config = state.config.clone();
+        let config_path = state.config_path.clone().unwrap();
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/organizations")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "Acme Corp",
+                            "provider": "custom",
+                            "idp": base_url,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp).await;
+        assert_eq!(body["name"], "Acme Corp");
+        assert_eq!(body["idp"], base_url);
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        assert!(
+            authorize_url.starts_with(&format!("{base_url}/authorize?")),
+            "expected discovered authorize endpoint, got: {authorize_url}"
+        );
+        assert!(authorize_url.contains("response_type=code"));
+        assert!(authorize_url.contains("scope=openid"));
+
+        // Persisted both in memory and on disk.
+        assert_eq!(config.read().await.organizations.len(), 1);
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(disk.contains("[[organizations]]"));
+        assert!(disk.contains("Acme Corp"));
+        // Tokens are never written to config.toml.
+        assert!(!disk.contains("id_token"));
+    }
+
+    #[tokio::test]
+    async fn create_organization_rejects_bad_issuer_pre_save() {
+        async fn not_found() -> StatusCode {
+            StatusCode::NOT_FOUND
+        }
+        let router = Router::new().route("/.well-known/oauth-authorization-server", get(not_found));
+        let (base_url, _server) = spawn_mock_as(router).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let config = state.config.clone();
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/organizations")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "Bad Org",
+                            "provider": "custom",
+                            "idp": base_url,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "invalid_issuer");
+        // Bad issuer must NOT be persisted.
+        assert!(config.read().await.organizations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_organization_blocks_loopback_without_allow_insecure() {
+        // allow_insecure=false → the discovery SSRF guard rejects the loopback
+        // mock host before any metadata is fetched, so the org is not saved.
+        let (base_url, _server) = spawn_mock_as(org_well_known_router()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), false).await;
+        let config = state.config.clone();
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/organizations")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "SSRF Org",
+                            "provider": "custom",
+                            "idp": base_url,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "invalid_issuer");
+        assert!(config.read().await.organizations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_organization_rejects_unknown_provider_and_missing_idp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let app = management_routes(state);
+
+        // Unknown provider id.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/organizations")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "name": "X", "provider": "nope" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await["error"], "unknown_provider");
+
+        // Custom without an idp URL.
+        let resp = app
+            .oneshot(
+                Request::post("/api/organizations")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "name": "Y", "provider": "custom" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(resp).await["error"], "missing_idp");
+    }
+
+    #[tokio::test]
+    async fn organization_lifecycle_get_delete_purges_credential_pool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let tm = state.token_manager.clone().unwrap();
+        let config = state.config.clone();
+
+        // Seed an org + a credential-pool entry keyed by the org name.
+        config.write().await.organizations = vec![crate::config::ConfigOrganization {
+            name: "Acme Corp".to_string(),
+            provider: "okta".to_string(),
+            idp: "https://acme.okta.com".to_string(),
+            client_id: None,
+        }];
+        tm.save_idp(
+            "Acme Corp",
+            &crate::token_manager::IdpCredentials {
+                idp_issuer: "https://acme.okta.com".to_string(),
+                id_token: "id-tok".to_string(),
+                refresh_token: Some("refresh-tok".to_string()),
+                id_token_expires_at: None,
+                obtained_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        let app = management_routes(state);
+
+        // GET reports the org as authenticated (creds present).
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/organizations")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let arr = body.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "Acme Corp");
+        assert_eq!(arr[0]["authenticated"], true);
+
+        // DELETE removes the org and purges its credentials.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::delete("/api/organizations/Acme%20Corp")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(config.read().await.organizations.is_empty());
+        assert!(tm.load_idp("Acme Corp").await.unwrap().is_none());
+
+        // GET now returns an empty list.
+        let resp = app
+            .oneshot(
+                Request::get("/api/organizations")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = body_json(resp).await;
+        assert!(body.as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_organization_missing_returns_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::delete("/api/organizations/ghost")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn reauthenticate_organization_returns_fresh_sso_url() {
+        let (base_url, _server) = spawn_mock_as(org_well_known_router()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        state.config.write().await.organizations = vec![crate::config::ConfigOrganization {
+            name: "Acme Corp".to_string(),
+            provider: "custom".to_string(),
+            idp: base_url.clone(),
+            client_id: None,
+        }];
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/organizations/Acme%20Corp/reauthenticate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["name"], "Acme Corp");
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        assert!(authorize_url.starts_with(&format!("{base_url}/authorize?")));
+        assert!(authorize_url.contains("scope=openid"));
+    }
+
+    /// Resolution chain — explicit: an org created with an explicit `client_id`
+    /// uses it verbatim in the authorize URL (over the CIMD the AS advertises)
+    /// and persists it on the org both in memory and on disk.
+    #[tokio::test]
+    async fn create_organization_explicit_client_id_wins_and_is_persisted() {
+        let (base_url, _server) = spawn_mock_as(org_well_known_router()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let config = state.config.clone();
+        let config_path = state.config_path.clone().unwrap();
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/organizations")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "Acme Corp",
+                            "provider": "custom",
+                            "idp": base_url,
+                            "client_id": "explicit-okta-client",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        assert!(
+            authorize_url.contains("client_id=explicit-okta-client"),
+            "explicit client_id must win over CIMD, got: {authorize_url}"
+        );
+
+        let orgs = config.read().await.organizations.clone();
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0].client_id.as_deref(), Some("explicit-okta-client"));
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(disk.contains("explicit-okta-client"));
+    }
+
+    /// Resolution chain — CIMD: an org on a CIMD-advertising AS with no explicit
+    /// `client_id` uses the hosted CIMD `client_id` and persists `None` (so the
+    /// org config round-trips unchanged).
+    #[tokio::test]
+    async fn create_organization_cimd_used_when_no_explicit_client_id() {
+        let (base_url, _server) = spawn_mock_as(org_well_known_router()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let config = state.config.clone();
+        let config_path = state.config_path.clone().unwrap();
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/organizations")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "Acme Corp",
+                            "provider": "custom",
+                            "idp": base_url,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        assert!(
+            authorize_url.contains(&format!(
+                "client_id={}",
+                urlencoding(crate::oauth::client::ENDARA_CLIENT_METADATA_URL)
+            )),
+            "CIMD client_id expected, got: {authorize_url}"
+        );
+
+        let orgs = config.read().await.organizations.clone();
+        assert_eq!(orgs.len(), 1);
+        assert!(orgs[0].client_id.is_none(), "CIMD must persist None");
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!disk.contains("client_id"));
+    }
+
+    /// Resolution chain — DCR: an org on an AS that advertises DCR (no CIMD, no
+    /// explicit client_id) registers a client and uses/persists the registered
+    /// `client_id`.
+    #[tokio::test]
+    async fn create_organization_dcr_registers_and_persists_client_id() {
+        let (base_url, _server) = spawn_mock_as(org_well_known_router_with_dcr()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let config = state.config.clone();
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/organizations")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "Acme Corp",
+                            "provider": "custom",
+                            "idp": base_url,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        assert!(
+            authorize_url.contains("client_id=dcr-registered-client"),
+            "DCR-registered client_id expected, got: {authorize_url}"
+        );
+
+        let orgs = config.read().await.organizations.clone();
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0].client_id.as_deref(), Some("dcr-registered-client"));
+    }
+
+    /// Resolution chain — 422: an org on an AS advertising neither CIMD nor DCR,
+    /// with no explicit `client_id`, returns `422 client_id_required` and is not
+    /// persisted.
+    #[tokio::test]
+    async fn create_organization_returns_422_when_no_client_id_resolvable() {
+        let (base_url, _server) = spawn_mock_as(org_well_known_router_no_client()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let config = state.config.clone();
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/organizations")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "Acme Corp",
+                            "provider": "custom",
+                            "idp": base_url,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "client_id_required");
+        assert!(
+            config.read().await.organizations.is_empty(),
+            "org must not be persisted when client_id is unresolvable"
         );
     }
 }
