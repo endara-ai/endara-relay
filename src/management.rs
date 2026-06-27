@@ -3349,6 +3349,7 @@ fn validate_endpoint_request(
         isolation,
         container_image: req.container_image.clone(),
         mounts: req.mounts.clone(),
+        auth: None,
     };
 
     Ok(new_ep)
@@ -4693,6 +4694,7 @@ mod tests {
                 isolation: Some("none".to_string()),
                 container_image: None,
                 mounts: None,
+                auth: None,
             }],
             profiles: None,
         }
@@ -7026,6 +7028,7 @@ command = "echo"
                 isolation: None,
                 container_image: None,
                 mounts: None,
+                auth: None,
             }],
             profiles: None,
         };
@@ -7246,6 +7249,7 @@ command = "echo"
                 isolation: None,
                 container_image: None,
                 mounts: None,
+                auth: None,
             }],
             profiles: None,
         };
@@ -7763,6 +7767,7 @@ command = "echo"
                 isolation: None,
                 container_image: None,
                 mounts: None,
+                auth: None,
             }],
             profiles: None,
         }
@@ -7952,6 +7957,7 @@ client_id = "client123"
                     isolation: None,
                     container_image: None,
                     mounts: None,
+                    auth: None,
                 })
                 .collect(),
             profiles: None,
@@ -8510,6 +8516,7 @@ client_id = "client123"
                 isolation: None,
                 container_image: None,
                 mounts: None,
+                auth: None,
             }],
             profiles: None,
         };
@@ -8807,6 +8814,7 @@ client_id = "client123"
                 isolation: None,
                 container_image: None,
                 mounts: None,
+                auth: None,
             });
             let toml_str = toml::to_string_pretty(&*cfg).unwrap();
             std::fs::write(&config_file, toml_str).unwrap();

@@ -1013,6 +1013,7 @@ mod tests {
             isolation: Some("none".to_string()),
             container_image: None,
             mounts: None,
+            auth: None,
         }
     }
 
@@ -1056,6 +1057,7 @@ mod tests {
             isolation: Some("none".to_string()),
             container_image: None,
             mounts: None,
+            auth: None,
         }
     }
 
@@ -1315,6 +1317,7 @@ mod tests {
             isolation: Some("none".to_string()),
             container_image: None,
             mounts: None,
+            auth: None,
         };
         let diff = ConfigDiff {
             changed: vec![("ep".to_string(), changed_ep)],
@@ -1353,6 +1356,7 @@ mod tests {
             isolation: Some("none".to_string()),
             container_image: None,
             mounts: None,
+            auth: None,
         };
         let diff = ConfigDiff {
             added: vec![new_ep],
@@ -1449,6 +1453,7 @@ mod tests {
             isolation: None,
             container_image: None,
             mounts: None,
+            auth: None,
         };
         let diff = ConfigDiff {
             added: vec![new_ep],
@@ -1521,6 +1526,7 @@ mod tests {
             isolation: None,
             container_image: None,
             mounts: None,
+            auth: None,
         };
         let diff = ConfigDiff {
             added: vec![new_ep],
@@ -1723,6 +1729,7 @@ mod tests {
             isolation: None,
             container_image: None,
             mounts: None,
+            auth: None,
         };
         let diff = ConfigDiff {
             added: vec![new_ep],
@@ -1882,6 +1889,7 @@ mod tests {
             isolation: None,
             container_image: None,
             mounts: None,
+            auth: None,
         }
     }
 
@@ -2011,6 +2019,7 @@ mod tests {
             isolation: None,
             container_image: None,
             mounts: None,
+            auth: None,
         }
     }
 

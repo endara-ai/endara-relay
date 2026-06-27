@@ -91,6 +91,7 @@ async fn test_config_diff_add_endpoint() {
             isolation: Some("none".to_string()),
             container_image: None,
             mounts: None,
+            auth: None,
         }],
         profiles: None,
     };
@@ -129,6 +130,7 @@ async fn test_config_diff_add_endpoint() {
                 isolation: Some("none".to_string()),
                 container_image: None,
                 mounts: None,
+                auth: None,
             },
             config::EndpointConfig {
                 name: "multi-ep".to_string(),
@@ -151,6 +153,7 @@ async fn test_config_diff_add_endpoint() {
                 isolation: Some("none".to_string()),
                 container_image: None,
                 mounts: None,
+                auth: None,
             },
         ],
         profiles: None,
@@ -278,6 +281,7 @@ async fn test_config_diff_remove_endpoint() {
                 isolation: Some("none".to_string()),
                 container_image: None,
                 mounts: None,
+                auth: None,
             },
             config::EndpointConfig {
                 name: "multi-ep".to_string(),
@@ -300,6 +304,7 @@ async fn test_config_diff_remove_endpoint() {
                 isolation: Some("none".to_string()),
                 container_image: None,
                 mounts: None,
+                auth: None,
             },
         ],
         profiles: None,
@@ -338,6 +343,7 @@ async fn test_config_diff_remove_endpoint() {
             isolation: Some("none".to_string()),
             container_image: None,
             mounts: None,
+            auth: None,
         }],
         profiles: None,
     };
