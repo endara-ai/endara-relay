@@ -4,7 +4,7 @@ use crate::adapter::oauth::{EmaConfig, EmaSsoWiring, OAuthAdapter, OAuthAdapterC
 use crate::adapter::sse::{SseAdapter, SseConfig};
 use crate::adapter::stdio::{IsolationMode, StdioAdapter, StdioConfig};
 use crate::adapter::{FailedAdapter, McpAdapter, StartingAdapter};
-use crate::config::{self, Config, ConfigDiff, EndpointConfig, Transport};
+use crate::config::{self, Config, ConfigDiff, ConfigOrganization, EndpointConfig, Transport};
 use crate::events::ToolCallEventBus;
 use crate::oauth::OAuthFlowManager;
 use crate::profile_registry::ProfileRegistry;
@@ -210,6 +210,7 @@ async fn reload_and_apply(
         new_config.relay.allow_insecure_oauth.unwrap_or(false),
         event_bus,
         jit,
+        &new_config.organizations,
     )
     .await;
 
@@ -261,6 +262,7 @@ pub async fn apply_diff(
     allow_insecure_oauth: bool,
     event_bus: Option<&ToolCallEventBus>,
     jit: Option<&JitWiring>,
+    organizations: &[ConfigOrganization],
 ) {
     // Remove endpoints
     for name in &diff.removed {
@@ -322,6 +324,7 @@ pub async fn apply_diff(
         let oai = oauth_adapter_inners.clone();
         let bus = event_bus.cloned();
         let jit_owned = jit.cloned();
+        let orgs = organizations.to_vec();
         let init_span = tracing::info_span!("endpoint_init", endpoint = %name_clone);
         tokio::spawn(
             async move {
@@ -332,6 +335,7 @@ pub async fn apply_diff(
                     allow_insecure_oauth,
                     bus.as_ref(),
                     jit_owned.as_ref(),
+                    &orgs,
                 )
                 .await;
                 let mut entries = reg.entries().write().await;
@@ -381,6 +385,7 @@ pub async fn apply_diff(
         let oai = oauth_adapter_inners.clone();
         let bus = event_bus.cloned();
         let jit_owned = jit.cloned();
+        let orgs = organizations.to_vec();
         let init_span = tracing::info_span!("endpoint_init", endpoint = %ep_clone.name);
         tokio::spawn(
             async move {
@@ -391,6 +396,7 @@ pub async fn apply_diff(
                     allow_insecure_oauth,
                     bus.as_ref(),
                     jit_owned.as_ref(),
+                    &orgs,
                 )
                 .await;
                 let mut entries = reg.entries().write().await;
@@ -425,6 +431,7 @@ pub async fn apply_diff_graceful(
     allow_insecure_oauth: bool,
     event_bus: Option<&ToolCallEventBus>,
     jit: Option<&JitWiring>,
+    organizations: &[ConfigOrganization],
 ) {
     // Build warning message map
     let warning_messages: std::collections::HashMap<String, String> = {
@@ -525,6 +532,7 @@ pub async fn apply_diff_graceful(
         let oai = oauth_adapter_inners.clone();
         let bus = event_bus.cloned();
         let jit_owned = jit.cloned();
+        let orgs = organizations.to_vec();
         let init_span = tracing::info_span!("endpoint_init", endpoint = %name_clone);
         tokio::spawn(
             async move {
@@ -535,6 +543,7 @@ pub async fn apply_diff_graceful(
                     allow_insecure_oauth,
                     bus.as_ref(),
                     jit_owned.as_ref(),
+                    &orgs,
                 )
                 .await;
                 let mut entries = reg.entries().write().await;
@@ -611,6 +620,7 @@ pub async fn apply_diff_graceful(
         let oai = oauth_adapter_inners.clone();
         let bus = event_bus.cloned();
         let jit_owned = jit.cloned();
+        let orgs = organizations.to_vec();
         let init_span = tracing::info_span!("endpoint_init", endpoint = %ep_clone.name);
         tokio::spawn(
             async move {
@@ -621,6 +631,7 @@ pub async fn apply_diff_graceful(
                     allow_insecure_oauth,
                     bus.as_ref(),
                     jit_owned.as_ref(),
+                    &orgs,
                 )
                 .await;
                 let mut entries = reg.entries().write().await;
@@ -760,26 +771,93 @@ pub struct JitWiring {
     pub flow_manager: Arc<OAuthFlowManager>,
 }
 
-/// Returns `(idp_issuer, resource)` when `ep` declares a complete EMA auth
-/// block (`[endpoints.auth] type = "ema"` with non-empty `idp` and `resource`).
-/// Incomplete blocks are surfaced as per-endpoint validation warnings elsewhere,
-/// so an EMA block missing a field falls through to the ordinary transport path.
-fn ema_auth(ep: &EndpointConfig) -> Option<(&str, &str)> {
+/// Returns `true` when `ep` declares an EMA auth block (`[endpoints.auth]
+/// type = "ema"`), regardless of whether it references an `[[organizations]]`
+/// entry (END-19) or carries a bare `idp` issuer (END-18 back-compat). The
+/// concrete IdP coordinates are resolved separately by [`resolve_ema_idp`];
+/// incomplete blocks are surfaced as per-endpoint validation warnings elsewhere.
+fn is_ema_endpoint(ep: &EndpointConfig) -> bool {
+    ep.auth.as_ref().is_some_and(|auth| auth.auth_type == "ema")
+}
+
+/// Resolved EMA IdP coordinates for an endpoint: the credential-pool key, the
+/// real IdP issuer URL, and the resource the access token is minted for.
+///
+/// The `idp_key` is what makes an org's EMA endpoints share a single IdP ID
+/// token (Wave 2): every endpoint that resolves to the same key reads and
+/// writes the same `IdpCredentials` record. For an END-19 `organization`
+/// reference the key is the org `name`; for a bare END-18 `idp` endpoint the
+/// key is the issuer URL itself, so pre-existing per-issuer `.idp.json` files
+/// keep resolving (back-compat).
+struct ResolvedEmaIdp {
+    idp_key: String,
+    idp_issuer: String,
+    resource: String,
+    /// Optional pre-registered org `client_id` (Okta/Entra). `None` for bare
+    /// END-18 `idp` endpoints and orgs that resolve to CIMD; the EMA legs then
+    /// keep sending the hosted CIMD `client_id`.
+    client_id: Option<String>,
+}
+
+/// Resolve an EMA endpoint's IdP coordinates, preferring the END-19
+/// `organization` reference over the deprecated END-18 bare `idp`.
+///
+/// Returns `None` when `ep` is not an EMA endpoint, is missing `resource`,
+/// references an unknown/empty-issuer org, or has neither an `organization`
+/// nor a bare `idp`. The caller registers a [`FailedAdapter`] in that case.
+fn resolve_ema_idp(
+    ep: &EndpointConfig,
+    organizations: &[ConfigOrganization],
+) -> Option<ResolvedEmaIdp> {
     let auth = ep.auth.as_ref()?;
     if auth.auth_type != "ema" {
         return None;
     }
-    let idp = auth
-        .idp
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?;
     let resource = auth
         .resource
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())?;
-    Some((idp, resource))
+
+    // Preferred END-19 form: reference a named `[[organizations]]` entry. All
+    // EMA endpoints sharing an org name share one pooled IdP credential.
+    if let Some(org_name) = auth
+        .organization
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        let org = organizations.iter().find(|o| o.name == org_name)?;
+        let idp_issuer = org.idp.trim();
+        if idp_issuer.is_empty() {
+            return None;
+        }
+        return Some(ResolvedEmaIdp {
+            idp_key: org.name.clone(),
+            idp_issuer: idp_issuer.to_string(),
+            resource: resource.to_string(),
+            client_id: org
+                .client_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        });
+    }
+
+    // END-18 back-compat: a bare `idp` issuer with no `organization`. Key the
+    // pool by the issuer URL so existing per-issuer credentials keep resolving.
+    let idp_issuer = auth
+        .idp
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    Some(ResolvedEmaIdp {
+        idp_key: idp_issuer.to_string(),
+        idp_issuer: idp_issuer.to_string(),
+        resource: resource.to_string(),
+        client_id: None,
+    })
 }
 
 /// Resolve EMA discovery into an [`EmaConfig`]: RFC 8414 metadata for the IdP
@@ -789,19 +867,21 @@ fn ema_auth(ep: &EndpointConfig) -> Option<(&str, &str)> {
 /// fails so the caller can register a [`FailedAdapter`].
 async fn resolve_ema_config(
     ep: &EndpointConfig,
-    idp: &str,
+    idp_key: &str,
+    idp_issuer: &str,
     resource: &str,
+    client_id: Option<&str>,
     allow_insecure_oauth: bool,
 ) -> Option<EmaConfig> {
     let idp_disc = match crate::oauth::discovery::discover_authorization_server(
-        idp,
+        idp_issuer,
         allow_insecure_oauth,
     )
     .await
     {
         Ok(d) => d,
         Err(e) => {
-            warn!(endpoint = %ep.name, idp = %idp, error = %e, "EMA IdP discovery failed at adapter init");
+            warn!(endpoint = %ep.name, idp = %idp_issuer, error = %e, "EMA IdP discovery failed at adapter init");
             return None;
         }
     };
@@ -818,14 +898,20 @@ async fn resolve_ema_config(
         }
     };
     Some(EmaConfig {
-        // v1 keys IdP credentials by the (sanitized) issuer; END-19 re-keys to org.
-        idp_key: idp.to_string(),
-        idp_issuer: idp.to_string(),
+        // Wave 2: EMA endpoints sharing an org (or a bare END-18 issuer) share
+        // this credential-pool key, so they reuse a single IdP ID token. The
+        // `idp_issuer` remains the real issuer URL (used for discovery + ID-JAG
+        // validation) even when the pool key is an org name.
+        idp_key: idp_key.to_string(),
+        idp_issuer: idp_issuer.to_string(),
         idp_authorization_endpoint: idp_disc.authorization_endpoint,
         idp_token_endpoint: idp_disc.token_endpoint,
         as_issuer: as_disc.issuer,
         as_token_endpoint: as_disc.token_endpoint,
         resource: resource.to_string(),
+        // Org's pre-registered client_id (when set); `None` keeps the EMA legs
+        // on the hosted CIMD `client_id`.
+        client_id: client_id.map(str::to_string),
     })
 }
 
@@ -841,16 +927,21 @@ async fn build_ema_adapter(
     allow_insecure_oauth: bool,
     event_bus: Option<&ToolCallEventBus>,
     jit: Option<&JitWiring>,
+    organizations: &[ConfigOrganization],
 ) -> Box<dyn McpAdapter> {
-    // The caller only reaches this path when `ema_auth(ep)` matched, so both
-    // fields are present here.
-    let (idp, resource) = match ema_auth(ep) {
+    // The caller only reaches this path when `is_ema_endpoint(ep)` matched.
+    // Resolve the org-pooled (or bare-idp back-compat) IdP coordinates; an
+    // unresolvable org reference / missing field is surfaced as a FailedAdapter.
+    let resolved = match resolve_ema_idp(ep, organizations) {
         Some(v) => v,
         None => {
-            return Box::new(FailedAdapter::new(format!(
-                "EMA endpoint '{}' is missing required idp/resource",
-                ep.name
-            )))
+            return Box::new(
+                FailedAdapter::new(format!(
+                    "EMA endpoint '{}' is missing a resolvable organization/idp and resource",
+                    ep.name
+                ))
+                .with_server_type_override(ep.server_type_override.clone()),
+            )
         }
     };
 
@@ -878,7 +969,16 @@ async fn build_ema_adapter(
             .with_server_type_override(ep.server_type_override.clone()),
         );
     }
-    let ema = match resolve_ema_config(ep, idp, resource, allow_insecure_oauth).await {
+    let ema = match resolve_ema_config(
+        ep,
+        &resolved.idp_key,
+        &resolved.idp_issuer,
+        &resolved.resource,
+        resolved.client_id.as_deref(),
+        allow_insecure_oauth,
+    )
+    .await
+    {
         Some(e) => e,
         None => {
             warn!(endpoint = %ep.name, "EMA endpoint discovery failed; registering as failed");
@@ -944,12 +1044,13 @@ pub(crate) async fn create_adapter(
     allow_insecure_oauth: bool,
     event_bus: Option<&ToolCallEventBus>,
     jit: Option<&JitWiring>,
+    organizations: &[ConfigOrganization],
 ) -> Box<dyn McpAdapter> {
     // EMA endpoints (`[endpoints.auth] type = "ema"`) wrap the upstream HTTP MCP
     // server in an `OAuthAdapter` whose refresh path runs the ID-JAG chain
     // (decision D1 / M10). Detected up front so it applies regardless of the
     // declared transport.
-    if ema_auth(ep).is_some() {
+    if is_ema_endpoint(ep) {
         return build_ema_adapter(
             ep,
             token_manager,
@@ -957,6 +1058,7 @@ pub(crate) async fn create_adapter(
             allow_insecure_oauth,
             event_bus,
             jit,
+            organizations,
         )
         .await;
     }
@@ -1213,6 +1315,7 @@ mod tests {
             removed: vec![],
             changed: vec![],
             unchanged: vec![],
+            organizations_changed: false,
         }
     }
 
@@ -1357,7 +1460,7 @@ mod tests {
 
         // PRODUCTION construction path — the interceptor is attached inside
         // create_adapter, never by the test.
-        let adapter = create_adapter(&ep, &tm, &inners, true, None, Some(&jit)).await;
+        let adapter = create_adapter(&ep, &tm, &inners, true, None, Some(&jit), &[]).await;
         assert!(matches!(adapter.health(), HealthStatus::Healthy));
 
         let result = adapter.call_tool("search", json!({})).await;
@@ -1398,7 +1501,7 @@ mod tests {
         let (tm, inners) = test_oauth_infra();
         let ep = http_endpoint("plain_http", &format!("{}/mcp", base));
 
-        let adapter = create_adapter(&ep, &tm, &inners, true, None, None).await;
+        let adapter = create_adapter(&ep, &tm, &inners, true, None, None, &[]).await;
         let result = adapter.call_tool("search", json!({})).await;
         match result {
             Err(AdapterError::HttpError { status: 401, .. }) => {}
@@ -1418,10 +1521,123 @@ mod tests {
         ep.url = url.map(|u| u.to_string());
         ep.auth = Some(crate::config::EndpointAuthConfig {
             auth_type: "ema".to_string(),
+            organization: None,
             idp: Some("https://idp.example.com".to_string()),
             resource: Some("https://api.example.com/mcp".to_string()),
         });
         ep
+    }
+
+    /// Build an END-19 org-referencing EMA endpoint (no bare `idp`).
+    fn ema_org_endpoint(name: &str, organization: &str, resource: &str) -> EndpointConfig {
+        let mut ep = http_endpoint(name, resource);
+        ep.transport = Transport::Http;
+        ep.url = Some(resource.to_string());
+        ep.auth = Some(crate::config::EndpointAuthConfig {
+            auth_type: "ema".to_string(),
+            organization: Some(organization.to_string()),
+            idp: None,
+            resource: Some(resource.to_string()),
+        });
+        ep
+    }
+
+    fn org_entry(name: &str, idp: &str) -> ConfigOrganization {
+        ConfigOrganization {
+            name: name.to_string(),
+            provider: "okta".to_string(),
+            idp: idp.to_string(),
+            client_id: None,
+        }
+    }
+
+    // ---- Wave 2: resolve_ema_idp (org pool + bare-idp back-compat) ----------
+
+    /// An END-19 `organization` reference keys the credential pool by the org
+    /// `name` (so every endpoint in the org shares one ID token) while the
+    /// resolved `idp_issuer` is the org's real issuer URL.
+    #[test]
+    fn resolve_ema_idp_org_reference_keys_by_org_name() {
+        let ep = ema_org_endpoint("github-acme", "Acme Corp", "https://api.example.com/mcp");
+        let orgs = vec![org_entry("Acme Corp", "https://acme.okta.com")];
+        let r = resolve_ema_idp(&ep, &orgs).expect("org ref resolves");
+        assert_eq!(r.idp_key, "Acme Corp");
+        assert_eq!(r.idp_issuer, "https://acme.okta.com");
+        assert_eq!(r.resource, "https://api.example.com/mcp");
+    }
+
+    /// A bare END-18 `idp` endpoint (no `organization`) keys the pool by the
+    /// issuer URL itself, so pre-existing per-issuer `.idp.json` credentials keep
+    /// resolving (migration/back-compat).
+    #[test]
+    fn resolve_ema_idp_bare_idp_keys_by_issuer() {
+        let ep = ema_endpoint(
+            "legacy-bare",
+            Transport::Http,
+            Some("https://api.example.com/mcp"),
+        );
+        let r = resolve_ema_idp(&ep, &[]).expect("bare idp resolves");
+        assert_eq!(r.idp_key, "https://idp.example.com");
+        assert_eq!(r.idp_issuer, "https://idp.example.com");
+        assert_eq!(
+            r.idp_key, r.idp_issuer,
+            "bare-idp key must equal its issuer"
+        );
+    }
+
+    /// Two endpoints referencing the same org resolve to the SAME `idp_key`,
+    /// which is what makes them share a single pooled IdP credential.
+    #[test]
+    fn resolve_ema_idp_two_endpoints_same_org_share_key() {
+        let a = ema_org_endpoint("github-acme", "Acme Corp", "https://api.example.com/gh");
+        let b = ema_org_endpoint("jira-acme", "Acme Corp", "https://api.example.com/jira");
+        let orgs = vec![org_entry("Acme Corp", "https://acme.okta.com")];
+        let ra = resolve_ema_idp(&a, &orgs).expect("a resolves");
+        let rb = resolve_ema_idp(&b, &orgs).expect("b resolves");
+        assert_eq!(ra.idp_key, rb.idp_key, "same org → same pool key");
+        assert_ne!(ra.resource, rb.resource, "distinct resources preserved");
+    }
+
+    /// An `organization` reference that names no configured `[[organizations]]`
+    /// entry resolves to `None` (caller registers a FailedAdapter) rather than
+    /// silently falling through to a bare-idp or non-EMA path.
+    #[test]
+    fn resolve_ema_idp_unknown_org_returns_none() {
+        let ep = ema_org_endpoint("github-acme", "Nope Inc", "https://api.example.com/mcp");
+        let orgs = vec![org_entry("Acme Corp", "https://acme.okta.com")];
+        assert!(resolve_ema_idp(&ep, &orgs).is_none());
+    }
+
+    /// When both an `organization` and a bare `idp` are present, the org
+    /// reference wins (END-19 precedence): the key is the org name and the
+    /// issuer is the org's issuer, not the bare `idp`.
+    #[test]
+    fn resolve_ema_idp_org_takes_precedence_over_bare_idp() {
+        let mut ep = ema_org_endpoint("github-acme", "Acme Corp", "https://api.example.com/mcp");
+        ep.auth.as_mut().unwrap().idp = Some("https://stale.okta.com".to_string());
+        let orgs = vec![org_entry("Acme Corp", "https://acme.okta.com")];
+        let r = resolve_ema_idp(&ep, &orgs).expect("org ref resolves");
+        assert_eq!(r.idp_key, "Acme Corp");
+        assert_eq!(r.idp_issuer, "https://acme.okta.com");
+    }
+
+    /// An EMA block missing `resource` resolves to `None`.
+    #[test]
+    fn resolve_ema_idp_missing_resource_returns_none() {
+        let mut ep = ema_endpoint(
+            "no-res",
+            Transport::Http,
+            Some("https://api.example.com/mcp"),
+        );
+        ep.auth.as_mut().unwrap().resource = None;
+        assert!(resolve_ema_idp(&ep, &[]).is_none());
+    }
+
+    /// A non-EMA endpoint is never treated as EMA by the resolver.
+    #[test]
+    fn resolve_ema_idp_non_ema_returns_none() {
+        let ep = http_endpoint("plain", "https://api.example.com/mcp");
+        assert!(resolve_ema_idp(&ep, &[]).is_none());
     }
 
     /// EMA detection runs before the transport match, so a `stdio` (non-HTTP)
@@ -1436,7 +1652,7 @@ mod tests {
             Some("https://api.example.com/mcp"),
         );
 
-        let adapter = create_adapter(&ep, &tm, &inners, true, None, None).await;
+        let adapter = create_adapter(&ep, &tm, &inners, true, None, None, &[]).await;
         match adapter.health() {
             HealthStatus::Unhealthy(msg) => {
                 assert!(
@@ -1455,7 +1671,7 @@ mod tests {
         let (tm, inners) = test_oauth_infra();
         let ep = ema_endpoint("ema_no_url", Transport::Http, None);
 
-        let adapter = create_adapter(&ep, &tm, &inners, true, None, None).await;
+        let adapter = create_adapter(&ep, &tm, &inners, true, None, None, &[]).await;
         match adapter.health() {
             HealthStatus::Unhealthy(msg) => {
                 assert!(
@@ -1482,7 +1698,17 @@ mod tests {
             )
             .await;
 
-        apply_diff(&empty_diff(), &registry, &tm, &inners, false, None, None).await;
+        apply_diff(
+            &empty_diff(),
+            &registry,
+            &tm,
+            &inners,
+            false,
+            None,
+            None,
+            &[],
+        )
+        .await;
 
         // Existing adapter should still be there, not shut down
         assert!(!shutdown.load(std::sync::atomic::Ordering::SeqCst));
@@ -1509,7 +1735,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners, false, None, None).await;
+        apply_diff(&diff, &registry, &tm, &inners, false, None, None, &[]).await;
 
         assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
         assert!(registry.merged_catalog().await.is_empty());
@@ -1525,7 +1751,7 @@ mod tests {
         };
 
         // Should not panic
-        apply_diff(&diff, &registry, &tm, &inners, false, None, None).await;
+        apply_diff(&diff, &registry, &tm, &inners, false, None, None, &[]).await;
     }
 
     #[tokio::test]
@@ -1573,7 +1799,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners, false, None, None).await;
+        apply_diff(&diff, &registry, &tm, &inners, false, None, None, &[]).await;
 
         // Old adapter should have been shut down
         assert!(shutdown.load(std::sync::atomic::Ordering::SeqCst));
@@ -1612,7 +1838,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners, false, None, None).await;
+        apply_diff(&diff, &registry, &tm, &inners, false, None, None, &[]).await;
 
         // Wait for background initialization to complete
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1664,7 +1890,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners, false, None, None).await;
+        apply_diff(&diff, &registry, &tm, &inners, false, None, None, &[]).await;
 
         // "keep" should still be alive
         assert!(!shutdown_keep.load(std::sync::atomic::Ordering::SeqCst));
@@ -1709,7 +1935,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners, false, None, None).await;
+        apply_diff(&diff, &registry, &tm, &inners, false, None, None, &[]).await;
 
         // Wait for background initialization to complete
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1782,7 +2008,7 @@ mod tests {
             ..empty_diff()
         };
 
-        apply_diff(&diff, &registry, &tm, &inners, true, None, None).await;
+        apply_diff(&diff, &registry, &tm, &inners, true, None, None, &[]).await;
 
         // Wait for background initialization to register the OAuth adapter inner.
         let stop = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1831,6 +2057,7 @@ mod tests {
             false,
             None,
             None,
+            &[],
         )
         .await;
 
@@ -1878,7 +2105,16 @@ mod tests {
             warnings.iter().map(|w| w.endpoint_name.clone()).collect();
 
         apply_diff_graceful(
-            &diff, &registry, &warnings, &warned, &tm, &inners, false, None, None,
+            &diff,
+            &registry,
+            &warnings,
+            &warned,
+            &tm,
+            &inners,
+            false,
+            None,
+            None,
+            &[],
         )
         .await;
 
@@ -1931,7 +2167,16 @@ mod tests {
         let warned: std::collections::HashSet<String> = ["ep".to_string()].into_iter().collect();
 
         apply_diff_graceful(
-            &diff, &registry, &warnings, &warned, &tm, &inners, false, None, None,
+            &diff,
+            &registry,
+            &warnings,
+            &warned,
+            &tm,
+            &inners,
+            false,
+            None,
+            None,
+            &[],
         )
         .await;
 
@@ -1988,7 +2233,16 @@ mod tests {
         let warned: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         apply_diff_graceful(
-            &diff, &registry, &warnings, &warned, &tm, &inners, true, None, None,
+            &diff,
+            &registry,
+            &warnings,
+            &warned,
+            &tm,
+            &inners,
+            true,
+            None,
+            None,
+            &[],
         )
         .await;
 

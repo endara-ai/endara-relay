@@ -631,6 +631,9 @@ async fn main() {
             let settled_inits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let mut init_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
             let allow_insecure_oauth = cfg.relay.allow_insecure_oauth.unwrap_or(false);
+            // Named IdP orgs (END-19) threaded into adapter construction so EMA
+            // endpoints resolve their pooled IdP credential key by org name.
+            let organizations = cfg.organizations.clone();
             // JIT wiring for plain-`http` adapters built during initial load —
             // the same bundle the config watcher uses for hot-reloads. The
             // loopback redirect_uri uses the runtime `port`, never hardcoded.
@@ -645,6 +648,7 @@ async fn main() {
                 let settled = settled_inits.clone();
                 let bus = event_bus.clone();
                 let jit_ep = jit.clone();
+                let orgs = organizations.clone();
                 let handle = tokio::spawn(async move {
                     let adapter = watcher::create_adapter(
                         &ep,
@@ -653,6 +657,7 @@ async fn main() {
                         allow_insecure_oauth,
                         Some(&bus),
                         Some(&jit_ep),
+                        &orgs,
                     )
                     .await;
                     let mut entries = reg.entries().write().await;

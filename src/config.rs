@@ -17,6 +17,14 @@ pub struct Config {
     /// plural `[[profiles]]` to match the existing `[[endpoints]]` convention.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profiles: Option<Vec<ProfileConfig>>,
+    /// Named identity-provider organizations (END-19). Each `[[organizations]]`
+    /// block carries a stable `name` (used in endpoint `auth.organization` refs
+    /// and the credential pool key), a provider template id, and the resolved
+    /// IdP issuer URL. Tokens are NEVER stored here — only in the credential
+    /// store. `#[serde(default)]` keeps pre-existing configs (no org blocks)
+    /// parsing unchanged.
+    #[serde(default)]
+    pub organizations: Vec<ConfigOrganization>,
 }
 
 /// Relay-specific configuration.
@@ -312,16 +320,48 @@ pub fn validate_profiles(config: &Config) -> Result<(), Vec<String>> {
     }
 }
 
+/// A named identity-provider organization (`[[organizations]]`, END-19).
+///
+/// Organizations are the stable identity source EMA endpoints reference via
+/// `auth.organization`, replacing END-18's provisional per-endpoint `idp`
+/// field. The `name` is the stable key used both in endpoint references and as
+/// the credential-pool key (Wave 2). `provider` is a template id
+/// (`okta|entra|google|ping|custom`) and `idp` is the resolved issuer URL.
+///
+/// **Tokens are NEVER part of this struct** — the ID token / refresh token live
+/// only in the credential store (`TokenManager`). Only `name`/`provider`/`idp`
+/// are ever serialized into `config.toml`.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct ConfigOrganization {
+    /// Stable key used in endpoint `auth.organization` refs and the credential
+    /// pool. Human-readable (e.g. `"Acme Corp"`).
+    pub name: String,
+    /// Provider template id: `okta`, `entra`, `google`, `ping`, or `custom`.
+    pub provider: String,
+    /// Resolved IdP issuer URL (built from a provider template or pasted).
+    pub idp: String,
+    /// Optional pre-registered OAuth `client_id` for this org's IdP (e.g. an
+    /// Okta/Entra app registration). When present it is used verbatim across the
+    /// authorize URL and every EMA token leg; when absent the relay falls back to
+    /// the shared resolution chain (CIMD → DCR) and the legs keep sending the
+    /// hosted CIMD `client_id`. Omitted from `config.toml` when unset so existing
+    /// configs round-trip unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+}
+
 /// Authentication configuration nested under `[endpoints.auth]`.
 ///
 /// Currently the only supported `type` is `"ema"` (Enterprise-Managed
-/// Authorization). An EMA block carries a provisional `idp` (the IdP issuer
-/// URL the relay performs SSO against) and a `resource` (the MCP server URL the
-/// minted access token is scoped to). The `idp` field is a **PROVISIONAL**
-/// END-19 seam: END-19 moves the IdP source to `[[organizations]]`.
+/// Authorization). An EMA block references an org via `organization` (the
+/// preferred END-19 form) and carries a `resource` (the MCP server URL the
+/// minted access token is scoped to). The `idp` field is a **DEPRECATED**
+/// back-compat seam from END-18: a bare `idp` issuer URL (with no
+/// `organization`) still validates so existing configs keep working, but new
+/// configs should reference an `[[organizations]]` entry by name instead.
 ///
-/// `idp`/`resource` are modeled as `Option` (rather than via a serde-tagged
-/// enum) so that a missing field surfaces as a clear
+/// `organization`/`idp`/`resource` are modeled as `Option` (rather than via a
+/// serde-tagged enum) so that a missing field surfaces as a clear
 /// [`ConfigError::ValidationError`] / per-endpoint warning through the existing
 /// validation paths instead of a raw TOML parse error, preserving the graceful
 /// per-endpoint loading model.
@@ -330,8 +370,13 @@ pub struct EndpointAuthConfig {
     /// Discriminator for the auth scheme. Only `"ema"` is currently supported.
     #[serde(rename = "type")]
     pub auth_type: String,
+    /// Name of the `[[organizations]]` entry this EMA endpoint authenticates
+    /// against (the preferred END-19 form). The IdP issuer is resolved from the
+    /// named org.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
     /// IdP issuer URL for `type = "ema"` (e.g. `https://acme.okta.com`).
-    /// PROVISIONAL END-19 seam.
+    /// **DEPRECATED** END-18 back-compat seam — prefer `organization`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idp: Option<String>,
     /// Target MCP server URL the EMA access token is minted for.
@@ -520,6 +565,7 @@ pub fn default_config() -> Config {
         relay: RelayConfig::default(),
         endpoints: Vec::new(),
         profiles: None,
+        organizations: Vec::new(),
     }
 }
 
@@ -785,24 +831,31 @@ fn is_valid_endpoint_name(name: &str) -> bool {
 /// Validate an endpoint's `[endpoints.auth]` block.
 ///
 /// Returns `Err(message)` for an unknown `type`, or — for `type = "ema"` — a
-/// missing/empty `idp` or `resource`. Returns `Ok(())` when there is no auth
-/// block or it is valid. The message is suitable for surfacing to the user
-/// (it is prefixed with the endpoint name by callers).
-fn validate_endpoint_auth(ep: &EndpointConfig) -> Result<(), String> {
+/// missing/empty `resource`, or neither an `organization` nor a bare `idp`. An
+/// EMA endpoint is valid when it has `resource` AND (`organization` OR `idp`);
+/// a bare `idp` (no `organization`) still validates for END-18 back-compat but
+/// is deprecated in favor of an `[[organizations]]` reference. Returns `Ok(())`
+/// when there is no auth block or it is valid. The message is suitable for
+/// surfacing to the user (it is prefixed with the endpoint name by callers).
+pub(crate) fn validate_endpoint_auth(ep: &EndpointConfig) -> Result<(), String> {
     let auth = match &ep.auth {
         Some(a) => a,
         None => return Ok(()),
     };
     match auth.auth_type.as_str() {
         "ema" => {
-            if auth.idp.as_deref().unwrap_or("").trim().is_empty() {
-                return Err(
-                    "auth.type = \"ema\" requires a non-empty 'idp' (IdP issuer URL)".to_string(),
-                );
-            }
             if auth.resource.as_deref().unwrap_or("").trim().is_empty() {
                 return Err(
                     "auth.type = \"ema\" requires a non-empty 'resource' (MCP server URL)"
+                        .to_string(),
+                );
+            }
+            let has_org = !auth.organization.as_deref().unwrap_or("").trim().is_empty();
+            let has_idp = !auth.idp.as_deref().unwrap_or("").trim().is_empty();
+            if !has_org && !has_idp {
+                return Err(
+                    "auth.type = \"ema\" requires an 'organization' (the name of an \
+                     [[organizations]] entry) or a bare 'idp' (IdP issuer URL; deprecated)"
                         .to_string(),
                 );
             }
@@ -1038,6 +1091,14 @@ pub struct ConfigDiff {
     /// production reader remains after the watcher's unchanged-loop removal.
     #[allow(dead_code)]
     pub unchanged: Vec<String>,
+    /// `true` when the `[[organizations]]` set differs between the two configs
+    /// (any org added, removed, or changed). EMA endpoints resolve their IdP
+    /// through their named org, so an org change must participate in the
+    /// hot-reload path just like an endpoint change. Wave 2 wires the watcher to
+    /// act on this; it is surfaced here so the diff is the single source of
+    /// truth for what changed.
+    #[allow(dead_code)]
+    pub organizations_changed: bool,
 }
 
 /// Compare two configs and produce a diff of endpoint changes.
@@ -1083,6 +1144,7 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
         removed,
         changed,
         unchanged,
+        organizations_changed: old.organizations != new.organizations,
     }
 }
 
@@ -1836,6 +1898,7 @@ js_execution = false
             },
             endpoints,
             profiles: None,
+            organizations: Vec::new(),
         }
     }
 
@@ -1906,6 +1969,7 @@ payload_window_minutes = 30
             },
             endpoints: vec![],
             profiles: None,
+            organizations: Vec::new(),
         };
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
@@ -2816,12 +2880,14 @@ idp = "https://acme.okta.com"
         let mut ep1 = sse_ep("github-acme", "https://api.githubcopilot.com/mcp/");
         ep1.auth = Some(EndpointAuthConfig {
             auth_type: "ema".to_string(),
+            organization: None,
             idp: Some("https://acme.okta.com".to_string()),
             resource: Some("https://api.githubcopilot.com/mcp/".to_string()),
         });
         let mut ep2 = sse_ep("github-acme", "https://api.githubcopilot.com/mcp/");
         ep2.auth = Some(EndpointAuthConfig {
             auth_type: "ema".to_string(),
+            organization: None,
             idp: Some("https://other.okta.com".to_string()),
             resource: Some("https://api.githubcopilot.com/mcp/".to_string()),
         });
@@ -2831,5 +2897,209 @@ idp = "https://acme.okta.com"
         let diff = diff_configs(&old, &new);
         assert_eq!(diff.changed.len(), 1, "EMA auth change should trigger diff");
         assert!(diff.unchanged.is_empty());
+    }
+
+    // --- [[organizations]] config tests (M1) ---
+
+    #[test]
+    fn organizations_parse_from_toml() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[organizations]]
+name = "Acme Corp"
+provider = "okta"
+idp = "https://acme.okta.com"
+
+[[organizations]]
+name = "Globex"
+provider = "entra"
+idp = "https://login.microsoftonline.com/globex/v2.0"
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(config.organizations.len(), 2);
+        assert_eq!(config.organizations[0].name, "Acme Corp");
+        assert_eq!(config.organizations[0].provider, "okta");
+        assert_eq!(config.organizations[0].idp, "https://acme.okta.com");
+        assert_eq!(config.organizations[1].name, "Globex");
+        assert_eq!(config.organizations[1].provider, "entra");
+    }
+
+    #[test]
+    fn organizations_default_to_empty_when_omitted() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert!(config.organizations.is_empty());
+    }
+
+    #[test]
+    fn organizations_round_trip_and_never_carry_tokens() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[organizations]]
+name = "Acme Corp"
+provider = "okta"
+idp = "https://acme.okta.com"
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        // The serialized org block must carry only name/provider/idp.
+        assert!(serialized.contains("Acme Corp"));
+        assert!(serialized.contains("okta"));
+        assert!(serialized.contains("https://acme.okta.com"));
+        // Tokens are stored only in the credential store, never in toml.
+        assert!(
+            !serialized.to_lowercase().contains("token"),
+            "org toml must never carry tokens: {}",
+            serialized
+        );
+        let reparsed = parse_and_validate(&serialized).unwrap();
+        assert_eq!(
+            reparsed.organizations, config.organizations,
+            "organizations should survive a serialize → parse round trip"
+        );
+    }
+
+    // --- EMA endpoint organization-ref tests (M3) ---
+
+    #[test]
+    fn ema_endpoint_with_organization_validates() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[organizations]]
+name = "Acme Corp"
+provider = "okta"
+idp = "https://acme.okta.com"
+
+[[endpoints]]
+name = "github-acme"
+url = "https://api.githubcopilot.com/mcp/"
+transport = "http"
+
+[endpoints.auth]
+type = "ema"
+organization = "Acme Corp"
+resource = "https://api.githubcopilot.com/mcp/"
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        let auth = config.endpoints[0].auth.as_ref().unwrap();
+        assert_eq!(auth.organization.as_deref(), Some("Acme Corp"));
+        assert!(auth.idp.is_none());
+    }
+
+    #[test]
+    fn ema_endpoint_organization_round_trips_through_serialize() {
+        let mut ep = sse_ep("github-acme", "https://api.githubcopilot.com/mcp/");
+        ep.transport = Transport::Http;
+        ep.auth = Some(EndpointAuthConfig {
+            auth_type: "ema".to_string(),
+            organization: Some("Acme Corp".to_string()),
+            idp: None,
+            resource: Some("https://api.githubcopilot.com/mcp/".to_string()),
+        });
+        let config = make_config(vec![ep]);
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let reparsed = parse_and_validate(&serialized).unwrap();
+        assert_eq!(reparsed.endpoints[0].auth, config.endpoints[0].auth);
+    }
+
+    #[test]
+    fn ema_endpoint_bare_idp_still_validates() {
+        // END-18 back-compat: a bare `idp` with no `organization` keeps working.
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "github-acme"
+url = "https://api.githubcopilot.com/mcp/"
+transport = "http"
+
+[endpoints.auth]
+type = "ema"
+idp = "https://acme.okta.com"
+resource = "https://api.githubcopilot.com/mcp/"
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        let auth = config.endpoints[0].auth.as_ref().unwrap();
+        assert!(auth.organization.is_none());
+        assert_eq!(auth.idp.as_deref(), Some("https://acme.okta.com"));
+    }
+
+    #[test]
+    fn ema_endpoint_without_org_or_idp_is_rejected() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "github-acme"
+url = "https://api.githubcopilot.com/mcp/"
+transport = "http"
+
+[endpoints.auth]
+type = "ema"
+resource = "https://api.githubcopilot.com/mcp/"
+"#;
+        let err = parse_and_validate(toml_str).unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                assert!(msg.contains("ema"), "Error should mention ema: {}", msg);
+                assert!(
+                    msg.contains("organization"),
+                    "Error should mention organization: {}",
+                    msg
+                );
+                assert!(msg.contains("idp"), "Error should mention idp: {}", msg);
+            }
+            other => panic!("Expected ValidationError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn organization_add_remove_change_triggers_config_diff() {
+        let acme = ConfigOrganization {
+            name: "Acme Corp".to_string(),
+            provider: "okta".to_string(),
+            idp: "https://acme.okta.com".to_string(),
+            client_id: None,
+        };
+        let mut with_org = make_config(vec![stdio_ep("a", "echo")]);
+        with_org.organizations = vec![acme.clone()];
+        let without_org = make_config(vec![stdio_ep("a", "echo")]);
+
+        // Added.
+        assert!(
+            diff_configs(&without_org, &with_org).organizations_changed,
+            "adding an org should be reflected in the diff"
+        );
+        // Removed.
+        assert!(
+            diff_configs(&with_org, &without_org).organizations_changed,
+            "removing an org should be reflected in the diff"
+        );
+        // Changed (idp issuer differs).
+        let mut changed = make_config(vec![stdio_ep("a", "echo")]);
+        changed.organizations = vec![ConfigOrganization {
+            idp: "https://acme.okta.com/changed".to_string(),
+            ..acme.clone()
+        }];
+        assert!(
+            diff_configs(&with_org, &changed).organizations_changed,
+            "changing an org should be reflected in the diff"
+        );
+        // Unchanged.
+        assert!(
+            !diff_configs(&with_org, &with_org).organizations_changed,
+            "identical orgs should not be flagged as changed"
+        );
     }
 }

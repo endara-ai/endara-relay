@@ -76,6 +76,10 @@ pub struct EmaConfig {
     pub as_token_endpoint: String,
     /// Target MCP server URL the access token is minted for.
     pub resource: String,
+    /// Optional pre-registered org `client_id` (Okta/Entra). Presented verbatim
+    /// in the IdP authorize URL and every EMA token leg. `None` keeps the legs
+    /// on the hosted CIMD `client_id` ([`ENDARA_CLIENT_METADATA_URL`]).
+    pub client_id: Option<String>,
 }
 
 /// SSO kick-off wiring for an EMA endpoint: the shared OAuth flow manager and
@@ -476,6 +480,7 @@ impl OAuthAdapterInner {
             &ema.as_token_endpoint,
             &ema.resource,
             self.config.allow_insecure_oauth,
+            ema.client_id.as_deref(),
         )
         .await
         {
@@ -527,18 +532,29 @@ impl OAuthAdapterInner {
         let code_challenge = pkce.code_challenge.clone();
         let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", sso.relay_port);
 
+        // Use the org's pre-registered client_id when set; otherwise fall back to
+        // the hosted CIMD client_id (byte-for-byte unchanged for bare END-18).
+        let client_id = ema
+            .client_id
+            .as_deref()
+            .unwrap_or(ENDARA_CLIENT_METADATA_URL);
+
         let state_param = sso
             .flow_manager
             .start_idp_flow(
                 &self.config.endpoint_name,
                 &ema.idp_token_endpoint,
-                ENDARA_CLIENT_METADATA_URL,
+                client_id,
                 None,
                 pkce,
                 &redirect_uri,
                 Some(&ema.idp_issuer),
                 false,
                 &ema.idp_issuer,
+                // Wave 2: persist the captured ID token under the pooled key
+                // (org name, or issuer for bare END-18 endpoints) so all of an
+                // org's EMA endpoints share one credential.
+                &ema.idp_key,
             )
             .await;
 
@@ -553,7 +569,7 @@ impl OAuthAdapterInner {
             "{}{}response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256&scope={}",
             ema.idp_authorization_endpoint,
             sep,
-            form_urlencode(ENDARA_CLIENT_METADATA_URL),
+            form_urlencode(client_id),
             form_urlencode(&redirect_uri),
             form_urlencode(&state_param),
             form_urlencode(&code_challenge),
@@ -1487,6 +1503,7 @@ mod tests {
                 as_issuer: format!("{}/as", resource),
                 as_token_endpoint: format!("{}/as/token", resource),
                 resource: resource.to_string(),
+                client_id: None,
             }),
         }
     }

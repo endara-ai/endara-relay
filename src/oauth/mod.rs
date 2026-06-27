@@ -1,6 +1,7 @@
 pub mod client;
 pub mod dcr;
 pub mod discovery;
+pub mod idp_providers;
 // EMA grant clients (END-18). Not yet wired into the binary's adapter/config in
 // this slice, so the binary crate (private `mod oauth;`) sees it as dead; the
 // lib crate exposes it as public API and the unit tests exercise it.
@@ -108,6 +109,13 @@ pub struct PendingFlow {
     /// keyed by this issuer. `None` for ordinary resource OAuth flows, which are
     /// left completely unaffected.
     pub idp_issuer: Option<String>,
+    /// Credential-pool key the captured `IdpCredentials` are persisted under
+    /// (Wave 2). For an END-19 org-referencing EMA endpoint this is the org
+    /// name, so every endpoint in the org shares one ID token; for a bare
+    /// END-18 `idp` endpoint it is the issuer URL (back-compat). `None` for
+    /// ordinary resource OAuth flows. When `None` on an EMA flow the callback
+    /// falls back to `idp_issuer` as the key.
+    pub idp_credential_key: Option<String>,
     pub created_at: Instant,
 }
 
@@ -151,6 +159,7 @@ impl OAuthFlowManager {
             issuer: issuer.map(|s| s.to_string()),
             iss_parameter_supported,
             idp_issuer: None,
+            idp_credential_key: None,
             created_at: Instant::now(),
         };
         self.pending.write().await.insert(state.clone(), flow);
@@ -163,6 +172,12 @@ impl OAuthFlowManager {
     /// the IdP refresh token and ID-Token expiry) and persists it as
     /// `IdpCredentials`. Callers request the `openid offline_access` scope (M1)
     /// when composing the authorize URL so the IdP returns a refresh token.
+    ///
+    /// `idp_credential_key` is the credential-pool key the callback persists the
+    /// captured `IdpCredentials` under (Wave 2): the org name for an END-19
+    /// org-referencing endpoint (so the whole org shares one ID token), or the
+    /// issuer URL for a bare END-18 `idp` endpoint. `idp_issuer` always remains
+    /// the real issuer URL stored inside the credentials.
     ///
     /// Consumed by the EMA OAuth adapter (END-18 T6) when it composes the IdP
     /// authorize URL for an endpoint that needs (re-)SSO.
@@ -178,6 +193,7 @@ impl OAuthFlowManager {
         issuer: Option<&str>,
         iss_parameter_supported: bool,
         idp_issuer: &str,
+        idp_credential_key: &str,
     ) -> String {
         let state = generate_state();
         let flow = PendingFlow {
@@ -190,6 +206,7 @@ impl OAuthFlowManager {
             issuer: issuer.map(|s| s.to_string()),
             iss_parameter_supported,
             idp_issuer: Some(idp_issuer.to_string()),
+            idp_credential_key: Some(idp_credential_key.to_string()),
             created_at: Instant::now(),
         };
         self.pending.write().await.insert(state.clone(), flow);

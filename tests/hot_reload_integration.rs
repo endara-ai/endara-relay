@@ -94,6 +94,7 @@ async fn test_config_diff_add_endpoint() {
             auth: None,
         }],
         profiles: None,
+        organizations: Vec::new(),
     };
 
     let new_config = config::Config {
@@ -157,6 +158,7 @@ async fn test_config_diff_add_endpoint() {
             },
         ],
         profiles: None,
+        organizations: Vec::new(),
     };
 
     let diff = config::diff_configs(&old_config, &new_config);
@@ -178,6 +180,7 @@ async fn test_config_diff_add_endpoint() {
         false,
         None,
         None,
+        &[],
     )
     .await;
 
@@ -308,6 +311,7 @@ async fn test_config_diff_remove_endpoint() {
             },
         ],
         profiles: None,
+        organizations: Vec::new(),
     };
 
     let new_config = config::Config {
@@ -346,6 +350,7 @@ async fn test_config_diff_remove_endpoint() {
             auth: None,
         }],
         profiles: None,
+        organizations: Vec::new(),
     };
 
     let diff = config::diff_configs(&old_config, &new_config);
@@ -365,6 +370,7 @@ async fn test_config_diff_remove_endpoint() {
         false,
         None,
         None,
+        &[],
     )
     .await;
 

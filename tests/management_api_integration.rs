@@ -120,6 +120,7 @@ fn test_config() -> Config {
             auth: None,
         }],
         profiles: None,
+        organizations: Vec::new(),
     }
 }
 
