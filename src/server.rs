@@ -1922,6 +1922,18 @@ async fn oauth_callback(
                 );
             }
         }
+
+        // EMA IdP SSO is complete: the IdP `token_set` above is the IdP's own
+        // access token, NOT the Step-3 resource access token. Persisting or
+        // applying it to the endpoint would let the adapter treat it as a valid
+        // resource token and skip/loop the EMA exchange on 401s. Return here so
+        // the resource token is always minted via `ema::ensure_access_token`
+        // on the adapter's next refresh. Ordinary resource OAuth flows leave
+        // `idp_issuer` unset and fall through to the save/apply path below.
+        return oauth_html_response(format!(
+            "<html><body><h1>Login Successful</h1><p>Identity provider sign-in for <strong>{}</strong> is complete. The connection will finish authenticating automatically.</p><p>You can close this window.</p></body></html>",
+            html_escape(&flow.endpoint_name)
+        ));
     }
 
     // Check if this is a setup session callback (preflight flow)
@@ -5209,6 +5221,67 @@ mod tests {
         assert_eq!(creds.id_token, id_token);
         assert_eq!(creds.refresh_token.as_deref(), Some("idp-refresh"));
         assert_eq!(creds.id_token_expires_at, Some(1_900_000_000));
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_ema_flow_does_not_save_endpoint_token() {
+        // On an EMA IdP SSO callback the token response's `access_token` is the
+        // IdP's own token, NOT the Step-3 resource access token. It must never be
+        // persisted as the endpoint TokenSet — otherwise the adapter would treat
+        // it as a valid resource token and skip/loop the EMA exchange on 401s.
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+
+        let id_token = id_token_with_exp(1_900_000_000);
+        let body = json!({
+            "access_token": "idp-access-not-resource",
+            "id_token": id_token,
+            "refresh_token": "idp-refresh",
+            "token_type": "Bearer",
+            "expires_in": 3600u64,
+        })
+        .to_string();
+        let (token_endpoint, _server) = spawn_idp_token_endpoint(body).await;
+
+        let pkce = crate::oauth::PkceChallenge::generate();
+        let idp_issuer = "https://acme.okta.com";
+        let endpoint_name = "github-acme";
+        let state_param = flow_mgr
+            .start_idp_flow(
+                endpoint_name,
+                &token_endpoint,
+                "client123",
+                None,
+                pkce,
+                "http://127.0.0.1:9400/oauth/callback",
+                None,
+                false,
+                idp_issuer,
+            )
+            .await;
+
+        let mut app_state = test_app_state();
+        app_state.oauth_flow_manager = Some(flow_mgr);
+        app_state.token_manager = Some(tm.clone());
+
+        let params = OAuthCallbackParams {
+            code: Some("authcode".to_string()),
+            state: Some(state_param),
+            error: None,
+            iss: None,
+        };
+        let resp = oauth_callback(State(app_state), Query(params)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // IdP credentials are captured for the EMA chain...
+        assert!(tm.load_idp(idp_issuer).await.unwrap().is_some());
+        // ...but the endpoint TokenSet must NOT have been written from the IdP
+        // token response. The resource token is minted later via the EMA chain.
+        assert!(
+            tm.load(endpoint_name).await.unwrap().is_none(),
+            "EMA IdP SSO must not persist the IdP access token as the endpoint TokenSet"
+        );
     }
 
     #[tokio::test]

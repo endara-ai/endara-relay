@@ -481,6 +481,10 @@ impl OAuthAdapterInner {
         {
             Ok(token_set) => {
                 self.metrics.inc_refresh_success();
+                // The endpoint is authenticated again; drop any stale IdP
+                // sign-in URL composed by a prior re-SSO-required outcome so
+                // callers don't keep surfacing it (M9).
+                *self.pending_authorize_url.write().await = None;
                 info!("EMA token exchange successful");
                 Ok(token_set)
             }
@@ -1519,6 +1523,40 @@ mod tests {
             .await
             .expect("EMA refresh returns the cached token");
         assert_eq!(ts.access_token, "cached-ema-access");
+    }
+
+    /// A successful EMA refresh clears any stale IdP authorize URL left over from
+    /// a prior re-SSO-required outcome, so callers stop surfacing a sign-in link
+    /// once the endpoint re-authenticates.
+    #[tokio::test]
+    async fn ema_refresh_success_clears_pending_authorize_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let token = TokenSet {
+            access_token: "cached-ema-access".to_string(),
+            refresh_token: None,
+            expires_at: Some(now_secs() + 3600),
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: Some(now_secs()),
+        };
+        tm.save("ema-ep", &token).await.unwrap();
+
+        let config = make_ema_config("http://127.0.0.1:1", "http://127.0.0.1:2");
+        let adapter = OAuthAdapter::new(config, tm);
+        // Seed a stale authorize URL as if a prior refresh required re-SSO.
+        *adapter.inner.pending_authorize_url.write().await =
+            Some("https://stale.example/authorize".to_string());
+
+        adapter
+            .inner
+            .do_token_refresh()
+            .await
+            .expect("EMA refresh returns the cached token");
+        assert!(
+            adapter.inner.pending_authorize_url().await.is_none(),
+            "stale authorize URL must be cleared after a successful EMA refresh"
+        );
     }
 
     /// With no stored IdP credentials the EMA chain is terminal: the adapter

@@ -853,6 +853,31 @@ async fn build_ema_adapter(
             )))
         }
     };
+
+    // EMA wraps an upstream HTTP MCP server in an `OAuthAdapter`, which speaks
+    // streamable HTTP and requires a concrete `url`. EMA detection runs before
+    // the transport match (so it applies regardless of the declared transport),
+    // so guard here against incompatible configs that would otherwise default
+    // `url` to an empty string and fail confusingly at runtime: reject non-HTTP
+    // transports and a missing/empty `url` up front with a clear message.
+    if !matches!(ep.transport, Transport::Http | Transport::Oauth) {
+        return Box::new(
+            FailedAdapter::new(format!(
+                "EMA endpoint '{}' requires transport \"http\" or \"oauth\", got \"{}\"",
+                ep.name, ep.transport
+            ))
+            .with_server_type_override(ep.server_type_override.clone()),
+        );
+    }
+    if ep.url.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        return Box::new(
+            FailedAdapter::new(format!(
+                "EMA endpoint '{}' requires a non-empty 'url' (upstream MCP server URL)",
+                ep.name
+            ))
+            .with_server_type_override(ep.server_type_override.clone()),
+        );
+    }
     let ema = match resolve_ema_config(ep, idp, resource, allow_insecure_oauth).await {
         Some(e) => e,
         None => {
@@ -1381,6 +1406,65 @@ mod tests {
         }
 
         server.abort();
+    }
+
+    /// Build an EMA endpoint config with the given transport/url for the
+    /// transport-validation tests. Uses loopback issuer/resource so that, if the
+    /// validation guard were ever removed, the test would surface a discovery
+    /// failure rather than reaching the network.
+    fn ema_endpoint(name: &str, transport: Transport, url: Option<&str>) -> EndpointConfig {
+        let mut ep = http_endpoint(name, url.unwrap_or(""));
+        ep.transport = transport;
+        ep.url = url.map(|u| u.to_string());
+        ep.auth = Some(crate::config::EndpointAuthConfig {
+            auth_type: "ema".to_string(),
+            idp: Some("https://idp.example.com".to_string()),
+            resource: Some("https://api.example.com/mcp".to_string()),
+        });
+        ep
+    }
+
+    /// EMA detection runs before the transport match, so a `stdio` (non-HTTP)
+    /// transport must be rejected up front with a clear FailedAdapter message
+    /// instead of silently defaulting `url` to an empty string.
+    #[tokio::test]
+    async fn create_adapter_ema_rejects_non_http_transport() {
+        let (tm, inners) = test_oauth_infra();
+        let ep = ema_endpoint(
+            "ema_stdio",
+            Transport::Stdio,
+            Some("https://api.example.com/mcp"),
+        );
+
+        let adapter = create_adapter(&ep, &tm, &inners, true, None, None).await;
+        match adapter.health() {
+            HealthStatus::Unhealthy(msg) => {
+                assert!(
+                    msg.contains("transport") && msg.contains("ema_stdio"),
+                    "expected a transport-validation message, got: {msg}"
+                );
+            }
+            other => panic!("expected Unhealthy FailedAdapter, got: {other:?}"),
+        }
+    }
+
+    /// An EMA endpoint with no `url` must be rejected up front rather than
+    /// defaulting to an empty upstream URL that fails confusingly at runtime.
+    #[tokio::test]
+    async fn create_adapter_ema_requires_non_empty_url() {
+        let (tm, inners) = test_oauth_infra();
+        let ep = ema_endpoint("ema_no_url", Transport::Http, None);
+
+        let adapter = create_adapter(&ep, &tm, &inners, true, None, None).await;
+        match adapter.health() {
+            HealthStatus::Unhealthy(msg) => {
+                assert!(
+                    msg.contains("url") && msg.contains("ema_no_url"),
+                    "expected a url-validation message, got: {msg}"
+                );
+            }
+            other => panic!("expected Unhealthy FailedAdapter, got: {other:?}"),
+        }
     }
 
     #[tokio::test]

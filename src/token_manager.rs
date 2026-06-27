@@ -83,19 +83,19 @@ pub struct IdpCredentials {
 
 /// Sanitize a logical IdP key into a filesystem-safe filename stem. Issuer URLs
 /// carry `/`, `:` and other characters unsafe for paths, so map anything that
-/// isn't ASCII alphanumeric, `-`, or `_` to `_`. Deterministic so the same key
-/// always resolves to the same `.idp.json` file. END-19 swaps the key *source*
-/// (issuer → org) without touching this sanitization.
+/// isn't ASCII alphanumeric, `-`, or `_` to `_`. A simple character map can
+/// collide distinct issuers (e.g. `a/b` and `a_b`), letting one IdP overwrite
+/// another's `*.idp.json`. To make the stem collision-resistant we hash the key
+/// with SHA-256 and encode it URL-safely (the alphabet `[A-Za-z0-9_-]` is
+/// filename-safe). Deterministic so the same key always resolves to the same
+/// `.idp.json` file; the original issuer is still stored inside the JSON.
+/// END-19 swaps the key *source* (issuer → org) without touching this hashing.
 fn sanitize_idp_key(key: &str) -> String {
-    key.chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(key.as_bytes());
+    URL_SAFE_NO_PAD.encode(hasher.finalize())
 }
 
 /// Decide whether persisted DCR credentials may be reused with the current
@@ -753,6 +753,44 @@ mod tests {
             sanitize_idp_key("https://acme.okta.com"),
             sanitize_idp_key("https://other.okta.com")
         );
+    }
+
+    #[test]
+    fn idp_keys_that_collided_under_char_map_now_resolve_distinctly() {
+        // Under the previous character-map sanitization (every non
+        // `[A-Za-z0-9_-]` char → `_`), these distinct issuers both mapped to the
+        // same stem `https___acme.example.com_a_b`, so one IdP's credentials
+        // overwrote the other's. Hashing must keep them in separate files.
+        assert_ne!(
+            sanitize_idp_key("https://acme.example.com/a/b"),
+            sanitize_idp_key("https://acme.example.com/a_b"),
+        );
+        assert_ne!(
+            sanitize_idp_key("https://acme.example.com:8443"),
+            sanitize_idp_key("https://acme.example.com_8443"),
+        );
+    }
+
+    #[tokio::test]
+    async fn idp_colliding_keys_do_not_clobber_each_other() {
+        // End-to-end guard: saving under two issuers that previously collided
+        // must persist two independent records, not overwrite one with the other.
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        let mut a = make_idp_creds();
+        a.idp_issuer = "https://acme.example.com/a/b".to_string();
+        a.id_token = "token-a".to_string();
+        let mut b = make_idp_creds();
+        b.idp_issuer = "https://acme.example.com/a_b".to_string();
+        b.id_token = "token-b".to_string();
+
+        mgr.save_idp(&a.idp_issuer, &a).await.unwrap();
+        mgr.save_idp(&b.idp_issuer, &b).await.unwrap();
+
+        let loaded_a = mgr.load_idp(&a.idp_issuer).await.unwrap().unwrap();
+        let loaded_b = mgr.load_idp(&b.idp_issuer).await.unwrap().unwrap();
+        assert_eq!(loaded_a.id_token, "token-a");
+        assert_eq!(loaded_b.id_token, "token-b");
     }
 
     #[cfg(unix)]
