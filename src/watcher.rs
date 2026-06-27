@@ -1,6 +1,6 @@
 use crate::adapter::http::{HttpAdapter, HttpConfig};
 use crate::adapter::oauth::jit::JitInterceptor;
-use crate::adapter::oauth::{OAuthAdapter, OAuthAdapterConfig};
+use crate::adapter::oauth::{EmaConfig, EmaSsoWiring, OAuthAdapter, OAuthAdapterConfig};
 use crate::adapter::sse::{SseAdapter, SseConfig};
 use crate::adapter::stdio::{IsolationMode, StdioAdapter, StdioConfig};
 use crate::adapter::{FailedAdapter, McpAdapter, StartingAdapter};
@@ -760,6 +760,179 @@ pub struct JitWiring {
     pub flow_manager: Arc<OAuthFlowManager>,
 }
 
+/// Returns `(idp_issuer, resource)` when `ep` declares a complete EMA auth
+/// block (`[endpoints.auth] type = "ema"` with non-empty `idp` and `resource`).
+/// Incomplete blocks are surfaced as per-endpoint validation warnings elsewhere,
+/// so an EMA block missing a field falls through to the ordinary transport path.
+fn ema_auth(ep: &EndpointConfig) -> Option<(&str, &str)> {
+    let auth = ep.auth.as_ref()?;
+    if auth.auth_type != "ema" {
+        return None;
+    }
+    let idp = auth
+        .idp
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let resource = auth
+        .resource
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    Some((idp, resource))
+}
+
+/// Resolve EMA discovery into an [`EmaConfig`]: RFC 8414 metadata for the IdP
+/// issuer (authorization + token endpoints) and RFC 9728 → 8414 metadata for the
+/// resource AS (issuer + token endpoint). All URLs are routed through
+/// `url_guard` inside the discovery clients. Returns `None` if either discovery
+/// fails so the caller can register a [`FailedAdapter`].
+async fn resolve_ema_config(
+    ep: &EndpointConfig,
+    idp: &str,
+    resource: &str,
+    allow_insecure_oauth: bool,
+) -> Option<EmaConfig> {
+    let idp_disc = match crate::oauth::discovery::discover_authorization_server(
+        idp,
+        allow_insecure_oauth,
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(endpoint = %ep.name, idp = %idp, error = %e, "EMA IdP discovery failed at adapter init");
+            return None;
+        }
+    };
+    let as_disc = match crate::oauth::discovery::discover_oauth_server(
+        resource,
+        allow_insecure_oauth,
+    )
+    .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(endpoint = %ep.name, resource = %resource, error = %e, "EMA resource AS discovery failed at adapter init");
+            return None;
+        }
+    };
+    Some(EmaConfig {
+        // v1 keys IdP credentials by the (sanitized) issuer; END-19 re-keys to org.
+        idp_key: idp.to_string(),
+        idp_issuer: idp.to_string(),
+        idp_authorization_endpoint: idp_disc.authorization_endpoint,
+        idp_token_endpoint: idp_disc.token_endpoint,
+        as_issuer: as_disc.issuer,
+        as_token_endpoint: as_disc.token_endpoint,
+        resource: resource.to_string(),
+    })
+}
+
+/// Build an [`OAuthAdapter`] for an EMA endpoint: post-Step-3 the adapter is an
+/// ordinary OAuth adapter (decision D1), but its refresh path runs the ID-JAG
+/// chain. The CIMD `client_id` is presented at the resource AS (Step 3, M7) and
+/// the SSO kick-off wiring (flow manager + relay port) is threaded through so an
+/// expired/missing IdP credential composes an IdP authorize URL.
+async fn build_ema_adapter(
+    ep: &EndpointConfig,
+    token_manager: &Arc<TokenManager>,
+    oauth_adapter_inners: &OAuthAdapterInners,
+    allow_insecure_oauth: bool,
+    event_bus: Option<&ToolCallEventBus>,
+    jit: Option<&JitWiring>,
+) -> Box<dyn McpAdapter> {
+    // The caller only reaches this path when `ema_auth(ep)` matched, so both
+    // fields are present here.
+    let (idp, resource) = match ema_auth(ep) {
+        Some(v) => v,
+        None => {
+            return Box::new(FailedAdapter::new(format!(
+                "EMA endpoint '{}' is missing required idp/resource",
+                ep.name
+            )))
+        }
+    };
+
+    // EMA wraps an upstream HTTP MCP server in an `OAuthAdapter`, which speaks
+    // streamable HTTP and requires a concrete `url`. EMA detection runs before
+    // the transport match (so it applies regardless of the declared transport),
+    // so guard here against incompatible configs that would otherwise default
+    // `url` to an empty string and fail confusingly at runtime: reject non-HTTP
+    // transports and a missing/empty `url` up front with a clear message.
+    if !matches!(ep.transport, Transport::Http | Transport::Oauth) {
+        return Box::new(
+            FailedAdapter::new(format!(
+                "EMA endpoint '{}' requires transport \"http\" or \"oauth\", got \"{}\"",
+                ep.name, ep.transport
+            ))
+            .with_server_type_override(ep.server_type_override.clone()),
+        );
+    }
+    if ep.url.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        return Box::new(
+            FailedAdapter::new(format!(
+                "EMA endpoint '{}' requires a non-empty 'url' (upstream MCP server URL)",
+                ep.name
+            ))
+            .with_server_type_override(ep.server_type_override.clone()),
+        );
+    }
+    let ema = match resolve_ema_config(ep, idp, resource, allow_insecure_oauth).await {
+        Some(e) => e,
+        None => {
+            warn!(endpoint = %ep.name, "EMA endpoint discovery failed; registering as failed");
+            return Box::new(
+                FailedAdapter::new(format!(
+                    "EMA endpoint '{}' could not resolve IdP/resource discovery",
+                    ep.name
+                ))
+                .with_server_type_override(ep.server_type_override.clone()),
+            );
+        }
+    };
+
+    let oauth_config = OAuthAdapterConfig {
+        endpoint_name: ep.name.clone(),
+        url: ep.url.clone().unwrap_or_default(),
+        // Step 3 (RFC 7523) redeems at the resource AS token endpoint.
+        token_endpoint_url: ema.as_token_endpoint.clone(),
+        // EMA is a public client identified by the relay's CIMD URL (M7).
+        client_id: crate::oauth::client::ENDARA_CLIENT_METADATA_URL.to_string(),
+        client_secret: None,
+        heartbeat_interval_secs: 30,
+        probe_timeout_secs: 10,
+        probe_failure_threshold: 3,
+        server_type_override: ep.server_type_override.clone(),
+        allow_insecure_oauth,
+        ema: Some(ema),
+    };
+
+    let mut adapter = match jit {
+        Some(j) => OAuthAdapter::new_ema(
+            oauth_config,
+            token_manager.clone(),
+            EmaSsoWiring {
+                flow_manager: j.flow_manager.clone(),
+                relay_port: j.relay_port,
+            },
+        ),
+        None => OAuthAdapter::new(oauth_config, token_manager.clone()),
+    };
+    if let Some(bus) = event_bus {
+        adapter.set_event_bus(bus.clone());
+    }
+    let shared_inner = adapter.shared_inner();
+    oauth_adapter_inners
+        .write()
+        .await
+        .insert(ep.name.clone(), shared_inner);
+
+    adapter.initialize().await.ok();
+    info!(endpoint = %ep.name, "EMA OAuth adapter initialized");
+    Box::new(adapter)
+}
+
 /// Create an adapter from an endpoint configuration.
 ///
 /// Always returns an adapter. If initialization fails, returns a [`FailedAdapter`]
@@ -772,6 +945,22 @@ pub(crate) async fn create_adapter(
     event_bus: Option<&ToolCallEventBus>,
     jit: Option<&JitWiring>,
 ) -> Box<dyn McpAdapter> {
+    // EMA endpoints (`[endpoints.auth] type = "ema"`) wrap the upstream HTTP MCP
+    // server in an `OAuthAdapter` whose refresh path runs the ID-JAG chain
+    // (decision D1 / M10). Detected up front so it applies regardless of the
+    // declared transport.
+    if ema_auth(ep).is_some() {
+        return build_ema_adapter(
+            ep,
+            token_manager,
+            oauth_adapter_inners,
+            allow_insecure_oauth,
+            event_bus,
+            jit,
+        )
+        .await;
+    }
+
     match ep.transport {
         Transport::Stdio => {
             let stdio_config = StdioConfig {
@@ -869,6 +1058,7 @@ pub(crate) async fn create_adapter(
                 probe_failure_threshold: 3,
                 server_type_override: ep.server_type_override.clone(),
                 allow_insecure_oauth,
+                ema: None,
             };
 
             let mut adapter = OAuthAdapter::new(oauth_config, token_manager.clone());
@@ -1013,6 +1203,7 @@ mod tests {
             isolation: Some("none".to_string()),
             container_image: None,
             mounts: None,
+            auth: None,
         }
     }
 
@@ -1056,6 +1247,7 @@ mod tests {
             isolation: Some("none".to_string()),
             container_image: None,
             mounts: None,
+            auth: None,
         }
     }
 
@@ -1216,6 +1408,65 @@ mod tests {
         server.abort();
     }
 
+    /// Build an EMA endpoint config with the given transport/url for the
+    /// transport-validation tests. Uses loopback issuer/resource so that, if the
+    /// validation guard were ever removed, the test would surface a discovery
+    /// failure rather than reaching the network.
+    fn ema_endpoint(name: &str, transport: Transport, url: Option<&str>) -> EndpointConfig {
+        let mut ep = http_endpoint(name, url.unwrap_or(""));
+        ep.transport = transport;
+        ep.url = url.map(|u| u.to_string());
+        ep.auth = Some(crate::config::EndpointAuthConfig {
+            auth_type: "ema".to_string(),
+            idp: Some("https://idp.example.com".to_string()),
+            resource: Some("https://api.example.com/mcp".to_string()),
+        });
+        ep
+    }
+
+    /// EMA detection runs before the transport match, so a `stdio` (non-HTTP)
+    /// transport must be rejected up front with a clear FailedAdapter message
+    /// instead of silently defaulting `url` to an empty string.
+    #[tokio::test]
+    async fn create_adapter_ema_rejects_non_http_transport() {
+        let (tm, inners) = test_oauth_infra();
+        let ep = ema_endpoint(
+            "ema_stdio",
+            Transport::Stdio,
+            Some("https://api.example.com/mcp"),
+        );
+
+        let adapter = create_adapter(&ep, &tm, &inners, true, None, None).await;
+        match adapter.health() {
+            HealthStatus::Unhealthy(msg) => {
+                assert!(
+                    msg.contains("transport") && msg.contains("ema_stdio"),
+                    "expected a transport-validation message, got: {msg}"
+                );
+            }
+            other => panic!("expected Unhealthy FailedAdapter, got: {other:?}"),
+        }
+    }
+
+    /// An EMA endpoint with no `url` must be rejected up front rather than
+    /// defaulting to an empty upstream URL that fails confusingly at runtime.
+    #[tokio::test]
+    async fn create_adapter_ema_requires_non_empty_url() {
+        let (tm, inners) = test_oauth_infra();
+        let ep = ema_endpoint("ema_no_url", Transport::Http, None);
+
+        let adapter = create_adapter(&ep, &tm, &inners, true, None, None).await;
+        match adapter.health() {
+            HealthStatus::Unhealthy(msg) => {
+                assert!(
+                    msg.contains("url") && msg.contains("ema_no_url"),
+                    "expected a url-validation message, got: {msg}"
+                );
+            }
+            other => panic!("expected Unhealthy FailedAdapter, got: {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn apply_diff_empty_is_noop() {
         let registry = Arc::new(AdapterRegistry::new());
@@ -1315,6 +1566,7 @@ mod tests {
             isolation: Some("none".to_string()),
             container_image: None,
             mounts: None,
+            auth: None,
         };
         let diff = ConfigDiff {
             changed: vec![("ep".to_string(), changed_ep)],
@@ -1353,6 +1605,7 @@ mod tests {
             isolation: Some("none".to_string()),
             container_image: None,
             mounts: None,
+            auth: None,
         };
         let diff = ConfigDiff {
             added: vec![new_ep],
@@ -1449,6 +1702,7 @@ mod tests {
             isolation: None,
             container_image: None,
             mounts: None,
+            auth: None,
         };
         let diff = ConfigDiff {
             added: vec![new_ep],
@@ -1521,6 +1775,7 @@ mod tests {
             isolation: None,
             container_image: None,
             mounts: None,
+            auth: None,
         };
         let diff = ConfigDiff {
             added: vec![new_ep],
@@ -1723,6 +1978,7 @@ mod tests {
             isolation: None,
             container_image: None,
             mounts: None,
+            auth: None,
         };
         let diff = ConfigDiff {
             added: vec![new_ep],
@@ -1882,6 +2138,7 @@ mod tests {
             isolation: None,
             container_image: None,
             mounts: None,
+            auth: None,
         }
     }
 
@@ -2011,6 +2268,7 @@ mod tests {
             isolation: None,
             container_image: None,
             mounts: None,
+            auth: None,
         }
     }
 

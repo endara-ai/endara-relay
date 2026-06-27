@@ -312,6 +312,33 @@ pub fn validate_profiles(config: &Config) -> Result<(), Vec<String>> {
     }
 }
 
+/// Authentication configuration nested under `[endpoints.auth]`.
+///
+/// Currently the only supported `type` is `"ema"` (Enterprise-Managed
+/// Authorization). An EMA block carries a provisional `idp` (the IdP issuer
+/// URL the relay performs SSO against) and a `resource` (the MCP server URL the
+/// minted access token is scoped to). The `idp` field is a **PROVISIONAL**
+/// END-19 seam: END-19 moves the IdP source to `[[organizations]]`.
+///
+/// `idp`/`resource` are modeled as `Option` (rather than via a serde-tagged
+/// enum) so that a missing field surfaces as a clear
+/// [`ConfigError::ValidationError`] / per-endpoint warning through the existing
+/// validation paths instead of a raw TOML parse error, preserving the graceful
+/// per-endpoint loading model.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct EndpointAuthConfig {
+    /// Discriminator for the auth scheme. Only `"ema"` is currently supported.
+    #[serde(rename = "type")]
+    pub auth_type: String,
+    /// IdP issuer URL for `type = "ema"` (e.g. `https://acme.okta.com`).
+    /// PROVISIONAL END-19 seam.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idp: Option<String>,
+    /// Target MCP server URL the EMA access token is minted for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
+}
+
 /// Configuration for a single MCP endpoint.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct EndpointConfig {
@@ -369,6 +396,11 @@ pub struct EndpointConfig {
     /// `isolation = "container"`. Default: no host filesystem access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mounts: Option<Vec<String>>,
+    /// Optional `[endpoints.auth]` block. Present only for endpoints using a
+    /// non-default auth scheme (currently `type = "ema"`). Omitted for ordinary
+    /// stdio/sse/http/oauth endpoints, keeping pre-existing configs unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth: Option<EndpointAuthConfig>,
 }
 
 impl EndpointConfig {
@@ -391,6 +423,8 @@ impl EndpointConfig {
 /// OAuth fields are included — changing OAuth config should trigger adapter restart.
 /// Isolation fields (`isolation`, `container_image`, `mounts`) are included —
 /// changing them should trigger adapter restart.
+/// The `auth` block is included — changing an EMA endpoint's IdP/resource (or
+/// adding/removing the block) should trigger adapter restart.
 impl PartialEq for EndpointConfig {
     fn eq(&self, other: &Self) -> bool {
         self.name == other.name
@@ -409,6 +443,7 @@ impl PartialEq for EndpointConfig {
             && self.isolation == other.isolation
             && self.container_image == other.container_image
             && self.mounts == other.mounts
+            && self.auth == other.auth
     }
 }
 
@@ -747,6 +782,39 @@ fn is_valid_endpoint_name(name: &str) -> bool {
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
+/// Validate an endpoint's `[endpoints.auth]` block.
+///
+/// Returns `Err(message)` for an unknown `type`, or — for `type = "ema"` — a
+/// missing/empty `idp` or `resource`. Returns `Ok(())` when there is no auth
+/// block or it is valid. The message is suitable for surfacing to the user
+/// (it is prefixed with the endpoint name by callers).
+fn validate_endpoint_auth(ep: &EndpointConfig) -> Result<(), String> {
+    let auth = match &ep.auth {
+        Some(a) => a,
+        None => return Ok(()),
+    };
+    match auth.auth_type.as_str() {
+        "ema" => {
+            if auth.idp.as_deref().unwrap_or("").trim().is_empty() {
+                return Err(
+                    "auth.type = \"ema\" requires a non-empty 'idp' (IdP issuer URL)".to_string(),
+                );
+            }
+            if auth.resource.as_deref().unwrap_or("").trim().is_empty() {
+                return Err(
+                    "auth.type = \"ema\" requires a non-empty 'resource' (MCP server URL)"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "unknown auth.type '{}' — supported values: \"ema\"",
+            other
+        )),
+    }
+}
+
 impl Config {
     /// Validate the config, collecting **all** errors instead of stopping at the first.
     ///
@@ -821,6 +889,10 @@ impl Config {
                         ));
                     }
                 }
+            }
+
+            if let Err(msg) = validate_endpoint_auth(ep) {
+                errors.push(format!("Endpoint '{}': {}", ep.name, msg));
             }
         }
 
@@ -932,6 +1004,14 @@ fn validate_graceful(config: &Config, warnings: &mut Vec<EndpointValidationWarni
                         ),
                     });
                 }
+            }
+
+            // Validate the `[endpoints.auth]` block (currently `type = "ema"`).
+            if let Err(msg) = validate_endpoint_auth(ep) {
+                warnings.push(EndpointValidationWarning {
+                    endpoint_name: ep.name.clone(),
+                    message: msg,
+                });
             }
         }
     }
@@ -1854,6 +1934,7 @@ payload_window_minutes = 30
             isolation: None,
             container_image: None,
             mounts: None,
+            auth: None,
         }
     }
 
@@ -1879,6 +1960,7 @@ payload_window_minutes = 30
             isolation: None,
             container_image: None,
             mounts: None,
+            auth: None,
         }
     }
 
@@ -2322,6 +2404,7 @@ scopes = ["openid", "profile", "email"]
             isolation: None,
             container_image: None,
             mounts: None,
+            auth: None,
         };
 
         let mut ep2 = ep1.clone();
@@ -2520,6 +2603,233 @@ isolation = "{}"
         let new = make_config(vec![ep2]);
         let diff = diff_configs(&old, &new);
         assert_eq!(diff.changed.len(), 1, "mounts change should trigger diff");
+        assert!(diff.unchanged.is_empty());
+    }
+
+    // --- EMA endpoint auth tests (M10) ---
+
+    #[test]
+    fn ema_endpoint_parses() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "github-acme"
+url = "https://api.githubcopilot.com/mcp/"
+transport = "http"
+
+[endpoints.auth]
+type = "ema"
+idp = "https://acme.okta.com"
+resource = "https://api.githubcopilot.com/mcp/"
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        let auth = config.endpoints[0].auth.as_ref().unwrap();
+        assert_eq!(auth.auth_type, "ema");
+        assert_eq!(auth.idp.as_deref(), Some("https://acme.okta.com"));
+        assert_eq!(
+            auth.resource.as_deref(),
+            Some("https://api.githubcopilot.com/mcp/")
+        );
+    }
+
+    #[test]
+    fn ema_endpoint_round_trips_through_serialize() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "github-acme"
+url = "https://api.githubcopilot.com/mcp/"
+transport = "http"
+
+[endpoints.auth]
+type = "ema"
+idp = "https://acme.okta.com"
+resource = "https://api.githubcopilot.com/mcp/"
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        let reparsed = parse_and_validate(&serialized).unwrap();
+        assert_eq!(
+            reparsed.endpoints[0].auth, config.endpoints[0].auth,
+            "EMA auth block should survive a serialize → parse round trip"
+        );
+    }
+
+    #[test]
+    fn ema_missing_resource_is_rejected() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "github-acme"
+url = "https://api.githubcopilot.com/mcp/"
+transport = "http"
+
+[endpoints.auth]
+type = "ema"
+idp = "https://acme.okta.com"
+"#;
+        let err = parse_and_validate(toml_str).unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                assert!(
+                    msg.contains("resource"),
+                    "Error should mention resource: {}",
+                    msg
+                );
+                assert!(msg.contains("ema"), "Error should mention ema: {}", msg);
+            }
+            other => panic!("Expected ValidationError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ema_missing_idp_is_rejected() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "github-acme"
+url = "https://api.githubcopilot.com/mcp/"
+transport = "http"
+
+[endpoints.auth]
+type = "ema"
+resource = "https://api.githubcopilot.com/mcp/"
+"#;
+        let err = parse_and_validate(toml_str).unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                assert!(msg.contains("idp"), "Error should mention idp: {}", msg);
+                assert!(msg.contains("ema"), "Error should mention ema: {}", msg);
+            }
+            other => panic!("Expected ValidationError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ema_empty_idp_is_rejected() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "github-acme"
+url = "https://api.githubcopilot.com/mcp/"
+transport = "http"
+
+[endpoints.auth]
+type = "ema"
+idp = "   "
+resource = "https://api.githubcopilot.com/mcp/"
+"#;
+        let err = parse_and_validate(toml_str).unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                assert!(msg.contains("idp"), "Error should mention idp: {}", msg);
+            }
+            other => panic!("Expected ValidationError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn unknown_auth_type_is_rejected() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "github-acme"
+url = "https://api.githubcopilot.com/mcp/"
+transport = "http"
+
+[endpoints.auth]
+type = "saml"
+idp = "https://acme.okta.com"
+resource = "https://api.githubcopilot.com/mcp/"
+"#;
+        let err = parse_and_validate(toml_str).unwrap_err();
+        match err {
+            ConfigError::ValidationError(msg) => {
+                assert!(
+                    msg.contains("unknown auth.type"),
+                    "Error should mention unknown auth.type: {}",
+                    msg
+                );
+                assert!(
+                    msg.contains("saml"),
+                    "Error should mention the value: {}",
+                    msg
+                );
+            }
+            other => panic!("Expected ValidationError, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn non_ema_config_unaffected_by_auth_field() {
+        // A config without any `[endpoints.auth]` block parses unchanged and
+        // leaves `auth` as `None` (backward compatibility).
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "plain"
+transport = "stdio"
+command = "echo"
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert!(config.endpoints[0].auth.is_none());
+    }
+
+    #[test]
+    fn ema_missing_fields_surface_as_graceful_warning() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+
+[[endpoints]]
+name = "github-acme"
+url = "https://api.githubcopilot.com/mcp/"
+transport = "http"
+
+[endpoints.auth]
+type = "ema"
+idp = "https://acme.okta.com"
+"#;
+        let (config, warnings) = parse_and_validate_graceful(toml_str).unwrap();
+        assert_eq!(config.endpoints.len(), 1);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].endpoint_name, "github-acme");
+        assert!(warnings[0].message.contains("resource"));
+    }
+
+    #[test]
+    fn ema_auth_change_triggers_config_diff() {
+        let mut ep1 = sse_ep("github-acme", "https://api.githubcopilot.com/mcp/");
+        ep1.auth = Some(EndpointAuthConfig {
+            auth_type: "ema".to_string(),
+            idp: Some("https://acme.okta.com".to_string()),
+            resource: Some("https://api.githubcopilot.com/mcp/".to_string()),
+        });
+        let mut ep2 = sse_ep("github-acme", "https://api.githubcopilot.com/mcp/");
+        ep2.auth = Some(EndpointAuthConfig {
+            auth_type: "ema".to_string(),
+            idp: Some("https://other.okta.com".to_string()),
+            resource: Some("https://api.githubcopilot.com/mcp/".to_string()),
+        });
+
+        let old = make_config(vec![ep1]);
+        let new = make_config(vec![ep2]);
+        let diff = diff_configs(&old, &new);
+        assert_eq!(diff.changed.len(), 1, "EMA auth change should trigger diff");
         assert!(diff.unchanged.is_empty());
     }
 }

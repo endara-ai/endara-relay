@@ -117,6 +117,7 @@ fn test_config() -> Config {
             isolation: Some("none".to_string()),
             container_image: None,
             mounts: None,
+            auth: None,
         }],
         profiles: None,
     }

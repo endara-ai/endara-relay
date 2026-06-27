@@ -52,6 +52,7 @@ fn empty_config() -> Config {
             isolation: None,
             container_image: None,
             mounts: None,
+            auth: None,
         }],
         profiles: None,
     }

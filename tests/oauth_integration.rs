@@ -1506,6 +1506,7 @@ async fn refresh_404_triggers_discovery_then_caches_new_token_endpoint() {
         // Required for the mock to be reachable via 127.0.0.1 from the
         // SSRF-aware discovery client.
         allow_insecure_oauth: true,
+        ema: None,
     };
     let adapter = OAuthAdapter::new(config, token_manager);
     let inner = adapter.shared_inner();

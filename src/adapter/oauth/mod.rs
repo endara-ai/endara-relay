@@ -10,8 +10,10 @@ use self::metrics::{generate_correlation_id, OAuthMetrics};
 use super::http::{HttpAdapter, HttpConfig};
 use super::server_type_resolution::effective_server_type;
 use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
+use crate::oauth::client::ENDARA_CLIENT_METADATA_URL;
 use crate::oauth::discovery::{discover_oauth_server, DiscoveryResult};
-use crate::oauth::OAuthError;
+use crate::oauth::ema::{self, EmaError};
+use crate::oauth::{OAuthError, OAuthFlowManager, PkceChallenge};
 use crate::token_manager::{TokenManager, TokenSet};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -37,6 +39,12 @@ fn fallback_refresh_deadline(now: Instant, expires_at: Instant) -> Instant {
     target.max(now)
 }
 
+/// `application/x-www-form-urlencoded` byte-serialize a single value for use in
+/// an authorize-URL query parameter (mirrors the JIT path's encoder).
+fn form_urlencode(s: &str) -> String {
+    url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
 /// Wall-clock timeout applied to the OAuth refresh `reqwest::Client`.
 ///
 /// Bounds recovery time when the configured token endpoint stops responding
@@ -45,6 +53,41 @@ fn fallback_refresh_deadline(now: Instant, expires_at: Instant) -> Instant {
 /// gives `refresh_http_client_uses_30s_timeout` a stable hook to assert
 /// against and forces a deliberate review of any future change.
 const REFRESH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Resolved Enterprise-Managed Authorization (EMA, END-18) parameters for an
+/// endpoint whose `[endpoints.auth] type = "ema"`. Present on
+/// [`OAuthAdapterConfig::ema`] only for EMA endpoints; `None` leaves the adapter
+/// on the standard OAuth `refresh_token` grant. The URLs are resolved via
+/// discovery at construction time and are re-validated through `url_guard`
+/// inside [`crate::oauth::ema`] on every leg.
+#[derive(Debug, Clone)]
+pub struct EmaConfig {
+    /// Token-store key for the IdP credentials (a sanitized IdP issuer in v1).
+    pub idp_key: String,
+    /// IdP issuer URL (e.g. `https://acme.okta.com`).
+    pub idp_issuer: String,
+    /// IdP authorization endpoint (for the SSO kick-off authorize URL).
+    pub idp_authorization_endpoint: String,
+    /// IdP token endpoint (token-exchange Step 2 + IdP refresh grant).
+    pub idp_token_endpoint: String,
+    /// Resource AS issuer (RFC 8693 `audience`; ID-JAG `aud` claim).
+    pub as_issuer: String,
+    /// Resource AS token endpoint (RFC 7523 Step 3 redemption).
+    pub as_token_endpoint: String,
+    /// Target MCP server URL the access token is minted for.
+    pub resource: String,
+}
+
+/// SSO kick-off wiring for an EMA endpoint: the shared OAuth flow manager and
+/// the relay loopback port used to compose the IdP authorize URL and register
+/// the pending IdP SSO flow (via [`OAuthFlowManager::start_idp_flow`]). Kept off
+/// [`OAuthAdapterConfig`] (which is `Debug`/`Clone`) because it carries shared
+/// runtime handles.
+#[derive(Clone)]
+pub struct EmaSsoWiring {
+    pub flow_manager: Arc<OAuthFlowManager>,
+    pub relay_port: u16,
+}
 
 /// Configuration for an OAuth-authenticated MCP endpoint.
 #[derive(Debug, Clone)]
@@ -76,6 +119,13 @@ pub struct OAuthAdapterConfig {
     /// production callers and is set to `true` only by tests that mock the
     /// well-known endpoints on `127.0.0.1`.
     pub allow_insecure_oauth: bool,
+    /// Enterprise-Managed Authorization (EMA, END-18) parameters. `Some(_)` for
+    /// `[endpoints.auth] type = "ema"` endpoints, routing token acquisition /
+    /// 401-expiry refresh through [`crate::oauth::ema::ensure_access_token`]
+    /// instead of the standard `refresh_token` grant; post-token behaviour
+    /// (`tools/list`, `tools/call`) is identical to OAuth (decision D1). `None`
+    /// for ordinary OAuth endpoints, which are completely unaffected.
+    pub ema: Option<EmaConfig>,
 }
 
 /// Outcome of a single POST to the OAuth token endpoint. Returned by
@@ -162,6 +212,14 @@ pub struct OAuthAdapterInner {
     /// token swap shares the same slot — the outer `set_event_bus` call
     /// thus reaches both the current inner adapter and any future one.
     event_bus: Arc<OnceLock<crate::events::ToolCallEventBus>>,
+    /// EMA (END-18) SSO kick-off wiring. `Some(_)` only for EMA endpoints built
+    /// with a flow manager + relay port; consulted by [`compose_idp_authorize_url`]
+    /// to register the IdP SSO pending flow and compose the authorize URL when
+    /// the EMA chain reports re-authentication is required.
+    ema_sso: Option<EmaSsoWiring>,
+    /// The most recent EMA IdP authorize URL composed when the chain surfaced a
+    /// re-SSO-required state. Surfaced to callers/desktop and asserted by tests.
+    pending_authorize_url: RwLock<Option<String>>,
 }
 
 impl OAuthAdapterInner {
@@ -260,6 +318,15 @@ impl OAuthAdapterInner {
     /// adapter transitions to `AuthRequired` (matching the pre-existing
     /// non-2xx behavior).
     pub async fn do_token_refresh(self: &Arc<Self>) -> Result<TokenSet, OAuthError> {
+        // EMA (END-18) endpoints mint/refresh their access token through the
+        // ID-JAG chain (Steps 2+3, with a stored ID Token) instead of the
+        // `refresh_token` grant. `ensure_access_token` coalesces concurrent
+        // refreshes on the same per-endpoint `refresh_mutex` (S2), so branch
+        // before acquiring it here to avoid a double lock.
+        if self.config.ema.is_some() {
+            return self.do_ema_refresh().await;
+        }
+
         // Snapshot the current access token before acquiring the mutex.
         // If it changes while we wait, another concurrent refresh succeeded.
         let pre_token = {
@@ -380,6 +447,130 @@ impl OAuthAdapterInner {
                 Err(OAuthError::Http(e))
             }
         }
+    }
+
+    /// EMA (END-18) refresh path: mint or refresh the endpoint's access token
+    /// through the full ID-JAG chain ([`ema::ensure_access_token`]) instead of
+    /// the OAuth `refresh_token` grant. Drives the same state machine as
+    /// `do_token_refresh` (Refreshing → Authenticated on success; AuthRequired /
+    /// ConnectionFailed on failure) and reuses the adapter's per-endpoint
+    /// `refresh_mutex` for coalescing (S2). On a re-SSO-required outcome it
+    /// composes and stores an IdP authorize URL (M1/M9) so the user can sign in.
+    async fn do_ema_refresh(self: &Arc<Self>) -> Result<TokenSet, OAuthError> {
+        let ema = self
+            .config
+            .ema
+            .as_ref()
+            .expect("do_ema_refresh called without EMA config");
+
+        self.transition_to(OAuthState::Refreshing, "starting EMA token exchange")
+            .await;
+
+        match ema::ensure_access_token(
+            &self.token_manager,
+            &self.refresh_mutex,
+            &self.config.endpoint_name,
+            &ema.idp_key,
+            &ema.idp_token_endpoint,
+            &ema.as_issuer,
+            &ema.as_token_endpoint,
+            &ema.resource,
+            self.config.allow_insecure_oauth,
+        )
+        .await
+        {
+            Ok(token_set) => {
+                self.metrics.inc_refresh_success();
+                // The endpoint is authenticated again; drop any stale IdP
+                // sign-in URL composed by a prior re-SSO-required outcome so
+                // callers don't keep surfacing it (M9).
+                *self.pending_authorize_url.write().await = None;
+                info!("EMA token exchange successful");
+                Ok(token_set)
+            }
+            Err(e) => {
+                self.metrics.inc_refresh_failure();
+                // A re-SSO-required outcome surfaces an IdP authorize URL so the
+                // user can sign in again (no silent loop, M9).
+                if matches!(e, EmaError::ReauthRequired { .. }) {
+                    if let Some(url) = self.compose_idp_authorize_url().await {
+                        *self.pending_authorize_url.write().await = Some(url);
+                    }
+                }
+                // Re-auth and policy denials are terminal (AuthRequired);
+                // transport/expiry-class errors are retryable (ConnectionFailed).
+                let (target, reason): (OAuthState, &str) = match &e {
+                    EmaError::ReauthRequired { .. } | EmaError::AuthorizationDenied { .. } => {
+                        (OAuthState::AuthRequired, "EMA re-authentication required")
+                    }
+                    _ => (OAuthState::ConnectionFailed, "EMA token exchange failed"),
+                };
+                error!(error = %e, "EMA token exchange failed");
+                self.transition_to(target, reason).await;
+                Err(OAuthError::Ema(e.to_string()))
+            }
+        }
+    }
+
+    /// Compose the IdP authorize URL for this EMA endpoint's Step-1 SSO and
+    /// register the pending IdP flow via [`OAuthFlowManager::start_idp_flow`]
+    /// (which tags the flow with `idp_issuer` so the `/oauth/callback` handler
+    /// persists the returned ID Token as `IdpCredentials`). The requested scope
+    /// is `openid offline_access` (M1) so the IdP returns a refresh token the
+    /// EMA chain can later use to re-mint ID Tokens silently. Returns `None`
+    /// when the adapter was built without EMA SSO wiring (e.g. unit tests).
+    async fn compose_idp_authorize_url(&self) -> Option<String> {
+        let ema = self.config.ema.as_ref()?;
+        let sso = self.ema_sso.as_ref()?;
+
+        let pkce = PkceChallenge::generate();
+        let code_challenge = pkce.code_challenge.clone();
+        let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", sso.relay_port);
+
+        let state_param = sso
+            .flow_manager
+            .start_idp_flow(
+                &self.config.endpoint_name,
+                &ema.idp_token_endpoint,
+                ENDARA_CLIENT_METADATA_URL,
+                None,
+                pkce,
+                &redirect_uri,
+                Some(&ema.idp_issuer),
+                false,
+                &ema.idp_issuer,
+            )
+            .await;
+
+        // Append a `?` or `&` depending on whether the discovered IdP authorize
+        // endpoint already carries a query string (mirrors the JIT path).
+        let sep = if ema.idp_authorization_endpoint.contains('?') {
+            '&'
+        } else {
+            '?'
+        };
+        let authorize_url = format!(
+            "{}{}response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256&scope={}",
+            ema.idp_authorization_endpoint,
+            sep,
+            form_urlencode(ENDARA_CLIENT_METADATA_URL),
+            form_urlencode(&redirect_uri),
+            form_urlencode(&state_param),
+            form_urlencode(&code_challenge),
+            form_urlencode("openid offline_access"),
+        );
+        info!(
+            endpoint = %self.config.endpoint_name,
+            idp_issuer = %ema.idp_issuer,
+            "EMA IdP SSO authorize URL composed (scope=openid offline_access)"
+        );
+        Some(authorize_url)
+    }
+
+    /// The most recent EMA IdP authorize URL composed when the chain surfaced a
+    /// re-SSO-required state, if any.
+    pub async fn pending_authorize_url(&self) -> Option<String> {
+        self.pending_authorize_url.read().await.clone()
     }
 
     /// Drive the discovery-and-retry fallback for an HTTP 404 from the token
@@ -646,7 +837,11 @@ impl OAuthAdapterInner {
         //    tokens persisted before `issued_at` was added will deserialize
         //    with `issued_at: None` (it's `#[serde(default)]`), but still
         //    deserve a proactive refresh.
-        let deadline = if !has_refresh_token {
+        // EMA endpoints refresh through the ID-JAG chain (using stored IdP
+        // credentials), so they schedule a proactive refresh whenever an
+        // `expires_at` is known even if the persisted `TokenSet` carries no
+        // `refresh_token`. Non-EMA endpoints still require a refresh token.
+        let deadline = if !has_refresh_token && self.config.ema.is_none() {
             info!("No refresh token, skipping proactive refresh");
             None
         } else if let Some(expires) = expires_at_secs {
@@ -843,6 +1038,25 @@ pub struct OAuthAdapter {
 impl OAuthAdapter {
     /// Create a new OAuthAdapter.
     pub fn new(config: OAuthAdapterConfig, token_manager: Arc<TokenManager>) -> Self {
+        Self::new_inner(config, token_manager, None)
+    }
+
+    /// Create a new OAuthAdapter for an EMA endpoint, attaching the SSO kick-off
+    /// wiring (flow manager + relay port) used to compose the IdP authorize URL
+    /// when the chain reports re-authentication is required.
+    pub fn new_ema(
+        config: OAuthAdapterConfig,
+        token_manager: Arc<TokenManager>,
+        ema_sso: EmaSsoWiring,
+    ) -> Self {
+        Self::new_inner(config, token_manager, Some(ema_sso))
+    }
+
+    fn new_inner(
+        config: OAuthAdapterConfig,
+        token_manager: Arc<TokenManager>,
+        ema_sso: Option<EmaSsoWiring>,
+    ) -> Self {
         let (outer_tools_changed_tx, _) = broadcast::channel(16);
         let span = tracing::info_span!(
             "endpoint",
@@ -872,6 +1086,8 @@ impl OAuthAdapter {
                 inner_forwarder_handle: Mutex::new(None),
                 span,
                 event_bus: Arc::new(OnceLock::new()),
+                ema_sso,
+                pending_authorize_url: RwLock::new(None),
             }),
         }
     }
@@ -887,6 +1103,42 @@ impl McpAdapter for OAuthAdapter {
     async fn initialize(&mut self) -> Result<(), AdapterError> {
         let span = self.inner.span.clone();
         async {
+            // EMA endpoints acquire/refresh their access token through the
+            // ID-JAG chain rather than loading a `refresh_token` from disk.
+            // `do_token_refresh` dispatches to the EMA path, which returns a
+            // valid cached token without network when one is persisted, mints a
+            // fresh one from stored IdP credentials otherwise, or surfaces a
+            // re-SSO-required state (composing an IdP authorize URL) when there
+            // are none.
+            if self.inner.config.ema.is_some() {
+                match self.inner.do_token_refresh().await {
+                    Ok(new_tokens) => {
+                        self.inner.apply_tokens(new_tokens).await;
+                    }
+                    Err(e) => {
+                        warn!(
+                            error = %e,
+                            "EMA token acquisition at startup failed (sign-in may be required)"
+                        );
+                        // `do_ema_refresh` already transitioned to a terminal
+                        // state (AuthRequired / ConnectionFailed) on its error
+                        // path.
+                    }
+                }
+
+                // Spawn the heartbeat probe loop (shared with the OAuth path).
+                let weak = Arc::downgrade(&self.inner);
+                let hb_span = self.inner.span.clone();
+                let handle = tokio::spawn(heartbeat::heartbeat_loop(weak).instrument(hb_span));
+                self.inner
+                    .heartbeat_task_handle
+                    .lock()
+                    .await
+                    .replace(handle);
+
+                return Ok(());
+            }
+
             // Try to load existing tokens from disk
             let loaded = self
                 .inner
@@ -1203,6 +1455,7 @@ mod tests {
             probe_failure_threshold: 3,
             server_type_override: None,
             allow_insecure_oauth: false,
+            ema: None,
         }
     }
 
@@ -1210,6 +1463,197 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap().keep();
         let tm = Arc::new(TokenManager::new(tmp));
         OAuthAdapter::new(config, tm)
+    }
+
+    // --- EMA refresh branch (END-18 T6) -------------------------------------
+
+    fn make_ema_config(idp: &str, resource: &str) -> OAuthAdapterConfig {
+        OAuthAdapterConfig {
+            endpoint_name: "ema-ep".to_string(),
+            url: resource.to_string(),
+            token_endpoint_url: format!("{}/as/token", resource),
+            client_id: ENDARA_CLIENT_METADATA_URL.to_string(),
+            client_secret: None,
+            heartbeat_interval_secs: 30,
+            probe_timeout_secs: 10,
+            probe_failure_threshold: 3,
+            server_type_override: None,
+            allow_insecure_oauth: true,
+            ema: Some(EmaConfig {
+                idp_key: idp.to_string(),
+                idp_issuer: idp.to_string(),
+                idp_authorization_endpoint: format!("{}/authorize", idp),
+                idp_token_endpoint: format!("{}/token", idp),
+                as_issuer: format!("{}/as", resource),
+                as_token_endpoint: format!("{}/as/token", resource),
+                resource: resource.to_string(),
+            }),
+        }
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    /// An EMA endpoint's refresh routes through `ema::ensure_access_token`; a
+    /// still-valid persisted access token is returned via the chain's fast path
+    /// with no network contact (the bogus IdP/AS endpoints are never hit).
+    #[tokio::test]
+    async fn ema_refresh_returns_valid_cached_token_without_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let token = TokenSet {
+            access_token: "cached-ema-access".to_string(),
+            refresh_token: None,
+            expires_at: Some(now_secs() + 3600),
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: Some(now_secs()),
+        };
+        tm.save("ema-ep", &token).await.unwrap();
+
+        let config = make_ema_config("http://127.0.0.1:1", "http://127.0.0.1:2");
+        let adapter = OAuthAdapter::new(config, tm);
+        let ts = adapter
+            .inner
+            .do_token_refresh()
+            .await
+            .expect("EMA refresh returns the cached token");
+        assert_eq!(ts.access_token, "cached-ema-access");
+    }
+
+    /// A successful EMA refresh clears any stale IdP authorize URL left over from
+    /// a prior re-SSO-required outcome, so callers stop surfacing a sign-in link
+    /// once the endpoint re-authenticates.
+    #[tokio::test]
+    async fn ema_refresh_success_clears_pending_authorize_url() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let token = TokenSet {
+            access_token: "cached-ema-access".to_string(),
+            refresh_token: None,
+            expires_at: Some(now_secs() + 3600),
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: Some(now_secs()),
+        };
+        tm.save("ema-ep", &token).await.unwrap();
+
+        let config = make_ema_config("http://127.0.0.1:1", "http://127.0.0.1:2");
+        let adapter = OAuthAdapter::new(config, tm);
+        // Seed a stale authorize URL as if a prior refresh required re-SSO.
+        *adapter.inner.pending_authorize_url.write().await =
+            Some("https://stale.example/authorize".to_string());
+
+        adapter
+            .inner
+            .do_token_refresh()
+            .await
+            .expect("EMA refresh returns the cached token");
+        assert!(
+            adapter.inner.pending_authorize_url().await.is_none(),
+            "stale authorize URL must be cleared after a successful EMA refresh"
+        );
+    }
+
+    /// With no stored IdP credentials the EMA chain is terminal: the adapter
+    /// reports the EMA error, transitions to `AuthRequired`, and — without SSO
+    /// wiring — composes no authorize URL.
+    #[tokio::test]
+    async fn ema_refresh_without_idp_credentials_sets_auth_required() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let config = make_ema_config("http://127.0.0.1:1", "http://127.0.0.1:2");
+        let adapter = OAuthAdapter::new(config, tm);
+
+        let err = adapter.inner.do_token_refresh().await.unwrap_err();
+        assert!(matches!(err, OAuthError::Ema(_)), "got {err:?}");
+        assert!(adapter.inner.pending_authorize_url().await.is_none());
+        assert_eq!(
+            adapter.inner.state.read().await.clone(),
+            OAuthState::AuthRequired
+        );
+    }
+
+    /// When SSO wiring is present, a re-auth-required EMA refresh composes an
+    /// IdP authorize URL via `start_idp_flow` with scope `openid offline_access`
+    /// (M1) and registers a pending flow tagged with the IdP issuer so the
+    /// `/oauth/callback` handler persists `IdpCredentials`.
+    #[tokio::test]
+    async fn ema_refresh_reauth_composes_idp_authorize_url_with_offline_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let config = make_ema_config("https://acme.okta.com", "https://api.example.com/mcp");
+        let adapter = OAuthAdapter::new_ema(
+            config,
+            tm,
+            EmaSsoWiring {
+                flow_manager: flow_mgr.clone(),
+                relay_port: 9400,
+            },
+        );
+
+        let err = adapter.inner.do_token_refresh().await.unwrap_err();
+        assert!(matches!(err, OAuthError::Ema(_)), "got {err:?}");
+
+        let url = adapter
+            .inner
+            .pending_authorize_url()
+            .await
+            .expect("authorize URL composed on re-auth");
+        assert!(
+            url.starts_with("https://acme.okta.com/authorize?"),
+            "got {url}"
+        );
+        assert!(
+            url.contains("scope=openid+offline_access"),
+            "scope must include openid offline_access; got {url}"
+        );
+        assert!(url.contains("code_challenge_method=S256"), "got {url}");
+        assert!(
+            url.contains(&format!(
+                "client_id={}",
+                form_urlencode(ENDARA_CLIENT_METADATA_URL)
+            )),
+            "got {url}"
+        );
+
+        let parsed = url::Url::parse(&url).unwrap();
+        let state_param = parsed
+            .query_pairs()
+            .find(|(k, _)| k == "state")
+            .map(|(_, v)| v.into_owned())
+            .expect("state param present");
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending IdP flow registered");
+        assert_eq!(flow.endpoint_name, "ema-ep");
+        assert_eq!(flow.idp_issuer.as_deref(), Some("https://acme.okta.com"));
+        assert_eq!(flow.client_id, ENDARA_CLIENT_METADATA_URL);
+        assert_eq!(flow.token_endpoint, "https://acme.okta.com/token");
+        assert_eq!(
+            adapter.inner.state.read().await.clone(),
+            OAuthState::AuthRequired
+        );
+    }
+
+    /// A non-EMA adapter is unaffected: `do_token_refresh` follows the standard
+    /// `refresh_token` path and fails with `NoRefreshToken` (never the EMA
+    /// branch) when no refresh token is present.
+    #[tokio::test]
+    async fn non_ema_refresh_uses_standard_path() {
+        let mut adapter = make_adapter(make_config());
+        adapter.initialize().await.unwrap();
+        let err = adapter.inner.do_token_refresh().await.unwrap_err();
+        assert!(
+            matches!(err, OAuthError::NoRefreshToken { .. }),
+            "got {err:?}"
+        );
     }
 
     #[tokio::test]

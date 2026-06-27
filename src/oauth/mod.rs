@@ -1,6 +1,11 @@
 pub mod client;
 pub mod dcr;
 pub mod discovery;
+// EMA grant clients (END-18). Not yet wired into the binary's adapter/config in
+// this slice, so the binary crate (private `mod oauth;`) sees it as dead; the
+// lib crate exposes it as public API and the unit tests exercise it.
+#[allow(dead_code)]
+pub mod ema;
 pub mod url_guard;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -38,6 +43,9 @@ pub enum OAuthError {
 
     #[error("Token storage error: {0}")]
     Storage(#[from] TokenError),
+
+    #[error("EMA token exchange failed: {0}")]
+    Ema(String),
 }
 
 /// PKCE (Proof Key for Code Exchange) challenge pair for OAuth 2.0 S256.
@@ -93,6 +101,13 @@ pub struct PendingFlow {
     /// authorization-response `iss` parameter. When `true`, a missing `iss` on
     /// the callback is rejected; when `false`, a missing `iss` is tolerated.
     pub iss_parameter_supported: bool,
+    /// EMA (END-18) Step-1 marker. When `Some(idp_issuer)`, this
+    /// authorization-code flow is an IdP SSO for an EMA endpoint, and the
+    /// `/oauth/callback` handler captures the returned `id_token` (plus the IdP
+    /// refresh token and ID-Token expiry) and persists it as `IdpCredentials`
+    /// keyed by this issuer. `None` for ordinary resource OAuth flows, which are
+    /// left completely unaffected.
+    pub idp_issuer: Option<String>,
     pub created_at: Instant,
 }
 
@@ -135,6 +150,46 @@ impl OAuthFlowManager {
             redirect_uri: redirect_uri.to_string(),
             issuer: issuer.map(|s| s.to_string()),
             iss_parameter_supported,
+            idp_issuer: None,
+            created_at: Instant::now(),
+        };
+        self.pending.write().await.insert(state.clone(), flow);
+        state
+    }
+
+    /// Register a pending **EMA IdP SSO** flow (END-18 Step 1). Behaves exactly
+    /// like [`start_flow`] but tags the pending flow with the IdP `idp_issuer`
+    /// so the `/oauth/callback` handler captures the returned `id_token` (plus
+    /// the IdP refresh token and ID-Token expiry) and persists it as
+    /// `IdpCredentials`. Callers request the `openid offline_access` scope (M1)
+    /// when composing the authorize URL so the IdP returns a refresh token.
+    ///
+    /// Consumed by the EMA OAuth adapter (END-18 T6) when it composes the IdP
+    /// authorize URL for an endpoint that needs (re-)SSO.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_idp_flow(
+        &self,
+        endpoint_name: &str,
+        token_endpoint: &str,
+        client_id: &str,
+        client_secret: Option<&str>,
+        pkce: PkceChallenge,
+        redirect_uri: &str,
+        issuer: Option<&str>,
+        iss_parameter_supported: bool,
+        idp_issuer: &str,
+    ) -> String {
+        let state = generate_state();
+        let flow = PendingFlow {
+            endpoint_name: endpoint_name.to_string(),
+            code_verifier: pkce.code_verifier,
+            token_endpoint: token_endpoint.to_string(),
+            client_id: client_id.to_string(),
+            client_secret: client_secret.map(|s| s.to_string()),
+            redirect_uri: redirect_uri.to_string(),
+            issuer: issuer.map(|s| s.to_string()),
+            iss_parameter_supported,
+            idp_issuer: Some(idp_issuer.to_string()),
             created_at: Instant::now(),
         };
         self.pending.write().await.insert(state.clone(), flow);
