@@ -553,6 +553,10 @@ async fn main() {
                         // `relay.allow_insecure_oauth` for the initial discovery
                         // see consistent behavior on rediscovery.
                         allow_insecure_oauth,
+                        // This branch only handles `transport = "oauth"`
+                        // endpoints; EMA endpoints (`auth.type = "ema"`) are
+                        // built via `create_adapter` in the deferred-init path.
+                        ema: None,
                     };
 
                     let adapter = OAuthAdapter::new(oauth_config, token_manager.clone());

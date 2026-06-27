@@ -43,6 +43,9 @@ pub enum OAuthError {
 
     #[error("Token storage error: {0}")]
     Storage(#[from] TokenError),
+
+    #[error("EMA token exchange failed: {0}")]
+    Ema(String),
 }
 
 /// PKCE (Proof Key for Code Exchange) challenge pair for OAuth 2.0 S256.
@@ -161,10 +164,8 @@ impl OAuthFlowManager {
     /// `IdpCredentials`. Callers request the `openid offline_access` scope (M1)
     /// when composing the authorize URL so the IdP returns a refresh token.
     ///
-    /// The binary crate doesn't yet call this (the EMA adapter wiring lands in a
-    /// later task); the lib crate exposes it as public API and the `server`
-    /// tests exercise it, so the bin build sees it as dead until then.
-    #[allow(dead_code)]
+    /// Consumed by the EMA OAuth adapter (END-18 T6) when it composes the IdP
+    /// authorize URL for an endpoint that needs (re-)SSO.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_idp_flow(
         &self,

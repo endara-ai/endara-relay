@@ -392,6 +392,7 @@ mod tests {
             probe_failure_threshold: threshold,
             server_type_override: None,
             allow_insecure_oauth: false,
+            ema: None,
         }
     }
 

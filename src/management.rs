@@ -6016,6 +6016,7 @@ command = "echo"
             probe_failure_threshold: 3,
             server_type_override: None,
             allow_insecure_oauth: false,
+            ema: None,
         }
     }
 
