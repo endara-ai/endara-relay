@@ -60,6 +60,44 @@ pub struct DcrCredentials {
     pub issuer: Option<String>,
 }
 
+/// Per-IdP credentials captured during EMA Step 1 (IdP SSO). Holds the ID Token
+/// and IdP refresh token used to mint per-resource ID-JAG grants (RFC 8693).
+///
+/// Persisted via `TokenManager::{save_idp,load_idp,delete_idp}`, keyed by a
+/// caller-supplied key (a sanitized IdP issuer in v1; END-19 re-keys to org).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct IdpCredentials {
+    /// IdP issuer these credentials belong to, e.g. `https://acme.okta.com`.
+    pub idp_issuer: String,
+    /// OIDC ID Token from the IdP token response.
+    pub id_token: String,
+    /// IdP refresh token (present when `offline_access` was granted).
+    #[serde(default)]
+    pub refresh_token: Option<String>,
+    /// Unix timestamp (seconds) when the ID Token expires.
+    #[serde(default)]
+    pub id_token_expires_at: Option<u64>,
+    /// Unix timestamp (seconds) when these credentials were obtained.
+    pub obtained_at: u64,
+}
+
+/// Sanitize a logical IdP key into a filesystem-safe filename stem. Issuer URLs
+/// carry `/`, `:` and other characters unsafe for paths, so map anything that
+/// isn't ASCII alphanumeric, `-`, or `_` to `_`. Deterministic so the same key
+/// always resolves to the same `.idp.json` file. END-19 swaps the key *source*
+/// (issuer → org) without touching this sanitization.
+fn sanitize_idp_key(key: &str) -> String {
+    key.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 /// Decide whether persisted DCR credentials may be reused with the current
 /// authorization server, or must be discarded and re-registered (RFC 7591).
 ///
@@ -182,6 +220,47 @@ impl TokenManager {
     /// Delete DCR credentials for an endpoint. No-op if file doesn't exist.
     pub async fn delete_dcr(&self, endpoint_name: &str) -> Result<(), TokenError> {
         let path = self.token_dir.join(format!("{}.dcr.json", endpoint_name));
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(TokenError::Io(e)),
+        }
+    }
+
+    /// Save IdP credentials under `key` (a sanitized IdP issuer in v1; END-19
+    /// re-keys to org). File written atomically (write to .tmp, rename).
+    /// File permissions: 0600 on Unix.
+    pub async fn save_idp(&self, key: &str, creds: &IdpCredentials) -> Result<(), TokenError> {
+        let stem = sanitize_idp_key(key);
+        let path = self.token_dir.join(format!("{}.idp.json", stem));
+        let tmp_path = self.token_dir.join(format!(".{}.idp.json.tmp", stem));
+        let json = serde_json::to_string_pretty(creds)?;
+        tokio::fs::write(&tmp_path, json.as_bytes()).await?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600)).await?;
+        }
+        tokio::fs::rename(&tmp_path, &path).await?;
+        Ok(())
+    }
+
+    /// Load IdP credentials for `key`. Returns None if file doesn't exist.
+    pub async fn load_idp(&self, key: &str) -> Result<Option<IdpCredentials>, TokenError> {
+        let stem = sanitize_idp_key(key);
+        let path = self.token_dir.join(format!("{}.idp.json", stem));
+        match tokio::fs::read_to_string(&path).await {
+            Ok(json) => Ok(Some(serde_json::from_str(&json)?)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(TokenError::Io(e)),
+        }
+    }
+
+    /// Delete IdP credentials for `key`. No-op if file doesn't exist.
+    #[allow(dead_code)]
+    pub async fn delete_idp(&self, key: &str) -> Result<(), TokenError> {
+        let stem = sanitize_idp_key(key);
+        let path = self.token_dir.join(format!("{}.idp.json", stem));
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -561,6 +640,134 @@ mod tests {
         let mgr = TokenManager::new(tmp.path().to_path_buf());
         mgr.save_dcr("perm-test", &make_dcr_creds()).await.unwrap();
         let path = tmp.path().join("perm-test.dcr.json");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "Expected 0600, got {:o}", mode & 0o777);
+    }
+
+    // --- IdP credential persistence tests ---
+
+    fn make_idp_creds() -> IdpCredentials {
+        IdpCredentials {
+            idp_issuer: "https://acme.okta.com".to_string(),
+            id_token: "idp-id-token".to_string(),
+            refresh_token: Some("idp-refresh-token".to_string()),
+            id_token_expires_at: Some(1700003600),
+            obtained_at: 1700000000,
+        }
+    }
+
+    #[tokio::test]
+    async fn idp_save_and_load_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        let creds = make_idp_creds();
+
+        mgr.save_idp("https://acme.okta.com", &creds).await.unwrap();
+        let loaded = mgr
+            .load_idp("https://acme.okta.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, creds);
+    }
+
+    #[tokio::test]
+    async fn idp_load_nonexistent_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        let result = mgr.load_idp("https://nobody.okta.com").await.unwrap();
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn idp_delete_existing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        mgr.save_idp("https://acme.okta.com", &make_idp_creds())
+            .await
+            .unwrap();
+        assert!(mgr
+            .load_idp("https://acme.okta.com")
+            .await
+            .unwrap()
+            .is_some());
+        mgr.delete_idp("https://acme.okta.com").await.unwrap();
+        assert!(mgr
+            .load_idp("https://acme.okta.com")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn idp_delete_nonexistent_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        // Should not error on first or second call
+        mgr.delete_idp("https://nobody.okta.com").await.unwrap();
+        mgr.delete_idp("https://nobody.okta.com").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idp_save_without_optional_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        let creds = IdpCredentials {
+            idp_issuer: "https://acme.okta.com".to_string(),
+            id_token: "idp-id-token".to_string(),
+            refresh_token: None,
+            id_token_expires_at: None,
+            obtained_at: 1700000000,
+        };
+
+        mgr.save_idp("https://acme.okta.com", &creds).await.unwrap();
+        let loaded = mgr
+            .load_idp("https://acme.okta.com")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, creds);
+        assert!(loaded.refresh_token.is_none());
+        assert!(loaded.id_token_expires_at.is_none());
+    }
+
+    #[test]
+    fn idp_tolerates_missing_optional_fields_on_deserialize() {
+        // Records written without the optional fields must still deserialize,
+        // with refresh_token = None and id_token_expires_at = None.
+        let json =
+            r#"{"idp_issuer":"https://acme.okta.com","id_token":"tok","obtained_at":1700000000}"#;
+        let creds: IdpCredentials = serde_json::from_str(json).unwrap();
+        assert_eq!(creds.idp_issuer, "https://acme.okta.com");
+        assert_eq!(creds.id_token, "tok");
+        assert_eq!(creds.refresh_token, None);
+        assert_eq!(creds.id_token_expires_at, None);
+        assert_eq!(creds.obtained_at, 1700000000);
+    }
+
+    #[test]
+    fn idp_distinct_issuers_resolve_to_distinct_files() {
+        // The sanitized key must keep different issuers in different files so
+        // multiple IdPs don't clobber one another.
+        assert_ne!(
+            sanitize_idp_key("https://acme.okta.com"),
+            sanitize_idp_key("https://other.okta.com")
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn idp_saved_file_has_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        mgr.save_idp("https://acme.okta.com", &make_idp_creds())
+            .await
+            .unwrap();
+        let path = tmp.path().join(format!(
+            "{}.idp.json",
+            sanitize_idp_key("https://acme.okta.com")
+        ));
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600, "Expected 0600, got {:o}", mode & 0o777);
     }
