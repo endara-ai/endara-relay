@@ -873,7 +873,8 @@ async fn test_observability_calls_list_filter_and_paging() {
     let (addr, _store, _payloads, _handle) = start_observability_server(None, true).await;
     let client = reqwest::Client::new();
 
-    // Full list, newest-first.
+    // Full list, newest-first. The first page returns a slim per-row DTO and
+    // omits `nextCursor` because it fits under the default limit.
     let resp = client
         .get(format!("http://{}/api/observability/calls", addr))
         .send()
@@ -886,7 +887,10 @@ async fn test_observability_calls_list_filter_and_paging() {
     assert_eq!(calls[0]["tsStart"], 3000);
     assert_eq!(calls[0]["serverName"], "beta");
     assert_eq!(body["limit"], 100);
-    assert_eq!(body["offset"], 0);
+    assert!(body.get("nextCursor").is_none() || body["nextCursor"].is_null());
+    // The slim list DTO drops transport/client/payload-byte detail.
+    assert!(calls[0].get("transport").is_none());
+    assert!(calls[0].get("clientName").is_none());
 
     // Filter by server.
     let resp = client
@@ -914,11 +918,25 @@ async fn test_observability_calls_list_filter_and_paging() {
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0]["requestUid"], "uid-a2");
 
-    // Paging: second page of size 1 is the middle record (ts 2000).
+    // Keyset paging: a limit-1 page returns the newest record plus a
+    // `nextCursor` token; feeding it back walks to the next-newest record.
+    let resp = client
+        .get(format!("http://{}/api/observability/calls?limit=1", addr))
+        .send()
+        .await
+        .expect("request failed");
+    let body: Value = resp.json().await.unwrap();
+    let calls = body["calls"].as_array().unwrap();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0]["tsStart"], 3000);
+    let cursor = body["nextCursor"]
+        .as_str()
+        .expect("nextCursor on full page");
+
     let resp = client
         .get(format!(
-            "http://{}/api/observability/calls?limit=1&offset=1",
-            addr
+            "http://{}/api/observability/calls?limit=1&cursor={}",
+            addr, cursor
         ))
         .send()
         .await
@@ -927,6 +945,18 @@ async fn test_observability_calls_list_filter_and_paging() {
     let calls = body["calls"].as_array().unwrap();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0]["tsStart"], 2000);
+
+    // An unparseable cursor is rejected as 400 — the token is opaque, but
+    // garbage in must not silently return the first page.
+    let resp = client
+        .get(format!(
+            "http://{}/api/observability/calls?cursor=not-a-real-token",
+            addr
+        ))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status().as_u16(), 400);
 }
 
 #[tokio::test]
@@ -1033,7 +1063,7 @@ async fn test_observability_purge() {
             .query(
                 &endara_relay::observability::store::QueryFilter::default(),
                 10,
-                0
+                None,
             )
             .unwrap()
             .len(),
