@@ -602,9 +602,14 @@ impl HttpAdapter {
     /// Record a successful request: reset the transport-failure counter and, if
     /// the adapter had previously demoted itself to `Unhealthy`, recover to
     /// `Healthy`. Other health states (`Starting`/`Stopped`) are left untouched.
+    ///
+    /// The counter reset and the health write are performed while holding the
+    /// `health` write lock so they transition atomically with respect to
+    /// [`Self::note_transport_failure`] — there is no interleaving that can
+    /// leave the counter and health disagreeing.
     async fn note_request_success(&self) {
-        self.transport_failures.store(0, Ordering::SeqCst);
         let mut health = self.health.write().await;
+        self.transport_failures.store(0, Ordering::SeqCst);
         if matches!(*health, HealthStatus::Unhealthy(_)) {
             *health = HealthStatus::Healthy;
         }
@@ -613,10 +618,17 @@ impl HttpAdapter {
     /// Record a transport-dead failure: increment the consecutive-failure
     /// counter and, once it reaches [`TRANSPORT_FAILURE_THRESHOLD`], flip health
     /// to `Unhealthy("upstream unreachable")`.
+    ///
+    /// The increment, threshold check, and health write are performed while
+    /// holding the `health` write lock so they transition atomically with
+    /// respect to [`Self::note_request_success`]. This guarantees there is no
+    /// interleaving that leaves `health == Unhealthy("upstream unreachable")`
+    /// while the failure counter is below the threshold.
     async fn note_transport_failure(&self) {
+        let mut health = self.health.write().await;
         let count = self.transport_failures.fetch_add(1, Ordering::SeqCst) + 1;
         if count >= TRANSPORT_FAILURE_THRESHOLD {
-            *self.health.write().await = HealthStatus::Unhealthy("upstream unreachable".into());
+            *health = HealthStatus::Unhealthy("upstream unreachable".into());
         }
     }
 
@@ -1056,6 +1068,9 @@ impl McpAdapter for HttpAdapter {
                 self.apply_server_identity(result).await?;
                 // 2026 is stateless: no notifications/initialized, no session id.
                 self.spawn_get_listener().await;
+                // Fresh start after (re)connect: clear any stale transport-dead
+                // count so reactive health begins from a clean slate.
+                self.transport_failures.store(0, Ordering::SeqCst);
                 *self.health.write().await = HealthStatus::Healthy;
                 info!(url = %self.config.url, "HTTP MCP adapter initialized (2026 stateless path)");
                 return Ok(());
@@ -1243,6 +1258,9 @@ impl McpAdapter for HttpAdapter {
             // via `parse_sse_response`.
             self.spawn_get_listener().await;
 
+            // Fresh start after (re)connect: clear any stale transport-dead
+            // count so reactive health begins from a clean slate.
+            self.transport_failures.store(0, Ordering::SeqCst);
             *self.health.write().await = HealthStatus::Healthy;
             info!(url = %self.config.url, "HTTP MCP adapter initialized");
             Ok(())
@@ -2550,6 +2568,74 @@ mod tests {
             adapter.transport_failures.load(Ordering::SeqCst),
             0,
             "a successful request must reset the failure counter"
+        );
+
+        server.abort();
+    }
+
+    /// Race guard (PR #123 review SHOULD-FIX): the failure-counter update and
+    /// the `health` write are performed under a single `health` write lock, so
+    /// concurrently firing a threshold-crossing transport failure and a
+    /// success can never leave the adapter stuck `Unhealthy` with the counter
+    /// below the threshold. Every settled state keeps counter and health in
+    /// agreement: `Unhealthy("upstream unreachable")` implies the counter is at
+    /// or above the threshold.
+    #[tokio::test]
+    async fn concurrent_success_and_failure_never_stick_unhealthy() {
+        for _ in 0..1000 {
+            let adapter = Arc::new(HttpAdapter::new(HttpConfig::new("http://127.0.0.1:1/mcp")));
+            *adapter.health.write().await = HealthStatus::Healthy;
+            // Prime the counter one below the threshold so the racing failure
+            // would cross it and demote health.
+            adapter
+                .transport_failures
+                .store(TRANSPORT_FAILURE_THRESHOLD - 1, Ordering::SeqCst);
+
+            let fail = {
+                let a = adapter.clone();
+                tokio::spawn(async move { a.note_transport_failure().await })
+            };
+            let ok = {
+                let a = adapter.clone();
+                tokio::spawn(async move { a.note_request_success().await })
+            };
+            fail.await.unwrap();
+            ok.await.unwrap();
+
+            // Observe the settled state under the lock: counter and health must
+            // agree. The buggy non-atomic version could leave counter == 0 while
+            // health == Unhealthy.
+            let health = adapter.health.read().await;
+            let count = adapter.transport_failures.load(Ordering::SeqCst);
+            if matches!(*health, HealthStatus::Unhealthy(_)) {
+                assert!(
+                    count >= TRANSPORT_FAILURE_THRESHOLD,
+                    "stuck Unhealthy with counter {} below threshold {}",
+                    count,
+                    TRANSPORT_FAILURE_THRESHOLD
+                );
+            }
+        }
+    }
+
+    /// A successful `initialize()` resets the transport-failure counter to 0,
+    /// giving reactive health a clean slate after a (re)connect even if a prior
+    /// run had accumulated transport-dead failures.
+    #[tokio::test]
+    async fn initialize_resets_transport_failure_counter() {
+        // GET 405 so the test doesn't depend on the SSE channel; POST returns ok.
+        let (url, server) = start_fake_http_server(true).await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        // Simulate stale state left over from a prior connection.
+        adapter.transport_failures.store(5, Ordering::SeqCst);
+
+        adapter.initialize().await.expect("initialize succeeds");
+
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert_eq!(
+            adapter.transport_failures.load(Ordering::SeqCst),
+            0,
+            "a successful initialize must reset the transport-failure counter"
         );
 
         server.abort();
