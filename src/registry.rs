@@ -1901,7 +1901,7 @@ mod tests {
         // Drain: poll until both rows land via the background consumer.
         let mut rows = Vec::new();
         for _ in 0..50 {
-            rows = store.query(&QueryFilter::default(), 10, 0).unwrap();
+            rows = store.query(&QueryFilter::default(), 10, None).unwrap();
             if rows.len() >= 2 {
                 break;
             }

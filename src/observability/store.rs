@@ -75,6 +75,12 @@ pub struct AggregateBucket {
     pub p95_ms: u64,
 }
 
+/// Opaque keyset cursor for [`Store::query`] — the `(ts_start, id)` of the last
+/// row returned by the previous page. Encodes as a `(ts_start, id)` row-value
+/// `<` comparison so paging stays stable across concurrent inserts and is
+/// O(limit) at any depth.
+pub type QueryCursor = (i64, i64);
+
 /// Outcome of [`Store::enforce_size_cap`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SizeCapResult {
@@ -190,12 +196,16 @@ impl Store {
         Ok(records.len())
     }
 
-    /// Query records (newest first), filtered by `filter`, with `limit`/`offset` paging.
+    /// Query records (newest first), filtered by `filter`, paged by an opaque
+    /// `(ts_start, id)` keyset `cursor` (`None` for the first page). The next
+    /// page's cursor is the last returned row's `(ts_start, id)`. Uses
+    /// SQLite's row-value `<` comparison so paging is stable under concurrent
+    /// inserts and O(limit) at any depth.
     pub fn query(
         &self,
         filter: &QueryFilter,
         limit: i64,
-        offset: i64,
+        cursor: Option<QueryCursor>,
     ) -> rusqlite::Result<Vec<CallRecord>> {
         let mut sql = format!("SELECT {SELECT_COLUMNS} FROM calls WHERE 1=1");
         let mut args: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -223,9 +233,13 @@ impl Store {
             sql.push_str(" AND ts_start < ?");
             args.push(Box::new(until));
         }
-        sql.push_str(" ORDER BY ts_start DESC, id DESC LIMIT ? OFFSET ?");
+        if let Some((cur_ts, cur_id)) = cursor {
+            sql.push_str(" AND (ts_start, id) < (?, ?)");
+            args.push(Box::new(cur_ts));
+            args.push(Box::new(cur_id));
+        }
+        sql.push_str(" ORDER BY ts_start DESC, id DESC LIMIT ?");
         args.push(Box::new(limit));
-        args.push(Box::new(offset));
 
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(&sql)?;
@@ -289,6 +303,13 @@ impl Store {
     /// [`AggregateBucket`] per (server, bucket) plus a global series
     /// (`server == None`). `bucket_seconds` is the bucket width; buckets are
     /// aligned to multiples of the width from the epoch.
+    ///
+    /// Aggregation is pushed into SQLite via `GROUP BY bucket` plus a window-
+    /// function CTE for nearest-rank percentiles, so the relay never
+    /// materializes every row of the window into a `Vec<CallRecord>` just to
+    /// count/percentile it. The per-server and global series are two
+    /// independent grouped queries; the global series is then zero-filled
+    /// across the aligned window so the sparkline draws a real time-shape.
     pub fn aggregate(
         &self,
         bucket_seconds: i64,
@@ -297,53 +318,107 @@ impl Store {
     ) -> rusqlite::Result<Vec<AggregateBucket>> {
         let bucket_ms = bucket_seconds.max(1) * 1000;
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
-            "SELECT server_name, ts_start, duration_ms, success FROM calls \
-             WHERE ts_start >= ?1 AND ts_start < ?2 ORDER BY ts_start ASC",
-        )?;
-        let rows = stmt.query_map(params![since, until], |row| {
-            let server: Option<String> = row.get(0)?;
-            let ts: i64 = row.get(1)?;
-            let dur: i64 = row.get(2)?;
-            let ok: i64 = row.get(3)?;
-            Ok((server, ts, dur.max(0) as u64, ok != 0))
-        })?;
+
+        // Per-(server, bucket) aggregate. The CTE ranks rows by duration within
+        // each (server, bucket) partition and tags each with the partition
+        // size `n`; the outer `GROUP BY` then picks count/error_count plus the
+        // single row whose `rn` is the nearest-rank index for p50 and p95
+        // (`ceil(p/100 * n)`, clamped to `[1, n]`, expressed as integer
+        // ceiling-division `(p*n + 99)/100`).
+        let per_server_sql = "WITH ranked AS (\n\
+                SELECT server_name, \n\
+                       (ts_start / ?1) * ?1 AS bucket_start, \n\
+                       MAX(duration_ms, 0) AS dur, \n\
+                       success, \n\
+                       ROW_NUMBER() OVER ( \n\
+                           PARTITION BY server_name, (ts_start / ?1) * ?1 \n\
+                           ORDER BY MAX(duration_ms, 0) \n\
+                       ) AS rn, \n\
+                       COUNT(*) OVER ( \n\
+                           PARTITION BY server_name, (ts_start / ?1) * ?1 \n\
+                       ) AS n \n\
+                FROM calls \n\
+                WHERE ts_start >= ?2 AND ts_start < ?3 AND server_name IS NOT NULL \n\
+            ) \n\
+            SELECT server_name, bucket_start, \n\
+                   MAX(n) AS count, \n\
+                   SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS error_count, \n\
+                   MAX(CASE WHEN rn = MAX(1, MIN(n, (50 * n + 99) / 100)) THEN dur END) AS p50, \n\
+                   MAX(CASE WHEN rn = MAX(1, MIN(n, (95 * n + 99) / 100)) THEN dur END) AS p95 \n\
+            FROM ranked \n\
+            GROUP BY server_name, bucket_start";
+
+        // Global series: same shape, but partitioned only by bucket so all
+        // servers' rows roll up into the same percentile/count pool.
+        let global_sql = "WITH ranked AS (\n\
+                SELECT (ts_start / ?1) * ?1 AS bucket_start, \n\
+                       MAX(duration_ms, 0) AS dur, \n\
+                       success, \n\
+                       ROW_NUMBER() OVER ( \n\
+                           PARTITION BY (ts_start / ?1) * ?1 \n\
+                           ORDER BY MAX(duration_ms, 0) \n\
+                       ) AS rn, \n\
+                       COUNT(*) OVER ( \n\
+                           PARTITION BY (ts_start / ?1) * ?1 \n\
+                       ) AS n \n\
+                FROM calls \n\
+                WHERE ts_start >= ?2 AND ts_start < ?3 \n\
+            ) \n\
+            SELECT bucket_start, \n\
+                   MAX(n) AS count, \n\
+                   SUM(CASE WHEN success = 0 THEN 1 ELSE 0 END) AS error_count, \n\
+                   MAX(CASE WHEN rn = MAX(1, MIN(n, (50 * n + 99) / 100)) THEN dur END) AS p50, \n\
+                   MAX(CASE WHEN rn = MAX(1, MIN(n, (95 * n + 99) / 100)) THEN dur END) AS p95 \n\
+            FROM ranked \n\
+            GROUP BY bucket_start";
+
+        let mut per_server: Vec<AggregateBucket> = {
+            let mut stmt = conn.prepare(per_server_sql)?;
+            let rows = stmt.query_map(params![bucket_ms, since, until], |row| {
+                Ok(AggregateBucket {
+                    server: row.get::<_, Option<String>>(0)?,
+                    bucket_start: row.get(1)?,
+                    count: row.get::<_, i64>(2)?.max(0) as u64,
+                    error_count: row.get::<_, i64>(3)?.max(0) as u64,
+                    p50_ms: row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as u64,
+                    p95_ms: row.get::<_, Option<i64>>(5)?.unwrap_or(0).max(0) as u64,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
 
         use std::collections::BTreeMap;
-        // key: (server, bucket_start) -> (durations, error_count)
-        let mut acc: BTreeMap<(Option<String>, i64), (Vec<u64>, u64)> = BTreeMap::new();
-        for row in rows {
-            let (server, ts, dur, ok) = row?;
-            let bucket = (ts / bucket_ms) * bucket_ms;
-            for key in [(server.clone(), bucket), (None, bucket)] {
-                let entry = acc.entry(key).or_default();
-                entry.0.push(dur);
-                if !ok {
-                    entry.1 += 1;
-                }
+        let mut global: BTreeMap<i64, AggregateBucket> = BTreeMap::new();
+        {
+            let mut stmt = conn.prepare(global_sql)?;
+            let rows = stmt.query_map(params![bucket_ms, since, until], |row| {
+                let bucket_start: i64 = row.get(0)?;
+                Ok((
+                    bucket_start,
+                    AggregateBucket {
+                        server: None,
+                        bucket_start,
+                        count: row.get::<_, i64>(1)?.max(0) as u64,
+                        error_count: row.get::<_, i64>(2)?.max(0) as u64,
+                        p50_ms: row.get::<_, Option<i64>>(3)?.unwrap_or(0).max(0) as u64,
+                        p95_ms: row.get::<_, Option<i64>>(4)?.unwrap_or(0).max(0) as u64,
+                    },
+                ))
+            })?;
+            for r in rows {
+                let (k, v) = r?;
+                global.insert(k, v);
             }
         }
 
-        // Build populated buckets, keeping global (server == None) separate so
-        // we can zero-fill it into a contiguous series spanning the window.
-        let mut global: BTreeMap<i64, AggregateBucket> = BTreeMap::new();
-        let mut per_server = Vec::new();
-        for ((server, bucket_start), (mut durations, error_count)) in acc {
-            durations.sort_unstable();
-            let bucket = AggregateBucket {
-                server: server.clone(),
-                bucket_start,
-                count: durations.len() as u64,
-                error_count,
-                p50_ms: percentile(&durations, 50),
-                p95_ms: percentile(&durations, 95),
-            };
-            if server.is_none() {
-                global.insert(bucket_start, bucket);
-            } else {
-                per_server.push(bucket);
-            }
-        }
+        // Stable order for per-server buckets matches the previous BTreeMap
+        // emission order, which the existing wire-shape tests depend on
+        // (sorted by server name, then by bucket_start ascending).
+        per_server.sort_by(|a, b| {
+            a.server
+                .cmp(&b.server)
+                .then_with(|| a.bucket_start.cmp(&b.bucket_start))
+        });
 
         // Emit one global bucket per step across the aligned `[since, until)`
         // window, filling gaps with zeros so the sparkline draws a real
@@ -441,17 +516,6 @@ impl Store {
     }
 }
 
-/// Nearest-rank percentile (`p` in `0..=100`) over a pre-sorted slice.
-fn percentile(sorted: &[u64], p: u64) -> u64 {
-    if sorted.is_empty() {
-        return 0;
-    }
-    let n = sorted.len();
-    let rank = ((p as f64 / 100.0) * n as f64).ceil() as usize;
-    let idx = rank.saturating_sub(1).min(n - 1);
-    sorted[idx]
-}
-
 /// Current wall-clock time in epoch milliseconds.
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -498,7 +562,7 @@ mod tests {
         assert!(dir.path().join("observability.db").exists());
         // Re-open: schema creation must be idempotent and data persists.
         let store = Store::open(dir.path()).unwrap();
-        let rows = store.query(&QueryFilter::default(), 10, 0).unwrap();
+        let rows = store.query(&QueryFilter::default(), 10, None).unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -514,7 +578,7 @@ mod tests {
             .unwrap();
 
         // Newest-first ordering.
-        let all = store.query(&QueryFilter::default(), 10, 0).unwrap();
+        let all = store.query(&QueryFilter::default(), 10, None).unwrap();
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].ts_start, 3000);
         assert_eq!(all[2].ts_start, 1000);
@@ -527,7 +591,7 @@ mod tests {
                     ..Default::default()
                 },
                 10,
-                0,
+                None,
             )
             .unwrap();
         assert_eq!(alpha.len(), 2);
@@ -540,7 +604,7 @@ mod tests {
                     ..Default::default()
                 },
                 10,
-                0,
+                None,
             )
             .unwrap();
         assert_eq!(alph.len(), 2);
@@ -553,7 +617,7 @@ mod tests {
                     ..Default::default()
                 },
                 10,
-                0,
+                None,
             )
             .unwrap();
         assert_eq!(mid.len(), 2);
@@ -566,7 +630,7 @@ mod tests {
                     ..Default::default()
                 },
                 10,
-                0,
+                None,
             )
             .unwrap();
         assert_eq!(by_tool.len(), 1);
@@ -580,13 +644,21 @@ mod tests {
                     ..Default::default()
                 },
                 10,
-                0,
+                None,
             )
             .unwrap();
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].server_name.as_deref(), Some("beta"));
 
-        let page2 = store.query(&QueryFilter::default(), 1, 1).unwrap();
+        // Keyset paging: the first page returns the newest row, and feeding
+        // back its `(ts_start, id)` advances to the next-newest row.
+        let page1 = store.query(&QueryFilter::default(), 1, None).unwrap();
+        assert_eq!(page1.len(), 1);
+        assert_eq!(page1[0].ts_start, 3000);
+        let cursor = (page1[0].ts_start, page1[0].id.expect("row id"));
+        let page2 = store
+            .query(&QueryFilter::default(), 1, Some(cursor))
+            .unwrap();
         assert_eq!(page2.len(), 1);
         assert_eq!(page2[0].ts_start, 2000);
 
@@ -618,7 +690,7 @@ mod tests {
                     ..Default::default()
                 },
                 10,
-                0,
+                None,
             )
             .unwrap();
         assert_eq!(underscore.len(), 1);
@@ -633,7 +705,7 @@ mod tests {
                     ..Default::default()
                 },
                 10,
-                0,
+                None,
             )
             .unwrap();
         assert_eq!(percent.len(), 1);
@@ -722,7 +794,7 @@ mod tests {
             .unwrap();
         let deleted = store.enforce_retention(7).unwrap();
         assert_eq!(deleted, 1);
-        let rows = store.query(&QueryFilter::default(), 10, 0).unwrap();
+        let rows = store.query(&QueryFilter::default(), 10, None).unwrap();
         assert_eq!(rows.len(), 1);
     }
 
@@ -745,7 +817,10 @@ mod tests {
         assert!(zero.evicted);
         assert!(zero.deleted_rows > 0);
         assert_eq!(zero.oldest_retained_ts, None);
-        assert_eq!(store.query(&QueryFilter::default(), 1, 0).unwrap().len(), 0);
+        assert_eq!(
+            store.query(&QueryFilter::default(), 1, None).unwrap().len(),
+            0
+        );
     }
 
     #[test]
@@ -762,13 +837,19 @@ mod tests {
         let removed = store.delete_for_server("alpha").unwrap();
         assert_eq!(removed, 2);
         assert_eq!(
-            store.query(&QueryFilter::default(), 10, 0).unwrap().len(),
+            store
+                .query(&QueryFilter::default(), 10, None)
+                .unwrap()
+                .len(),
             1
         );
 
         store.purge_all().unwrap();
         assert_eq!(
-            store.query(&QueryFilter::default(), 10, 0).unwrap().len(),
+            store
+                .query(&QueryFilter::default(), 10, None)
+                .unwrap()
+                .len(),
             0
         );
     }

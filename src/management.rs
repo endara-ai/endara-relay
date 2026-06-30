@@ -3822,8 +3822,50 @@ impl From<CallRecord> for CallRecordDto {
     }
 }
 
+/// Slim per-row DTO for the calls list. Drops the verbose
+/// transport/client/payload-byte detail columns the table doesn't render so a
+/// 100-row page stays a few KB instead of tens of KB on the wire. The full
+/// row (`CallRecordDto`) is still served by the drill-through detail route.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CallSummaryDto {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_name: Option<String>,
+    tool: String,
+    ts_start: i64,
+    duration_ms: i64,
+    success: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_message: Option<String>,
+    request_bytes: i64,
+    response_bytes: i64,
+}
+
+impl From<CallRecord> for CallSummaryDto {
+    fn from(r: CallRecord) -> Self {
+        CallSummaryDto {
+            id: r.id,
+            request_uid: r.request_uid,
+            server_name: r.server_name,
+            tool: r.tool,
+            ts_start: r.ts_start,
+            duration_ms: r.duration_ms,
+            success: r.success,
+            error_message: r.error_message,
+            request_bytes: r.request_bytes,
+            response_bytes: r.response_bytes,
+        }
+    }
+}
+
 /// Query string for `GET /api/observability/calls`. All filters are optional
-/// and ANDed; `since`/`until` bound `ts_start` as epoch milliseconds.
+/// and ANDed; `since`/`until` bound `ts_start` as epoch milliseconds. `cursor`
+/// is an opaque base64url token returned as `nextCursor` on the previous page;
+/// omit it to fetch the first page.
 #[derive(Deserialize)]
 struct CallsQuery {
     server_name: Option<String>,
@@ -3833,21 +3875,42 @@ struct CallsQuery {
     since: Option<i64>,
     until: Option<i64>,
     limit: Option<i64>,
-    offset: Option<i64>,
+    cursor: Option<String>,
 }
 
-/// Response for `GET /api/observability/calls`.
+/// Response for `GET /api/observability/calls`. `next_cursor` is the opaque
+/// token to pass back as `cursor` for the next page; absent when the page is
+/// the last one.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CallsResponse {
-    calls: Vec<CallRecordDto>,
+    calls: Vec<CallSummaryDto>,
     limit: i64,
-    offset: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
 }
 
 /// Default and maximum page sizes for the calls list.
 const CALLS_DEFAULT_LIMIT: i64 = 100;
 const CALLS_MAX_LIMIT: i64 = 1000;
+
+/// Encode a `(ts_start, id)` keyset cursor as a stable, opaque base64url token.
+/// The format is intentionally undocumented to the client — it's a substring
+/// of the response, not a contract.
+fn encode_calls_cursor(ts_start: i64, id: i64) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    URL_SAFE_NO_PAD.encode(format!("{ts_start}:{id}"))
+}
+
+/// Decode a `(ts_start, id)` keyset cursor. Returns `None` for any malformed
+/// input so the caller can reject it with a 400.
+fn decode_calls_cursor(token: &str) -> Option<(i64, i64)> {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    let bytes = URL_SAFE_NO_PAD.decode(token).ok()?;
+    let s = std::str::from_utf8(&bytes).ok()?;
+    let (ts, id) = s.split_once(':')?;
+    Some((ts.parse().ok()?, id.parse().ok()?))
+}
 
 /// 503 body used when the observability subsystem is unwired (e.g. the metadata
 /// store failed to open at startup). Distinct from a wired-but-disabled handle:
@@ -3871,7 +3934,9 @@ fn now_epoch_ms() -> i64 {
 }
 
 /// GET /api/observability/calls — filtered, paged metadata list (payloads
-/// excluded; use the drill-through route for those).
+/// excluded; use the drill-through route for those). Pagination is keyset on
+/// `(ts_start, id)` via the opaque `cursor` query param so paging stays
+/// stable across concurrent inserts and is O(limit) at any depth.
 async fn get_observability_calls(
     State(state): State<ManagementState>,
     Query(q): Query<CallsQuery>,
@@ -3883,7 +3948,20 @@ async fn get_observability_calls(
         .limit
         .unwrap_or(CALLS_DEFAULT_LIMIT)
         .clamp(1, CALLS_MAX_LIMIT);
-    let offset = q.offset.unwrap_or(0).max(0);
+    let cursor = match q.cursor.as_deref() {
+        Some(token) => match decode_calls_cursor(token) {
+            Some(c) => Some(c),
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid cursor",
+                    Some("The cursor query parameter is not a valid continuation token."),
+                )
+                .into_response();
+            }
+        },
+        None => None,
+    };
     let filter = QueryFilter {
         server_name: q.server_name,
         tool: q.tool,
@@ -3895,14 +3973,26 @@ async fn get_observability_calls(
     // Offload the synchronous rusqlite query to a blocking thread so a slow
     // query never stalls the async runtime serving management + relay tasks.
     let store = Arc::clone(obs.store());
-    let queried = tokio::task::spawn_blocking(move || store.query(&filter, limit, offset)).await;
+    let queried = tokio::task::spawn_blocking(move || store.query(&filter, limit, cursor)).await;
     match queried {
-        Ok(Ok(rows)) => Json(CallsResponse {
-            calls: rows.into_iter().map(CallRecordDto::from).collect(),
-            limit,
-            offset,
-        })
-        .into_response(),
+        Ok(Ok(rows)) => {
+            // Emit a continuation token only when the page filled the limit —
+            // otherwise we're at the tail and there's no more to fetch. The
+            // token encodes the last row's `(ts_start, id)`, which the next
+            // request feeds back via `?cursor=`.
+            let next_cursor = if rows.len() as i64 >= limit {
+                rows.last()
+                    .and_then(|r| r.id.map(|id| encode_calls_cursor(r.ts_start, id)))
+            } else {
+                None
+            };
+            Json(CallsResponse {
+                calls: rows.into_iter().map(CallSummaryDto::from).collect(),
+                limit,
+                next_cursor,
+            })
+            .into_response()
+        }
         Ok(Err(e)) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "failed to query observability records",
@@ -5512,7 +5602,7 @@ command = "cat"
                     ..Default::default()
                 },
                 100,
-                0,
+                None,
             )
             .unwrap();
         assert!(echo_rows.is_empty(), "echo metadata rows should be deleted");
@@ -5527,7 +5617,7 @@ command = "cat"
                     ..Default::default()
                 },
                 100,
-                0,
+                None,
             )
             .unwrap();
         assert_eq!(keep_rows.len(), 2, "keep-me metadata rows should survive");
