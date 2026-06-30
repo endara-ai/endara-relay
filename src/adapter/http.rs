@@ -131,7 +131,22 @@ pub struct HttpAdapter {
     /// sent a top-level `ttlMs`; `None` otherwise. Read by the registry cache to
     /// honor the upstream's freshness window. See [`Self::list_tools_ttl_ms`].
     list_ttl_ms: Arc<RwLock<Option<u64>>>,
+    /// Count of consecutive transport-level ("upstream is dead") failures seen
+    /// on outbound requests issued via [`Self::send_request`] (the `list_tools`
+    /// and `call_tool` paths). Incremented only for transport-dead signals
+    /// (see [`Self::is_transport_dead`]); reset to 0 on any successful request.
+    /// Once it reaches [`TRANSPORT_FAILURE_THRESHOLD`] the adapter flips its
+    /// own health to `Unhealthy("upstream unreachable")`, giving plain HTTP the
+    /// post-init death detection it otherwise lacks (no background heartbeat).
+    transport_failures: AtomicU64,
 }
+
+/// Consecutive transport-dead failures on `send_request` before the plain HTTP
+/// adapter flips its health to `Unhealthy("upstream unreachable")`. A single
+/// blip shouldn't demote a server, but a server that's actually gone fails
+/// every request, so a small threshold both avoids flapping and reports death
+/// quickly.
+const TRANSPORT_FAILURE_THRESHOLD: u64 = 3;
 
 /// HTTP header name reqwest reads/writes for the MCP session ID. Reqwest's
 /// `HeaderMap` stores names lowercase internally, so reading and writing both
@@ -215,6 +230,7 @@ impl HttpAdapter {
             last_www_authenticate: Arc::new(RwLock::new(None)),
             upstream_dialect: Arc::new(RwLock::new(ProtocolVersion::V2025_03_26)),
             list_ttl_ms: Arc::new(RwLock::new(None)),
+            transport_failures: AtomicU64::new(0),
         }
     }
 
@@ -265,6 +281,7 @@ impl HttpAdapter {
             last_www_authenticate: Arc::new(RwLock::new(None)),
             upstream_dialect: Arc::new(RwLock::new(ProtocolVersion::V2025_03_26)),
             list_ttl_ms: Arc::new(RwLock::new(None)),
+            transport_failures: AtomicU64::new(0),
         }
     }
 
@@ -562,8 +579,73 @@ impl HttpAdapter {
         }
     }
 
+    /// Classify an [`AdapterError`] as a transport-dead ("upstream is gone")
+    /// signal versus an alive-but-erroring one. Only the former feed the
+    /// consecutive-failure counter that drives reactive health.
+    ///
+    /// - Dead: [`AdapterError::ConnectionFailed`] (reqwest `is_connect`),
+    ///   [`AdapterError::Timeout`] (`is_timeout`), and
+    ///   [`AdapterError::HttpError`] with `status == 0` (other reqwest send
+    ///   errors) — the server didn't answer at the transport level.
+    /// - Not dead: any `HttpError` with a non-zero status (401/404/500…),
+    ///   `JsonRpcError`, and `ProtocolError` — the server is up and responding,
+    ///   so these must never demote health (a 401 means the server is alive).
+    fn is_transport_dead(err: &AdapterError) -> bool {
+        matches!(
+            err,
+            AdapterError::ConnectionFailed(_)
+                | AdapterError::Timeout(_)
+                | AdapterError::HttpError { status: 0, .. }
+        )
+    }
+
+    /// Record a successful request: reset the transport-failure counter and, if
+    /// the adapter had previously demoted itself to `Unhealthy`, recover to
+    /// `Healthy`. Other health states (`Starting`/`Stopped`) are left untouched.
+    async fn note_request_success(&self) {
+        self.transport_failures.store(0, Ordering::SeqCst);
+        let mut health = self.health.write().await;
+        if matches!(*health, HealthStatus::Unhealthy(_)) {
+            *health = HealthStatus::Healthy;
+        }
+    }
+
+    /// Record a transport-dead failure: increment the consecutive-failure
+    /// counter and, once it reaches [`TRANSPORT_FAILURE_THRESHOLD`], flip health
+    /// to `Unhealthy("upstream unreachable")`.
+    async fn note_transport_failure(&self) {
+        let count = self.transport_failures.fetch_add(1, Ordering::SeqCst) + 1;
+        if count >= TRANSPORT_FAILURE_THRESHOLD {
+            *self.health.write().await = HealthStatus::Unhealthy("upstream unreachable".into());
+        }
+    }
+
     /// Send a JSON-RPC request via HTTP POST and return the result.
+    ///
+    /// Wraps [`Self::send_request_inner`] to centralize reactive health: the
+    /// outcome of every `list_tools` / `call_tool` request feeds the
+    /// transport-failure counter so a plain HTTP server that dies after init is
+    /// detected (flips to `Unhealthy`) and auto-recovers on the next success.
     async fn send_request(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, AdapterError> {
+        let result = self.send_request_inner(method, params).await;
+        match &result {
+            Ok(_) => self.note_request_success().await,
+            Err(e) if Self::is_transport_dead(e) => self.note_transport_failure().await,
+            // Alive-but-erroring (HTTP status>0, JSON-RPC, protocol): leave the
+            // counter and health untouched so a 401/500/etc. never demotes.
+            Err(_) => {}
+        }
+        result
+    }
+
+    /// Inner request implementation: builds and sends the HTTP POST and maps the
+    /// response/transport outcome to a `Result`. Health bookkeeping lives in the
+    /// [`Self::send_request`] wrapper.
+    async fn send_request_inner(
         &self,
         method: &str,
         params: Option<Value>,
@@ -2338,6 +2420,138 @@ mod tests {
             Err(AdapterError::HttpError { status: 401, .. }) => {}
             other => panic!("expected HttpError {{ 401 }}, got {:?}", other),
         }
+        server.abort();
+    }
+
+    // --- Reactive transport-failure health detection ---
+
+    /// Classification is the contract the reactive counter relies on: only
+    /// transport-dead signals (connect/timeout/`HttpError { status: 0 }`) feed
+    /// the counter; a live-but-erroring server (non-zero HTTP status, JSON-RPC
+    /// error, protocol error) must never be treated as dead.
+    #[test]
+    fn is_transport_dead_classifies_errors() {
+        assert!(HttpAdapter::is_transport_dead(
+            &AdapterError::ConnectionFailed("refused".into())
+        ));
+        assert!(HttpAdapter::is_transport_dead(&AdapterError::Timeout(30)));
+        assert!(HttpAdapter::is_transport_dead(&AdapterError::HttpError {
+            status: 0,
+            body: "send error".into(),
+        }));
+
+        assert!(!HttpAdapter::is_transport_dead(&AdapterError::HttpError {
+            status: 401,
+            body: "unauthorized".into(),
+        }));
+        assert!(!HttpAdapter::is_transport_dead(&AdapterError::HttpError {
+            status: 500,
+            body: "boom".into(),
+        }));
+        assert!(!HttpAdapter::is_transport_dead(
+            &AdapterError::JsonRpcError {
+                code: -32000,
+                message: "nope".into(),
+                data: None,
+            }
+        ));
+        assert!(!HttpAdapter::is_transport_dead(
+            &AdapterError::ProtocolError("bad".into())
+        ));
+    }
+
+    /// A plain HTTP server that dies after init: once the upstream stops
+    /// answering, repeated `call_tool` transport failures flip health to
+    /// `Unhealthy` at the threshold (and not before).
+    #[tokio::test]
+    async fn transport_failures_flip_health_to_unhealthy() {
+        // Bind then immediately drop a listener to obtain a port that refuses
+        // connections — every request will fail with `ConnectionFailed`.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{}/mcp", addr);
+
+        let adapter = HttpAdapter::new(HttpConfig::new(url));
+        // Simulate the post-init state: the server came up Healthy.
+        *adapter.health.write().await = HealthStatus::Healthy;
+
+        for _ in 0..(TRANSPORT_FAILURE_THRESHOLD - 1) {
+            let result = adapter.call_tool("x", json!({})).await;
+            assert!(result.is_err(), "dead upstream should error");
+            assert_eq!(
+                adapter.health(),
+                HealthStatus::Healthy,
+                "health must stay Healthy below the failure threshold"
+            );
+        }
+
+        let result = adapter.call_tool("x", json!({})).await;
+        assert!(result.is_err());
+        match adapter.health() {
+            HealthStatus::Unhealthy(msg) => assert_eq!(msg, "upstream unreachable"),
+            other => panic!("expected Unhealthy after threshold, got {:?}", other),
+        }
+    }
+
+    /// A live-but-erroring server (hard 401 on every call) must NOT flip health:
+    /// the upstream is reachable, so the transport-failure counter stays at 0.
+    #[tokio::test]
+    async fn http_error_does_not_flip_health() {
+        let (base, server) = spawn_gated_mcp_fixture().await;
+        let adapter = HttpAdapter::new(HttpConfig::new(format!("{}/mcp", base)));
+        *adapter.health.write().await = HealthStatus::Healthy;
+
+        for _ in 0..(TRANSPORT_FAILURE_THRESHOLD + 2) {
+            let result = adapter.call_tool("search", json!({})).await;
+            match result {
+                Err(AdapterError::HttpError { status: 401, .. }) => {}
+                other => panic!("expected HttpError {{ 401 }}, got {:?}", other),
+            }
+        }
+
+        assert_eq!(
+            adapter.health(),
+            HealthStatus::Healthy,
+            "a reachable server returning 401 must not be demoted"
+        );
+        assert_eq!(
+            adapter.transport_failures.load(Ordering::SeqCst),
+            0,
+            "non-transport errors must not increment the failure counter"
+        );
+
+        server.abort();
+    }
+
+    /// Auto-recovery: after the adapter has demoted itself to `Unhealthy`, the
+    /// next successful request flips it back to `Healthy` and resets the counter.
+    #[tokio::test]
+    async fn success_recovers_health_and_resets_counter() {
+        // GET 405 so the test doesn't depend on the SSE channel; POST returns ok.
+        let (url, server) = start_fake_http_server(true).await;
+        let adapter = HttpAdapter::new(HttpConfig::new(url));
+        // Simulate a prior run of transport failures that demoted the adapter.
+        *adapter.health.write().await = HealthStatus::Unhealthy("upstream unreachable".into());
+        adapter.transport_failures.store(5, Ordering::SeqCst);
+
+        let result = adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("live server should answer successfully");
+        assert_eq!(result["ok"], true);
+
+        assert_eq!(
+            adapter.health(),
+            HealthStatus::Healthy,
+            "a successful request must recover health from Unhealthy"
+        );
+        assert_eq!(
+            adapter.transport_failures.load(Ordering::SeqCst),
+            0,
+            "a successful request must reset the failure counter"
+        );
+
         server.abort();
     }
 
