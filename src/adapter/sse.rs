@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, Notify, RwLock};
@@ -157,6 +157,15 @@ pub struct SseAdapter {
     /// body with this span so events carry `endpoint`/`transport` (and
     /// `server_type` once the MCP handshake completes).
     span: tracing::Span,
+    /// Once-guard for the span's `server_type` field. `Span::record` appends
+    /// each write to the span's field list, so recording on every
+    /// [`Self::initialize`] call (e.g. across SSE reconnects) grows the
+    /// `endpoint{…}` header without bound. This flag is flipped the first
+    /// time a non-empty `server_type` is written so subsequent handshakes
+    /// skip the record call. `Arc`-wrapped because [`SseAdapter`] is
+    /// `Clone`d into the reconnect supervisor task and each clone must
+    /// share the same guard.
+    server_type_recorded: Arc<AtomicBool>,
     /// Shared typed event bus for the desktop overlay's SSE stream. See
     /// the matching field on [`super::stdio::StdioAdapter`].
     event_bus: Arc<OnceLock<ToolCallEventBus>>,
@@ -230,6 +239,7 @@ impl SseAdapter {
             shutdown_notify: Arc::new(Notify::new()),
             tools_changed_tx,
             span,
+            server_type_recorded: Arc::new(AtomicBool::new(false)),
             event_bus: Arc::new(OnceLock::new()),
             tool_annotations_cache: Arc::new(RwLock::new(HashMap::new())),
             upstream_dialect: Arc::new(RwLock::new(ProtocolVersion::V2024_11_05)),
@@ -239,6 +249,24 @@ impl SseAdapter {
 
     fn next_id(&self) -> u64 {
         self.request_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Record `server_type` on the per-endpoint span at most once. `Span::record`
+    /// appends each write to the span's field list, so recording on every
+    /// [`Self::initialize`] call (e.g. across SSE reconnects) grows the
+    /// `endpoint{…}` header without bound. The guard flips the first time a
+    /// non-empty name is written so subsequent handshakes are a no-op.
+    fn record_server_type_once(&self, name: &str) {
+        if !self.server_type_recorded.swap(true, Ordering::Relaxed) {
+            self.span
+                .record("server_type", tracing::field::display(name));
+        }
+    }
+
+    /// Test-only accessor for the `server_type` once-guard state.
+    #[cfg(test)]
+    pub(crate) fn server_type_recorded_flag(&self) -> bool {
+        self.server_type_recorded.load(Ordering::Relaxed)
     }
 
     /// Record the upstream server's negotiated [`ProtocolVersion`]. Populated
@@ -711,8 +739,7 @@ impl SseAdapter {
 
         debug!(url = %self.config.url, raw_name = %raw_name, sanitized = %sanitized, effective = ?effective, "MCP server reported serverInfo.name");
         if let Some(ref name) = effective {
-            self.span
-                .record("server_type", tracing::field::display(name));
+            self.record_server_type_once(name);
         }
         *self.server_type.write().await = effective;
         *self.upstream_server_name.write().await = Some(upstream_stripped);
@@ -1200,6 +1227,26 @@ mod tests {
         tracker.record_failure();
         tracker.reset();
         assert_eq!(tracker.backoff_duration(), Duration::from_secs(1));
+    }
+
+    /// Repeated `initialize` calls (SSE reconnects re-run the handshake) must
+    /// NOT re-append `server_type` to the per-endpoint span's field list. The
+    /// once-guard flips on the first record and short-circuits every later
+    /// call, preventing unbounded `endpoint{…}` log-header growth.
+    #[test]
+    fn record_server_type_once_guards_repeated_calls() {
+        let adapter = SseAdapter::new(SseConfig::new("http://localhost:8080/sse"));
+        assert!(!adapter.server_type_recorded_flag());
+
+        adapter.record_server_type_once("some-server");
+        assert!(adapter.server_type_recorded_flag());
+
+        // Second and subsequent calls (e.g. after a reconnect re-runs
+        // initialize) must NOT re-record — the guard has already flipped,
+        // so this is a no-op.
+        adapter.record_server_type_once("some-server");
+        adapter.record_server_type_once("other-name");
+        assert!(adapter.server_type_recorded_flag());
     }
 
     // -----------------------------------------------------------------

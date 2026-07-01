@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, Notify, RwLock};
@@ -75,6 +75,13 @@ pub struct HttpAdapter {
     /// body with this span so events carry `endpoint`/`transport` (and
     /// `server_type` once the MCP handshake completes).
     span: tracing::Span,
+    /// Once-guard for the span's `server_type` field. `Span::record` appends
+    /// each write to the span's field list, so recording on every
+    /// [`Self::initialize`] call (e.g. across reconnects) grows the
+    /// `endpoint{…}` header without bound. This flag is flipped the first
+    /// time a non-empty `server_type` is written so subsequent handshakes
+    /// skip the record call.
+    server_type_recorded: AtomicBool,
     /// Broadcast emitter for `notifications/tools/list_changed` events
     /// observed from the upstream server. Ticks come from two sources:
     ///
@@ -205,6 +212,7 @@ impl HttpAdapter {
             upstream_server_name: Arc::new(RwLock::new(None)),
             activity_log: Arc::new(RwLock::new(RingBuffer::new(1000))),
             span,
+            server_type_recorded: AtomicBool::new(false),
             tools_changed_tx,
             listener_handle: Arc::new(Mutex::new(None)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -255,6 +263,7 @@ impl HttpAdapter {
             upstream_server_name: Arc::new(RwLock::new(None)),
             activity_log: Arc::new(RwLock::new(RingBuffer::new(1000))),
             span,
+            server_type_recorded: AtomicBool::new(false),
             tools_changed_tx,
             listener_handle: Arc::new(Mutex::new(None)),
             shutdown_notify: Arc::new(Notify::new()),
@@ -266,6 +275,24 @@ impl HttpAdapter {
             upstream_dialect: Arc::new(RwLock::new(ProtocolVersion::V2025_03_26)),
             list_ttl_ms: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Record `server_type` on the per-endpoint span at most once. `Span::record`
+    /// appends each write to the span's field list, so recording on every
+    /// [`Self::initialize`] call (e.g. across HTTP/SSE reconnects) grows the
+    /// `endpoint{…}` header without bound. The guard flips the first time a
+    /// non-empty name is written so subsequent handshakes are a no-op.
+    fn record_server_type_once(&self, name: &str) {
+        if !self.server_type_recorded.swap(true, Ordering::Relaxed) {
+            self.span
+                .record("server_type", tracing::field::display(name));
+        }
+    }
+
+    /// Test-only accessor for the `server_type` once-guard state.
+    #[cfg(test)]
+    pub(crate) fn server_type_recorded_flag(&self) -> bool {
+        self.server_type_recorded.load(Ordering::Relaxed)
     }
 
     /// Install the given event-bus handle (Arc-cloned) on this adapter,
@@ -904,8 +931,7 @@ impl HttpAdapter {
 
         info!(url = %self.config.url, raw_name = %raw_name, sanitized = %sanitized, effective = ?effective, "MCP server reported serverInfo.name");
         if let Some(ref name) = effective {
-            self.span
-                .record("server_type", tracing::field::display(name));
+            self.record_server_type_once(name);
         }
         *self.server_type.write().await = effective;
         *self.upstream_server_name.write().await = Some(upstream_stripped);
@@ -1403,6 +1429,26 @@ mod tests {
     fn test_http_adapter_initial_health() {
         let adapter = HttpAdapter::new(HttpConfig::new("http://localhost:8080/mcp"));
         assert_eq!(adapter.health(), HealthStatus::Stopped);
+    }
+
+    /// Repeated `initialize` calls (standalone HTTP/SSE reconnects) must NOT
+    /// re-append `server_type` to the per-endpoint span's field list. The
+    /// once-guard flips on the first record and short-circuits every later
+    /// call, preventing unbounded `endpoint{…}` log-header growth.
+    #[test]
+    fn record_server_type_once_guards_repeated_calls() {
+        let adapter = HttpAdapter::new(HttpConfig::new("http://localhost:8080/mcp"));
+        assert!(!adapter.server_type_recorded_flag());
+
+        adapter.record_server_type_once("some-server");
+        assert!(adapter.server_type_recorded_flag());
+
+        // Second and subsequent calls (e.g. after a reconnect re-runs
+        // initialize) must NOT re-record — the guard has already flipped,
+        // so this is a no-op.
+        adapter.record_server_type_once("some-server");
+        adapter.record_server_type_once("other-name");
+        assert!(adapter.server_type_recorded_flag());
     }
 
     #[tokio::test]
