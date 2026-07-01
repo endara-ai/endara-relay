@@ -6445,9 +6445,19 @@ mod tests {
                 Some("echo".to_string()),
             )
             .await;
+        // Deliberately use a config with NO endpoints so restart_endpoint's
+        // background task cannot find a matching config entry for "echo" and
+        // therefore takes the in-place `old.initialize()` re-init branch
+        // instead of `watcher::create_adapter` (which would spawn a real
+        // `echo` subprocess and run an MCP handshake that only fails after
+        // an internal timeout, the source of flakiness on loaded CI).
+        // SlowShutdownAdapter::initialize returns Ok(()) instantly, so the
+        // background tick fires deterministically after the 150ms shutdown.
+        let mut cfg = test_config();
+        cfg.endpoints.clear();
         let state = ManagementState {
             registry: Arc::new(registry),
-            config: Arc::new(RwLock::new(test_config())),
+            config: Arc::new(RwLock::new(cfg)),
             start_time: Instant::now(),
             config_path: None,
             oauth_flow_manager: None,
@@ -6484,12 +6494,12 @@ mod tests {
             .expect("foreground tick channel closed");
         assert_eq!(first, "echo", "foreground tick should carry endpoint name");
 
-        // Second tick: background re-init swap completion. Allow generous
-        // time because the slow shutdown must finish before the new adapter
-        // is swapped in, and CI can be slow.
-        let second = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+        // Second tick: background in-place re-init swap completion. Fires
+        // after the 150ms SlowShutdownAdapter shutdown finishes and
+        // `old.initialize()` returns Ok(()) instantly.
+        let second = tokio::time::timeout(Duration::from_secs(5), rx.recv())
             .await
-            .expect("background tick did not arrive within 30s")
+            .expect("background tick did not arrive within 5s")
             .expect("background tick channel closed");
         assert_eq!(second, "echo", "background tick should carry endpoint name");
     }
