@@ -1597,6 +1597,22 @@ async fn set_endpoint_credentials(
         .into_response();
     }
 
+    // Symmetric guard: a resource secret must be paired with a resource client_id.
+    if resource_client_secret.is_some()
+        && resource_client_id
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "resource_client_id must not be empty when setting resource_client_secret",
+            None,
+        )
+        .into_response();
+    }
+
     let client_secret_set = client_secret.is_some();
     let resource_client_secret_set = resource_client_secret.is_some();
 
@@ -8709,6 +8725,25 @@ command = "echo"
                     .header("content-type", "application/json")
                     .body(Body::from(
                         serde_json::json!({ "client_secret": "x" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn credentials_endpoint_rejects_missing_resource_client_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _tm) = test_state_with_token_manager("ep1", tmp.path(), None, None).await;
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/credentials")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "resource_client_secret": "x" }).to_string(),
                     ))
                     .unwrap(),
             )
