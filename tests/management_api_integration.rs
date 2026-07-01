@@ -178,6 +178,7 @@ async fn test_management_api_status() {
         description: Some("Echoes input".into()),
         input_schema: json!({"type": "object"}),
         annotations: None,
+        ..Default::default()
     }];
     let (addr, _handle) =
         start_management_server(vec![("echo-ep", MockAdapter::healthy_with_tools(tools))]).await;
@@ -202,6 +203,7 @@ async fn test_management_api_endpoints() {
         description: None,
         input_schema: json!({}),
         annotations: None,
+        ..Default::default()
     }];
     let (addr, _handle) =
         start_management_server(vec![("echo-ep", MockAdapter::healthy_with_tools(tools))]).await;
@@ -228,12 +230,14 @@ async fn test_management_api_endpoint_tools() {
             description: Some("Read a file".into()),
             input_schema: json!({"type": "object"}),
             annotations: None,
+            ..Default::default()
         },
         ToolInfo {
             name: "write_file".into(),
             description: Some("Write a file".into()),
             input_schema: json!({"type": "object"}),
             annotations: None,
+            ..Default::default()
         },
     ];
     let (addr, _handle) =
@@ -260,6 +264,7 @@ async fn test_management_api_refresh_endpoint() {
         description: None,
         input_schema: json!({}),
         annotations: None,
+        ..Default::default()
     }];
     let (addr, _handle) =
         start_management_server(vec![("echo-ep", MockAdapter::healthy_with_tools(tools))]).await;
@@ -492,6 +497,7 @@ command = "cat"
         description: Some("Echoes input".into()),
         input_schema: json!({"type": "object"}),
         annotations: None,
+        ..Default::default()
     }];
     let (addr, _handle) = start_management_server_with_config(
         vec![("echo-ep", MockAdapter::healthy_with_tools(tools))],
@@ -540,12 +546,14 @@ async fn test_management_api_catalog() {
             description: Some("Read a file".into()),
             input_schema: json!({"type": "object"}),
             annotations: None,
+            ..Default::default()
         },
         ToolInfo {
             name: "write_file".into(),
             description: Some("Write a file".into()),
             input_schema: json!({"type": "object"}),
             annotations: Some(json!({"readOnly": true})),
+            ..Default::default()
         },
     ];
     let (addr, _handle) = start_management_server(vec![
@@ -656,6 +664,7 @@ async fn test_management_api_catalog_with_unhealthy_endpoints() {
         description: Some("Read a file".into()),
         input_schema: json!({"type": "object"}),
         annotations: None,
+        ..Default::default()
     }];
     let unhealthy_tools = vec![
         ToolInfo {
@@ -663,12 +672,14 @@ async fn test_management_api_catalog_with_unhealthy_endpoints() {
             description: Some("Ping server".into()),
             input_schema: json!({"type": "object"}),
             annotations: None,
+            ..Default::default()
         },
         ToolInfo {
             name: "status".into(),
             description: Some("Server status".into()),
             input_schema: json!({"type": "object"}),
             annotations: None,
+            ..Default::default()
         },
     ];
     let (addr, _handle) = start_management_server(vec![
@@ -734,6 +745,7 @@ async fn test_management_api_catalog_description_enriched() {
         description: Some("Read a file".into()),
         input_schema: json!({"type": "object"}),
         annotations: None,
+        ..Default::default()
     }];
     let (addr, _handle) =
         start_management_server(vec![("fs-ep", MockAdapter::healthy_with_tools(tools))]).await;

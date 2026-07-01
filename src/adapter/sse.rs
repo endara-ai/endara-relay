@@ -928,6 +928,69 @@ impl McpAdapter for SseAdapter {
         *self.list_ttl_ms.read().await
     }
 
+    async fn list_resources(&self) -> Result<Vec<Value>, AdapterError> {
+        async {
+            let result = self.send_request("resources/list", None).await?;
+            match result.get("resources") {
+                Some(Value::Array(items)) => Ok(items.clone()),
+                _ => Ok(vec![]),
+            }
+        }
+        .instrument(self.span.clone())
+        .await
+    }
+
+    async fn list_resource_templates(&self) -> Result<Vec<Value>, AdapterError> {
+        async {
+            let result = self.send_request("resources/templates/list", None).await?;
+            match result.get("resourceTemplates") {
+                Some(Value::Array(items)) => Ok(items.clone()),
+                _ => Ok(vec![]),
+            }
+        }
+        .instrument(self.span.clone())
+        .await
+    }
+
+    async fn read_resource(&self, uri: &str) -> Result<Value, AdapterError> {
+        async {
+            let params = serde_json::json!({ "uri": uri });
+            self.send_request("resources/read", Some(params)).await
+        }
+        .instrument(self.span.clone())
+        .await
+    }
+
+    async fn list_prompts(&self) -> Result<Vec<Value>, AdapterError> {
+        async {
+            let result = self.send_request("prompts/list", None).await?;
+            match result.get("prompts") {
+                Some(Value::Array(items)) => Ok(items.clone()),
+                _ => Ok(vec![]),
+            }
+        }
+        .instrument(self.span.clone())
+        .await
+    }
+
+    async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+    ) -> Result<Value, AdapterError> {
+        async {
+            let mut params = serde_json::Map::new();
+            params.insert("name".to_string(), Value::String(name.to_string()));
+            if let Some(args) = arguments {
+                params.insert("arguments".to_string(), args);
+            }
+            self.send_request("prompts/get", Some(Value::Object(params)))
+                .await
+        }
+        .instrument(self.span.clone())
+        .await
+    }
+
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
         self.call_tool_with_request_params(name, arguments, serde_json::Map::new())
             .await

@@ -64,7 +64,24 @@ impl fmt::Display for HealthStatus {
 }
 
 /// Information about a tool exposed by an MCP server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Fields beyond the four originals (`name`, `description`, `inputSchema`,
+/// `annotations`) are preserved verbatim so the merged `tools/list` catalog
+/// stays lossless for MCP Apps clients:
+/// - `title`, `output_schema` (`outputSchema`), and `_meta` are modeled
+///   explicitly because they carry MCP Apps UI pointers
+///   (`_meta.ui.resourceUri`, OpenAI alias `_meta["openai/outputTemplate"]`)
+///   and structured-output metadata the relay must round-trip without
+///   inventing or dropping siblings.
+/// - `extra` catches any future tool-descriptor field not modeled above via
+///   `#[serde(flatten)]` so the relay survives upstream schema additions
+///   without a code change.
+///
+/// All new fields are `#[serde(default, skip_serializing_if = ...)]` so an
+/// upstream tool that sends none of them re-serializes byte-for-byte
+/// identically to the pre-extension shape, and `#[derive(Default)]` lets
+/// existing struct literals stay terse via `..Default::default()`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolInfo {
     pub name: String,
@@ -72,6 +89,26 @@ pub struct ToolInfo {
     pub input_schema: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<Value>,
+    /// User-facing tool title (MCP 2026-07-28). Passed through verbatim from
+    /// the upstream tool descriptor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Structured-output schema describing the shape of `structuredContent`
+    /// in `tools/call` results. Passed through verbatim; the relay does not
+    /// validate against it today (mirrors `inputSchema` passthrough).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    /// Tool-level `_meta` object. Preserved verbatim so downstream MCP Apps
+    /// pointers (`_meta.ui.resourceUri`, alias `_meta["openai/outputTemplate"]`)
+    /// and arbitrary upstream metadata reach the client. Subsequent tasks
+    /// (T6) wrap UI pointers in place without losing siblings.
+    #[serde(default, rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+    /// Catch-all for any tool-descriptor field not modeled above. Preserved
+    /// across deserialize → re-serialize so future MCP spec additions survive
+    /// aggregation through `merged_catalog` without a relay code change.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// Max character count retained from `HttpError.body` when formatting an
@@ -184,6 +221,105 @@ pub trait McpAdapter: Send + Sync {
         _request_params: serde_json::Map<String, Value>,
     ) -> Result<Value, AdapterError> {
         self.call_tool(name, arguments).await
+    }
+
+    /// List concrete resources advertised by the upstream MCP server.
+    ///
+    /// Returns the raw `resources` array from the upstream `resources/list`
+    /// response (each element preserved verbatim so MCP fields like `name`,
+    /// `description`, `mimeType`, `_meta`, etc. round-trip untouched). The
+    /// registry wraps each `uri` per slot #4 before forwarding to the client.
+    ///
+    /// The default implementation returns an empty list so adapters that do
+    /// not support resources (placeholder adapters, transports that haven't
+    /// implemented the passthrough yet) participate silently. Concrete
+    /// transports override this to forward `resources/list` upstream.
+    async fn list_resources(&self) -> Result<Vec<Value>, AdapterError> {
+        Ok(vec![])
+    }
+
+    /// List resource templates (RFC 6570 URI templates) advertised by the
+    /// upstream MCP server.
+    ///
+    /// Returns the raw `resourceTemplates` array from the upstream
+    /// `resources/templates/list` response. The registry wraps each
+    /// `uriTemplate` per slot #5 before forwarding to the client; the
+    /// wrapper-scheme encoding preserves RFC 6570 `{var}` braces so variable
+    /// expansion on the client side is unaffected.
+    ///
+    /// The default implementation returns an empty list so adapters that do
+    /// not support resource templates participate silently.
+    async fn list_resource_templates(&self) -> Result<Vec<Value>, AdapterError> {
+        Ok(vec![])
+    }
+
+    /// List prompts advertised by the upstream MCP server.
+    ///
+    /// Returns the raw `prompts` array from the upstream `prompts/list`
+    /// response (each element preserved verbatim so MCP fields like
+    /// `description`, `arguments`, `_meta`, etc. round-trip untouched). The
+    /// registry namespaces each `name` per slot #8 before forwarding to the
+    /// client, mirroring the tool-prefix scheme so a prefixed prompt name
+    /// later routes back to its owning upstream.
+    ///
+    /// The default implementation returns an empty list so adapters that do
+    /// not support prompts (placeholder adapters, transports that haven't
+    /// implemented the passthrough yet) participate silently. Concrete
+    /// transports override this to forward `prompts/list` upstream.
+    async fn list_prompts(&self) -> Result<Vec<Value>, AdapterError> {
+        Ok(vec![])
+    }
+
+    /// Fetch a single prompt by name from the upstream MCP server.
+    ///
+    /// `name` is the original (reverse-prefixed) prompt name — slot #9 inbound
+    /// name un-prefixing happens in the registry before dispatch, so adapters
+    /// receive the same name the upstream originally advertised via
+    /// `prompts/list`. `arguments` is the optional client-supplied `arguments`
+    /// object (forwarded verbatim, `null`/missing → no field on the wire). The
+    /// returned `Value` is the raw `result` object from the upstream
+    /// (`{ messages: [...] , description?: "..." }`); the registry rewrites
+    /// the enumerated slot #9 URIs on the returned messages before forwarding
+    /// to the client.
+    ///
+    /// The default implementation returns a JSON-RPC method-not-found error so
+    /// adapters that do not support prompts (placeholder adapters, transports
+    /// that haven't implemented the passthrough yet) reject fetches cleanly
+    /// instead of silently succeeding with an empty payload. Concrete
+    /// transports override this to forward `prompts/get` upstream.
+    async fn get_prompt(
+        &self,
+        _name: &str,
+        _arguments: Option<Value>,
+    ) -> Result<Value, AdapterError> {
+        Err(AdapterError::JsonRpcError {
+            code: -32601,
+            message: "prompts/get not supported by this adapter".to_string(),
+            data: None,
+        })
+    }
+
+    /// Read a single resource by URI from the upstream MCP server.
+    ///
+    /// `uri` is the original (de-wrapped) resource URI — slot #6 reverse
+    /// rewriting happens in the registry before dispatch, so adapters receive
+    /// the same URI the upstream originally advertised via `resources/list` or
+    /// `resources/templates/list`. The returned `Value` is the raw `result`
+    /// object from the upstream (`{ contents: [...] }`); per DD2 the relay
+    /// returns it to the client unmodified — URIs inside the resource body
+    /// are not rewritten in v1.
+    ///
+    /// The default implementation returns a JSON-RPC method-not-found error so
+    /// adapters that do not support resources (placeholder adapters, transports
+    /// that haven't implemented the passthrough yet) reject reads cleanly
+    /// instead of silently succeeding with an empty payload. Concrete
+    /// transports override this to forward `resources/read` upstream.
+    async fn read_resource(&self, _uri: &str) -> Result<Value, AdapterError> {
+        Err(AdapterError::JsonRpcError {
+            code: -32601,
+            message: "resources/read not supported by this adapter".to_string(),
+            data: None,
+        })
     }
 
     /// Get the current health status.

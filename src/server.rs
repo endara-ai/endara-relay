@@ -515,11 +515,35 @@ async fn mcp_initialize(
 /// Build the `InitializeResult` body (`protocolVersion`/`capabilities`/
 /// `serverInfo`/optional `instructions`) shared by `initialize` and
 /// `server/discover`, so both advertise the relay identically.
+///
+/// The advertised capability set MUST stay in lockstep with the reachable
+/// method arms in the `/mcp` dispatcher (see `handle_single_message`). The
+/// relay currently dispatches `tools/*`, `resources/list`,
+/// `resources/templates/list`, `resources/read`, `prompts/list`, and
+/// `prompts/get` — hence `tools`, `resources`, and `prompts` here. T7
+/// decision: resources and prompts pass through in BOTH normal and
+/// `local_js_execution` modes (the JS-mode catalog reduction only collapses
+/// `tools/list` to the meta-tools; it does not gate `resources/*` or
+/// `prompts/*`), so the capability set is mode-invariant.
 async fn build_initialize_result(state: &AppState, profile_ctx: Option<&ProfileContext>) -> Value {
     let mut result = json!({
         "protocolVersion": protocol::VERSION_2025_03_26,
         "capabilities": {
-            "tools": { "listChanged": true }
+            "tools": { "listChanged": true },
+            // T7: advertise `resources` now that `resources/list`,
+            // `resources/templates/list`, and `resources/read` are all
+            // dispatched. `listChanged` and `subscribe` are intentionally
+            // omitted — the relay does NOT forward upstream
+            // `notifications/resources/list_changed` and does NOT implement
+            // `resources/subscribe`/`unsubscribe` dispatch arms. Adding
+            // either sub-flag here would lie about a reachable method.
+            "resources": {},
+            // T10: advertise `prompts` so clients know the relay proxies
+            // `prompts/list` + `prompts/get`. `listChanged` is intentionally
+            // omitted — the relay does not yet forward upstream
+            // `notifications/prompts/list_changed` to clients (no equivalent
+            // of the tools-changed SSE pipeline for prompts).
+            "prompts": {}
         },
         "serverInfo": {
             "name": "Endara Relay",
@@ -543,8 +567,13 @@ async fn build_initialize_result(state: &AppState, profile_ctx: Option<&ProfileC
 /// `initialize` handshake. The result reuses [`build_initialize_result`] so
 /// `serverInfo`/`capabilities`/`protocolVersion` stay byte-for-byte consistent
 /// with `initialize`, then appends the aggregated primitive summary the relay
-/// exposes — `tools` (mirroring `tools/list`). The relay advertises no prompts
-/// or resources, so only `tools` appears.
+/// exposes — `tools` (mirroring `tools/list`). Only the `tools` primitive
+/// summary array is emitted here; aggregated `resources`/`prompts` summaries
+/// would require their own list aggregators in this dispatcher and are not
+/// yet shipped. The `capabilities` object (built above by
+/// `build_initialize_result`) still advertises `tools`, `resources`, and
+/// `prompts` — clients fetch the live `resources/list` and `prompts/list`
+/// directly when they need those primitives.
 ///
 /// Per the coordinator decision (T11 — relay is local/single-user), the result
 /// carries NO `ttlMs` and NO `cacheScope`: 2026 clients treat the absent hint
@@ -681,7 +710,21 @@ async fn mcp_tools_list(
         meta_tool_definitions(js_mode, &state.registry, toon_enabled, profile_ctx).await;
 
     let tools: Vec<Value> = if js_mode {
-        // JS execution mode: only the 3 meta-tools (incl. execute_tools)
+        // JS execution mode: only the 3 meta-tools (incl. execute_tools).
+        // T7 decision: the JS-mode catalog reduction is SCOPED to
+        // `tools/list` only — `resources/*` and `prompts/*` continue to pass
+        // through in JS mode (see `mcp_resources_list` /
+        // `mcp_resource_templates_list` / `mcp_resources_read` /
+        // `mcp_prompts_list` / `mcp_prompts_get`, none of which read
+        // `js_mode`). Rationale: the catalog collapse exists to keep the
+        // tool-prompt budget small when the LLM drives calls through
+        // `execute_tools`; resources and prompts are user/host-driven (the
+        // MCP Apps UI host calls `resources/read` with a URI it received
+        // from a tool descriptor; users select prompts explicitly), so
+        // hiding them would break the apps + prompts flow without saving
+        // any tokens. The advertised capability set in
+        // `build_initialize_result` matches this — `resources` and
+        // `prompts` are advertised in BOTH modes.
         meta_tools
     } else {
         // Normal mode: full prefixed catalog + list/search meta-tools.
@@ -717,6 +760,150 @@ async fn mcp_tools_list(
     };
 
     jsonrpc_response(body.id, json!({ "tools": tools }))
+}
+
+/// POST /mcp `resources/list`
+///
+/// Aggregates [`AdapterRegistry::list_resources`] across every non-disabled
+/// adapter and returns the merged `{ resources: [...] }` payload to the
+/// client. Slot #4 URI wrapping is applied inside the registry method so the
+/// `uri` field of every entry routes back to its owning endpoint via the
+/// `mcp-relay://` wrapper scheme (or passes through unwrapped under DD5
+/// single-endpoint mode).
+///
+/// When `profile_ctx` is `Some`, the listing is restricted to the profile's
+/// allowed endpoints and the wrap trigger is the *in-profile* active count.
+/// This keeps the outbound wrap and inbound
+/// [`ProfileRegistryView::route_resource_read`] unwrap symmetric per DD5,
+/// closing the `(global>=2, profile==1)` foreign-endpoint bypass.
+async fn mcp_resources_list(
+    State(state): State<AppState>,
+    Json(body): Json<JsonRpcBody>,
+    profile_ctx: Option<&ProfileContext>,
+) -> Json<Value> {
+    let resources = match profile_ctx {
+        Some(ctx) => ctx.registry_view.list_resources().await,
+        None => state.registry.list_resources().await,
+    };
+    jsonrpc_response(body.id, json!({ "resources": resources }))
+}
+
+/// POST /mcp `resources/templates/list`
+///
+/// Aggregates [`AdapterRegistry::list_resource_templates`] across every
+/// non-disabled adapter. Slot #5 wrapping uses the template-aware encoder so
+/// RFC 6570 `{var}` markers survive untouched and client-side variable
+/// expansion still works. Profile gating mirrors [`mcp_resources_list`].
+async fn mcp_resource_templates_list(
+    State(state): State<AppState>,
+    Json(body): Json<JsonRpcBody>,
+    profile_ctx: Option<&ProfileContext>,
+) -> Json<Value> {
+    let templates = match profile_ctx {
+        Some(ctx) => ctx.registry_view.list_resource_templates().await,
+        None => state.registry.list_resource_templates().await,
+    };
+    jsonrpc_response(body.id, json!({ "resourceTemplates": templates }))
+}
+
+/// POST /mcp `prompts/list`
+///
+/// Aggregates [`AdapterRegistry::list_prompts`] across every non-disabled
+/// adapter and returns the merged `{ prompts: [...] }` payload to the
+/// client. Slot #8 name namespacing is applied inside the registry method
+/// so each `prompts[].name` routes back to its owning endpoint via the
+/// existing tool-prefix scheme (or passes through unprefixed under DD5
+/// single-endpoint mode).
+///
+/// When `profile_ctx` is `Some`, the listing is restricted to the profile's
+/// allowed endpoints and the prefix trigger is the *in-profile* active
+/// count, matching the profile-scoped tool catalog's behavior.
+async fn mcp_prompts_list(
+    State(state): State<AppState>,
+    Json(body): Json<JsonRpcBody>,
+    profile_ctx: Option<&ProfileContext>,
+) -> Json<Value> {
+    let prompts = match profile_ctx {
+        Some(ctx) => ctx.registry_view.list_prompts().await,
+        None => state.registry.list_prompts().await,
+    };
+    jsonrpc_response(body.id, json!({ "prompts": prompts }))
+}
+
+/// POST /mcp `prompts/get` (slot #9).
+///
+/// Pulls the namespaced `name` and optional `arguments` out of `params`,
+/// hands them to [`AdapterRegistry::route_prompt_get`] (or the
+/// profile-scoped [`ProfileRegistryView::route_prompt_get`] when
+/// `profile_ctx` is `Some`), and returns the upstream `result` object with
+/// slot #9 URI rewriting applied to `messages[].content` blocks scoped to
+/// the owning endpoint. Strict DD1: only the enumerated resource /
+/// resource_link slots are wrapped; `text` blocks and arbitrary sibling
+/// fields round-trip verbatim.
+///
+/// Errors map to a JSON-RPC `-32602` (invalid params) when the request is
+/// missing the `name` field and `-32603` (internal error) for routing /
+/// adapter failures, mirroring `mcp_resources_read`'s shape so log scrapers
+/// see the same code surface across the prompts and resources arms.
+async fn mcp_prompts_get(
+    State(state): State<AppState>,
+    Json(body): Json<JsonRpcBody>,
+    profile_ctx: Option<&ProfileContext>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let params = body.params.clone().unwrap_or(json!({}));
+    let name = params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| jsonrpc_error(body.id.clone(), -32602, "missing 'name' in params"))?;
+    // `arguments` is optional per MCP spec; forward verbatim when present
+    // (covers both the canonical object shape and any unexpected shape an
+    // upstream might accept) and as `None` otherwise so adapters drop the
+    // field on the wire entirely.
+    let arguments = params.get("arguments").cloned();
+
+    let result = match profile_ctx {
+        Some(ctx) => ctx.registry_view.route_prompt_get(name, arguments).await,
+        None => state.registry.route_prompt_get(name, arguments).await,
+    };
+
+    match result {
+        Ok(value) => Ok(jsonrpc_response(body.id, value)),
+        Err(e) => Err(jsonrpc_error(body.id, -32603, &e.to_string())),
+    }
+}
+
+/// POST /mcp `resources/read` (slot #6).
+///
+/// Pulls the wrapped `uri` out of `params`, hands it to
+/// [`AdapterRegistry::route_resource_read`] (or the profile-scoped
+/// [`ProfileRegistryView::route_resource_read`] when `profile_ctx` is
+/// `Some`), and returns the upstream `result` object verbatim per DD2 — URIs
+/// inside the resource body are not rewritten in v1.
+///
+/// Errors map to a JSON-RPC `-32602` (invalid params) when the request is
+/// missing the `uri` field and `-32603` (internal error) for routing /
+/// adapter failures, mirroring `mcp_tools_call`'s shape so log scrapers see
+/// the same code surface across `tools/call` and `resources/read`.
+async fn mcp_resources_read(
+    State(state): State<AppState>,
+    Json(body): Json<JsonRpcBody>,
+    profile_ctx: Option<&ProfileContext>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let params = body.params.clone().unwrap_or(json!({}));
+    let uri = params
+        .get("uri")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| jsonrpc_error(body.id.clone(), -32602, "missing 'uri' in params"))?;
+
+    let result = match profile_ctx {
+        Some(ctx) => ctx.registry_view.route_resource_read(uri).await,
+        None => state.registry.route_resource_read(uri).await,
+    };
+
+    match result {
+        Ok(value) => Ok(jsonrpc_response(body.id, value)),
+        Err(e) => Err(jsonrpc_error(body.id, -32603, &e.to_string())),
+    }
 }
 
 /// POST /mcp/tools/call
@@ -985,6 +1172,22 @@ async fn handle_single_message(
             }
             "tools/list" => Ok(mcp_tools_list(State(state.clone()), Json(body), profile_ctx).await),
             "tools/call" => mcp_tools_call(State(state.clone()), Json(body), profile_ctx).await,
+            "resources/list" => {
+                Ok(mcp_resources_list(State(state.clone()), Json(body), profile_ctx).await)
+            }
+            "resources/templates/list" => {
+                Ok(
+                    mcp_resource_templates_list(State(state.clone()), Json(body), profile_ctx)
+                        .await,
+                )
+            }
+            "resources/read" => {
+                mcp_resources_read(State(state.clone()), Json(body), profile_ctx).await
+            }
+            "prompts/list" => {
+                Ok(mcp_prompts_list(State(state.clone()), Json(body), profile_ctx).await)
+            }
+            "prompts/get" => mcp_prompts_get(State(state.clone()), Json(body), profile_ctx).await,
             _ => Err(jsonrpc_error(
                 body.id,
                 -32601,
@@ -2415,6 +2618,7 @@ mod tests {
                         description: Some(format!("{} tool", n)),
                         input_schema: json!({"type": "object"}),
                         annotations: None,
+                        ..Default::default()
                     })
                     .collect(),
             }
@@ -3650,6 +3854,178 @@ mod tests {
         assert!(body["result"]["tools"].is_array());
     }
 
+    /// T3 — `resources/list` is dispatched to the registry aggregator and
+    /// returns a `{ resources: [...] }` payload (empty array with no
+    /// adapters registered).
+    #[tokio::test]
+    async fn mcp_unified_dispatches_resources_list() {
+        let state = test_app_state();
+        let resp = post_mcp(
+            state,
+            &json!({"jsonrpc":"2.0","method":"resources/list","id":31}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["id"], 31);
+        assert!(
+            body["result"]["resources"].is_array(),
+            "expected resources array, got {:?}",
+            body
+        );
+    }
+
+    /// T3 — `resources/templates/list` is dispatched to the registry
+    /// aggregator and returns a `{ resourceTemplates: [...] }` payload.
+    #[tokio::test]
+    async fn mcp_unified_dispatches_resources_templates_list() {
+        let state = test_app_state();
+        let resp = post_mcp(
+            state,
+            &json!({"jsonrpc":"2.0","method":"resources/templates/list","id":32}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["id"], 32);
+        assert!(
+            body["result"]["resourceTemplates"].is_array(),
+            "expected resourceTemplates array, got {:?}",
+            body
+        );
+    }
+
+    /// T9 — `prompts/list` is dispatched to the registry aggregator and
+    /// returns a `{ prompts: [...] }` payload (empty array with no
+    /// adapters registered).
+    #[tokio::test]
+    async fn mcp_unified_dispatches_prompts_list() {
+        let state = test_app_state();
+        let resp = post_mcp(
+            state,
+            &json!({"jsonrpc":"2.0","method":"prompts/list","id":91}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["id"], 91);
+        assert!(
+            body["result"]["prompts"].is_array(),
+            "expected prompts array, got {:?}",
+            body
+        );
+    }
+
+    /// T10 — `prompts/get` missing the `name` param is rejected with the
+    /// JSON-RPC `-32602` (invalid params) code, mirroring `tools/call`'s
+    /// missing-`name` shape.
+    #[tokio::test]
+    async fn mcp_unified_prompts_get_missing_name_returns_invalid_params() {
+        let state = test_app_state();
+        let resp = post_mcp(
+            state,
+            &json!({"jsonrpc":"2.0","method":"prompts/get","id":92,"params":{}}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["id"], 92);
+        assert_eq!(body["error"]["code"], -32602);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("missing 'name'"),
+            "unexpected error message: {body:?}"
+        );
+    }
+
+    /// T10 — `prompts/get` with no adapters registered returns a JSON-RPC
+    /// `-32603` (internal error) wrapping the registry's
+    /// "no prompt found for prefixed name" rejection; proves the arm
+    /// dispatches into `AdapterRegistry::route_prompt_get` rather than the
+    /// method-not-found fallback.
+    #[tokio::test]
+    async fn mcp_unified_prompts_get_dispatches_to_route_prompt_get() {
+        let state = test_app_state();
+        let resp = post_mcp(
+            state,
+            &json!({
+                "jsonrpc":"2.0",
+                "method":"prompts/get",
+                "id":93,
+                "params":{ "name": "nonexistent" }
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["id"], 93);
+        assert_eq!(body["error"]["code"], -32603);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no prompt found for prefixed name"),
+            "unexpected error message: {body:?}"
+        );
+    }
+
+    /// T4 — `resources/read` missing the `uri` param is rejected with the
+    /// JSON-RPC `-32602` (invalid params) code, mirroring `tools/call`'s
+    /// missing-`name` shape.
+    #[tokio::test]
+    async fn mcp_unified_resources_read_missing_uri_returns_invalid_params() {
+        let state = test_app_state();
+        let resp = post_mcp(
+            state,
+            &json!({"jsonrpc":"2.0","method":"resources/read","id":33,"params":{}}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["id"], 33);
+        assert_eq!(body["error"]["code"], -32602);
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("missing 'uri'"),
+            "unexpected error message: {body:?}"
+        );
+    }
+
+    /// T4 — `resources/read` with no adapters registered returns a JSON-RPC
+    /// `-32603` (internal error) wrapping the registry's "no active endpoint"
+    /// rejection; proves the arm dispatches into
+    /// `AdapterRegistry::route_resource_read` rather than the
+    /// method-not-found fallback.
+    #[tokio::test]
+    async fn mcp_unified_resources_read_dispatches_to_route_resource_read() {
+        let state = test_app_state();
+        let resp = post_mcp(
+            state,
+            &json!({
+                "jsonrpc":"2.0",
+                "method":"resources/read",
+                "id":34,
+                "params":{ "uri": "ui://app/main" }
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["id"], 34);
+        // Internal error from the registry's empty-adapter rejection, not
+        // a `-32601` "method not found".
+        assert_eq!(body["error"]["code"], -32603);
+        let msg = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            msg.contains("no active endpoint") || msg.contains("ui://app/main"),
+            "expected routing error mentioning the URI, got: {msg}"
+        );
+    }
+
     #[tokio::test]
     async fn mcp_unified_2026_stateless_tools_list_without_handshake() {
         // A 2026 client calls tools/list with no prior initialize/initialized
@@ -4794,6 +5170,7 @@ mod tests {
                         description: Some("draw tool".into()),
                         input_schema: schema.clone(),
                         annotations: None,
+                        ..Default::default()
                     }],
                 }),
                 "stdio".into(),
@@ -5371,6 +5748,196 @@ mod tests {
         );
     }
 
+    /// T10 — `initialize` must advertise a `prompts` capability so MCP
+    /// clients know the relay proxies `prompts/list` + `prompts/get`.
+    /// `listChanged` is intentionally absent — the relay does not yet
+    /// forward upstream `notifications/prompts/list_changed` to clients.
+    #[tokio::test]
+    async fn mcp_initialize_advertises_prompts_capability() {
+        let state = test_app_state();
+        let body = JsonRpcBody {
+            jsonrpc: Some("2.0".to_string()),
+            method: Some("initialize".to_string()),
+            params: None,
+            id: Some(json!(8)),
+        };
+        let Json(resp) = mcp_initialize(State(state), Json(body), None).await;
+        assert!(
+            resp["result"]["capabilities"]["prompts"].is_object(),
+            "initialize must advertise prompts capability (got {resp})"
+        );
+        assert!(
+            resp["result"]["capabilities"]["prompts"]
+                .get("listChanged")
+                .is_none(),
+            "relay must not claim listChanged for prompts (got {resp})"
+        );
+    }
+
+    /// T7 — `initialize` must advertise EXACTLY the set of capabilities
+    /// that have matching dispatcher arms in `handle_single_message`:
+    /// `tools`, `resources`, `prompts`. No extra keys, and `resources` /
+    /// `prompts` must NOT carry `listChanged` or `subscribe` sub-flags —
+    /// the relay does not implement either, so advertising them would lie
+    /// about a reachable method.
+    #[tokio::test]
+    async fn mcp_initialize_capabilities_exact_shape() {
+        let state = test_app_state();
+        let body = JsonRpcBody {
+            jsonrpc: Some("2.0".to_string()),
+            method: Some("initialize".to_string()),
+            params: None,
+            id: Some(json!(9)),
+        };
+        let Json(resp) = mcp_initialize(State(state), Json(body), None).await;
+        let caps = &resp["result"]["capabilities"];
+
+        let mut keys: Vec<&str> = caps
+            .as_object()
+            .expect("capabilities must be an object")
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["prompts", "resources", "tools"],
+            "capabilities must contain EXACTLY tools/resources/prompts (got {caps})"
+        );
+
+        // tools: listChanged true (SSE pipeline implemented).
+        assert_eq!(caps["tools"]["listChanged"], true);
+        // resources: bare {}, no unimplemented sub-flags.
+        assert!(caps["resources"].is_object());
+        assert!(
+            caps["resources"].get("listChanged").is_none(),
+            "resources must not claim listChanged (got {caps})"
+        );
+        assert!(
+            caps["resources"].get("subscribe").is_none(),
+            "resources must not claim subscribe (got {caps})"
+        );
+        // prompts: bare {}, no listChanged.
+        assert!(caps["prompts"].is_object());
+        assert!(caps["prompts"].get("listChanged").is_none());
+    }
+
+    /// T7 — `server/discover` must advertise the same EXACT capability
+    /// shape as `initialize` (they share `build_initialize_result`).
+    #[tokio::test]
+    async fn mcp_server_discover_capabilities_exact_shape() {
+        let state = test_app_state();
+        let resp = post_mcp(
+            state,
+            &json!({"jsonrpc":"2.0","method":"server/discover","id":42}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let caps = &body["result"]["capabilities"];
+
+        let mut keys: Vec<&str> = caps
+            .as_object()
+            .expect("capabilities must be an object")
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["prompts", "resources", "tools"],
+            "server/discover capabilities must contain EXACTLY tools/resources/prompts (got {caps})"
+        );
+        assert!(caps["resources"].get("listChanged").is_none());
+        assert!(caps["resources"].get("subscribe").is_none());
+        assert!(caps["prompts"].get("listChanged").is_none());
+    }
+
+    /// T7 — JS-execution mode keeps `resources/*` and `prompts/*`
+    /// reachable: the catalog reduction is scoped to `tools/list` only.
+    /// Capability advertisement and method reachability must agree —
+    /// `resources/list` and `prompts/list` are both advertised AND must
+    /// remain dispatched when `local_js_execution` is on.
+    #[tokio::test]
+    async fn mcp_js_mode_resources_and_prompts_remain_reachable() {
+        let state = test_app_state();
+        state.js_execution_mode.store(true, Ordering::Relaxed);
+
+        // resources/list: still dispatched (returns the empty-aggregate body).
+        let resp = post_mcp(
+            state.clone(),
+            &json!({"jsonrpc":"2.0","method":"resources/list","id":71}),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert!(
+            body["result"]["resources"].is_array(),
+            "resources/list must remain reachable in JS mode (got {body})"
+        );
+        assert!(
+            body.get("error").is_none(),
+            "resources/list must not be method-not-found in JS mode (got {body})"
+        );
+
+        // resources/templates/list: same.
+        let resp = post_mcp(
+            state.clone(),
+            &json!({"jsonrpc":"2.0","method":"resources/templates/list","id":72}),
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert!(
+            body["result"]["resourceTemplates"].is_array(),
+            "resources/templates/list must remain reachable in JS mode (got {body})"
+        );
+
+        // prompts/list: still dispatched.
+        let resp = post_mcp(
+            state,
+            &json!({"jsonrpc":"2.0","method":"prompts/list","id":73}),
+        )
+        .await;
+        let body = body_json(resp).await;
+        assert!(
+            body["result"]["prompts"].is_array(),
+            "prompts/list must remain reachable in JS mode (got {body})"
+        );
+        assert!(
+            body.get("error").is_none(),
+            "prompts/list must not be method-not-found in JS mode (got {body})"
+        );
+    }
+
+    /// T7 — `initialize`/`server/discover` advertise the same capability
+    /// set when JS mode is on (the JS-mode catalog reduction is scoped to
+    /// `tools/list` and does not affect capability advertisement).
+    #[tokio::test]
+    async fn mcp_initialize_capabilities_unchanged_in_js_mode() {
+        let state = test_app_state();
+        state.js_execution_mode.store(true, Ordering::Relaxed);
+        let body = JsonRpcBody {
+            jsonrpc: Some("2.0".to_string()),
+            method: Some("initialize".to_string()),
+            params: None,
+            id: Some(json!(10)),
+        };
+        let Json(resp) = mcp_initialize(State(state), Json(body), None).await;
+        let caps = &resp["result"]["capabilities"];
+        let mut keys: Vec<&str> = caps
+            .as_object()
+            .expect("capabilities must be an object")
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["prompts", "resources", "tools"],
+            "JS-mode capabilities must still include resources + prompts (got {caps})"
+        );
+    }
+
     /// Helper: read the SSE response body as a UTF-8 string, accumulating
     /// chunks until `predicate` returns true or `timeout` elapses. Returns
     /// the accumulated text either way so tests can produce useful failure
@@ -5542,6 +6109,7 @@ mod tests {
                             description: Some("smoke tool".into()),
                             input_schema: json!({"type": "object"}),
                             annotations: None,
+                            ..Default::default()
                         }],
                         server_type_val: "smoke-server".into(),
                     }),

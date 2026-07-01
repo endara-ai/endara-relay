@@ -14,10 +14,12 @@ pub mod prefix;
 pub mod profile_registry;
 pub mod protocol;
 pub mod registry;
+pub mod resource_uri;
 pub mod server;
 pub mod shell_env;
 pub mod token_manager;
 pub mod token_security;
+pub mod tool_call_rewrite;
 pub mod toon_convert;
 pub mod watcher;
 

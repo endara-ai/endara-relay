@@ -1361,6 +1361,7 @@ mod tests {
             description: Some(desc.to_string()),
             input_schema: json!({"type": "object"}),
             annotations: None,
+            ..Default::default()
         }
     }
 
@@ -1599,6 +1600,7 @@ mod tests {
             description: Some(desc.to_string()),
             input_schema: schema,
             annotations: None,
+            ..Default::default()
         }
     }
 
@@ -2759,6 +2761,7 @@ mod tests {
             description: Some(format!("{} tool", name)),
             input_schema: json!({"type": "object"}),
             annotations: Some(annotations),
+            ..Default::default()
         }
     }
 

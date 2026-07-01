@@ -203,6 +203,7 @@ impl McpAdapter for JsonPayloadAdapter {
             description: Some("returns a JSON object in TextContent".to_string()),
             input_schema: json!({"type": "object"}),
             annotations: None,
+            ..Default::default()
         }])
     }
     async fn call_tool(&self, _name: &str, _args: Value) -> Result<Value, AdapterError> {
@@ -356,6 +357,7 @@ impl McpAdapter for NamedToolAdapter {
             description: Some(format!("the {} tool", self.tool)),
             input_schema: json!({"type": "object"}),
             annotations: None,
+            ..Default::default()
         }])
     }
     async fn call_tool(&self, _name: &str, _args: Value) -> Result<Value, AdapterError> {
