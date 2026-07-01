@@ -162,6 +162,135 @@ impl ProfileRegistryView {
             .route_tool_call_with_request_params(prefixed_name, arguments, request_params)
             .await
     }
+
+    /// Profile-scoped variant of [`AdapterRegistry::list_resources`].
+    ///
+    /// Aggregates `resources/list` across only the profile's allowed endpoints
+    /// and wraps URIs using the *in-profile* active count so the wrap trigger
+    /// matches [`Self::route_resource_read`]'s unwrap trigger — keeping the
+    /// allowed-endpoint guard tight in the `(global>=2, profile==1)` corner.
+    pub async fn list_resources(&self) -> Vec<Value> {
+        self.inner.list_resources_in(&self.allowed_endpoints).await
+    }
+
+    /// Profile-scoped variant of [`AdapterRegistry::list_resource_templates`].
+    /// See [`Self::list_resources`] for the wrap-trigger rationale.
+    pub async fn list_resource_templates(&self) -> Vec<Value> {
+        self.inner
+            .list_resource_templates_in(&self.allowed_endpoints)
+            .await
+    }
+
+    /// Profile-scoped variant of [`AdapterRegistry::list_prompts`].
+    ///
+    /// Aggregates `prompts/list` across only the profile's allowed endpoints
+    /// and namespaces `prompts[].name` using the *in-profile* active count so
+    /// the prefix trigger stays consistent with the profile-scoped tool
+    /// catalog.
+    pub async fn list_prompts(&self) -> Vec<Value> {
+        self.inner.list_prompts_in(&self.allowed_endpoints).await
+    }
+
+    /// Profile-scoped variant of [`AdapterRegistry::route_prompt_get`].
+    ///
+    /// Rebuilds the reverse lookup from the *in-profile* `list_prompts_in_with_lookup`
+    /// so the prefix-trigger matches what the profile-scoped `prompts/list`
+    /// emitted; that closes the `(global>=2, profile==1)` foreign-prompt
+    /// bypass the same way [`Self::route_resource_read`] does for resources.
+    /// Rejects any prompt whose owning endpoint is outside the profile's
+    /// allowed set before dispatch. Slot #9 URI rewriting is applied with
+    /// the in-profile `skip_wrap` trigger so the wrap toggles in lockstep
+    /// with the profile-scoped prompt-name prefix toggle.
+    pub async fn route_prompt_get(
+        &self,
+        prefixed_name: &str,
+        arguments: Option<Value>,
+    ) -> Result<Value, AdapterError> {
+        let (_prompts, lookup) = self
+            .inner
+            .list_prompts_in_with_lookup(&self.allowed_endpoints)
+            .await;
+        let (endpoint, raw_name) = match lookup.get(prefixed_name) {
+            Some(v) => v.clone(),
+            None => {
+                return Err(AdapterError::ProtocolError(format!(
+                    "no prompt '{}' in profile",
+                    prefixed_name
+                )));
+            }
+        };
+        if !self.allowed_endpoints.contains(&endpoint) {
+            return Err(AdapterError::ProtocolError(format!(
+                "prompt '{}' is not available in this profile",
+                prefixed_name
+            )));
+        }
+        let skip_wrap = self
+            .inner
+            .active_endpoint_count_in(&self.allowed_endpoints)
+            .await
+            <= 1;
+        let value = self
+            .inner
+            .dispatch_prompt_get_to(&endpoint, &raw_name, arguments)
+            .await?;
+        Ok(crate::tool_call_rewrite::rewrite_prompt_get_result(
+            value, &endpoint, skip_wrap,
+        ))
+    }
+
+    /// Profile-scoped variant of [`AdapterRegistry::route_resource_read`].
+    ///
+    /// Always attempts a strict decode of `wrapped_uri` first — independent
+    /// of the in-profile active count — so a fully-wrapped `mcp-relay://`
+    /// URI is recognised even when the profile would otherwise pass URIs
+    /// through (DD5 single-endpoint). When the decoded endpoint is outside
+    /// the profile's allowed set, the read is rejected before dispatch.
+    /// When the URI is not wrapped, the request is treated as a DD5 raw URI
+    /// and dispatched to the sole in-profile active endpoint; if zero or
+    /// more than one in-profile endpoint is active, the request is rejected.
+    ///
+    /// This always-strict decode is what closes the
+    /// `(global>=2, profile==1)` foreign-endpoint bypass: without it, a
+    /// `skip_wrap=true` decode would treat the wrapper as raw and dispatch
+    /// to the profile's sole endpoint with a foreign endpoint name baked
+    /// into the URI string.
+    pub async fn route_resource_read(&self, wrapped_uri: &str) -> Result<Value, AdapterError> {
+        // Strict-decode first. Successful decode → wrapper-style URI; the
+        // resolved endpoint must be inside the profile.
+        if let Ok((endpoint, original_uri)) = crate::resource_uri::decode_resource_uri(wrapped_uri)
+        {
+            if !self.allowed_endpoints.contains(&endpoint) {
+                return Err(AdapterError::ProtocolError(format!(
+                    "resource '{}' is not available in this profile",
+                    wrapped_uri
+                )));
+            }
+            return self
+                .inner
+                .dispatch_resource_read_to(&endpoint, &original_uri)
+                .await;
+        }
+
+        // Not a wrapped URI → DD5 single-endpoint mode within the profile.
+        // Require exactly one in-profile active endpoint; reject otherwise
+        // because there is no endpoint hint to disambiguate the target.
+        match self
+            .inner
+            .find_single_active_endpoint_in(&self.allowed_endpoints)
+            .await
+        {
+            Some(endpoint) => {
+                self.inner
+                    .dispatch_resource_read_to(&endpoint, wrapped_uri)
+                    .await
+            }
+            None => Err(AdapterError::ProtocolError(format!(
+                "no active endpoint to serve resource '{}'",
+                wrapped_uri
+            ))),
+        }
+    }
 }
 
 #[async_trait]
@@ -399,6 +528,18 @@ mod tests {
         ) -> Result<serde_json::Value, AdapterError> {
             Ok(json!({ "called": name, "args": arguments }))
         }
+        async fn read_resource(&self, uri: &str) -> Result<serde_json::Value, AdapterError> {
+            // Echo the URI the adapter received so the profile-guard test
+            // can assert (a) the reverse-rewrite stripped the wrapper and
+            // (b) the call reached the correct endpoint.
+            Ok(json!({
+                "contents": [{
+                    "uri": uri,
+                    "mimeType": "text/plain",
+                    "text": format!("body for {uri}"),
+                }]
+            }))
+        }
         fn health(&self) -> HealthStatus {
             HealthStatus::Healthy
         }
@@ -416,6 +557,7 @@ mod tests {
             description: Some(format!("{name} tool")),
             input_schema: json!({"type": "object"}),
             annotations: None,
+            ..Default::default()
         }
     }
 
@@ -546,6 +688,7 @@ mod tests {
                             "required": ["repo"],
                         }),
                         annotations: None,
+                        ..Default::default()
                     }],
                 }),
                 "stdio".into(),
@@ -850,5 +993,573 @@ mod tests {
             err_msg.contains("todoist__add_task"),
             "expected error to mention the out-of-profile tool, got: {err_msg}"
         );
+    }
+
+    // ---- T4 — profile-scoped `route_resource_read` -----------------------
+
+    /// A wrapped URI whose owning endpoint is inside the profile dispatches
+    /// successfully, and the adapter receives the *original* (un-wrapped) URI.
+    #[tokio::test]
+    async fn route_resource_read_succeeds_for_in_profile_endpoint() {
+        let registry = registry_with_four_endpoints().await;
+        let pr = ProfileRegistry::new(registry);
+        pr.rebuild(&[ProfileConfig {
+            name: "Work".into(),
+            path: "work".into(),
+            endpoints: vec!["gmail".into(), "linear".into()],
+            js_execution: false,
+            toon_output: true,
+        }])
+        .await;
+
+        let ctx = pr.get("work").await.unwrap();
+        let wrapped = crate::resource_uri::encode_resource_uri("gmail", "ui://inbox/123");
+        let result = ctx
+            .registry_view
+            .route_resource_read(&wrapped)
+            .await
+            .expect("in-profile resource read must succeed");
+        assert_eq!(
+            result["contents"][0]["uri"], "ui://inbox/123",
+            "wrapper must be stripped before reaching the adapter"
+        );
+    }
+
+    /// A wrapped URI whose owning endpoint is outside the profile is rejected
+    /// before delegation, mirroring the `route_tool_call` guard.
+    #[tokio::test]
+    async fn route_resource_read_rejects_out_of_profile_endpoint() {
+        let registry = registry_with_four_endpoints().await;
+        let pr = ProfileRegistry::new(registry);
+        pr.rebuild(&[ProfileConfig {
+            name: "Work".into(),
+            path: "work".into(),
+            endpoints: vec!["gmail".into(), "linear".into()],
+            js_execution: false,
+            toon_output: true,
+        }])
+        .await;
+
+        let ctx = pr.get("work").await.unwrap();
+        let wrapped = crate::resource_uri::encode_resource_uri("todoist", "ui://tasks/today");
+        let err = ctx
+            .registry_view
+            .route_resource_read(&wrapped)
+            .await
+            .expect_err("out-of-profile read must be rejected");
+        match err {
+            AdapterError::ProtocolError(msg) => {
+                assert!(
+                    msg.contains("not available in this profile"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected ProtocolError, got {other:?}"),
+        }
+    }
+
+    /// T12 regression — the `(global>=2, profile==1)` foreign-endpoint
+    /// bypass. With multiple endpoints globally but only one in the
+    /// profile, the profile's in-scope `skip_wrap` is `true` so the
+    /// incoming URI is treated as its own original. A wrapped URI that
+    /// targets a *foreign* endpoint must NOT be accepted as a raw URI by
+    /// the profile's single allowed endpoint — the dispatch target is
+    /// resolved against the profile's allowed set, not the global registry.
+    #[tokio::test]
+    async fn route_resource_read_rejects_wrapped_foreign_uri_in_single_endpoint_profile() {
+        let registry = registry_with_four_endpoints().await;
+        let pr = ProfileRegistry::new(registry);
+        pr.rebuild(&[ProfileConfig {
+            name: "Solo".into(),
+            path: "solo".into(),
+            endpoints: vec!["gmail".into()],
+            js_execution: false,
+            toon_output: true,
+        }])
+        .await;
+
+        let ctx = pr.get("solo").await.unwrap();
+        // Profile has 1 endpoint → its `skip_wrap` is true; global has 4
+        // → wrapping is normally in effect. Build a fully-wrapped URI
+        // targeting a foreign endpoint and submit it through the
+        // profile-scoped path.
+        let wrapped = crate::resource_uri::encode_resource_uri("todoist", "ui://tasks/today");
+        let result = ctx.registry_view.route_resource_read(&wrapped).await;
+        match result {
+            Ok(v) => panic!(
+                "wrapped foreign-endpoint URI must NOT be served by the profile's \
+                 sole endpoint (bypass!): {v}"
+            ),
+            Err(AdapterError::ProtocolError(_)) => {
+                // Either path is acceptable as a closed bypass: the URI
+                // may be reported as not-available-in-profile, or as
+                // unknown by the adapter (the in-profile endpoint won't
+                // recognise the `mcp-relay://` scheme). The critical
+                // invariant is that we never see the foreign adapter's
+                // `read_resource` echo for `ui://tasks/today`.
+            }
+            Err(other) => panic!("expected ProtocolError, got {other:?}"),
+        }
+    }
+
+    /// T12 regression (list side) — the outbound `list_resources`
+    /// aggregation must also use the profile-local active count when
+    /// deciding to wrap. With one in-profile endpoint, URIs flow through
+    /// unwrapped, matching the unwrap trigger used by
+    /// [`ProfileRegistryView::route_resource_read`]. The list must contain
+    /// only the profile's endpoint's resources.
+    #[tokio::test]
+    async fn list_resources_is_profile_scoped_with_in_profile_active_count() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "gmail".into(),
+                Box::new(ResourceMockForProfile {
+                    resources: vec![json!({ "uri": "ui://inbox/1", "name": "inbox" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("gmail".into()),
+            )
+            .await;
+        registry
+            .register(
+                "todoist".into(),
+                Box::new(ResourceMockForProfile {
+                    resources: vec![json!({ "uri": "ui://tasks/today", "name": "today" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("todoist".into()),
+            )
+            .await;
+
+        let pr = ProfileRegistry::new(registry);
+        pr.rebuild(&[ProfileConfig {
+            name: "Solo".into(),
+            path: "solo".into(),
+            endpoints: vec!["gmail".into()],
+            js_execution: false,
+            toon_output: true,
+        }])
+        .await;
+
+        let ctx = pr.get("solo").await.unwrap();
+        let resources = ctx.registry_view.list_resources().await;
+        assert_eq!(
+            resources.len(),
+            1,
+            "must list only gmail's resources: {resources:?}"
+        );
+        // One in-profile endpoint → wrap is skipped, the URI is its raw
+        // original (no `mcp-relay://` prefix). This is exactly what
+        // `route_resource_read`'s in-profile single-endpoint dispatch
+        // expects, so the listing and read paths stay symmetric.
+        assert_eq!(resources[0]["uri"], "ui://inbox/1");
+    }
+
+    /// T9 — profile-scoped `list_prompts` filters to the profile's allowed
+    /// endpoints and applies the *in-profile* active count when deciding to
+    /// prefix names. With one in-profile endpoint, names pass through
+    /// unprefixed (DD5 parity); foreign endpoints' prompts are excluded.
+    #[tokio::test]
+    async fn list_prompts_is_profile_scoped_with_in_profile_active_count() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "gmail".into(),
+                Box::new(PromptMockForProfile {
+                    prompts: vec![json!({ "name": "compose", "description": "Compose mail" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("gmail".into()),
+            )
+            .await;
+        registry
+            .register(
+                "todoist".into(),
+                Box::new(PromptMockForProfile {
+                    prompts: vec![json!({ "name": "add_task", "description": "Add a task" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("todoist".into()),
+            )
+            .await;
+
+        let pr = ProfileRegistry::new(registry);
+        pr.rebuild(&[ProfileConfig {
+            name: "Solo".into(),
+            path: "solo".into(),
+            endpoints: vec!["gmail".into()],
+            js_execution: false,
+            toon_output: true,
+        }])
+        .await;
+
+        let ctx = pr.get("solo").await.unwrap();
+        let prompts = ctx.registry_view.list_prompts().await;
+        assert_eq!(
+            prompts.len(),
+            1,
+            "must list only gmail's prompts: {prompts:?}"
+        );
+        // One in-profile endpoint → prefix is skipped, the name is its raw
+        // original. Symmetric with the registry's DD5 unprefixed mode.
+        assert_eq!(prompts[0]["name"], "compose");
+    }
+
+    /// T9 — profile-scoped `list_prompts` prefixes names when the in-profile
+    /// active count is ≥ 2, even when only a subset of the global registry
+    /// is in the profile.
+    #[tokio::test]
+    async fn list_prompts_profile_prefixes_when_multiple_in_profile() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "gmail".into(),
+                Box::new(PromptMockForProfile {
+                    prompts: vec![json!({ "name": "compose" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("gmail".into()),
+            )
+            .await;
+        registry
+            .register(
+                "todoist".into(),
+                Box::new(PromptMockForProfile {
+                    prompts: vec![json!({ "name": "add_task" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("todoist".into()),
+            )
+            .await;
+
+        let pr = ProfileRegistry::new(registry);
+        pr.rebuild(&[ProfileConfig {
+            name: "All".into(),
+            path: "all".into(),
+            endpoints: vec!["gmail".into(), "todoist".into()],
+            js_execution: false,
+            toon_output: true,
+        }])
+        .await;
+
+        let ctx = pr.get("all").await.unwrap();
+        let mut prompts = ctx.registry_view.list_prompts().await;
+        prompts.sort_by(|a, b| {
+            a["name"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b["name"].as_str().unwrap_or(""))
+        });
+        assert_eq!(prompts.len(), 2);
+        assert_eq!(prompts[0]["name"], "gmail__compose");
+        assert_eq!(prompts[1]["name"], "todoist__add_task");
+    }
+
+    // ---- T10 — profile-scoped `route_prompt_get` --------------------------
+
+    /// Adapter mock that advertises a prompt and serves `prompts/get` with
+    /// content blocks the slot #9 wrapper must visit. Tags responses with
+    /// `endpoint_label` so the profile-scoped dispatch can be verified.
+    struct PromptGetMockForProfile {
+        endpoint_label: String,
+        prompts: Vec<serde_json::Value>,
+    }
+
+    #[async_trait]
+    impl McpAdapter for PromptGetMockForProfile {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, AdapterError> {
+            Ok(json!({}))
+        }
+        async fn list_prompts(&self) -> Result<Vec<serde_json::Value>, AdapterError> {
+            Ok(self.prompts.clone())
+        }
+        async fn get_prompt(
+            &self,
+            name: &str,
+            _arguments: Option<serde_json::Value>,
+        ) -> Result<serde_json::Value, AdapterError> {
+            Ok(json!({
+                "endpoint": self.endpoint_label,
+                "raw_name": name,
+                "messages": [{
+                    "role": "assistant",
+                    "content": [
+                        { "type": "text", "text": "see https://example.com" },
+                        { "type": "resource_link", "uri": "ui://app/link", "name": "Open" }
+                    ]
+                }]
+            }))
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    /// Profile-scoped `route_prompt_get` dispatches in-profile prompts to
+    /// the owning upstream, applies slot #9 URI wrapping using the
+    /// *in-profile* active count, and forwards the raw name verbatim.
+    #[tokio::test]
+    async fn route_prompt_get_succeeds_for_in_profile_endpoint() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "gmail".into(),
+                Box::new(PromptGetMockForProfile {
+                    endpoint_label: "gmail".into(),
+                    prompts: vec![json!({ "name": "compose" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("gmail".into()),
+            )
+            .await;
+        registry
+            .register(
+                "todoist".into(),
+                Box::new(PromptGetMockForProfile {
+                    endpoint_label: "todoist".into(),
+                    prompts: vec![json!({ "name": "add_task" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("todoist".into()),
+            )
+            .await;
+
+        let pr = ProfileRegistry::new(registry);
+        pr.rebuild(&[ProfileConfig {
+            name: "All".into(),
+            path: "all".into(),
+            endpoints: vec!["gmail".into(), "todoist".into()],
+            js_execution: false,
+            toon_output: true,
+        }])
+        .await;
+
+        let ctx = pr.get("all").await.unwrap();
+        let result = ctx
+            .registry_view
+            .route_prompt_get("gmail__compose", None)
+            .await
+            .expect("in-profile prompt must dispatch");
+        assert_eq!(result["endpoint"], "gmail");
+        assert_eq!(result["raw_name"], "compose");
+        // Multi-endpoint profile → slot #9 wraps the resource_link URI.
+        let link_uri = result["messages"][0]["content"][1]["uri"].as_str().unwrap();
+        let (ep, orig) = crate::resource_uri::decode_resource_uri(link_uri).unwrap();
+        assert_eq!(ep, "gmail");
+        assert_eq!(orig, "ui://app/link");
+    }
+
+    /// Profile-scoped `route_prompt_get` rejects a prompt whose owning
+    /// endpoint is not in the profile's allowed set — even when that
+    /// endpoint exists in the global registry. This is the prompts-side
+    /// analogue of the foreign-endpoint guard `route_resource_read` /
+    /// `route_tool_call` enforce.
+    #[tokio::test]
+    async fn route_prompt_get_rejects_out_of_profile_endpoint() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "gmail".into(),
+                Box::new(PromptGetMockForProfile {
+                    endpoint_label: "gmail".into(),
+                    prompts: vec![json!({ "name": "compose" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("gmail".into()),
+            )
+            .await;
+        registry
+            .register(
+                "todoist".into(),
+                Box::new(PromptGetMockForProfile {
+                    endpoint_label: "todoist".into(),
+                    prompts: vec![json!({ "name": "add_task" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("todoist".into()),
+            )
+            .await;
+
+        let pr = ProfileRegistry::new(registry);
+        pr.rebuild(&[ProfileConfig {
+            name: "Solo".into(),
+            path: "solo".into(),
+            endpoints: vec!["gmail".into()],
+            js_execution: false,
+            toon_output: true,
+        }])
+        .await;
+
+        let ctx = pr.get("solo").await.unwrap();
+        // `todoist__add_task` exists in the global registry but is not in
+        // the profile's allowed set; the lookup is built from the in-profile
+        // list so the name doesn't even appear in `lookup`.
+        let err = ctx
+            .registry_view
+            .route_prompt_get("todoist__add_task", None)
+            .await
+            .expect_err("foreign prompt must reject");
+        match err {
+            AdapterError::ProtocolError(msg) => {
+                assert!(
+                    msg.contains("no prompt") || msg.contains("not available in this profile"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected ProtocolError, got: {other:?}"),
+        }
+    }
+
+    /// Profile-scoped `route_prompt_get` follows the in-profile DD5 rule:
+    /// when the profile has exactly one active endpoint, names pass
+    /// through unprefixed and slot #9 URIs flow through unwrapped, even
+    /// when the global registry has multiple endpoints.
+    #[tokio::test]
+    async fn route_prompt_get_single_in_profile_passes_through() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "gmail".into(),
+                Box::new(PromptGetMockForProfile {
+                    endpoint_label: "gmail".into(),
+                    prompts: vec![json!({ "name": "compose" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("gmail".into()),
+            )
+            .await;
+        registry
+            .register(
+                "todoist".into(),
+                Box::new(PromptGetMockForProfile {
+                    endpoint_label: "todoist".into(),
+                    prompts: vec![json!({ "name": "add_task" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("todoist".into()),
+            )
+            .await;
+
+        let pr = ProfileRegistry::new(registry);
+        pr.rebuild(&[ProfileConfig {
+            name: "Solo".into(),
+            path: "solo".into(),
+            endpoints: vec!["gmail".into()],
+            js_execution: false,
+            toon_output: true,
+        }])
+        .await;
+
+        let ctx = pr.get("solo").await.unwrap();
+        let result = ctx
+            .registry_view
+            .route_prompt_get("compose", None)
+            .await
+            .expect("DD5 in-profile dispatch must succeed");
+        assert_eq!(result["endpoint"], "gmail");
+        assert_eq!(result["raw_name"], "compose");
+        // In-profile active_count == 1 → slot #9 wrap is skipped.
+        assert_eq!(result["messages"][0]["content"][1]["uri"], "ui://app/link");
+    }
+
+    /// Adapter mock for profile-scoped resource listing tests. Kept local
+    /// to the module so it doesn't grow the existing `MockAdapter` with
+    /// resource fields used only by these tests.
+    struct ResourceMockForProfile {
+        resources: Vec<serde_json::Value>,
+    }
+
+    #[async_trait]
+    impl McpAdapter for ResourceMockForProfile {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, AdapterError> {
+            Ok(json!({ "called": name, "args": arguments }))
+        }
+        async fn list_resources(&self) -> Result<Vec<serde_json::Value>, AdapterError> {
+            Ok(self.resources.clone())
+        }
+        async fn read_resource(&self, uri: &str) -> Result<serde_json::Value, AdapterError> {
+            Ok(json!({
+                "contents": [{
+                    "uri": uri,
+                    "mimeType": "text/plain",
+                    "text": format!("body for {uri}"),
+                }]
+            }))
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    /// Adapter mock for profile-scoped prompt listing tests. Kept local
+    /// to the module so it doesn't grow the existing mocks with prompt
+    /// fields used only by these tests.
+    struct PromptMockForProfile {
+        prompts: Vec<serde_json::Value>,
+    }
+
+    #[async_trait]
+    impl McpAdapter for PromptMockForProfile {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, AdapterError> {
+            Ok(json!({ "called": name, "args": arguments }))
+        }
+        async fn list_prompts(&self) -> Result<Vec<serde_json::Value>, AdapterError> {
+            Ok(self.prompts.clone())
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
     }
 }

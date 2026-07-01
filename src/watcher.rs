@@ -1280,6 +1280,7 @@ mod tests {
             description: Some(format!("{} tool", name)),
             input_schema: json!({"type": "object"}),
             annotations: None,
+            ..Default::default()
         }
     }
 
@@ -3108,6 +3109,7 @@ validate_inputs = false
                                     "required": ["repo"],
                                 }),
                                 annotations: None,
+                                ..Default::default()
                             }],
                             dummy,
                         )),

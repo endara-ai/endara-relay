@@ -5760,6 +5760,7 @@ mod tests {
             description: None,
             input_schema: serde_json::json!({}),
             annotations: None,
+            ..Default::default()
         }];
         let state = test_state(vec![("echo", MockAdapter::healthy_with_tools(tools))]).await;
         let app = management_routes(state);
@@ -5818,12 +5819,14 @@ mod tests {
                 description: None,
                 input_schema: serde_json::json!({}),
                 annotations: None,
+                ..Default::default()
             },
             ToolInfo {
                 name: "t2".into(),
                 description: None,
                 input_schema: serde_json::json!({}),
                 annotations: None,
+                ..Default::default()
             },
         ];
         let state = test_state(vec![
@@ -5948,6 +5951,7 @@ mod tests {
             description: Some("Read a file".into()),
             input_schema: serde_json::json!({"type": "object"}),
             annotations: None,
+            ..Default::default()
         }];
         let state = test_state(vec![("fs", MockAdapter::healthy_with_tools(tools))]).await;
         let app = management_routes(state);
@@ -6074,6 +6078,7 @@ mod tests {
             description: None,
             input_schema: serde_json::json!({}),
             annotations: None,
+            ..Default::default()
         }];
         let state = test_state(vec![("echo", MockAdapter::healthy_with_tools(tools))]).await;
         let app = management_routes(state);
@@ -6715,6 +6720,7 @@ command = "echo"
             description: None,
             input_schema: serde_json::json!({}),
             annotations: None,
+            ..Default::default()
         }];
         let state = test_state(vec![("echo", MockAdapter::healthy_with_tools(tools))]).await;
         let app = management_routes(state);
@@ -6754,6 +6760,7 @@ command = "echo"
             description: None,
             input_schema: serde_json::json!({}),
             annotations: None,
+            ..Default::default()
         }];
         let state = test_state(vec![("echo", MockAdapter::healthy_with_tools(tools))]).await;
         let app = management_routes(state);
@@ -6820,12 +6827,14 @@ command = "echo"
                 description: Some("Read".into()),
                 input_schema: serde_json::json!({"type": "object"}),
                 annotations: None,
+                ..Default::default()
             },
             ToolInfo {
                 name: "write".into(),
                 description: Some("Write".into()),
                 input_schema: serde_json::json!({"type": "object"}),
                 annotations: None,
+                ..Default::default()
             },
         ];
         let state = test_state(vec![("fs", MockAdapter::healthy_with_tools(tools))]).await;
@@ -6878,6 +6887,7 @@ command = "echo"
             description: Some("Read".into()),
             input_schema: serde_json::json!({"type": "object"}),
             annotations: None,
+            ..Default::default()
         }];
         let state = test_state(vec![("fs", MockAdapter::healthy_with_tools(tools))]).await;
         let app = management_routes(state);
@@ -6974,6 +6984,7 @@ command = "echo"
             description: None,
             input_schema: serde_json::json!({}),
             annotations: None,
+            ..Default::default()
         }];
         let state = test_state(vec![("echo", MockAdapter::healthy_with_tools(tools))]).await;
         // Hold the registry Arc so the broadcast sender outlives the router.
@@ -6997,6 +7008,7 @@ command = "echo"
             description: None,
             input_schema: serde_json::json!({}),
             annotations: None,
+            ..Default::default()
         }];
         let state = test_state(vec![("echo", MockAdapter::healthy_with_tools(tools))]).await;
         let app = management_routes(state.clone());
@@ -7022,6 +7034,7 @@ command = "echo"
             description: Some("Read".into()),
             input_schema: serde_json::json!({"type": "object"}),
             annotations: None,
+            ..Default::default()
         }];
         let state = test_state(vec![("fs", MockAdapter::healthy_with_tools(tools))]).await;
         // Hold the registry Arc so the broadcast sender outlives the router.
@@ -7045,6 +7058,7 @@ command = "echo"
             description: Some("Read".into()),
             input_schema: serde_json::json!({"type": "object"}),
             annotations: None,
+            ..Default::default()
         }];
         let state = test_state(vec![("fs", MockAdapter::healthy_with_tools(tools))]).await;
         let app = management_routes(state.clone());
@@ -9100,6 +9114,7 @@ client_id = "client123"
                         description: None,
                         input_schema: serde_json::json!({}),
                         annotations: None,
+                        ..Default::default()
                     }])),
                     "stdio".to_string(),
                     None,

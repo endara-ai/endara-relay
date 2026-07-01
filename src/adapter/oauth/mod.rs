@@ -1277,6 +1277,63 @@ impl McpAdapter for OAuthAdapter {
         }
     }
 
+    async fn list_resources(&self) -> Result<Vec<Value>, AdapterError> {
+        // Delegate to the inner transport adapter. Upstreams that do not
+        // expose `resources/list` return `-32601`, which the registry
+        // tolerates by skipping the endpoint.
+        let guard = self.inner.inner_adapter.read().await;
+        match guard.as_ref() {
+            Some(adapter) => adapter.list_resources().await,
+            None => Ok(vec![]),
+        }
+    }
+
+    async fn list_resource_templates(&self) -> Result<Vec<Value>, AdapterError> {
+        let guard = self.inner.inner_adapter.read().await;
+        match guard.as_ref() {
+            Some(adapter) => adapter.list_resource_templates().await,
+            None => Ok(vec![]),
+        }
+    }
+
+    async fn read_resource(&self, uri: &str) -> Result<Value, AdapterError> {
+        // Delegate to the inner transport adapter. The inner adapter forwards
+        // `resources/read` upstream and returns the raw `result`; the registry
+        // returns it to the client unmodified per DD2.
+        let guard = self.inner.inner_adapter.read().await;
+        match guard.as_ref() {
+            Some(adapter) => adapter.read_resource(uri).await,
+            None => Err(AdapterError::NotInitialized),
+        }
+    }
+
+    async fn list_prompts(&self) -> Result<Vec<Value>, AdapterError> {
+        // Delegate to the inner transport adapter. Upstreams that do not
+        // expose `prompts/list` return `-32601`, which the registry
+        // tolerates by skipping the endpoint.
+        let guard = self.inner.inner_adapter.read().await;
+        match guard.as_ref() {
+            Some(adapter) => adapter.list_prompts().await,
+            None => Ok(vec![]),
+        }
+    }
+
+    async fn get_prompt(
+        &self,
+        name: &str,
+        arguments: Option<Value>,
+    ) -> Result<Value, AdapterError> {
+        // Delegate to the inner transport adapter. The inner adapter forwards
+        // `prompts/get` upstream and returns the raw `result`; the registry
+        // rewrites any enumerated resource URIs on returned messages before
+        // forwarding to the client.
+        let guard = self.inner.inner_adapter.read().await;
+        match guard.as_ref() {
+            Some(adapter) => adapter.get_prompt(name, arguments).await,
+            None => Err(AdapterError::NotInitialized),
+        }
+    }
+
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AdapterError> {
         self.call_tool_with_request_params(name, arguments, serde_json::Map::new())
             .await

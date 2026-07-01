@@ -585,6 +585,45 @@ impl AdapterRegistry {
             .count()
     }
 
+    /// Count non-disabled adapters whose endpoint name is in
+    /// `allowed_endpoints`. Used by [`crate::profile_registry::ProfileRegistryView`]
+    /// to compute the in-profile `skip_wrap` / `skip_prefix` trigger so the
+    /// wrap toggles in lockstep with the profile-scoped catalog rather than
+    /// the global one (closes the `(global>=2, profile==1)` foreign-endpoint
+    /// bypass for any per-request wrap pass).
+    pub(crate) async fn active_endpoint_count_in(
+        &self,
+        allowed_endpoints: &HashSet<String>,
+    ) -> usize {
+        let adapters = self.adapters.read().await;
+        adapters
+            .iter()
+            .filter(|(name, e)| !e.disabled && allowed_endpoints.contains(*name))
+            .count()
+    }
+
+    /// Pick the sole non-disabled adapter whose endpoint name is in
+    /// `allowed_endpoints`, or `None` if zero or more than one match.
+    /// Used by [`crate::profile_registry::ProfileRegistryView::route_resource_read`]
+    /// to resolve the DD5 single-endpoint dispatch target *within the
+    /// profile's scope* rather than the global registry's, which is what
+    /// closes the `(global>=2, profile==1)` foreign-endpoint bypass.
+    pub(crate) async fn find_single_active_endpoint_in(
+        &self,
+        allowed_endpoints: &HashSet<String>,
+    ) -> Option<String> {
+        let adapters = self.adapters.read().await;
+        let mut iter = adapters
+            .iter()
+            .filter(|(name, e)| !e.disabled && allowed_endpoints.contains(*name));
+        let first = iter.next().map(|(name, _)| name.clone());
+        if iter.next().is_some() {
+            None
+        } else {
+            first
+        }
+    }
+
     /// Access the underlying adapters map (for management API use).
     pub fn entries(&self) -> &Arc<RwLock<HashMap<String, RegisteredAdapter>>> {
         &self.adapters
@@ -693,11 +732,45 @@ impl AdapterRegistry {
                             final_name.clone(),
                             (endpoint_name.clone(), tool.name.clone()),
                         );
+                        // Slot #1 (T6): wrap the MCP Apps UI pointer fields
+                        // (`_meta.ui.resourceUri` + alias
+                        // `_meta["openai/outputTemplate"]`) on the tool
+                        // descriptor to this tool's owning endpoint, so a
+                        // pointer the client receives via `tools/list`
+                        // reverses through `route_resource_read` back to the
+                        // same upstream. STRICT DD1: only those two fields
+                        // are touched; arbitrary `_meta` siblings (e.g.
+                        // `ui.csp`) pass through untouched. DD5: skipped in
+                        // single-endpoint mode (`skip_prefix == true`) so the
+                        // wrap/unwrap pair flips with the tool-prefix step
+                        // above. The helper is the same one slot #2 calls in
+                        // `rewrite_tool_call_result`, keeping descriptor and
+                        // result encoding in lockstep with slot #6's decoder.
+                        let mut meta = tool.meta;
+                        if !skip_prefix {
+                            if let Some(meta_obj) = meta.as_mut().and_then(|v| v.as_object_mut()) {
+                                crate::tool_call_rewrite::rewrite_meta_ui_pointers(
+                                    meta_obj,
+                                    endpoint_name,
+                                );
+                            }
+                        }
+                        // Preserve every upstream descriptor field other than
+                        // `name` (rewritten by the prefix step above) and
+                        // `description` (enriched with the `[endpoint]` /
+                        // `[⚠️ UNAVAILABLE]` label above) so MCP Apps UI
+                        // pointers in `_meta`, plus `title`/`outputSchema`
+                        // and any catch-all `extra` fields, survive
+                        // re-serialization through the merged catalog.
                         catalog.push(ToolInfo {
                             name: final_name,
                             description: enriched_description,
                             input_schema: tool.input_schema,
                             annotations: tool.annotations,
+                            title: tool.title,
+                            output_schema: tool.output_schema,
+                            meta,
+                            extra: tool.extra,
                         });
                     }
                 }
@@ -761,6 +834,12 @@ impl AdapterRegistry {
         };
 
         let adapters = self.adapters.read().await;
+        // DD5 single-endpoint passthrough trigger. Mirrors
+        // [`Self::list_resources`] / [`Self::route_resource_read`] /
+        // [`Self::build_catalog`] so the tool-prefix wrap and the result-URI
+        // wrap flip together — when only one active endpoint is registered,
+        // both pass through unchanged (slots #2 and #3 are no-ops below).
+        let skip_wrap = adapters.values().filter(|e| !e.disabled).count() <= 1;
         let entry = match adapters.get(endpoint) {
             Some(e) => e,
             None => {
@@ -857,11 +936,22 @@ impl AdapterRegistry {
         // path. Cheap no-op when the pipeline is unwired or disabled, and
         // skipped for internal callers that have no `request_uid`. Enqueue is
         // non-blocking (`try_send`); overflow drops are counted in the handle.
+        //
+        // T5: each return path applies `rewrite_tool_call_result` so the
+        // enumerated URI slots (`_meta.ui.resourceUri`,
+        // `_meta["openai/outputTemplate"]`, `content[]` of type `resource` /
+        // `resource_link`) are namespaced to `endpoint`. `skip_wrap` mirrors
+        // DD5 single-endpoint passthrough so the rewrite is byte-for-byte
+        // identical to the upstream response when only one endpoint is
+        // active.
         let Some(obs) = self.observability.as_ref().filter(|o| o.is_enabled()) else {
             return entry
                 .adapter
                 .call_tool_with_request_params(tool, arguments, request_params)
-                .await;
+                .await
+                .map(|v| {
+                    crate::tool_call_rewrite::rewrite_tool_call_result(v, endpoint, skip_wrap)
+                });
         };
         let span_ctx = current_request_context();
         // Gate capture on an inbound request context (skip internal callers),
@@ -875,7 +965,10 @@ impl AdapterRegistry {
             return entry
                 .adapter
                 .call_tool_with_request_params(tool, arguments, request_params)
-                .await;
+                .await
+                .map(|v| {
+                    crate::tool_call_rewrite::rewrite_tool_call_result(v, endpoint, skip_wrap)
+                });
         }
         let request_uid = uuid::Uuid::new_v4().to_string();
 
@@ -903,7 +996,8 @@ impl AdapterRegistry {
         let result = entry
             .adapter
             .call_tool_with_request_params(tool, arguments, request_params)
-            .await;
+            .await
+            .map(|v| crate::tool_call_rewrite::rewrite_tool_call_result(v, endpoint, skip_wrap));
         let duration_ms = started.elapsed().as_millis() as i64;
         let ts_end = ts_start + duration_ms;
 
@@ -959,6 +1053,521 @@ impl AdapterRegistry {
         obs.capture(CaptureRecord { record, payloads });
 
         result
+    }
+
+    /// Aggregate `resources/list` across every non-disabled adapter, wrapping
+    /// each `uri` per slot #4 so the resulting list routes back to the owning
+    /// endpoint via `resources/read`.
+    ///
+    /// Mirrors [`Self::build_catalog`]'s `skip_prefix` semantics: when only
+    /// one non-disabled adapter is active (DD5), URIs flow through unwrapped.
+    /// Adapters whose upstream rejects `resources/list` (e.g. `-32601` for
+    /// servers that don't expose resources) are skipped with a warning so a
+    /// mixed-capability deployment still surfaces the resources it can.
+    pub async fn list_resources(&self) -> Vec<Value> {
+        let adapters = self.adapters.read().await;
+        let active_count = adapters.values().filter(|e| !e.disabled).count();
+        let skip_wrap = active_count <= 1;
+
+        let mut merged: Vec<Value> = Vec::new();
+        for (endpoint_name, entry) in adapters.iter() {
+            if entry.disabled {
+                continue;
+            }
+            match entry.adapter.list_resources().await {
+                Ok(items) => {
+                    for mut item in items {
+                        if let Some(uri) = item.get("uri").and_then(|v| v.as_str()) {
+                            let wrapped = crate::resource_uri::maybe_encode_resource_uri(
+                                endpoint_name,
+                                uri,
+                                skip_wrap,
+                            );
+                            if let Some(obj) = item.as_object_mut() {
+                                obj.insert("uri".to_string(), Value::String(wrapped));
+                            }
+                        }
+                        merged.push(item);
+                    }
+                }
+                Err(e) => {
+                    warn!(endpoint = %endpoint_name, error = %e, "Failed to list resources");
+                }
+            }
+        }
+        merged
+    }
+
+    /// Aggregate `resources/templates/list` across every non-disabled
+    /// adapter, wrapping each `uriTemplate` per slot #5 via
+    /// [`crate::resource_uri::maybe_encode_resource_uri_template`] so RFC
+    /// 6570 `{var}` markers survive the wrap and client-side variable
+    /// expansion still works. DD5 single-endpoint mode passes templates
+    /// through unwrapped, mirroring [`Self::list_resources`].
+    pub async fn list_resource_templates(&self) -> Vec<Value> {
+        let adapters = self.adapters.read().await;
+        let active_count = adapters.values().filter(|e| !e.disabled).count();
+        let skip_wrap = active_count <= 1;
+
+        let mut merged: Vec<Value> = Vec::new();
+        for (endpoint_name, entry) in adapters.iter() {
+            if entry.disabled {
+                continue;
+            }
+            match entry.adapter.list_resource_templates().await {
+                Ok(items) => {
+                    for mut item in items {
+                        if let Some(tmpl) = item.get("uriTemplate").and_then(|v| v.as_str()) {
+                            let wrapped = crate::resource_uri::maybe_encode_resource_uri_template(
+                                endpoint_name,
+                                tmpl,
+                                skip_wrap,
+                            );
+                            if let Some(obj) = item.as_object_mut() {
+                                obj.insert("uriTemplate".to_string(), Value::String(wrapped));
+                            }
+                        }
+                        merged.push(item);
+                    }
+                }
+                Err(e) => {
+                    warn!(endpoint = %endpoint_name, error = %e, "Failed to list resource templates");
+                }
+            }
+        }
+        merged
+    }
+
+    /// Profile-scoped variant of [`Self::list_resources`]: aggregates
+    /// `resources/list` only across non-disabled adapters whose endpoint name
+    /// is in `allowed_endpoints`, wrapping URIs based on the *in-profile*
+    /// active count. This keeps the wrap trigger consistent with
+    /// [`crate::profile_registry::ProfileRegistryView::route_resource_read`]
+    /// so the allowed-endpoint guard cannot be bypassed in the
+    /// `(global>=2, profile==1)` corner case.
+    pub async fn list_resources_in(&self, allowed_endpoints: &HashSet<String>) -> Vec<Value> {
+        let adapters = self.adapters.read().await;
+        let active_count = adapters
+            .iter()
+            .filter(|(name, e)| !e.disabled && allowed_endpoints.contains(*name))
+            .count();
+        let skip_wrap = active_count <= 1;
+
+        let mut merged: Vec<Value> = Vec::new();
+        for (endpoint_name, entry) in adapters.iter() {
+            if entry.disabled || !allowed_endpoints.contains(endpoint_name) {
+                continue;
+            }
+            match entry.adapter.list_resources().await {
+                Ok(items) => {
+                    for mut item in items {
+                        if let Some(uri) = item.get("uri").and_then(|v| v.as_str()) {
+                            let wrapped = crate::resource_uri::maybe_encode_resource_uri(
+                                endpoint_name,
+                                uri,
+                                skip_wrap,
+                            );
+                            if let Some(obj) = item.as_object_mut() {
+                                obj.insert("uri".to_string(), Value::String(wrapped));
+                            }
+                        }
+                        merged.push(item);
+                    }
+                }
+                Err(e) => {
+                    warn!(endpoint = %endpoint_name, error = %e, "Failed to list resources");
+                }
+            }
+        }
+        merged
+    }
+
+    /// Profile-scoped variant of [`Self::list_resource_templates`] — see
+    /// [`Self::list_resources_in`] for the rationale; uses the template-aware
+    /// encoder so RFC 6570 `{var}` markers survive the wrap.
+    pub async fn list_resource_templates_in(
+        &self,
+        allowed_endpoints: &HashSet<String>,
+    ) -> Vec<Value> {
+        let adapters = self.adapters.read().await;
+        let active_count = adapters
+            .iter()
+            .filter(|(name, e)| !e.disabled && allowed_endpoints.contains(*name))
+            .count();
+        let skip_wrap = active_count <= 1;
+
+        let mut merged: Vec<Value> = Vec::new();
+        for (endpoint_name, entry) in adapters.iter() {
+            if entry.disabled || !allowed_endpoints.contains(endpoint_name) {
+                continue;
+            }
+            match entry.adapter.list_resource_templates().await {
+                Ok(items) => {
+                    for mut item in items {
+                        if let Some(tmpl) = item.get("uriTemplate").and_then(|v| v.as_str()) {
+                            let wrapped = crate::resource_uri::maybe_encode_resource_uri_template(
+                                endpoint_name,
+                                tmpl,
+                                skip_wrap,
+                            );
+                            if let Some(obj) = item.as_object_mut() {
+                                obj.insert("uriTemplate".to_string(), Value::String(wrapped));
+                            }
+                        }
+                        merged.push(item);
+                    }
+                }
+                Err(e) => {
+                    warn!(endpoint = %endpoint_name, error = %e, "Failed to list resource templates");
+                }
+            }
+        }
+        merged
+    }
+
+    /// Aggregate `prompts/list` across every non-disabled adapter, namespacing
+    /// each `prompts[].name` via the existing tool-prefix scheme
+    /// ([`prefix::encode_tool_name`]) per slot #8 so a prefixed prompt name
+    /// later routes back to its owning upstream. Mirrors
+    /// [`Self::build_catalog`]'s `skip_prefix` semantics: when only one
+    /// non-disabled adapter is active (DD5), names flow through unprefixed.
+    ///
+    /// Returns the merged `prompts` array. Adapters whose upstream rejects
+    /// `prompts/list` (e.g. `-32601` for servers that don't expose prompts)
+    /// are skipped with a warning so a mixed-capability deployment still
+    /// surfaces the prompts it can.
+    pub async fn list_prompts(&self) -> Vec<Value> {
+        self.list_prompts_with_lookup().await.0
+    }
+
+    /// Aggregate `prompts/list` and build a reverse lookup map from each
+    /// prefixed prompt name to `(endpoint_name, raw_prompt_name)`. The lookup
+    /// shape mirrors the tool catalog's reverse map so a future
+    /// `prompts/get` dispatcher can reuse the same resolution pattern as
+    /// `route_tool_call`.
+    pub async fn list_prompts_with_lookup(
+        &self,
+    ) -> (Vec<Value>, HashMap<String, (String, String)>) {
+        let adapters = self.adapters.read().await;
+        let active_count = adapters.values().filter(|e| !e.disabled).count();
+        let skip_prefix = active_count <= 1;
+
+        let mut merged: Vec<Value> = Vec::new();
+        let mut lookup: HashMap<String, (String, String)> = HashMap::new();
+        for (endpoint_name, entry) in adapters.iter() {
+            if entry.disabled {
+                continue;
+            }
+            let effective_prefix = if skip_prefix {
+                None
+            } else {
+                entry.tool_prefix.clone()
+            };
+            match entry.adapter.list_prompts().await {
+                Ok(items) => {
+                    for mut item in items {
+                        if let Some(raw_name) = item
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                        {
+                            let final_name = match &effective_prefix {
+                                Some(pfx) => prefix::encode_tool_name(pfx, None, &raw_name),
+                                None => raw_name.clone(),
+                            };
+                            if let Some(obj) = item.as_object_mut() {
+                                obj.insert("name".to_string(), Value::String(final_name.clone()));
+                            }
+                            lookup.insert(final_name, (endpoint_name.clone(), raw_name));
+                        }
+                        merged.push(item);
+                    }
+                }
+                Err(e) => {
+                    warn!(endpoint = %endpoint_name, error = %e, "Failed to list prompts");
+                }
+            }
+        }
+        (merged, lookup)
+    }
+
+    /// Profile-scoped variant of [`Self::list_prompts`]: aggregates
+    /// `prompts/list` only across non-disabled adapters whose endpoint name
+    /// is in `allowed_endpoints`, namespacing names based on the *in-profile*
+    /// active count. This keeps the prefix trigger consistent with the
+    /// profile-scoped tool catalog so the allowed-endpoint guard cannot be
+    /// bypassed in the `(global>=2, profile==1)` corner case.
+    pub async fn list_prompts_in(&self, allowed_endpoints: &HashSet<String>) -> Vec<Value> {
+        self.list_prompts_in_with_lookup(allowed_endpoints).await.0
+    }
+
+    /// Profile-scoped variant of [`Self::list_prompts_with_lookup`] — see
+    /// [`Self::list_prompts_in`] for the rationale.
+    pub async fn list_prompts_in_with_lookup(
+        &self,
+        allowed_endpoints: &HashSet<String>,
+    ) -> (Vec<Value>, HashMap<String, (String, String)>) {
+        let adapters = self.adapters.read().await;
+        let active_count = adapters
+            .iter()
+            .filter(|(name, e)| !e.disabled && allowed_endpoints.contains(*name))
+            .count();
+        let skip_prefix = active_count <= 1;
+
+        let mut merged: Vec<Value> = Vec::new();
+        let mut lookup: HashMap<String, (String, String)> = HashMap::new();
+        for (endpoint_name, entry) in adapters.iter() {
+            if entry.disabled || !allowed_endpoints.contains(endpoint_name) {
+                continue;
+            }
+            let effective_prefix = if skip_prefix {
+                None
+            } else {
+                entry.tool_prefix.clone()
+            };
+            match entry.adapter.list_prompts().await {
+                Ok(items) => {
+                    for mut item in items {
+                        if let Some(raw_name) = item
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string)
+                        {
+                            let final_name = match &effective_prefix {
+                                Some(pfx) => prefix::encode_tool_name(pfx, None, &raw_name),
+                                None => raw_name.clone(),
+                            };
+                            if let Some(obj) = item.as_object_mut() {
+                                obj.insert("name".to_string(), Value::String(final_name.clone()));
+                            }
+                            lookup.insert(final_name, (endpoint_name.clone(), raw_name));
+                        }
+                        merged.push(item);
+                    }
+                }
+                Err(e) => {
+                    warn!(endpoint = %endpoint_name, error = %e, "Failed to list prompts");
+                }
+            }
+        }
+        (merged, lookup)
+    }
+
+    /// Route an inbound `prompts/get` to the owning upstream after
+    /// reverse-prefixing the namespaced prompt name and wrapping resource
+    /// references in the returned messages (slot #9).
+    ///
+    /// `prefixed_name` is the prompt name the client received from a previous
+    /// `prompts/list` — either `{endpoint_prefix}__{raw_name}` (multi-endpoint
+    /// mode) or the raw upstream name passed through unchanged (DD5 single-
+    /// endpoint mode). The reverse map is rebuilt from
+    /// [`Self::list_prompts_with_lookup`] so the wrap/unwrap pair stays
+    /// symmetric — a name that came out of `prompts/list` must reverse here.
+    ///
+    /// Mirrors [`Self::route_tool_call_with_request_params`]'s early-rejection
+    /// shape: an unknown prefixed name, an endpoint the registry no longer
+    /// has an adapter for, a disabled endpoint, and an unhealthy endpoint
+    /// each return a distinct [`AdapterError::ProtocolError`] message so log
+    /// scrapers can distinguish the cases. The returned `Value` is the
+    /// upstream `prompts/get` result with slot #9 URI rewriting applied to
+    /// `messages[].content` blocks scoped to the owning endpoint — the
+    /// `skip_wrap` trigger mirrors [`Self::route_tool_call_with_request_params`]
+    /// (`active_count <= 1`) so the wrap toggles in lockstep with the name
+    /// prefix toggle.
+    pub async fn route_prompt_get(
+        &self,
+        prefixed_name: &str,
+        arguments: Option<Value>,
+    ) -> Result<Value, AdapterError> {
+        let (_prompts, lookup) = self.list_prompts_with_lookup().await;
+        let (endpoint, raw_name) = match lookup.get(prefixed_name) {
+            Some(v) => v.clone(),
+            None => {
+                return Err(AdapterError::ProtocolError(format!(
+                    "no prompt found for prefixed name '{}'",
+                    prefixed_name
+                )));
+            }
+        };
+
+        let skip_wrap = {
+            let adapters = self.adapters.read().await;
+            adapters.values().filter(|e| !e.disabled).count() <= 1
+        };
+
+        let value = self
+            .dispatch_prompt_get_to(&endpoint, &raw_name, arguments)
+            .await?;
+        Ok(crate::tool_call_rewrite::rewrite_prompt_get_result(
+            value, &endpoint, skip_wrap,
+        ))
+    }
+
+    /// Dispatch a `prompts/get` to a specific endpoint without performing any
+    /// name reverse-prefixing or result rewriting. The caller is responsible
+    /// for selecting the endpoint (e.g. by consulting the reverse lookup
+    /// themselves), supplying the raw upstream prompt name, and applying any
+    /// downstream slot #9 URI rewrite.
+    ///
+    /// Returns the same error shapes as [`Self::route_prompt_get`] for unknown
+    /// / disabled / unhealthy endpoints so log scrapers see identical messages
+    /// regardless of whether the fetch came through the global or a profile-
+    /// scoped path.
+    pub(crate) async fn dispatch_prompt_get_to(
+        &self,
+        endpoint_name: &str,
+        raw_name: &str,
+        arguments: Option<Value>,
+    ) -> Result<Value, AdapterError> {
+        let adapters = self.adapters.read().await;
+        let entry = match adapters.get(endpoint_name) {
+            Some(e) => e,
+            None => {
+                return Err(AdapterError::ProtocolError(format!(
+                    "no adapter found for endpoint '{}'",
+                    endpoint_name
+                )));
+            }
+        };
+
+        if entry.disabled {
+            return Err(AdapterError::ProtocolError(format!(
+                "endpoint '{}' is disabled",
+                endpoint_name
+            )));
+        }
+
+        if !matches!(entry.adapter.health(), HealthStatus::Healthy) {
+            return Err(AdapterError::ProtocolError(format!(
+                "prompt '{}' is currently unavailable: endpoint '{}' is not healthy",
+                raw_name, endpoint_name
+            )));
+        }
+
+        info!(
+            endpoint = %endpoint_name,
+            prompt = %raw_name,
+            "Routing prompt get"
+        );
+
+        entry.adapter.get_prompt(raw_name, arguments).await
+    }
+
+    /// Route an inbound `resources/read` to the owning upstream after
+    /// reverse-rewriting the wrapped URI (slot #6).
+    ///
+    /// `wrapped_uri` is the URI the client received from a previous
+    /// `resources/list`, `resources/templates/list`, or `tools/call` result —
+    /// either `mcp-relay://{endpoint}/{percent-encoded-original}` (multi-
+    /// endpoint mode) or the original URI passed through unchanged (DD5
+    /// single-endpoint mode). The decode trigger mirrors `build_catalog`'s
+    /// `skip_prefix = active_count <= 1` so the wrap/unwrap pair is symmetric:
+    /// in single-endpoint mode the URI is treated as already-original and
+    /// dispatched to the sole adapter; in multi-endpoint mode the wrapper
+    /// scheme is decoded to `(endpoint, original_uri)` and the original is
+    /// forwarded to the adapter at `endpoint`.
+    ///
+    /// Rejects every error branch as [`AdapterError::ProtocolError`] mirroring
+    /// [`Self::route_tool_call`]'s early-rejection shape: a wrapped URI that
+    /// fails to decode, an unknown endpoint, a disabled endpoint, and an
+    /// unhealthy endpoint each return a distinct message so log scrapers can
+    /// distinguish the cases. No `ToolCallEvent` is emitted — the event bus is
+    /// scoped to `tools/call` (R3.B) and reusing it here would inject phantom
+    /// tool-call rows into the desktop overlay.
+    ///
+    /// Per DD2 the returned `Value` is the upstream `resources/read` result
+    /// object forwarded verbatim — URIs inside the resource body are not
+    /// rewritten in v1.
+    pub async fn route_resource_read(&self, wrapped_uri: &str) -> Result<Value, AdapterError> {
+        let (endpoint_name, original_uri) = {
+            let adapters = self.adapters.read().await;
+            let active_count = adapters.values().filter(|e| !e.disabled).count();
+            let skip_wrap = active_count <= 1;
+
+            // Decode the wrapped URI to `(Option<endpoint>, original_uri)`. In
+            // DD5 single-endpoint mode the wrap is skipped entirely so the URI is
+            // its own original and the endpoint hint is absent — dispatched to
+            // the sole active adapter below.
+            let (endpoint_hint, original_uri) =
+                crate::resource_uri::maybe_decode_resource_uri(wrapped_uri, skip_wrap).map_err(
+                    |e| {
+                        AdapterError::ProtocolError(format!(
+                            "invalid resource URI '{}': {}",
+                            wrapped_uri, e
+                        ))
+                    },
+                )?;
+
+            let endpoint_name = match endpoint_hint {
+                Some(name) => name,
+                None => {
+                    // DD5 single-endpoint mode: dispatch to the sole non-disabled
+                    // adapter. If somehow zero are active (unlikely — the wrap
+                    // trigger uses `active_count <= 1`) return a clean rejection.
+                    match adapters.iter().find(|(_, e)| !e.disabled) {
+                        Some((name, _)) => name.clone(),
+                        None => {
+                            return Err(AdapterError::ProtocolError(format!(
+                                "no active endpoint to serve resource '{}'",
+                                wrapped_uri
+                            )));
+                        }
+                    }
+                }
+            };
+            (endpoint_name, original_uri)
+        };
+
+        self.dispatch_resource_read_to(&endpoint_name, &original_uri)
+            .await
+    }
+
+    /// Dispatch a `resources/read` to a specific endpoint without performing
+    /// any URI decoding. The caller is responsible for selecting the endpoint
+    /// (e.g. by decoding the wrapper themselves) and supplying the unwrapped
+    /// resource URI.
+    ///
+    /// Returns the same error shapes as [`Self::route_resource_read`] for
+    /// unknown / disabled / unhealthy endpoints so log scrapers see identical
+    /// messages regardless of whether the read came through the global or a
+    /// profile-scoped path.
+    pub(crate) async fn dispatch_resource_read_to(
+        &self,
+        endpoint_name: &str,
+        original_uri: &str,
+    ) -> Result<Value, AdapterError> {
+        let adapters = self.adapters.read().await;
+        let entry = match adapters.get(endpoint_name) {
+            Some(e) => e,
+            None => {
+                return Err(AdapterError::ProtocolError(format!(
+                    "no adapter found for endpoint '{}'",
+                    endpoint_name
+                )));
+            }
+        };
+
+        if entry.disabled {
+            return Err(AdapterError::ProtocolError(format!(
+                "endpoint '{}' is disabled",
+                endpoint_name
+            )));
+        }
+
+        if !matches!(entry.adapter.health(), HealthStatus::Healthy) {
+            return Err(AdapterError::ProtocolError(format!(
+                "resource '{}' is currently unavailable: endpoint '{}' is not healthy",
+                original_uri, endpoint_name
+            )));
+        }
+
+        info!(
+            endpoint = %endpoint_name,
+            uri = %original_uri,
+            "Routing resource read"
+        );
+
+        entry.adapter.read_resource(original_uri).await
     }
 
     /// Publish a `Started` + `Failed` pair on the shared
@@ -2137,6 +2746,7 @@ mod tests {
             description: Some(format!("{} tool", name)),
             input_schema: json!({"type": "object"}),
             annotations: None,
+            ..Default::default()
         }
     }
 
@@ -2159,6 +2769,97 @@ mod tests {
         assert_eq!(catalog.len(), 1);
         // Single adapter → no prefix
         assert_eq!(catalog[0].name, "read");
+    }
+
+    // --- T1: lossless passthrough of tool-descriptor metadata ---
+
+    #[tokio::test]
+    async fn test_merged_catalog_preserves_tool_metadata_passthrough() {
+        // A tool with `title`, `outputSchema`, `_meta.ui.resourceUri`,
+        // and an unmodeled top-level field must survive aggregation through
+        // `merged_catalog` without losing or mutating those fields. `name`
+        // (prefixed for multi-server), `description` (enriched with the
+        // `[endpoint]` label), and the two slot #1 `_meta` UI pointers (T6
+        // namespaces `_meta.ui.resourceUri` + `_meta["openai/outputTemplate"]`
+        // to the owning endpoint) are expected to change.
+        let registry = AdapterRegistry::new();
+        let upstream = ToolInfo {
+            name: "show_users".into(),
+            description: Some("Show users".into()),
+            input_schema: json!({"type": "object"}),
+            annotations: Some(json!({"readOnlyHint": true})),
+            title: Some("Show Users".into()),
+            output_schema: Some(json!({
+                "type": "object",
+                "properties": {"users": {"type": "array"}},
+            })),
+            meta: Some(json!({
+                "ui": {"resourceUri": "ui://widgets/users.html"},
+                "openai/outputTemplate": "ui://widgets/users.html",
+            })),
+            extra: {
+                let mut m = serde_json::Map::new();
+                m.insert("futureField".into(), json!("future-value"));
+                m
+            },
+        };
+        registry
+            .register(
+                "ep1".into(),
+                Box::new(MockAdapter::healthy(vec![upstream.clone()])),
+                "stdio".into(),
+                None,
+                Some("ep1".into()),
+            )
+            .await;
+        registry
+            .register(
+                "ep2".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("noop")])),
+                "stdio".into(),
+                None,
+                Some("ep2".into()),
+            )
+            .await;
+
+        let catalog = registry.merged_catalog().await;
+        let entry = catalog
+            .iter()
+            .find(|t| t.name == "ep1__show_users")
+            .expect("prefixed tool present in catalog");
+
+        // Enrichment label is applied to description; everything else
+        // passes through verbatim.
+        assert_eq!(
+            entry.description.as_deref(),
+            Some("[ep1] Show users"),
+            "description should carry the [endpoint] enrichment label"
+        );
+        assert_eq!(entry.input_schema, upstream.input_schema);
+        assert_eq!(entry.annotations, upstream.annotations);
+        assert_eq!(entry.title, upstream.title);
+        assert_eq!(entry.output_schema, upstream.output_schema);
+        assert_eq!(entry.extra, upstream.extra);
+
+        // Re-serializing through serde_json must keep `_meta` (renamed,
+        // not dropped) and the catch-all `extra` field reachable for
+        // downstream MCP Apps clients. The two slot #1 pointer fields are
+        // wrapped to the owning endpoint per T6; everything else under
+        // `_meta` (none here, but a CSP sibling would be) and the unmodeled
+        // top-level fields survive verbatim.
+        let wrapped_ui = crate::resource_uri::encode_resource_uri("ep1", "ui://widgets/users.html");
+        let wire = serde_json::to_value(entry).expect("serialize entry");
+        assert_eq!(
+            wire["_meta"]["ui"]["resourceUri"], wrapped_ui,
+            "_meta.ui.resourceUri must be wrapped to the owning endpoint (T6 slot #1)"
+        );
+        assert_eq!(
+            wire["_meta"]["openai/outputTemplate"], wrapped_ui,
+            "_meta openai alias must be wrapped to the owning endpoint (T6 slot #1)"
+        );
+        assert_eq!(wire["title"], "Show Users");
+        assert!(wire["outputSchema"].is_object());
+        assert_eq!(wire["futureField"], "future-value");
     }
 
     // --- Multi-server with tool_prefix ---
@@ -2587,6 +3288,7 @@ mod tests {
             description: None,
             input_schema: json!({"type": "object"}),
             annotations: None,
+            ..Default::default()
         };
         registry
             .register(
@@ -4204,6 +4906,7 @@ mod tests {
             description: Some(format!("{} tool", name)),
             input_schema: schema,
             annotations: None,
+            ..Default::default()
         }
     }
 
@@ -5069,6 +5772,1421 @@ mod tests {
                 assert_eq!(status, "validation_error");
             }
             other => panic!("expected Failed, got {:?}", other),
+        }
+    }
+
+    // --- T3: resources/list + resources/templates/list aggregation ---
+
+    /// Adapter mock that returns canned `list_resources` and
+    /// `list_resource_templates` payloads. Kept separate from `MockAdapter`
+    /// so the existing tools-only tests don't grow new fields.
+    struct ResourceMockAdapter {
+        resources: Vec<serde_json::Value>,
+        templates: Vec<serde_json::Value>,
+    }
+
+    #[async_trait]
+    impl McpAdapter for ResourceMockAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, AdapterError> {
+            Ok(json!({ "called": name, "args": arguments }))
+        }
+        async fn list_resources(&self) -> Result<Vec<serde_json::Value>, AdapterError> {
+            Ok(self.resources.clone())
+        }
+        async fn list_resource_templates(&self) -> Result<Vec<serde_json::Value>, AdapterError> {
+            Ok(self.templates.clone())
+        }
+        async fn read_resource(&self, uri: &str) -> Result<serde_json::Value, AdapterError> {
+            // Echo the URI the adapter received so tests can assert the
+            // registry's reverse-rewrite stripped the wrapper before dispatch.
+            Ok(json!({
+                "contents": [{
+                    "uri": uri,
+                    "mimeType": "text/plain",
+                    "text": format!("body for {uri}"),
+                }]
+            }))
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    /// Adapter mock whose `list_resources` / `list_resource_templates`
+    /// always error out, used to exercise the registry's "skip on error"
+    /// branch in the multi-endpoint aggregation.
+    struct FailingResourceAdapter;
+
+    #[async_trait]
+    impl McpAdapter for FailingResourceAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, AdapterError> {
+            Err(AdapterError::ProtocolError("not implemented".into()))
+        }
+        async fn list_resources(&self) -> Result<Vec<serde_json::Value>, AdapterError> {
+            Err(AdapterError::JsonRpcError {
+                code: -32601,
+                message: "method not found".into(),
+                data: None,
+            })
+        }
+        async fn list_resource_templates(&self) -> Result<Vec<serde_json::Value>, AdapterError> {
+            Err(AdapterError::JsonRpcError {
+                code: -32601,
+                message: "method not found".into(),
+                data: None,
+            })
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    /// DD5 — single-endpoint mode passes resource URIs through unwrapped
+    /// (mirrors the tool-prefix `skip_prefix` parity).
+    #[tokio::test]
+    async fn list_resources_single_endpoint_passes_uris_through() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(ResourceMockAdapter {
+                    resources: vec![json!({
+                        "uri": "ui://app/main",
+                        "name": "Main",
+                        "mimeType": "text/html"
+                    })],
+                    templates: vec![],
+                }),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+
+        let resources = registry.list_resources().await;
+        assert_eq!(resources.len(), 1);
+        assert_eq!(resources[0]["uri"], "ui://app/main");
+        // Sibling fields round-trip untouched.
+        assert_eq!(resources[0]["name"], "Main");
+        assert_eq!(resources[0]["mimeType"], "text/html");
+    }
+
+    /// Multi-endpoint aggregation wraps every `uri` to its owning endpoint
+    /// via the `mcp-relay://` wrapper scheme (slot #4).
+    #[tokio::test]
+    async fn list_resources_multi_endpoint_wraps_uris() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(ResourceMockAdapter {
+                    resources: vec![json!({ "uri": "ui://app/main", "name": "A" })],
+                    templates: vec![],
+                }),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+        registry
+            .register(
+                "beta".into(),
+                Box::new(ResourceMockAdapter {
+                    resources: vec![json!({ "uri": "file:///tmp/notes.md", "name": "B" })],
+                    templates: vec![],
+                }),
+                "stdio".into(),
+                None,
+                Some("beta".into()),
+            )
+            .await;
+
+        let mut resources = registry.list_resources().await;
+        assert_eq!(resources.len(), 2);
+        // Stable order for assertion regardless of HashMap iteration order.
+        resources.sort_by(|a, b| {
+            a["name"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b["name"].as_str().unwrap_or(""))
+        });
+
+        let a_uri = resources[0]["uri"].as_str().unwrap();
+        let b_uri = resources[1]["uri"].as_str().unwrap();
+        assert!(
+            a_uri.starts_with("mcp-relay://alpha/"),
+            "expected alpha wrap, got {}",
+            a_uri
+        );
+        assert!(
+            b_uri.starts_with("mcp-relay://beta/"),
+            "expected beta wrap, got {}",
+            b_uri
+        );
+
+        // Round-trip back to the original URI to prove the wrap is reversible.
+        let (ep_a, orig_a) = crate::resource_uri::decode_resource_uri(a_uri).unwrap();
+        let (ep_b, orig_b) = crate::resource_uri::decode_resource_uri(b_uri).unwrap();
+        assert_eq!(ep_a, "alpha");
+        assert_eq!(orig_a, "ui://app/main");
+        assert_eq!(ep_b, "beta");
+        assert_eq!(orig_b, "file:///tmp/notes.md");
+    }
+
+    /// Multi-endpoint template aggregation wraps `uriTemplate` via the
+    /// template-aware encoder (slot #5) so RFC 6570 `{var}` markers survive
+    /// the wrap and client-side expansion still works.
+    #[tokio::test]
+    async fn list_resource_templates_multi_endpoint_preserves_rfc6570_braces() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(ResourceMockAdapter {
+                    resources: vec![],
+                    templates: vec![json!({
+                        "uriTemplate": "ui://app/items/{id}",
+                        "name": "Item"
+                    })],
+                }),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+        registry
+            .register(
+                "beta".into(),
+                Box::new(ResourceMockAdapter {
+                    resources: vec![],
+                    templates: vec![json!({
+                        "uriTemplate": "file:///docs/{section}/{page}",
+                        "name": "Doc"
+                    })],
+                }),
+                "stdio".into(),
+                None,
+                Some("beta".into()),
+            )
+            .await;
+
+        let templates = registry.list_resource_templates().await;
+        assert_eq!(templates.len(), 2);
+        for t in &templates {
+            let wrapped = t["uriTemplate"].as_str().unwrap();
+            assert!(
+                wrapped.starts_with("mcp-relay://"),
+                "expected wrap, got {}",
+                wrapped
+            );
+            assert!(
+                wrapped.contains('{') && wrapped.contains('}'),
+                "RFC 6570 braces must survive the wrap, got {}",
+                wrapped
+            );
+            // Confirm the literal `{var}` is reachable after a decode pass
+            // (proves the host's RFC 6570 expansion will find it).
+            let (_, original) = crate::resource_uri::decode_resource_uri(wrapped).unwrap();
+            assert!(
+                original.contains('{') && original.contains('}'),
+                "decoded original must still carry literal braces, got {}",
+                original
+            );
+        }
+    }
+
+    /// DD5 — single-endpoint template mode is also a passthrough.
+    #[tokio::test]
+    async fn list_resource_templates_single_endpoint_passes_through() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(ResourceMockAdapter {
+                    resources: vec![],
+                    templates: vec![json!({
+                        "uriTemplate": "ui://app/items/{id}",
+                        "name": "Item"
+                    })],
+                }),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+
+        let templates = registry.list_resource_templates().await;
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0]["uriTemplate"], "ui://app/items/{id}");
+    }
+
+    /// Adapters whose upstream rejects `resources/list` (typical for MCP
+    /// servers that do not expose resources, returning `-32601`) are skipped
+    /// without poisoning the merged response — endpoints that DO support
+    /// resources still surface their entries.
+    #[tokio::test]
+    async fn list_resources_skips_endpoints_that_error_out() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(ResourceMockAdapter {
+                    resources: vec![json!({ "uri": "ui://app/main", "name": "A" })],
+                    templates: vec![],
+                }),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+        registry
+            .register(
+                "beta".into(),
+                Box::new(FailingResourceAdapter),
+                "stdio".into(),
+                None,
+                Some("beta".into()),
+            )
+            .await;
+
+        let resources = registry.list_resources().await;
+        assert_eq!(
+            resources.len(),
+            1,
+            "endpoint that errored on list_resources must be skipped, leaving alpha's entry"
+        );
+        let uri = resources[0]["uri"].as_str().unwrap();
+        assert!(
+            uri.starts_with("mcp-relay://alpha/"),
+            "alpha's URI must still be wrapped under multi-endpoint mode, got {}",
+            uri
+        );
+    }
+
+    /// The default adapter implementation returns an empty resource list
+    /// (placeholder adapters / transports that haven't implemented the
+    /// passthrough yet). Aggregating them yields an empty merged list.
+    #[tokio::test]
+    async fn list_resources_default_impl_returns_empty() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(MockAdapter::healthy(vec![])),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+        assert!(registry.list_resources().await.is_empty());
+        assert!(registry.list_resource_templates().await.is_empty());
+    }
+
+    // ---- T4 — `route_resource_read` ---------------------------------------
+
+    /// Multi-endpoint reverse-rewrite (slot #6): a `mcp-relay://A/...` URI
+    /// is decoded back to endpoint `A` and the adapter receives the original
+    /// URI, not the wrapped one. Symmetric with `list_resources_multi_endpoint_wraps_uris`.
+    #[tokio::test]
+    async fn route_resource_read_decodes_wrapper_and_dispatches_to_owning_endpoint() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(ResourceMockAdapter {
+                    resources: vec![json!({ "uri": "ui://app/main", "name": "A" })],
+                    templates: vec![],
+                }),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+        registry
+            .register(
+                "beta".into(),
+                Box::new(ResourceMockAdapter {
+                    resources: vec![json!({ "uri": "file:///tmp/notes.md", "name": "B" })],
+                    templates: vec![],
+                }),
+                "stdio".into(),
+                None,
+                Some("beta".into()),
+            )
+            .await;
+
+        let wrapped = crate::resource_uri::encode_resource_uri("alpha", "ui://app/main");
+        let result = registry
+            .route_resource_read(&wrapped)
+            .await
+            .expect("read should succeed");
+        // The adapter echoes back the URI it actually received — proving the
+        // wrapper was stripped before dispatch.
+        let echoed = result["contents"][0]["uri"].as_str().unwrap();
+        assert_eq!(echoed, "ui://app/main", "wrapper must be stripped");
+        let text = result["contents"][0]["text"].as_str().unwrap();
+        assert!(text.contains("ui://app/main"));
+    }
+
+    /// DD5 single-endpoint mode: the wrap was skipped on the outbound side,
+    /// so the inbound URI is its own original. The registry must dispatch it
+    /// to the sole adapter without trying to decode a `mcp-relay://` prefix.
+    #[tokio::test]
+    async fn route_resource_read_single_endpoint_passes_uri_through() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "solo".into(),
+                Box::new(ResourceMockAdapter {
+                    resources: vec![json!({ "uri": "ui://app/main", "name": "Main" })],
+                    templates: vec![],
+                }),
+                "stdio".into(),
+                None,
+                Some("solo".into()),
+            )
+            .await;
+
+        let result = registry
+            .route_resource_read("ui://app/main")
+            .await
+            .expect("single-endpoint read should succeed");
+        let echoed = result["contents"][0]["uri"].as_str().unwrap();
+        assert_eq!(echoed, "ui://app/main");
+    }
+
+    /// A wrapped URI pointing at an endpoint that isn't registered must be
+    /// rejected with a `ProtocolError`, mirroring `route_tool_call`'s
+    /// "no adapter found for endpoint" shape so log scrapers can match on the
+    /// same wording.
+    #[tokio::test]
+    async fn route_resource_read_unknown_endpoint_returns_protocol_error() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(ResourceMockAdapter {
+                    resources: vec![],
+                    templates: vec![],
+                }),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+        registry
+            .register(
+                "beta".into(),
+                Box::new(ResourceMockAdapter {
+                    resources: vec![],
+                    templates: vec![],
+                }),
+                "stdio".into(),
+                None,
+                Some("beta".into()),
+            )
+            .await;
+
+        let wrapped = crate::resource_uri::encode_resource_uri("ghost", "ui://x/y");
+        let err = registry
+            .route_resource_read(&wrapped)
+            .await
+            .expect_err("unknown endpoint must be rejected");
+        match err {
+            AdapterError::ProtocolError(msg) => {
+                assert!(
+                    msg.contains("ghost") && msg.contains("no adapter found"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected ProtocolError, got {other:?}"),
+        }
+    }
+
+    /// A URI that doesn't decode as a relay wrapper (in multi-endpoint mode)
+    /// returns a `ProtocolError` rather than silently dispatching to a random
+    /// adapter. Mirrors the unknown-endpoint branch.
+    #[tokio::test]
+    async fn route_resource_read_undecodable_uri_returns_protocol_error() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(ResourceMockAdapter {
+                    resources: vec![],
+                    templates: vec![],
+                }),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+        registry
+            .register(
+                "beta".into(),
+                Box::new(ResourceMockAdapter {
+                    resources: vec![],
+                    templates: vec![],
+                }),
+                "stdio".into(),
+                None,
+                Some("beta".into()),
+            )
+            .await;
+
+        // No `mcp-relay://` prefix → decode fails when multiple endpoints are
+        // active (the wrap was never skipped on the outbound side).
+        let err = registry
+            .route_resource_read("ui://app/main")
+            .await
+            .expect_err("undecodable URI must be rejected in multi-endpoint mode");
+        match err {
+            AdapterError::ProtocolError(msg) => {
+                assert!(
+                    msg.contains("invalid resource URI"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected ProtocolError, got {other:?}"),
+        }
+    }
+
+    /// DD2 — the relay returns the upstream `resources/read` result verbatim;
+    /// URIs inside the resource body are not rewritten in v1.
+    #[tokio::test]
+    async fn route_resource_read_returns_body_unmodified() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(ResourceMockAdapter {
+                    resources: vec![],
+                    templates: vec![],
+                }),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+        registry
+            .register(
+                "beta".into(),
+                Box::new(ResourceMockAdapter {
+                    resources: vec![],
+                    templates: vec![],
+                }),
+                "stdio".into(),
+                None,
+                Some("beta".into()),
+            )
+            .await;
+
+        let wrapped = crate::resource_uri::encode_resource_uri("alpha", "ui://app/main");
+        let result = registry.route_resource_read(&wrapped).await.unwrap();
+        // The mock echoes the *original* URI into `contents[0].uri`; the
+        // registry forwards the `result` value unchanged so the body still
+        // contains the original (un-wrapped) URI rather than the wrapper.
+        assert_eq!(result["contents"][0]["uri"], "ui://app/main");
+        assert!(result.get("contents").is_some());
+    }
+
+    // --- T5: tools/call result URI rewriting wired through `route_tool_call` ---
+
+    /// Mock adapter whose `call_tool` returns a payload exercising every
+    /// rewrite slot (slots #2 and #3) plus untouched text/image/structured
+    /// content. Used to verify [`AdapterRegistry::route_tool_call`] applies
+    /// [`crate::tool_call_rewrite::rewrite_tool_call_result`] end-to-end.
+    struct UriEchoAdapter;
+
+    #[async_trait]
+    impl McpAdapter for UriEchoAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(vec![make_tool("open")])
+        }
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, AdapterError> {
+            Ok(json!({
+                "_meta": {
+                    "ui": { "resourceUri": "ui://app/main" },
+                    "openai/outputTemplate": "ui://app/template"
+                },
+                "content": [
+                    { "type": "text", "text": "see ui://app/main" },
+                    { "type": "resource", "resource": { "uri": "ui://app/inline", "mimeType": "text/html" } },
+                    { "type": "resource_link", "uri": "ui://app/link", "name": "Open" }
+                ],
+                "structuredContent": { "uri": "ui://app/inside-structured" }
+            }))
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn route_tool_call_rewrites_enumerated_uri_slots_two_endpoints() {
+        // Two endpoints registered → multi-endpoint mode (DD5 `skip_wrap=false`).
+        // Verifies the rewrite is wired through the fast (no-observability)
+        // path and touches slots #2 and #3 but not text/structuredContent.
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(UriEchoAdapter),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+        registry
+            .register(
+                "beta".into(),
+                Box::new(MockAdapter::healthy(vec![make_tool("noop")])),
+                "stdio".into(),
+                None,
+                Some("beta".into()),
+            )
+            .await;
+
+        let result = registry
+            .route_tool_call("alpha__open", json!({}))
+            .await
+            .unwrap();
+
+        let decode = crate::resource_uri::decode_resource_uri;
+        // Slot #2: `_meta.ui.resourceUri` + `openai/outputTemplate` alias.
+        let ui = result["_meta"]["ui"]["resourceUri"].as_str().unwrap();
+        assert_eq!(
+            decode(ui).unwrap(),
+            ("alpha".to_string(), "ui://app/main".to_string())
+        );
+        let tmpl = result["_meta"]["openai/outputTemplate"].as_str().unwrap();
+        assert_eq!(
+            decode(tmpl).unwrap(),
+            ("alpha".to_string(), "ui://app/template".to_string())
+        );
+        // Slot #3: `content[type==resource].resource.uri` + `content[type==resource_link].uri`.
+        let inline = result["content"][1]["resource"]["uri"].as_str().unwrap();
+        assert_eq!(
+            decode(inline).unwrap(),
+            ("alpha".to_string(), "ui://app/inline".to_string())
+        );
+        let link = result["content"][2]["uri"].as_str().unwrap();
+        assert_eq!(
+            decode(link).unwrap(),
+            ("alpha".to_string(), "ui://app/link".to_string())
+        );
+        // Untouched: text content and `structuredContent.uri` (DD1).
+        assert_eq!(result["content"][0]["text"], "see ui://app/main");
+        assert_eq!(
+            result["structuredContent"]["uri"],
+            "ui://app/inside-structured"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_tool_call_skips_rewrite_in_single_endpoint_mode() {
+        // Single active endpoint → DD5 passthrough (`skip_wrap=true`):
+        // the upstream result is returned byte-for-byte unchanged.
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "solo".into(),
+                Box::new(UriEchoAdapter),
+                "stdio".into(),
+                None,
+                Some("solo".into()),
+            )
+            .await;
+
+        let result = registry.route_tool_call("open", json!({})).await.unwrap();
+
+        assert_eq!(result["_meta"]["ui"]["resourceUri"], "ui://app/main");
+        assert_eq!(
+            result["_meta"]["openai/outputTemplate"],
+            "ui://app/template"
+        );
+        assert_eq!(result["content"][1]["resource"]["uri"], "ui://app/inline");
+        assert_eq!(result["content"][2]["uri"], "ui://app/link");
+        assert_eq!(result["content"][0]["text"], "see ui://app/main");
+        assert_eq!(
+            result["structuredContent"]["uri"],
+            "ui://app/inside-structured"
+        );
+    }
+
+    // ---- T6 — `tools/list` descriptor UI-pointer rewriting (slot #1) ------
+
+    /// Adapter that advertises a single tool descriptor carrying the two MCP
+    /// Apps `_meta` UI pointers (slot #1) plus an unrelated `_meta` sibling
+    /// (DD1 regression: must not be touched), and a `read_resource`
+    /// implementation that echoes the URI it received so the round-trip test
+    /// can prove the de-wrapped original reaches the owning upstream.
+    struct DescriptorMetaAdapter {
+        endpoint_label: String,
+    }
+
+    #[async_trait]
+    impl McpAdapter for DescriptorMetaAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(vec![ToolInfo {
+                name: "open".into(),
+                description: Some("open tool".into()),
+                input_schema: json!({"type": "object"}),
+                annotations: None,
+                meta: Some(json!({
+                    "ui": { "resourceUri": "ui://app/main" },
+                    "openai/outputTemplate": "ui://app/template",
+                    "ui.csp": { "origins": ["https://cdn.example.com"] }
+                })),
+                ..Default::default()
+            }])
+        }
+        async fn call_tool(
+            &self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, AdapterError> {
+            Ok(json!({ "called": name, "args": arguments }))
+        }
+        async fn read_resource(&self, uri: &str) -> Result<serde_json::Value, AdapterError> {
+            // Tag the response with the endpoint that served it so the
+            // round-trip test can assert which adapter was reached.
+            Ok(json!({
+                "endpoint": self.endpoint_label,
+                "contents": [{ "uri": uri, "mimeType": "text/plain", "text": "ok" }]
+            }))
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    /// Two endpoints → multi-endpoint mode (`skip_prefix=false`): each tool
+    /// descriptor's `_meta.ui.resourceUri` and `_meta["openai/outputTemplate"]`
+    /// are wrapped to that tool's owning endpoint, while unrelated `_meta`
+    /// siblings (`ui.csp`) pass through untouched per DD1.
+    #[tokio::test]
+    async fn build_catalog_wraps_descriptor_ui_pointers_two_endpoints() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(DescriptorMetaAdapter {
+                    endpoint_label: "alpha".into(),
+                }),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+        registry
+            .register(
+                "beta".into(),
+                Box::new(DescriptorMetaAdapter {
+                    endpoint_label: "beta".into(),
+                }),
+                "stdio".into(),
+                None,
+                Some("beta".into()),
+            )
+            .await;
+
+        let (catalog, _lookup) = registry.merged_catalog_with_lookup().await;
+        assert_eq!(catalog.len(), 2, "two endpoints, one tool each");
+
+        for tool in &catalog {
+            let (expected_endpoint, _raw) = if tool.name == "alpha__open" {
+                ("alpha", "open")
+            } else if tool.name == "beta__open" {
+                ("beta", "open")
+            } else {
+                panic!("unexpected prefixed name: {}", tool.name);
+            };
+
+            let meta = tool.meta.as_ref().expect("descriptor _meta preserved");
+
+            // Slot #1: `_meta.ui.resourceUri` wrapped to the owning endpoint.
+            let ui_uri = meta["ui"]["resourceUri"].as_str().unwrap();
+            let (ep, orig) = crate::resource_uri::decode_resource_uri(ui_uri).unwrap();
+            assert_eq!(ep, expected_endpoint);
+            assert_eq!(orig, "ui://app/main");
+
+            // Slot #1 alias: `_meta["openai/outputTemplate"]` wrapped.
+            let tmpl = meta["openai/outputTemplate"].as_str().unwrap();
+            let (ep, orig) = crate::resource_uri::decode_resource_uri(tmpl).unwrap();
+            assert_eq!(ep, expected_endpoint);
+            assert_eq!(orig, "ui://app/template");
+
+            // DD1: unrelated `_meta` siblings must pass through untouched.
+            assert_eq!(
+                meta["ui.csp"]["origins"][0], "https://cdn.example.com",
+                "_meta.ui.csp must not be rewritten"
+            );
+        }
+    }
+
+    /// Round-trip: a wrapped pointer emitted by `build_catalog` (slot #1)
+    /// must reverse exactly via `route_resource_read` (slot #6) back to the
+    /// owning upstream, with the adapter receiving the de-wrapped original
+    /// URI. This is the closed-loop guarantee that ties T6's encoder to T4's
+    /// decoder; if the two ever diverge, a real client would receive a
+    /// pointer it cannot read back.
+    #[tokio::test]
+    async fn build_catalog_pointer_round_trips_through_route_resource_read() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(DescriptorMetaAdapter {
+                    endpoint_label: "alpha".into(),
+                }),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+        registry
+            .register(
+                "beta".into(),
+                Box::new(DescriptorMetaAdapter {
+                    endpoint_label: "beta".into(),
+                }),
+                "stdio".into(),
+                None,
+                Some("beta".into()),
+            )
+            .await;
+
+        let (catalog, _) = registry.merged_catalog_with_lookup().await;
+
+        // Pick the `beta__open` descriptor and feed its wrapped pointer
+        // straight back into `route_resource_read` — the response must be
+        // tagged with `beta` (slot #6 dispatch reached the right upstream)
+        // and the adapter must have received the original `ui://app/main`
+        // (slot #6 stripped the wrapper before dispatch).
+        let beta = catalog
+            .iter()
+            .find(|t| t.name == "beta__open")
+            .expect("beta__open present");
+        let wrapped = beta.meta.as_ref().unwrap()["ui"]["resourceUri"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let read_result = registry
+            .route_resource_read(&wrapped)
+            .await
+            .expect("round-trip read succeeds");
+        assert_eq!(
+            read_result["endpoint"], "beta",
+            "wrapper must route back to the owning upstream"
+        );
+        assert_eq!(
+            read_result["contents"][0]["uri"], "ui://app/main",
+            "adapter must receive the de-wrapped original URI"
+        );
+
+        // Same pointer scheme works for the alias slot.
+        let tmpl_wrapped = beta.meta.as_ref().unwrap()["openai/outputTemplate"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let read_result = registry
+            .route_resource_read(&tmpl_wrapped)
+            .await
+            .expect("alias round-trip read succeeds");
+        assert_eq!(read_result["endpoint"], "beta");
+        assert_eq!(read_result["contents"][0]["uri"], "ui://app/template");
+    }
+
+    /// DD5 single-endpoint mode: descriptor `_meta` UI pointers pass through
+    /// unwrapped (no `mcp-relay://` scheme), mirroring the tool-prefix
+    /// `skip_prefix` parity. The whole `_meta` object must be structurally
+    /// identical to the upstream descriptor — no wrap, no inserted defaults.
+    #[tokio::test]
+    async fn build_catalog_single_endpoint_descriptor_meta_passes_through() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "solo".into(),
+                Box::new(DescriptorMetaAdapter {
+                    endpoint_label: "solo".into(),
+                }),
+                "stdio".into(),
+                None,
+                Some("solo".into()),
+            )
+            .await;
+
+        let (catalog, _) = registry.merged_catalog_with_lookup().await;
+        assert_eq!(catalog.len(), 1);
+        // Single-endpoint mode also skips tool-name prefixing (DD5 parity).
+        assert_eq!(catalog[0].name, "open");
+
+        let meta = catalog[0]
+            .meta
+            .as_ref()
+            .expect("descriptor _meta preserved");
+        assert_eq!(
+            meta["ui"]["resourceUri"], "ui://app/main",
+            "single-endpoint mode must not wrap"
+        );
+        assert_eq!(
+            meta["openai/outputTemplate"], "ui://app/template",
+            "single-endpoint mode must not wrap the alias"
+        );
+        assert_eq!(meta["ui.csp"]["origins"][0], "https://cdn.example.com");
+    }
+
+    /// Regression: the existing tool-name prefixing and `[endpoint]`
+    /// description enrichment continue to work alongside the new `_meta`
+    /// rewriting — slot #1 wrapping must not perturb other descriptor fields.
+    #[tokio::test]
+    async fn build_catalog_prefixing_and_enrichment_unchanged() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(DescriptorMetaAdapter {
+                    endpoint_label: "alpha".into(),
+                }),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+        registry
+            .register(
+                "beta".into(),
+                Box::new(DescriptorMetaAdapter {
+                    endpoint_label: "beta".into(),
+                }),
+                "stdio".into(),
+                None,
+                Some("beta".into()),
+            )
+            .await;
+
+        let (catalog, lookup) = registry.merged_catalog_with_lookup().await;
+        // Prefixing: each tool gets `{prefix}__{name}`.
+        assert!(catalog.iter().any(|t| t.name == "alpha__open"));
+        assert!(catalog.iter().any(|t| t.name == "beta__open"));
+        // Lookup map points back at `(endpoint, raw_tool)`.
+        assert_eq!(
+            lookup.get("alpha__open").unwrap(),
+            &("alpha".to_string(), "open".to_string())
+        );
+        // Description enrichment: `[endpoint] {desc}` prefix preserved.
+        let alpha = catalog.iter().find(|t| t.name == "alpha__open").unwrap();
+        assert_eq!(
+            alpha.description.as_deref().unwrap(),
+            "[alpha] open tool",
+            "`[endpoint]` enrichment must survive the slot #1 rewrite"
+        );
+    }
+
+    // --- T9: prompts/list aggregation with prompt-name namespacing ---
+
+    /// Adapter mock that returns a canned `list_prompts` payload. Kept
+    /// separate from `MockAdapter` / `ResourceMockAdapter` so the existing
+    /// tools-only and resources-only tests don't grow new fields.
+    struct PromptMockAdapter {
+        prompts: Vec<serde_json::Value>,
+    }
+
+    #[async_trait]
+    impl McpAdapter for PromptMockAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            name: &str,
+            arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, AdapterError> {
+            Ok(json!({ "called": name, "args": arguments }))
+        }
+        async fn list_prompts(&self) -> Result<Vec<serde_json::Value>, AdapterError> {
+            Ok(self.prompts.clone())
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    /// Adapter mock whose `list_prompts` always errors out, used to
+    /// exercise the registry's "skip on error" branch in the merged
+    /// aggregation (mirrors `FailingResourceAdapter`).
+    struct FailingPromptAdapter;
+
+    #[async_trait]
+    impl McpAdapter for FailingPromptAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, AdapterError> {
+            Err(AdapterError::ProtocolError("not implemented".into()))
+        }
+        async fn list_prompts(&self) -> Result<Vec<serde_json::Value>, AdapterError> {
+            Err(AdapterError::JsonRpcError {
+                code: -32601,
+                message: "method not found".into(),
+                data: None,
+            })
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    /// DD5 — single-endpoint mode passes prompt names through unprefixed,
+    /// mirroring the tool-prefix `skip_prefix` parity.
+    #[tokio::test]
+    async fn list_prompts_single_endpoint_passes_names_through() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(PromptMockAdapter {
+                    prompts: vec![json!({
+                        "name": "summarize",
+                        "description": "Summarize the input",
+                        "arguments": []
+                    })],
+                }),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+
+        let (prompts, lookup) = registry.list_prompts_with_lookup().await;
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0]["name"], "summarize");
+        // Sibling fields round-trip untouched.
+        assert_eq!(prompts[0]["description"], "Summarize the input");
+        // Reverse lookup is keyed by the unprefixed name and points back at
+        // the owning endpoint with the raw prompt name preserved.
+        assert_eq!(
+            lookup.get("summarize").unwrap(),
+            &("alpha".to_string(), "summarize".to_string())
+        );
+    }
+
+    /// Multi-endpoint aggregation namespaces every `name` to its owning
+    /// endpoint via the tool-prefix scheme (`{prefix}__{name}`) per slot #8.
+    /// Identically-named prompts on two endpoints stay distinct in the
+    /// merged list because each carries its endpoint's prefix.
+    #[tokio::test]
+    async fn list_prompts_multi_endpoint_prefixes_names() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(PromptMockAdapter {
+                    prompts: vec![json!({ "name": "summarize", "description": "A" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+        registry
+            .register(
+                "beta".into(),
+                Box::new(PromptMockAdapter {
+                    prompts: vec![json!({ "name": "summarize", "description": "B" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("beta".into()),
+            )
+            .await;
+
+        let (mut prompts, lookup) = registry.list_prompts_with_lookup().await;
+        assert_eq!(prompts.len(), 2, "collision must surface both prompts");
+        // Stable order for assertion regardless of HashMap iteration order.
+        prompts.sort_by(|a, b| {
+            a["name"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(b["name"].as_str().unwrap_or(""))
+        });
+
+        assert_eq!(prompts[0]["name"], "alpha__summarize");
+        assert_eq!(prompts[0]["description"], "A");
+        assert_eq!(prompts[1]["name"], "beta__summarize");
+        assert_eq!(prompts[1]["description"], "B");
+
+        // Reverse lookup maps each prefixed name back to (endpoint, raw_name)
+        // so a future `prompts/get` dispatch can resolve like `route_tool_call`.
+        assert_eq!(
+            lookup.get("alpha__summarize").unwrap(),
+            &("alpha".to_string(), "summarize".to_string())
+        );
+        assert_eq!(
+            lookup.get("beta__summarize").unwrap(),
+            &("beta".to_string(), "summarize".to_string())
+        );
+    }
+
+    /// Adapters whose upstream rejects `prompts/list` (typical for MCP
+    /// servers that do not expose prompts, returning `-32601`) are skipped
+    /// without poisoning the merged response — endpoints that DO support
+    /// prompts still surface their entries with the prefix applied.
+    #[tokio::test]
+    async fn list_prompts_skips_endpoints_that_error_out() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(PromptMockAdapter {
+                    prompts: vec![json!({ "name": "summarize", "description": "A" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+        registry
+            .register(
+                "beta".into(),
+                Box::new(FailingPromptAdapter),
+                "stdio".into(),
+                None,
+                Some("beta".into()),
+            )
+            .await;
+
+        let prompts = registry.list_prompts().await;
+        assert_eq!(
+            prompts.len(),
+            1,
+            "endpoint that errored on prompts/list must be skipped, leaving alpha's entry"
+        );
+        assert_eq!(
+            prompts[0]["name"], "alpha__summarize",
+            "alpha's name must still be prefixed under multi-endpoint mode"
+        );
+    }
+
+    /// The default adapter implementation returns an empty prompt list
+    /// (placeholder adapters / transports that haven't implemented the
+    /// passthrough yet). Aggregating them yields an empty merged list.
+    #[tokio::test]
+    async fn list_prompts_default_impl_returns_empty() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(MockAdapter::healthy(vec![])),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+        assert!(registry.list_prompts().await.is_empty());
+    }
+
+    // --- T10: prompts/get routing + slot #9 result rewriting ---------------
+
+    /// Adapter mock that advertises a single prompt and echoes the
+    /// `get_prompt` arguments back in the result `description`, plus emits
+    /// resource / resource_link / text content blocks on the returned
+    /// messages so the slot #9 wrapper can be verified end-to-end.
+    struct PromptGetMockAdapter {
+        endpoint_label: String,
+        prompts: Vec<serde_json::Value>,
+    }
+
+    #[async_trait]
+    impl McpAdapter for PromptGetMockAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(vec![])
+        }
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, AdapterError> {
+            Ok(json!({}))
+        }
+        async fn list_prompts(&self) -> Result<Vec<serde_json::Value>, AdapterError> {
+            Ok(self.prompts.clone())
+        }
+        async fn get_prompt(
+            &self,
+            name: &str,
+            arguments: Option<serde_json::Value>,
+        ) -> Result<serde_json::Value, AdapterError> {
+            // Tag the response with the endpoint that served it so the
+            // round-trip test can assert which adapter was reached, and echo
+            // the raw `name` + `arguments` for the reverse-prefix assertion.
+            Ok(json!({
+                "endpoint": self.endpoint_label,
+                "raw_name": name,
+                "arguments": arguments,
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            { "type": "text", "text": "see https://example.com/x" },
+                            { "type": "resource", "resource": { "uri": "ui://app/inline", "mimeType": "text/html" } },
+                            { "type": "resource_link", "uri": "ui://app/link", "name": "Open" }
+                        ]
+                    }
+                ]
+            }))
+        }
+        fn health(&self) -> HealthStatus {
+            HealthStatus::Healthy
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    /// Multi-endpoint mode: a prefixed prompt name routes back to its
+    /// owning upstream with the raw name + arguments forwarded verbatim,
+    /// and slot #9 resource refs in the returned messages are wrapped to
+    /// the owning endpoint while `text` blocks pass through (DD1).
+    #[tokio::test]
+    async fn route_prompt_get_multi_endpoint_dispatches_and_wraps() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(PromptGetMockAdapter {
+                    endpoint_label: "alpha".into(),
+                    prompts: vec![json!({ "name": "summarize", "description": "A" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+        registry
+            .register(
+                "beta".into(),
+                Box::new(PromptGetMockAdapter {
+                    endpoint_label: "beta".into(),
+                    prompts: vec![json!({ "name": "summarize", "description": "B" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("beta".into()),
+            )
+            .await;
+
+        let result = registry
+            .route_prompt_get("beta__summarize", Some(json!({ "k": "v" })))
+            .await
+            .expect("dispatch must succeed");
+
+        // Dispatched to the right upstream with the de-prefixed name.
+        assert_eq!(result["endpoint"], "beta");
+        assert_eq!(result["raw_name"], "summarize");
+        assert_eq!(result["arguments"], json!({ "k": "v" }));
+
+        // Slot #9: resource / resource_link URIs wrapped to `beta`.
+        let res_uri = result["messages"][0]["content"][1]["resource"]["uri"]
+            .as_str()
+            .unwrap();
+        let (ep, orig) = crate::resource_uri::decode_resource_uri(res_uri).unwrap();
+        assert_eq!(ep, "beta");
+        assert_eq!(orig, "ui://app/inline");
+
+        let link_uri = result["messages"][0]["content"][2]["uri"].as_str().unwrap();
+        let (ep, orig) = crate::resource_uri::decode_resource_uri(link_uri).unwrap();
+        assert_eq!(ep, "beta");
+        assert_eq!(orig, "ui://app/link");
+
+        // DD1: `text` block round-trips verbatim.
+        assert_eq!(
+            result["messages"][0]["content"][0]["text"],
+            "see https://example.com/x"
+        );
+    }
+
+    /// Round-trip: a wrapped URI emitted by `route_prompt_get` (slot #9)
+    /// must reverse exactly via `route_resource_read` (slot #6) back to the
+    /// owning upstream. Closes the encode/decode loop the same way the T6
+    /// descriptor round-trip does for slot #1.
+    #[tokio::test]
+    async fn route_prompt_get_wrapped_uri_round_trips_through_read() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(DescriptorMetaAdapter {
+                    endpoint_label: "alpha".into(),
+                }),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+        registry
+            .register(
+                "beta".into(),
+                Box::new(PromptGetMockAdapter {
+                    endpoint_label: "beta".into(),
+                    prompts: vec![json!({ "name": "summarize" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("beta".into()),
+            )
+            .await;
+
+        let result = registry
+            .route_prompt_get("beta__summarize", None)
+            .await
+            .expect("dispatch must succeed");
+        let wrapped = result["messages"][0]["content"][2]["uri"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // `beta`'s `DescriptorMetaAdapter` was not registered, so we feed
+        // the wrapped URI back through `route_resource_read`. The wrapper
+        // names `beta`, but `beta`'s `PromptGetMockAdapter` doesn't
+        // implement `read_resource` — the default impl returns -32601, which
+        // proves slot #9 decoding routed to the owning endpoint.
+        let read_err = registry
+            .route_resource_read(&wrapped)
+            .await
+            .expect_err("default read_resource impl returns -32601");
+        let msg = read_err.to_string();
+        assert!(
+            msg.contains("not supported by this adapter") || msg.contains("-32601"),
+            "expected default read_resource rejection, got: {msg}"
+        );
+    }
+
+    /// DD5 single-endpoint mode: prompt names pass through unprefixed and
+    /// slot #9 URIs flow through unwrapped — strict byte-for-byte parity
+    /// with the upstream `prompts/get` shape.
+    #[tokio::test]
+    async fn route_prompt_get_single_endpoint_passes_through() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "solo".into(),
+                Box::new(PromptGetMockAdapter {
+                    endpoint_label: "solo".into(),
+                    prompts: vec![json!({ "name": "summarize", "description": "" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("solo".into()),
+            )
+            .await;
+
+        let result = registry
+            .route_prompt_get("summarize", None)
+            .await
+            .expect("DD5 dispatch must succeed");
+        // Slot #9 must NOT wrap when only one active endpoint exists.
+        assert_eq!(
+            result["messages"][0]["content"][1]["resource"]["uri"],
+            "ui://app/inline"
+        );
+        assert_eq!(result["messages"][0]["content"][2]["uri"], "ui://app/link");
+    }
+
+    /// Unknown prefixed name is rejected as a `ProtocolError` with a
+    /// distinct message so log scrapers can distinguish it from the other
+    /// early-rejection branches (mirrors `route_tool_call`'s shape).
+    #[tokio::test]
+    async fn route_prompt_get_unknown_name_returns_protocol_error() {
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "alpha".into(),
+                Box::new(PromptGetMockAdapter {
+                    endpoint_label: "alpha".into(),
+                    prompts: vec![json!({ "name": "summarize" })],
+                }),
+                "stdio".into(),
+                None,
+                Some("alpha".into()),
+            )
+            .await;
+
+        let err = registry
+            .route_prompt_get("nonexistent", None)
+            .await
+            .expect_err("unknown prefixed name must reject");
+        match err {
+            AdapterError::ProtocolError(msg) => {
+                assert!(
+                    msg.contains("no prompt found for prefixed name"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected ProtocolError, got: {other:?}"),
         }
     }
 }

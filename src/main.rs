@@ -25,10 +25,12 @@ mod prefix;
 mod profile_registry;
 mod protocol;
 mod registry;
+mod resource_uri;
 mod server;
 mod shell_env;
 #[cfg(test)]
 mod test_tracing;
+mod tool_call_rewrite;
 mod toon_convert;
 
 use adapter::oauth::{OAuthAdapter, OAuthAdapterConfig, OAuthAdapterInner};
