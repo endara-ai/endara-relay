@@ -365,6 +365,19 @@ pub struct ConfigOrganization {
 /// [`ConfigError::ValidationError`] / per-endpoint warning through the existing
 /// validation paths instead of a raw TOML parse error, preserving the graceful
 /// per-endpoint loading model.
+///
+/// Client credentials are intentionally **not** modeled here, and the two
+/// credential kinds live at different scopes (never in `config.toml`):
+///   * the requesting `client_secret` is genuinely org-level (the shared
+///     SSO/requesting app) — persisted in `{org}.dcr.json` (0600) keyed by org
+///     name, captured via `POST`/`PUT /api/organizations`.
+///   * the optional EMA **resource** credential pair
+///     (`resource_client_id`/`resource_client_secret`, presented at the MAS in
+///     Step 3) is **per-resource**, so R3 keys it by **endpoint** —  persisted in
+///     `{name}.dcr.json` (0600) and captured via
+///     `POST /api/endpoints/{name}/credentials`, never on the org record.
+///
+/// Both are loaded at adapter init.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 pub struct EndpointAuthConfig {
     /// Discriminator for the auth scheme. Only `"ema"` is currently supported.

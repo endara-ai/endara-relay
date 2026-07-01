@@ -280,6 +280,10 @@ fn ema_config(urls: &FxUrls) -> OAuthAdapterConfig {
             as_token_endpoint: urls.as_token_endpoint.clone(),
             resource: RESOURCE.to_string(),
             client_id: None,
+            client_secret: None,
+            resource_client_id: None,
+            resource_client_secret: None,
+            resource_scope: None,
         }),
     }
 }
