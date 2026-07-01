@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -80,6 +81,31 @@ pub struct EmaConfig {
     /// in the IdP authorize URL and every EMA token leg. `None` keeps the legs
     /// on the hosted CIMD `client_id` ([`ENDARA_CLIENT_METADATA_URL`]).
     pub client_id: Option<String>,
+    /// Optional pre-registered org `client_secret` (confidential IdP client).
+    /// Loaded from the `{org}.dcr.json` credential store at adapter init and
+    /// sent on the IdP-facing legs (RFC 8693 token-exchange Step 2 and the IdP
+    /// `refresh_token` grant) so confidential clients authenticate with
+    /// `client_secret_post`. `None` keeps the legs on the public/PKCE flow.
+    /// **Never** presented at the resource AS (Step 3 stays a public client).
+    pub client_secret: Option<String>,
+    /// Optional **resource** `client_id` presented at the MAS in Step 3
+    /// (RFC 7523 ID-JAG redemption). Distinct from `client_id`, which is the
+    /// requesting client used for SSO / the Step 2 exchange. Per-resource, so
+    /// R3 loads it from the *endpoint* DCR store (`{name}.dcr.json`) rather than
+    /// the org record. `None` keeps Step 3 identifying as the requesting
+    /// `client_id` (org id, else the hosted CIMD `client_id`).
+    pub resource_client_id: Option<String>,
+    /// Optional **resource** `client_secret` paired with `resource_client_id`,
+    /// presented via `client_secret_post` at the MAS in Step 3. Never sent on
+    /// the IdP-facing legs and never substituted by the requesting
+    /// `client_secret` (R1): when `None`, Step 3 sends no secret at the MAS.
+    pub resource_client_secret: Option<String>,
+    /// Optional resource scopes (space-delimited) configured for this endpoint
+    /// (R2). Threaded verbatim onto the Step 2 exchange and Step 3 redemption,
+    /// and composed with `openid`/`offline_access` for the SSO authorize URL and
+    /// the IdP `refresh_token` grant via [`crate::oauth::ema::compose_idp_scope`].
+    /// `None` keeps the historical scopes (regression-safe).
+    pub resource_scope: Option<String>,
 }
 
 /// SSO kick-off wiring for an EMA endpoint: the shared OAuth flow manager and
@@ -224,6 +250,13 @@ pub struct OAuthAdapterInner {
     /// The most recent EMA IdP authorize URL composed when the chain surfaced a
     /// re-SSO-required state. Surfaced to callers/desktop and asserted by tests.
     pending_authorize_url: RwLock<Option<String>>,
+    /// Once-guard for the span's `server_type` field. `Span::record` appends
+    /// each write to the span's field list, so recording on every
+    /// [`Self::apply_tokens`] (e.g. across token refreshes) grows the
+    /// `endpoint{…}` header without bound. This flag is flipped the first
+    /// time a non-empty `server_type` is written so subsequent applies skip
+    /// the record call.
+    server_type_recorded: AtomicBool,
 }
 
 impl OAuthAdapterInner {
@@ -277,6 +310,24 @@ impl OAuthAdapterInner {
             reason = %reason,
             "OAuth state transition"
         );
+    }
+
+    /// Record `server_type` on the per-endpoint span at most once. `Span::record`
+    /// appends each write to the span's field list, so recording on every
+    /// [`Self::apply_tokens`] call (e.g. across token refreshes) grows the
+    /// `endpoint{…}` header without bound. The guard flips the first time a
+    /// non-empty name is written so subsequent applies are a no-op.
+    fn record_server_type_once(&self, name: &str) {
+        if !self.server_type_recorded.swap(true, Ordering::Relaxed) {
+            self.span
+                .record("server_type", tracing::field::display(name));
+        }
+    }
+
+    /// Test-only accessor for the `server_type` once-guard state.
+    #[cfg(test)]
+    pub(crate) fn server_type_recorded_flag(&self) -> bool {
+        self.server_type_recorded.load(Ordering::Relaxed)
     }
 
     /// Resolve the URL that the next token-refresh POST should target.
@@ -479,8 +530,12 @@ impl OAuthAdapterInner {
             &ema.as_issuer,
             &ema.as_token_endpoint,
             &ema.resource,
+            ema.resource_scope.as_deref(),
             self.config.allow_insecure_oauth,
             ema.client_id.as_deref(),
+            ema.client_secret.as_deref(),
+            ema.resource_client_id.as_deref(),
+            ema.resource_client_secret.as_deref(),
         )
         .await
         {
@@ -521,9 +576,11 @@ impl OAuthAdapterInner {
     /// register the pending IdP flow via [`OAuthFlowManager::start_idp_flow`]
     /// (which tags the flow with `idp_issuer` so the `/oauth/callback` handler
     /// persists the returned ID Token as `IdpCredentials`). The requested scope
-    /// is `openid offline_access` (M1) so the IdP returns a refresh token the
-    /// EMA chain can later use to re-mint ID Tokens silently. Returns `None`
-    /// when the adapter was built without EMA SSO wiring (e.g. unit tests).
+    /// is composed via [`ema::compose_idp_scope`] (R2): always `openid` and
+    /// `offline_access` (M1) so the IdP returns a refresh token the EMA chain can
+    /// later use to re-mint ID Tokens silently, plus any configured resource
+    /// scopes. Returns `None` when the adapter was built without EMA SSO wiring
+    /// (e.g. unit tests).
     async fn compose_idp_authorize_url(&self) -> Option<String> {
         let ema = self.config.ema.as_ref()?;
         let sso = self.ema_sso.as_ref()?;
@@ -565,6 +622,7 @@ impl OAuthAdapterInner {
         } else {
             '?'
         };
+        let scope = ema::compose_idp_scope(ema.resource_scope.as_deref(), true);
         let authorize_url = format!(
             "{}{}response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256&scope={}",
             ema.idp_authorization_endpoint,
@@ -573,12 +631,13 @@ impl OAuthAdapterInner {
             form_urlencode(&redirect_uri),
             form_urlencode(&state_param),
             form_urlencode(&code_challenge),
-            form_urlencode("openid offline_access"),
+            form_urlencode(&scope),
         );
         info!(
             endpoint = %self.config.endpoint_name,
             idp_issuer = %ema.idp_issuer,
-            "EMA IdP SSO authorize URL composed (scope=openid offline_access)"
+            scope = %scope,
+            "EMA IdP SSO authorize URL composed"
         );
         Some(authorize_url)
     }
@@ -806,8 +865,7 @@ impl OAuthAdapterInner {
                 // OAuth span so subsequent events render with the resolved
                 // name in the `endpoint:` header.
                 if let Some(name) = adapter.server_type() {
-                    self.span
-                        .record("server_type", tracing::field::display(&name));
+                    self.record_server_type_once(&name);
                 }
                 // Reflect the freshly initialized inner adapter's health
                 // immediately so health() reports Healthy without waiting for
@@ -1104,6 +1162,7 @@ impl OAuthAdapter {
                 event_bus: Arc::new(OnceLock::new()),
                 ema_sso,
                 pending_authorize_url: RwLock::new(None),
+                server_type_recorded: AtomicBool::new(false),
             }),
         }
     }
@@ -1504,6 +1563,10 @@ mod tests {
                 as_token_endpoint: format!("{}/as/token", resource),
                 resource: resource.to_string(),
                 client_id: None,
+                client_secret: None,
+                resource_client_id: None,
+                resource_client_secret: None,
+                resource_scope: None,
             }),
         }
     }
@@ -3365,5 +3428,26 @@ mod tests {
                 server.abort();
             });
         });
+    }
+
+    /// Repeated `apply_tokens` calls (token refresh, reconnect) must NOT
+    /// re-append `server_type` to the per-endpoint span's field list. The
+    /// once-guard flips on the first record and short-circuits every later
+    /// call, preventing unbounded `endpoint{…}` log-header growth.
+    #[test]
+    fn record_server_type_once_guards_repeated_calls() {
+        let adapter = make_adapter(make_config());
+        let inner = adapter.shared_inner();
+        assert!(!inner.server_type_recorded_flag());
+
+        inner.record_server_type_once("some-server");
+        assert!(inner.server_type_recorded_flag());
+
+        // Second and subsequent calls (e.g. after a token refresh rebuilds
+        // the inner adapter) must NOT re-record — the guard has already
+        // flipped, so this is a no-op.
+        inner.record_server_type_once("some-server");
+        inner.record_server_type_once("other-name");
+        assert!(inner.server_type_recorded_flag());
     }
 }

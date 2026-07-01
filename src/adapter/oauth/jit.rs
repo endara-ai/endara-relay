@@ -401,6 +401,7 @@ impl JitInterceptor {
                     client_secret_expires_at: resolved.client_secret_expires_at,
                     registered_at: now_secs(),
                     issuer: Some(disc.issuer.clone()),
+                    ..Default::default()
                 };
                 if let Err(e) = tm.save_dcr(endpoint_name, &creds).await {
                     warn!(error = %e, "failed to persist JIT client credentials");

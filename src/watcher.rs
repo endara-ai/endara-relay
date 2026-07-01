@@ -865,12 +865,16 @@ fn resolve_ema_idp(
 /// resource AS (issuer + token endpoint). All URLs are routed through
 /// `url_guard` inside the discovery clients. Returns `None` if either discovery
 /// fails so the caller can register a [`FailedAdapter`].
+#[allow(clippy::too_many_arguments)]
 async fn resolve_ema_config(
     ep: &EndpointConfig,
     idp_key: &str,
     idp_issuer: &str,
     resource: &str,
     client_id: Option<&str>,
+    client_secret: Option<&str>,
+    resource_client_id: Option<&str>,
+    resource_client_secret: Option<&str>,
     allow_insecure_oauth: bool,
 ) -> Option<EmaConfig> {
     let idp_disc = match crate::oauth::discovery::discover_authorization_server(
@@ -912,6 +916,23 @@ async fn resolve_ema_config(
         // Org's pre-registered client_id (when set); `None` keeps the EMA legs
         // on the hosted CIMD `client_id`.
         client_id: client_id.map(str::to_string),
+        // Org's pre-registered client_secret (confidential client); `None`
+        // keeps the IdP-facing legs on the public/PKCE flow. The resource AS
+        // leg (Step 3) never uses this value.
+        client_secret: client_secret.map(str::to_string),
+        // Optional resource credential presented at the MAS in Step 3 (R1);
+        // `None` keeps Step 3 identifying as the requesting client_id with no
+        // secret.
+        resource_client_id: resource_client_id.map(str::to_string),
+        resource_client_secret: resource_client_secret.map(str::to_string),
+        // R2: the endpoint's configured resource scopes (space-delimited),
+        // threaded onto the EMA legs. An absent/empty list keeps the historical
+        // scopes (regression-safe).
+        resource_scope: ep
+            .scopes
+            .as_ref()
+            .map(|s| s.join(" "))
+            .filter(|s| !s.is_empty()),
     })
 }
 
@@ -969,12 +990,60 @@ async fn build_ema_adapter(
             .with_server_type_override(ep.server_type_override.clone()),
         );
     }
+    // Load the org DCR record (`{org}.dcr.json`) once for the requesting
+    // `client_secret` used on the IdP-facing legs (RFC 8693 Step 2 + the IdP
+    // refresh grant) so confidential clients authenticate with
+    // `client_secret_post`. Only honoured when the stored `client_id` matches
+    // the resolved org `client_id`; otherwise treated as stale and the legs fall
+    // back to the public flow. This requesting credential is genuinely org-level
+    // (the shared SSO/requesting app) and stays keyed by the org.
+    let dcr = match token_manager.load_dcr(&resolved.idp_key).await {
+        Ok(creds) => creds,
+        Err(e) => {
+            warn!(endpoint = %ep.name, organization = %resolved.idp_key, error = %e, "Failed to load org DCR credentials; continuing as public client");
+            None
+        }
+    };
+    let resolved_client_secret = match (resolved.client_id.as_deref(), dcr.as_ref()) {
+        (Some(org_client_id), Some(creds)) if creds.client_id == org_client_id => {
+            creds.client_secret.clone()
+        }
+        // No org client_id (CIMD/bare-idp END-18) or a stale/mismatched DCR
+        // record: no confidential secret on the IdP-facing legs.
+        _ => None,
+    };
+    // R3: the optional EMA **resource** credential pair (presented at the MAS in
+    // Step 3) is per-resource, so it is loaded from the *endpoint* DCR record
+    // (`{ep.name}.dcr.json`), captured via POST /api/endpoints/{name}/credentials
+    // — NOT from the org record. Loaded independently of the requesting
+    // `client_id` since it is a separate per-pairing credential; Step 3 never
+    // uses the requesting secret. `None` (the common case) keeps Step 3 on the
+    // requesting client_id with no secret. Any resource cred written to the org
+    // record by a pre-R3 build is intentionally ignored (re-enter it on the
+    // endpoint's Config tab).
+    let endpoint_dcr = match token_manager.load_dcr(&ep.name).await {
+        Ok(creds) => creds,
+        Err(e) => {
+            warn!(endpoint = %ep.name, error = %e, "Failed to load endpoint DCR credentials; continuing without a resource credential");
+            None
+        }
+    };
+    let resource_client_id = endpoint_dcr
+        .as_ref()
+        .and_then(|c| c.resource_client_id.clone());
+    let resource_client_secret = endpoint_dcr
+        .as_ref()
+        .and_then(|c| c.resource_client_secret.clone());
+
     let ema = match resolve_ema_config(
         ep,
         &resolved.idp_key,
         &resolved.idp_issuer,
         &resolved.resource,
         resolved.client_id.as_deref(),
+        resolved_client_secret.as_deref(),
+        resource_client_id.as_deref(),
+        resource_client_secret.as_deref(),
         allow_insecure_oauth,
     )
     .await
@@ -2409,6 +2478,7 @@ mod tests {
                 client_secret_expires_at: 0,
                 registered_at: 1_700_000_000,
                 issuer: None,
+                ..Default::default()
             },
         )
         .await

@@ -1070,6 +1070,18 @@ struct EndpointCredentialsRequest {
     #[serde(default)]
     #[allow(dead_code)]
     oauth_server_url: Option<String>,
+    /// Optional EMA **resource** `client_id` presented at the MCP Authorization
+    /// Server in Step 3 (ID-JAG redemption) — R3 re-scoped this pair from the
+    /// org record to the endpoint because it is per-resource. Absent preserves
+    /// the stored value, an empty string clears it, a non-empty value sets it.
+    /// Persisted in `{name}.dcr.json` (0600), never in `config.toml`.
+    #[serde(default)]
+    resource_client_id: Option<String>,
+    /// Optional EMA **resource** `client_secret` paired with `resource_client_id`,
+    /// presented via `client_secret_post` at the MAS in Step 3. Same merge
+    /// semantics; never written to `config.toml` and never returned to the UI.
+    #[serde(default)]
+    resource_client_secret: Option<String>,
 }
 
 /// Response body for GET /api/endpoints/:name/credentials.
@@ -1080,6 +1092,12 @@ struct EndpointCredentialsResponse {
     client_secret_set: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     oauth_server_url: Option<String>,
+    /// The EMA **resource** `client_id` stored per-endpoint (R3); omitted when
+    /// unset. The paired secret is never returned — only its presence via
+    /// `resource_client_secret_set`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resource_client_id: Option<String>,
+    resource_client_secret_set: bool,
     /// Where the credentials surfaced from: "dcr" or "config" or "none".
     source: &'static str,
 }
@@ -1330,6 +1348,7 @@ async fn oauth_start(
                             .unwrap_or_default()
                             .as_secs(),
                         issuer: issuer.clone(),
+                        ..Default::default()
                     };
                     if let Err(e) = tm.save_dcr(&name, &creds).await {
                         warn!(endpoint = %name, error = %e, "Failed to persist DCR credentials");
@@ -1472,6 +1491,7 @@ async fn oauth_credentials(
         // Manually-supplied credentials are user-managed, not bound to a
         // discovered issuer; leave None so they are always reused as-is.
         issuer: None,
+        ..Default::default()
     };
 
     if let Err(e) = tm.save_dcr(&name, &creds).await {
@@ -1488,9 +1508,22 @@ async fn oauth_credentials(
 
 /// POST /api/endpoints/:name/credentials
 ///
-/// Persist caller-supplied OAuth client credentials via `TokenManager` (the
-/// DCR file). Never writes them to `config.toml`. Used by Wave 3a so that
-/// `client_secret` is no longer treated as a static config value.
+/// Persist caller-supplied credentials for an endpoint via `TokenManager` (the
+/// `{name}.dcr.json` DCR file, 0600). Never writes them to `config.toml`.
+///
+/// Two independently-optional credential groups are merged into the single
+/// per-endpoint DCR record so updating one never wipes the other:
+///   * the requesting OAuth `client_id`/`client_secret` (Wave 3a) used by the
+///     endpoint's own OAuth flow;
+///   * the optional EMA **resource** `client_id`/`client_secret` pair (R3),
+///     presented only at the MAS in Step 3. R3 re-scoped this pair from the org
+///     record to the endpoint because it is per-resource.
+///
+/// Merge semantics per field: absent preserves the stored value, an empty
+/// string clears it, a non-empty value sets it. A requesting `client_secret`
+/// requires a `client_id` (existing or supplied) — a secret with no client_id
+/// is rejected with 400. When the merged record holds no credential material
+/// the DCR file is deleted.
 async fn set_endpoint_credentials(
     State(state): State<ManagementState>,
     Path(name): Path<String>,
@@ -1505,14 +1538,6 @@ async fn set_endpoint_credentials(
         }
     }
 
-    let client_id = match body.client_id.as_deref().map(str::trim) {
-        Some(id) if !id.is_empty() => id.to_string(),
-        _ => {
-            return error_response(StatusCode::BAD_REQUEST, "client_id must not be empty", None)
-                .into_response();
-        }
-    };
-
     let Some(ref tm) = state.token_manager else {
         return error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1522,23 +1547,102 @@ async fn set_endpoint_credentials(
         .into_response();
     };
 
-    let client_secret_set = body
-        .client_secret
-        .as_deref()
-        .map(|s| !s.is_empty())
-        .unwrap_or(false);
+    // Load the existing record so unspecified fields are preserved.
+    let existing = match tm.load_dcr(&name).await {
+        Ok(creds) => creds,
+        Err(e) => {
+            warn!(endpoint = %name, error = %e, "Failed to load endpoint DCR record during credential update");
+            None
+        }
+    };
+
+    // keep (absent) / clear (empty) / set (non-empty) per field.
+    let merge = |action: Option<&str>, current: Option<String>| match action {
+        None => current,
+        Some("") => None,
+        Some(s) => Some(s.to_string()),
+    };
+
+    // client_id is a plain (non-optional) field on the record: absent keeps the
+    // stored id (empty for a resource-only EMA endpoint), a value replaces it.
+    let merged_client_id = match body.client_id.as_deref().map(str::trim) {
+        None => existing
+            .as_ref()
+            .map(|c| c.client_id.clone())
+            .unwrap_or_default(),
+        Some(s) => s.to_string(),
+    };
+    let client_secret = merge(
+        body.client_secret.as_deref().map(str::trim),
+        existing.as_ref().and_then(|c| c.client_secret.clone()),
+    );
+    let resource_client_id = merge(
+        body.resource_client_id.as_deref().map(str::trim),
+        existing.as_ref().and_then(|c| c.resource_client_id.clone()),
+    );
+    let resource_client_secret = merge(
+        body.resource_client_secret.as_deref().map(str::trim),
+        existing
+            .as_ref()
+            .and_then(|c| c.resource_client_secret.clone()),
+    );
+
+    // A requesting secret has no meaning without a client_id to pair it with.
+    if client_secret.is_some() && merged_client_id.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "client_id must not be empty when setting client_secret",
+            None,
+        )
+        .into_response();
+    }
+
+    let client_secret_set = client_secret.is_some();
+    let resource_client_secret_set = resource_client_secret.is_some();
+
+    // Nothing left to persist → remove the DCR record entirely.
+    if merged_client_id.is_empty()
+        && client_secret.is_none()
+        && resource_client_id.is_none()
+        && resource_client_secret.is_none()
+    {
+        if let Err(e) = tm.delete_dcr(&name).await {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to clear credentials",
+                Some(&e.to_string()),
+            )
+            .into_response();
+        }
+        return Json(serde_json::json!({
+            "ok": true,
+            "client_secret_set": false,
+            "resource_client_secret_set": false,
+        }))
+        .into_response();
+    }
 
     let creds = DcrCredentials {
-        client_id,
-        client_secret: body.client_secret.filter(|s| !s.is_empty()),
-        client_secret_expires_at: 0,
-        registered_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
+        client_id: merged_client_id,
+        client_secret,
+        client_secret_expires_at: existing
+            .as_ref()
+            .map(|c| c.client_secret_expires_at)
+            .unwrap_or(0),
+        registered_at: existing
+            .as_ref()
+            .map(|c| c.registered_at)
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs()
+            }),
         // Manually-supplied credentials are user-managed, not bound to a
-        // discovered issuer; leave None so they are always reused as-is.
-        issuer: None,
+        // discovered issuer; preserve any existing binding but never invent one.
+        issuer: existing.as_ref().and_then(|c| c.issuer.clone()),
+        resource_client_id,
+        resource_client_secret,
     };
 
     if let Err(e) = tm.save_dcr(&name, &creds).await {
@@ -1553,6 +1657,7 @@ async fn set_endpoint_credentials(
     Json(serde_json::json!({
         "ok": true,
         "client_secret_set": client_secret_set,
+        "resource_client_secret_set": resource_client_secret_set,
     }))
     .into_response()
 }
@@ -1582,10 +1687,13 @@ async fn get_endpoint_credentials(
     if let Some(ref tm) = state.token_manager {
         match tm.load_dcr(&name).await {
             Ok(Some(creds)) => {
+                let resource_client_secret_set = creds.resource_client_secret.is_some();
                 return Json(EndpointCredentialsResponse {
-                    client_id: Some(creds.client_id),
+                    client_id: Some(creds.client_id).filter(|s| !s.is_empty()),
                     client_secret_set: creds.client_secret.is_some(),
                     oauth_server_url: cfg_oauth_server_url,
+                    resource_client_id: creds.resource_client_id,
+                    resource_client_secret_set,
                     source: "dcr",
                 })
                 .into_response();
@@ -1609,6 +1717,8 @@ async fn get_endpoint_credentials(
             .map(|s| !s.is_empty())
             .unwrap_or(false),
         oauth_server_url: cfg_oauth_server_url,
+        resource_client_id: None,
+        resource_client_secret_set: false,
         source,
     })
     .into_response()
@@ -2049,11 +2159,14 @@ struct OrgProbeResponse {
 /// Run the discovery → ID-JAG-exchange chain for a single resource and map the
 /// outcome to an [`OrgProbeStatus`]. Persists nothing: a successful exchange's
 /// ID-JAG is discarded and Step 3 (redemption) is never run.
+#[allow(clippy::too_many_arguments)]
 async fn run_org_probe_chain(
     resource: &str,
     idp_token_endpoint: &str,
     id_token: &str,
     allow_insecure: bool,
+    client_id: Option<&str>,
+    client_secret: Option<&str>,
 ) -> (OrgProbeStatus, Option<String>) {
     let resource = resource.trim();
     let chain = async {
@@ -2069,7 +2182,11 @@ async fn run_org_probe_chain(
             id_token,
             &as_issuer,
             resource,
+            // Connectivity probe only: no resource scope is threaded (R2).
+            None,
             allow_insecure,
+            client_id,
+            client_secret,
         )
         .await
         {
@@ -2097,12 +2214,15 @@ async fn run_org_probe_chain(
 }
 
 /// Probe one resource, consulting (and populating) the short-TTL cache.
+#[allow(clippy::too_many_arguments)]
 async fn probe_one_resource(
     org: String,
     resource: String,
     idp_token_endpoint: String,
     id_token: String,
     allow_insecure: bool,
+    client_id: Option<String>,
+    client_secret: Option<String>,
 ) -> OrgProbeResult {
     let key = (org, resource.clone());
 
@@ -2119,8 +2239,15 @@ async fn probe_one_resource(
         }
     }
 
-    let (status, server_as_issuer) =
-        run_org_probe_chain(&resource, &idp_token_endpoint, &id_token, allow_insecure).await;
+    let (status, server_as_issuer) = run_org_probe_chain(
+        &resource,
+        &idp_token_endpoint,
+        &id_token,
+        allow_insecure,
+        client_id.as_deref(),
+        client_secret.as_deref(),
+    )
+    .await;
 
     if let Ok(mut cache) = ORG_PROBE_CACHE.write() {
         cache.insert(
@@ -2159,7 +2286,7 @@ async fn probe_organization(
     Json(body): Json<OrgProbeRequest>,
 ) -> impl IntoResponse {
     // Resolve the org's IdP issuer (and the insecure-loopback policy) from config.
-    let (idp_issuer, allow_insecure) = {
+    let (idp_issuer, org_client_id, allow_insecure) = {
         let config = state.config.read().await;
         let Some(found) = config.organizations.iter().find(|o| o.name == org) else {
             return error_response(
@@ -2171,6 +2298,12 @@ async fn probe_organization(
         };
         (
             found.idp.clone(),
+            found
+                .client_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
             config.relay.allow_insecure_oauth.unwrap_or(false),
         )
     };
@@ -2228,15 +2361,44 @@ async fn probe_organization(
 
     let id_token = creds.id_token;
 
+    // Confidential-client support: load the optional org `client_secret` from
+    // the secure credential store (`{org}.dcr.json`) and thread it into the
+    // probe's RFC 8693 Step 2 exchange so confidential clients authenticate
+    // with `client_secret_post`. Only honour the stored secret when the DCR
+    // `client_id` matches the resolved org `client_id`; otherwise treat the
+    // secret as stale and fall back to the public flow. The probe never runs
+    // Step 3 so no resource-AS leg is involved.
+    let org_client_secret = match org_client_id.as_deref() {
+        Some(cid) => match token_manager.load_dcr(&org).await {
+            Ok(Some(dcr)) if dcr.client_id == cid => dcr.client_secret,
+            Ok(_) => None,
+            Err(e) => {
+                warn!(organization = %org, error = %e, "Failed to load org DCR credentials; probing as public client");
+                None
+            }
+        },
+        None => None,
+    };
+
     use futures_util::stream::StreamExt;
     let results: Vec<OrgProbeResult> =
         futures_util::stream::iter(body.resources.into_iter().map(|resource| {
             let org = org.clone();
             let idp_token_endpoint = idp_token_endpoint.clone();
             let id_token = id_token.clone();
+            let client_id = org_client_id.clone();
+            let client_secret = org_client_secret.clone();
             async move {
-                probe_one_resource(org, resource, idp_token_endpoint, id_token, allow_insecure)
-                    .await
+                probe_one_resource(
+                    org,
+                    resource,
+                    idp_token_endpoint,
+                    id_token,
+                    allow_insecure,
+                    client_id,
+                    client_secret,
+                )
+                .await
             }
         }))
         .buffered(ORG_PROBE_CONCURRENCY)
@@ -2478,6 +2640,7 @@ async fn oauth_setup(
                         ClientRegistration::Manual => None,
                         _ => Some(issuer.clone()),
                     },
+                    ..Default::default()
                 };
                 if let Err(e) = tm.save_dcr(&body.name, &creds).await {
                     warn!(endpoint = %body.name, error = %e, "Failed to persist client credentials");
@@ -2654,6 +2817,7 @@ async fn oauth_setup_credentials(
                 .as_secs(),
             // Manually-supplied credentials are user-managed; not issuer-bound.
             issuer: None,
+            ..Default::default()
         };
         if let Err(e) = tm.save_dcr(&name, &creds).await {
             warn!(endpoint = %name, error = %e, "Failed to persist manual credentials");
@@ -4693,7 +4857,10 @@ pub fn management_routes(state: ManagementState) -> Router {
             "/api/organizations",
             get(list_organizations).post(create_organization),
         )
-        .route("/api/organizations/{org}", delete(delete_organization))
+        .route(
+            "/api/organizations/{org}",
+            delete(delete_organization).put(update_organization),
+        )
         .route(
             "/api/organizations/{org}/reauthenticate",
             post(reauthenticate_organization),
@@ -4728,6 +4895,45 @@ struct CreateOrganizationRequest {
     /// and is persisted on the org; when omitted the relay falls back to CIMD/DCR.
     #[serde(default)]
     client_id: Option<String>,
+    /// Optional pre-registered OAuth `client_secret` for confidential IdP clients
+    /// that require the authorization-code → token exchange (and later EMA legs)
+    /// to authenticate with `client_secret_post`. Persisted in the secure
+    /// credential store keyed by org name (`{org}.dcr.json`, 0600); never
+    /// written to `config.toml` and never returned to the UI.
+    #[serde(default)]
+    client_secret: Option<String>,
+}
+
+/// Request body for `PUT /api/organizations/{org}`.
+///
+/// Every field is optional — omitted fields preserve the current value.
+/// `client_id` and `client_secret` use an empty string (`""`) as the explicit
+/// "clear" signal so callers can distinguish "keep" (absent) from "remove"
+/// (present-and-empty) without a serde absent-vs-null dance.
+#[derive(Deserialize)]
+struct UpdateOrganizationRequest {
+    /// New display name. When supplied and different from the path segment the
+    /// org is renamed (and pooled IdP credentials are purged — see handler).
+    #[serde(default)]
+    name: Option<String>,
+    /// New provider template id (`okta`, `entra`, `google`, `ping`, `custom`).
+    #[serde(default)]
+    provider: Option<String>,
+    /// New slug for templated providers (Okta subdomain, Entra tenant, …).
+    #[serde(default)]
+    slug: Option<String>,
+    /// New full issuer URL for `provider = "custom"`.
+    #[serde(default)]
+    idp: Option<String>,
+    /// New explicit `client_id`. Empty string clears the persisted id so the
+    /// next resolution falls back to CIMD/DCR. Identity-affecting — see handler.
+    #[serde(default)]
+    client_id: Option<String>,
+    /// New confidential-client `client_secret`. Empty string deletes the
+    /// stored secret (org returns to public/PKCE behaviour). Never written to
+    /// `config.toml`; persisted at `{org}.dcr.json` (0600).
+    #[serde(default)]
+    client_secret: Option<String>,
 }
 
 /// One organization entry returned by `GET /api/organizations`.
@@ -4857,6 +5063,7 @@ async fn compose_org_sso_url(
     issuer: &str,
     disc: &crate::oauth::discovery::DiscoveryResult,
     client_id: &str,
+    client_secret: Option<&str>,
 ) -> String {
     let pkce = PkceChallenge::generate();
     let code_challenge = pkce.code_challenge.clone();
@@ -4867,7 +5074,7 @@ async fn compose_org_sso_url(
             org_name,
             &disc.token_endpoint,
             client_id,
-            None,
+            client_secret,
             pkce,
             &redirect_uri,
             Some(issuer),
@@ -5085,6 +5292,46 @@ async fn create_organization(
     }
     state.config.write().await.organizations = orgs;
 
+    // Confidential-client support: persist an optional requesting `client_secret`
+    // in the secure credential store keyed by org name (`{org}.dcr.json`, 0600).
+    // It is never written to `config.toml` or returned to the UI. When omitted,
+    // no DCR file is written and the public/PKCE behaviour is preserved
+    // byte-for-byte. The stored `client_id` is the resolved id used for the
+    // authorize URL so the auth-code exchange (and later EMA legs) present a
+    // consistent (client_id, client_secret) pair. The EMA **resource** credential
+    // pair is per-resource and lives on the endpoint DCR record (R3), captured via
+    // POST /api/endpoints/{name}/credentials, never on the org record.
+    let trimmed_secret = body
+        .client_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(tm) = state.token_manager.as_ref() {
+        if trimmed_secret.is_some() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let creds = DcrCredentials {
+                client_id: resolved_client_id.clone(),
+                client_secret: trimmed_secret.map(str::to_string),
+                client_secret_expires_at: 0,
+                registered_at: now,
+                issuer: Some(issuer.clone()),
+                ..Default::default()
+            };
+            if let Err(e) = tm.save_dcr(&name, &creds).await {
+                warn!(organization = %name, error = %e, "Failed to persist org credentials to DCR store");
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to persist client secret",
+                    Some(&e.to_string()),
+                )
+                .into_response();
+            }
+        }
+    }
+
     let authorize_url = compose_org_sso_url(
         flow_mgr,
         state.relay_port,
@@ -5092,6 +5339,7 @@ async fn create_organization(
         &issuer,
         &disc,
         &resolved_client_id,
+        trimmed_secret,
     )
     .await;
 
@@ -5107,6 +5355,340 @@ async fn create_organization(
         }),
     )
         .into_response()
+}
+
+/// PUT /api/organizations/{org}
+///
+/// Updates an existing organization's `name`, `provider`/`slug`/`idp`,
+/// `client_id`, and/or `client_secret`. Body fields are all optional —
+/// omitted fields preserve the current value; `client_id` / `client_secret`
+/// use an empty string to mean "clear" (see [`UpdateOrganizationRequest`]).
+///
+/// **Credential invalidation strategy (chosen: purge + require re-auth).**
+/// Identity-affecting changes — rename, issuer change (via provider/slug/idp),
+/// or `client_id` change — purge the pooled IdP credentials at both the old
+/// and new keys via [`TokenManager::delete_idp`] so the next use forces a
+/// fresh SSO. A rename also purges the cached DCR at the old name (the file
+/// is keyed by org name); the user must re-supply `client_secret` in this
+/// same call (or a follow-up call) to restore confidential-client behaviour.
+/// The "purge + require re-auth" choice is explicitly allowed by the slice
+/// spec (rename can either rekey OR purge — purge is simpler and consistent
+/// with how issuer/client_id changes invalidate the auth state already).
+///
+/// `client_secret` round-trips through the secure store (`{org}.dcr.json`,
+/// 0600) and is never written to `config.toml`; an empty-string secret
+/// deletes the stored entry.
+///
+/// **Returns:** when an identity-affecting change occurred the response
+/// mirrors [`OrganizationSsoResponse`] (the caller must re-run SSO with the
+/// returned `authorize_url`); otherwise it mirrors [`OrganizationResponse`]
+/// with the refreshed metadata + current auth status. Unknown org → 404.
+async fn update_organization(
+    State(state): State<ManagementState>,
+    Path(org): Path<String>,
+    Json(body): Json<UpdateOrganizationRequest>,
+) -> impl IntoResponse {
+    let Some(ref flow_mgr) = state.oauth_flow_manager else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "OAuth not configured",
+            None,
+        )
+        .into_response();
+    };
+    let Some(ref config_path) = state.config_path else {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "config_path not configured",
+            None,
+        )
+        .into_response();
+    };
+
+    // Look up the existing org; capture snapshot for diffing.
+    let (current, allow_insecure, orgs_before) = {
+        let config = state.config.read().await;
+        let Some(found) = config.organizations.iter().find(|o| o.name == org).cloned() else {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                "organization not found",
+                Some(&format!("No organization named '{org}'.")),
+            )
+            .into_response();
+        };
+        (
+            found,
+            config.relay.allow_insecure_oauth.unwrap_or(false),
+            config.organizations.clone(),
+        )
+    };
+
+    // Resolve effective field values: present-and-non-empty → use; absent → keep.
+    let new_name = body
+        .name
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| current.name.clone());
+    let new_provider = body
+        .provider
+        .as_ref()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| current.provider.clone());
+
+    // Reject duplicate name on rename.
+    if new_name != current.name && orgs_before.iter().any(|o| o.name == new_name) {
+        return error_response(
+            StatusCode::CONFLICT,
+            "organization_exists",
+            Some(&format!(
+                "An organization named '{new_name}' already exists. Use a different name."
+            )),
+        )
+        .into_response();
+    }
+
+    // Resolve effective issuer: rebuild from provider+slug, take pasted custom,
+    // or keep the current org.idp when neither side moved.
+    let issuer_in_body = body.slug.is_some() || body.idp.is_some();
+    let provider_changed = new_provider != current.provider;
+    let new_issuer = if provider_changed || issuer_in_body {
+        if new_provider == "custom" {
+            match body
+                .idp
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
+                Some(idp) => idp.to_string(),
+                None if !provider_changed => current.idp.clone(),
+                None => {
+                    return error_response(
+                        StatusCode::BAD_REQUEST,
+                        "missing_idp",
+                        Some("provider 'custom' requires a full 'idp' issuer URL."),
+                    )
+                    .into_response();
+                }
+            }
+        } else {
+            let Some(provider) = crate::oauth::idp_providers::find_provider(&new_provider) else {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "unknown_provider",
+                    Some(&format!(
+                        "Unknown provider '{}'. Use GET /api/idp-providers to list templates.",
+                        new_provider
+                    )),
+                )
+                .into_response();
+            };
+            match provider.build_issuer(body.slug.as_deref()) {
+                Ok(issuer) => issuer,
+                Err(e) => {
+                    return error_response(StatusCode::BAD_REQUEST, "invalid_slug", Some(&e))
+                        .into_response();
+                }
+            }
+        }
+    } else {
+        current.idp.clone()
+    };
+
+    // Effective explicit client_id: empty string clears, non-empty sets,
+    // absent preserves the persisted org.client_id.
+    let effective_explicit_client_id: Option<String> = match body.client_id.as_ref() {
+        Some(s) if s.trim().is_empty() => None,
+        Some(s) => Some(s.trim().to_string()),
+        None => current.client_id.clone(),
+    };
+
+    // Always re-validate the issuer + re-resolve the client (matches create /
+    // reauth) so the persisted client_id and any new authorize URL stay
+    // coherent with what the IdP currently advertises.
+    let disc = match validate_org_issuer(&new_issuer, allow_insecure).await {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+    let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", state.relay_port);
+    let (resolved_client_id, registration) = match resolve_org_client(
+        effective_explicit_client_id.as_deref(),
+        &disc,
+        &redirect_uri,
+        &new_name,
+        allow_insecure,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let persisted_client_id = match registration {
+        ClientRegistration::Cimd => None,
+        _ => Some(resolved_client_id.clone()),
+    };
+
+    let name_changed = new_name != current.name;
+    let issuer_changed = new_issuer != current.idp;
+    let client_id_changed = persisted_client_id != current.client_id;
+    let identity_changed = name_changed || issuer_changed || client_id_changed;
+
+    // Persist the updated org list to config.toml + in-memory.
+    let updated_org = crate::config::ConfigOrganization {
+        name: new_name.clone(),
+        provider: new_provider.clone(),
+        idp: new_issuer.clone(),
+        client_id: persisted_client_id.clone(),
+    };
+    let mut orgs = orgs_before.clone();
+    for o in orgs.iter_mut() {
+        if o.name == current.name {
+            *o = updated_org.clone();
+            break;
+        }
+    }
+    let resolved = crate::config::expand_tilde(config_path);
+    if let Err((status, msg, detail)) = write_organizations_to_disk(&resolved, &orgs) {
+        return error_response(status, msg, Some(&detail)).into_response();
+    }
+    state.config.write().await.organizations = orgs;
+
+    // Credential invalidation. Pooled IdP credentials are keyed by org name
+    // and bound to (issuer, client_id), so any rename / issuer / client_id
+    // change makes the cached entry meaningless — purge at both old and new
+    // names so a stale entry on either side cannot be picked up next call.
+    // DCR cached state is keyed by org name and binds (client_id, secret) to
+    // an issuer; purge the old-name DCR on rename and the same-name DCR when
+    // issuer/client_id moved so a subsequent secret save lands cleanly.
+    if let Some(ref tm) = state.token_manager {
+        if identity_changed {
+            if let Err(e) = tm.delete_idp(&current.name).await {
+                warn!(organization = %current.name, error = %e, "Failed to purge old IdP credentials during update");
+            }
+            if name_changed {
+                if let Err(e) = tm.delete_idp(&new_name).await {
+                    warn!(organization = %new_name, error = %e, "Failed to purge new IdP credentials during update");
+                }
+                if let Err(e) = tm.delete_dcr(&current.name).await {
+                    warn!(organization = %current.name, error = %e, "Failed to purge old DCR record during update");
+                }
+            }
+            if !name_changed && (issuer_changed || client_id_changed) {
+                if let Err(e) = tm.delete_dcr(&new_name).await {
+                    warn!(organization = %new_name, error = %e, "Failed to purge stale DCR record during update");
+                }
+            }
+        }
+    }
+
+    // Apply an explicit requesting `client_secret` override to the single
+    // `{org}.dcr.json` record: absent in the body preserves the stored value,
+    // an empty string clears it, a non-empty value sets it. When cleared the
+    // DCR file is deleted (back to public/PKCE). The EMA **resource** credential
+    // pair is per-resource and lives on the endpoint DCR record (R3), captured
+    // via POST /api/endpoints/{name}/credentials, never on the org record.
+    if let Some(action) = body.client_secret.as_deref().map(str::trim) {
+        if let Some(tm) = state.token_manager.as_ref() {
+            let client_secret = match action {
+                "" => None,
+                s => Some(s.to_string()),
+            };
+            if client_secret.is_none() {
+                if let Err(e) = tm.delete_dcr(&new_name).await {
+                    warn!(organization = %new_name, error = %e, "Failed to clear org credentials from DCR store");
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to clear client secret",
+                        Some(&e.to_string()),
+                    )
+                    .into_response();
+                }
+            } else {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let creds = DcrCredentials {
+                    client_id: resolved_client_id.clone(),
+                    client_secret,
+                    client_secret_expires_at: 0,
+                    registered_at: now,
+                    issuer: Some(new_issuer.clone()),
+                    ..Default::default()
+                };
+                if let Err(e) = tm.save_dcr(&new_name, &creds).await {
+                    warn!(organization = %new_name, error = %e, "Failed to persist updated org credentials to DCR store");
+                    return error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to persist client secret",
+                        Some(&e.to_string()),
+                    )
+                    .into_response();
+                }
+            }
+        }
+    }
+
+    // Build the response. Identity changes require fresh SSO → return an
+    // authorize URL just like create / reauthenticate. Otherwise return the
+    // refreshed org metadata with the live auth status.
+    if identity_changed {
+        // Load any freshly-stored secret so the pending flow carries it.
+        let client_secret = match state.token_manager.as_ref() {
+            Some(tm) => match tm.load_dcr(&new_name).await {
+                Ok(Some(creds)) if creds.client_id == resolved_client_id => creds.client_secret,
+                _ => None,
+            },
+            None => None,
+        };
+        let authorize_url = compose_org_sso_url(
+            flow_mgr,
+            state.relay_port,
+            &new_name,
+            &new_issuer,
+            &disc,
+            &resolved_client_id,
+            client_secret.as_deref(),
+        )
+        .await;
+        info!(
+            organization = %new_name,
+            previous_name = %current.name,
+            "Organization updated; identity changed, re-authentication required",
+        );
+        return Json(OrganizationSsoResponse {
+            name: new_name,
+            provider: new_provider,
+            idp: new_issuer,
+            authorize_url,
+        })
+        .into_response();
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let authenticated = if let Some(ref tm) = state.token_manager {
+        match tm.load_idp(&new_name).await {
+            Ok(Some(creds)) => {
+                let id_valid = creds.id_token_expires_at.map(|e| e > now).unwrap_or(true);
+                id_valid || creds.refresh_token.is_some()
+            }
+            _ => false,
+        }
+    } else {
+        false
+    };
+    info!(organization = %new_name, "Organization updated; credentials preserved");
+    Json(OrganizationResponse {
+        name: new_name,
+        provider: new_provider,
+        idp: new_issuer,
+        authenticated,
+    })
+    .into_response()
 }
 
 /// GET /api/organizations
@@ -5245,6 +5827,22 @@ async fn reauthenticate_organization(
         Err(resp) => return resp,
     };
 
+    // Load the optional confidential-client secret from the secure credential
+    // store (`{org}.dcr.json`); when present the auth-code exchange in
+    // `/oauth/callback` will include `client_secret` in the form body. Missing
+    // DCR / load failure / no secret → public/PKCE flow (existing behaviour).
+    let client_secret = match state.token_manager.as_ref() {
+        Some(tm) => match tm.load_dcr(&org).await {
+            Ok(Some(creds)) if creds.client_id == resolved_client_id => creds.client_secret,
+            Ok(_) => None,
+            Err(e) => {
+                warn!(organization = %org, error = %e, "Failed to load org DCR credentials; continuing as public client");
+                None
+            }
+        },
+        None => None,
+    };
+
     let authorize_url = compose_org_sso_url(
         flow_mgr,
         state.relay_port,
@@ -5252,6 +5850,7 @@ async fn reauthenticate_organization(
         &issuer,
         &disc,
         &resolved_client_id,
+        client_secret.as_deref(),
     )
     .await;
 
@@ -8156,6 +8755,7 @@ command = "echo"
                 client_secret_expires_at: 0,
                 registered_at: 1_700_000_000,
                 issuer: None,
+                ..Default::default()
             },
         )
         .await
@@ -8200,6 +8800,195 @@ command = "echo"
         assert_eq!(body["client_secret_set"], true);
         assert_eq!(body["source"], "config");
         assert!(body.get("client_secret").is_none());
+    }
+
+    /// R3: the optional EMA **resource** credential pair is captured + persisted
+    /// **per-endpoint** in `{name}.dcr.json` via POST
+    /// /api/endpoints/{name}/credentials, with absent=keep / empty=clear /
+    /// non-empty=set semantics. A resource-only update (no requesting client_id)
+    /// is allowed, and each field merges independently.
+    #[tokio::test]
+    async fn endpoint_credentials_resource_pair_persist_and_merge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, tm) = test_state_with_token_manager("ep1", tmp.path(), None, None).await;
+        let app = management_routes(state);
+
+        // 1. SET — resource-only update (no requesting client_id) is allowed.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/endpoints/ep1/credentials")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "resource_client_id": "res-client",
+                            "resource_client_secret": "res-secret",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let creds = tm
+            .load_dcr("ep1")
+            .await
+            .unwrap()
+            .expect("endpoint DCR should exist after set");
+        assert_eq!(creds.resource_client_id.as_deref(), Some("res-client"));
+        assert_eq!(creds.resource_client_secret.as_deref(), Some("res-secret"));
+        // Resource-only: no requesting client_id/secret was supplied.
+        assert!(creds.client_id.is_empty());
+        assert!(creds.client_secret.is_none());
+
+        // 2. Update ONLY the resource secret — resource id preserved.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/endpoints/ep1/credentials")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"resource_client_secret": "res-secret-v2"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let creds = tm.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(
+            creds.resource_client_id.as_deref(),
+            Some("res-client"),
+            "resource_client_id must survive a resource-secret update"
+        );
+        assert_eq!(
+            creds.resource_client_secret.as_deref(),
+            Some("res-secret-v2")
+        );
+
+        // 3. Add requesting client_id + secret — resource pair preserved.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/endpoints/ep1/credentials")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "client_id": "req-client",
+                            "client_secret": "req-secret",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let creds = tm.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(creds.client_id, "req-client");
+        assert_eq!(creds.client_secret.as_deref(), Some("req-secret"));
+        assert_eq!(
+            creds.resource_client_id.as_deref(),
+            Some("res-client"),
+            "resource pair must survive a requesting-cred update"
+        );
+        assert_eq!(
+            creds.resource_client_secret.as_deref(),
+            Some("res-secret-v2")
+        );
+
+        // 4. Clear ONLY the resource secret — everything else kept.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/endpoints/ep1/credentials")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"resource_client_secret": ""}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let creds = tm.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(creds.client_id, "req-client");
+        assert_eq!(creds.client_secret.as_deref(), Some("req-secret"));
+        assert_eq!(creds.resource_client_id.as_deref(), Some("res-client"));
+        assert!(
+            creds.resource_client_secret.is_none(),
+            "resource_client_secret must be cleared by an empty string"
+        );
+
+        // 5. GET surfaces the resource id + secret-set flag (never the secret).
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::post("/api/endpoints/ep1/credentials")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"resource_client_secret": "res-secret-v3"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get("/api/endpoints/ep1/credentials")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["resource_client_id"], "res-client");
+        assert_eq!(body["resource_client_secret_set"], true);
+        assert!(body.get("resource_client_secret").is_none());
+    }
+
+    /// R3: clearing the last remaining credential removes the per-endpoint DCR
+    /// record entirely (back to the no-credential state).
+    #[tokio::test]
+    async fn endpoint_credentials_clearing_last_removes_dcr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, tm) = test_state_with_token_manager("ep1", tmp.path(), None, None).await;
+        let app = management_routes(state);
+        // Seed a resource-only record.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/endpoints/ep1/credentials")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"resource_client_id": "res-client"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(tm.load_dcr("ep1").await.unwrap().is_some());
+        // Clear it — the record should be removed.
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/credentials")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"resource_client_id": ""}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            tm.load_dcr("ep1").await.unwrap().is_none(),
+            "DCR file should be removed when the last credential is cleared"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -8635,6 +9424,7 @@ command = "echo"
             client_secret_expires_at: 0,
             registered_at: 0,
             issuer: None,
+            ..Default::default()
         };
         token_manager.save_dcr("ep1", &creds).await.unwrap();
 
@@ -8697,6 +9487,7 @@ command = "echo"
             client_secret_expires_at: 0,
             registered_at: 0,
             issuer: None,
+            ..Default::default()
         };
         token_manager.save_dcr("ep1", &creds).await.unwrap();
 
@@ -10718,5 +11509,651 @@ client_id = "client123"
             config.read().await.organizations.is_empty(),
             "org must not be persisted when client_id is unresolvable"
         );
+    }
+
+    /// Confidential client: an org created with `client_secret` persists the
+    /// secret to the secure credential store (`{org}.dcr.json`), NEVER to
+    /// `config.toml`, and the composed SSO flow carries the secret so the
+    /// auth-code exchange in `/oauth/callback` authenticates with it.
+    #[tokio::test]
+    async fn create_organization_with_client_secret_persists_dcr_and_threads_flow_secret() {
+        let (base_url, _server) = spawn_mock_as(org_well_known_router()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let flow_mgr = state.oauth_flow_manager.clone().unwrap();
+        let token_manager = state.token_manager.clone().unwrap();
+        let config = state.config.clone();
+        let config_path = state.config_path.clone().unwrap();
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/organizations")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "Acme Corp",
+                            "provider": "custom",
+                            "idp": base_url,
+                            "client_id": "explicit-okta-client",
+                            "client_secret": "super-secret-value",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+
+        // The DCR file must hold the resolved client_id + the secret.
+        let loaded = token_manager
+            .load_dcr("Acme Corp")
+            .await
+            .unwrap()
+            .expect("DCR credentials should be persisted for the org");
+        assert_eq!(loaded.client_id, "explicit-okta-client");
+        assert_eq!(loaded.client_secret.as_deref(), Some("super-secret-value"));
+        assert_eq!(loaded.issuer.as_deref(), Some(base_url.as_str()));
+
+        // config.toml must NOT contain the secret (only public org fields).
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !disk.contains("super-secret-value"),
+            "client_secret must never be written to config.toml; got: {disk}"
+        );
+        assert!(!disk.contains("client_secret"));
+        let orgs = config.read().await.organizations.clone();
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0].client_id.as_deref(), Some("explicit-okta-client"));
+
+        // The pending flow registered with the OAuthFlowManager must carry the
+        // secret so /oauth/callback includes it in the form body.
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending IdP flow was registered");
+        assert_eq!(flow.client_id, "explicit-okta-client");
+        assert_eq!(
+            flow.client_secret.as_deref(),
+            Some("super-secret-value"),
+            "create_organization must thread client_secret into the pending flow"
+        );
+    }
+
+    /// Public/PKCE org: omitting `client_secret` MUST keep the existing
+    /// behaviour byte-for-byte — no DCR file is written and the pending flow
+    /// carries no secret.
+    #[tokio::test]
+    async fn create_organization_without_client_secret_keeps_public_pkce_behaviour() {
+        let (base_url, _server) = spawn_mock_as(org_well_known_router()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let flow_mgr = state.oauth_flow_manager.clone().unwrap();
+        let token_manager = state.token_manager.clone().unwrap();
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/organizations")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "Acme Corp",
+                            "provider": "custom",
+                            "idp": base_url,
+                            "client_id": "explicit-okta-client",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+
+        assert!(
+            token_manager.load_dcr("Acme Corp").await.unwrap().is_none(),
+            "no DCR file should be written when client_secret is omitted"
+        );
+
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending IdP flow was registered");
+        assert!(
+            flow.client_secret.is_none(),
+            "public/PKCE flow must not carry a client_secret; got {:?}",
+            flow.client_secret
+        );
+    }
+
+    /// Re-authenticate threads the previously-stored client_secret into the
+    /// pending flow so the second authorize → token exchange uses it just like
+    /// the first one.
+    #[tokio::test]
+    async fn reauthenticate_organization_threads_stored_client_secret() {
+        let (base_url, _server) = spawn_mock_as(org_well_known_router()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let flow_mgr = state.oauth_flow_manager.clone().unwrap();
+        let token_manager = state.token_manager.clone().unwrap();
+
+        // Seed the org config + DCR store as if creation had captured a secret.
+        state.config.write().await.organizations = vec![crate::config::ConfigOrganization {
+            name: "Acme Corp".to_string(),
+            provider: "custom".to_string(),
+            idp: base_url.clone(),
+            client_id: Some("explicit-okta-client".to_string()),
+        }];
+        token_manager
+            .save_dcr(
+                "Acme Corp",
+                &DcrCredentials {
+                    client_id: "explicit-okta-client".to_string(),
+                    client_secret: Some("super-secret-value".to_string()),
+                    client_secret_expires_at: 0,
+                    registered_at: 0,
+                    issuer: Some(base_url.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/organizations/Acme%20Corp/reauthenticate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending IdP flow was registered on reauth");
+        assert_eq!(flow.client_id, "explicit-okta-client");
+        assert_eq!(
+            flow.client_secret.as_deref(),
+            Some("super-secret-value"),
+            "reauthenticate must load and thread the stored client_secret"
+        );
+    }
+
+    /// PUT against an unknown org returns 404 and leaves config untouched.
+    #[tokio::test]
+    async fn update_organization_missing_returns_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::put("/api/organizations/ghost")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::json!({"name": "ghost"}).to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// Field-level update with no identity change (provider/idp/client_id all
+    /// match the existing org) returns the refreshed org metadata WITHOUT an
+    /// authorize_url and preserves pooled IdP credentials.
+    #[tokio::test]
+    async fn update_organization_no_identity_change_preserves_creds_and_returns_org() {
+        let (base_url, _server) = spawn_mock_as(org_well_known_router()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let tm = state.token_manager.clone().unwrap();
+        state.config.write().await.organizations = vec![crate::config::ConfigOrganization {
+            name: "Acme Corp".to_string(),
+            provider: "custom".to_string(),
+            idp: base_url.clone(),
+            client_id: None,
+        }];
+        tm.save_idp(
+            "Acme Corp",
+            &crate::token_manager::IdpCredentials {
+                idp_issuer: base_url.clone(),
+                id_token: "id-tok".to_string(),
+                refresh_token: Some("refresh-tok".to_string()),
+                id_token_expires_at: None,
+                obtained_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let app = management_routes(state);
+
+        // Send a PUT with an empty body — everything preserved.
+        let resp = app
+            .oneshot(
+                Request::put("/api/organizations/Acme%20Corp")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert!(
+            body.get("authorize_url").is_none(),
+            "no authorize_url should be returned when identity is unchanged; got: {body}"
+        );
+        assert_eq!(body["name"], "Acme Corp");
+        assert_eq!(body["authenticated"], true);
+        // IdP credentials must still be present.
+        assert!(tm.load_idp("Acme Corp").await.unwrap().is_some());
+    }
+
+    /// Changing the issuer (provider/slug/idp) purges pooled IdP credentials
+    /// so the org flips back to "Sign-in required", and the response carries
+    /// a fresh authorize URL pointing at the NEW issuer.
+    #[tokio::test]
+    async fn update_organization_issuer_change_purges_pooled_credentials() {
+        let (old_base_url, _old_server) = spawn_mock_as(org_well_known_router()).await;
+        let (new_base_url, _new_server) = spawn_mock_as(org_well_known_router()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let tm = state.token_manager.clone().unwrap();
+        let config = state.config.clone();
+        let config_path = state.config_path.clone().unwrap();
+        state.config.write().await.organizations = vec![crate::config::ConfigOrganization {
+            name: "Acme Corp".to_string(),
+            provider: "custom".to_string(),
+            idp: old_base_url.clone(),
+            client_id: None,
+        }];
+        tm.save_idp(
+            "Acme Corp",
+            &crate::token_manager::IdpCredentials {
+                idp_issuer: old_base_url.clone(),
+                id_token: "id-tok".to_string(),
+                refresh_token: Some("refresh-tok".to_string()),
+                id_token_expires_at: None,
+                obtained_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::put("/api/organizations/Acme%20Corp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "provider": "custom",
+                            "idp": new_base_url,
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["idp"], new_base_url);
+        let authorize_url = body["authorize_url"]
+            .as_str()
+            .expect("issuer change must return an authorize_url since pooled creds were purged");
+        assert!(
+            authorize_url.starts_with(&format!("{new_base_url}/authorize?")),
+            "authorize_url should target the NEW issuer, got: {authorize_url}"
+        );
+
+        // Pooled IdP credentials must be gone — status flips to "Sign-in required".
+        assert!(tm.load_idp("Acme Corp").await.unwrap().is_none());
+        // config.toml + in-memory both reflect the new issuer.
+        let orgs = config.read().await.organizations.clone();
+        assert_eq!(orgs[0].idp, new_base_url);
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(disk.contains(&new_base_url));
+        assert!(!disk.contains(&old_base_url));
+    }
+
+    /// Changing the explicit `client_id` purges pooled IdP credentials and
+    /// the stale DCR record, then persists the new id.
+    #[tokio::test]
+    async fn update_organization_client_id_change_purges_pooled_credentials() {
+        let (base_url, _server) = spawn_mock_as(org_well_known_router()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let tm = state.token_manager.clone().unwrap();
+        let config = state.config.clone();
+        state.config.write().await.organizations = vec![crate::config::ConfigOrganization {
+            name: "Acme Corp".to_string(),
+            provider: "custom".to_string(),
+            idp: base_url.clone(),
+            client_id: Some("old-client".to_string()),
+        }];
+        tm.save_idp(
+            "Acme Corp",
+            &crate::token_manager::IdpCredentials {
+                idp_issuer: base_url.clone(),
+                id_token: "id-tok".to_string(),
+                refresh_token: Some("refresh-tok".to_string()),
+                id_token_expires_at: None,
+                obtained_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        tm.save_dcr(
+            "Acme Corp",
+            &DcrCredentials {
+                client_id: "old-client".to_string(),
+                client_secret: Some("old-secret".to_string()),
+                client_secret_expires_at: 0,
+                registered_at: 0,
+                issuer: Some(base_url.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::put("/api/organizations/Acme%20Corp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"client_id": "new-client"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"]
+            .as_str()
+            .expect("client_id change must return an authorize_url");
+        assert!(
+            authorize_url.contains("client_id=new-client"),
+            "authorize_url should carry the new client_id, got: {authorize_url}"
+        );
+
+        assert!(tm.load_idp("Acme Corp").await.unwrap().is_none());
+        // The stale DCR (bound to the old client_id) must be purged.
+        assert!(tm.load_dcr("Acme Corp").await.unwrap().is_none());
+        let orgs = config.read().await.organizations.clone();
+        assert_eq!(orgs[0].client_id.as_deref(), Some("new-client"));
+    }
+
+    /// `client_secret` lifecycle: set on a public/PKCE org, replace it, then
+    /// clear it. The DCR file is created, overwritten, then deleted; the
+    /// config.toml is never touched.
+    #[tokio::test]
+    async fn update_organization_client_secret_set_replace_clear() {
+        let (base_url, _server) = spawn_mock_as(org_well_known_router()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let tm = state.token_manager.clone().unwrap();
+        let config_path = state.config_path.clone().unwrap();
+        state.config.write().await.organizations = vec![crate::config::ConfigOrganization {
+            name: "Acme Corp".to_string(),
+            provider: "custom".to_string(),
+            idp: base_url.clone(),
+            client_id: Some("explicit-okta-client".to_string()),
+        }];
+        let app = management_routes(state);
+
+        // 1. SET — supply a secret on an org that had none.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::put("/api/organizations/Acme%20Corp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"client_secret": "secret-v1"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let creds = tm
+            .load_dcr("Acme Corp")
+            .await
+            .unwrap()
+            .expect("DCR file should exist after secret set");
+        assert_eq!(creds.client_id, "explicit-okta-client");
+        assert_eq!(creds.client_secret.as_deref(), Some("secret-v1"));
+        assert_eq!(creds.issuer.as_deref(), Some(base_url.as_str()));
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!disk.contains("secret-v1"));
+        assert!(!disk.contains("client_secret"));
+
+        // 2. REPLACE — overwrite with a new secret.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::put("/api/organizations/Acme%20Corp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"client_secret": "secret-v2"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let creds = tm
+            .load_dcr("Acme Corp")
+            .await
+            .unwrap()
+            .expect("DCR file still present after replace");
+        assert_eq!(creds.client_secret.as_deref(), Some("secret-v2"));
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!disk.contains("secret-v1"));
+        assert!(!disk.contains("secret-v2"));
+
+        // 3. CLEAR — empty string deletes the DCR record.
+        let resp = app
+            .oneshot(
+                Request::put("/api/organizations/Acme%20Corp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"client_secret": ""}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            tm.load_dcr("Acme Corp").await.unwrap().is_none(),
+            "DCR file should be removed when client_secret is explicitly cleared"
+        );
+    }
+
+    /// R3: the org route still captures the requesting `client_secret`, but the
+    /// EMA **resource** credential pair has moved to the endpoint (R3/D2) — any
+    /// resource fields posted to `/api/organizations` are now ignored and never
+    /// land in `{org}.dcr.json`.
+    #[tokio::test]
+    async fn update_organization_ignores_resource_creds_keeps_requesting_secret() {
+        let (base_url, _server) = spawn_mock_as(org_well_known_router()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let tm = state.token_manager.clone().unwrap();
+        let config_path = state.config_path.clone().unwrap();
+        state.config.write().await.organizations = vec![crate::config::ConfigOrganization {
+            name: "Acme Corp".to_string(),
+            provider: "custom".to_string(),
+            idp: base_url.clone(),
+            client_id: Some("explicit-okta-client".to_string()),
+        }];
+        let app = management_routes(state);
+
+        // Supply the requesting secret AND (now-ignored) resource fields.
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::put("/api/organizations/Acme%20Corp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "client_secret": "req-secret",
+                            "resource_client_id": "res-client",
+                            "resource_client_secret": "res-secret",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let creds = tm
+            .load_dcr("Acme Corp")
+            .await
+            .unwrap()
+            .expect("DCR file should exist after set");
+        assert_eq!(creds.client_secret.as_deref(), Some("req-secret"));
+        assert!(
+            creds.resource_client_id.is_none(),
+            "org route must not persist a resource_client_id (moved to endpoint)"
+        );
+        assert!(
+            creds.resource_client_secret.is_none(),
+            "org route must not persist a resource_client_secret (moved to endpoint)"
+        );
+        // Secrets never leak into config.toml.
+        let disk = std::fs::read_to_string(&config_path).unwrap();
+        assert!(!disk.contains("req-secret"));
+        assert!(!disk.contains("res-secret"));
+    }
+
+    /// Rename purges pooled credentials at both keys and removes the old DCR,
+    /// returning an authorize_url so the user re-runs SSO under the new name.
+    #[tokio::test]
+    async fn update_organization_rename_purges_credentials_at_both_keys() {
+        let (base_url, _server) = spawn_mock_as(org_well_known_router()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let tm = state.token_manager.clone().unwrap();
+        let config = state.config.clone();
+        state.config.write().await.organizations = vec![crate::config::ConfigOrganization {
+            name: "Acme Corp".to_string(),
+            provider: "custom".to_string(),
+            idp: base_url.clone(),
+            client_id: None,
+        }];
+        tm.save_idp(
+            "Acme Corp",
+            &crate::token_manager::IdpCredentials {
+                idp_issuer: base_url.clone(),
+                id_token: "id-tok".to_string(),
+                refresh_token: Some("refresh-tok".to_string()),
+                id_token_expires_at: None,
+                obtained_at: 0,
+            },
+        )
+        .await
+        .unwrap();
+        tm.save_dcr(
+            "Acme Corp",
+            &DcrCredentials {
+                client_id: "old-client".to_string(),
+                client_secret: Some("old-secret".to_string()),
+                client_secret_expires_at: 0,
+                registered_at: 0,
+                issuer: Some(base_url.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::put("/api/organizations/Acme%20Corp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"name": "Acme Inc"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["name"], "Acme Inc");
+        assert!(
+            body.get("authorize_url").is_some(),
+            "rename must return a fresh authorize_url; got: {body}"
+        );
+
+        // Both the old and new IdP keys must be empty; the old DCR must be gone.
+        assert!(tm.load_idp("Acme Corp").await.unwrap().is_none());
+        assert!(tm.load_idp("Acme Inc").await.unwrap().is_none());
+        assert!(tm.load_dcr("Acme Corp").await.unwrap().is_none());
+
+        let orgs = config.read().await.organizations.clone();
+        assert_eq!(orgs.len(), 1);
+        assert_eq!(orgs[0].name, "Acme Inc");
+    }
+
+    /// Rename onto a name that already exists returns 409 and leaves the org
+    /// list untouched.
+    #[tokio::test]
+    async fn update_organization_rename_conflict_returns_409() {
+        let (base_url, _server) = spawn_mock_as(org_well_known_router()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let state = test_state_orgs(tmp.path(), true).await;
+        let config = state.config.clone();
+        state.config.write().await.organizations = vec![
+            crate::config::ConfigOrganization {
+                name: "Acme Corp".to_string(),
+                provider: "custom".to_string(),
+                idp: base_url.clone(),
+                client_id: None,
+            },
+            crate::config::ConfigOrganization {
+                name: "Acme Inc".to_string(),
+                provider: "custom".to_string(),
+                idp: base_url.clone(),
+                client_id: None,
+            },
+        ];
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::put("/api/organizations/Acme%20Corp")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"name": "Acme Inc"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let orgs = config.read().await.organizations.clone();
+        assert_eq!(orgs.len(), 2);
+        assert!(orgs.iter().any(|o| o.name == "Acme Corp"));
     }
 }

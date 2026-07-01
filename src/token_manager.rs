@@ -43,7 +43,7 @@ impl TokenSet {
 }
 
 /// A set of DCR (Dynamic Client Registration) credentials for a single endpoint.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct DcrCredentials {
     pub client_id: String,
     pub client_secret: Option<String>,
@@ -58,6 +58,23 @@ pub struct DcrCredentials {
     /// existed (treated as "reuse as-is" for backward compatibility).
     #[serde(default)]
     pub issuer: Option<String>,
+    /// Optional EMA **resource** client id used only at the MCP Authorization
+    /// Server (Step 3, RFC 7523 ID-JAG redemption). Distinct from `client_id`,
+    /// which is the *requesting* client used for SSO / the ID-JAG exchange at
+    /// the IdP. Spec-compliant MASes need no resource credential; xaa.dev/Okta
+    /// style MASes require this per-pairing credential. `None` (the common case)
+    /// keeps Step 3 on the requesting client_id with no secret. This pair is
+    /// **per-resource**, so R3 persists it on the *endpoint* DCR record
+    /// (`{name}.dcr.json`, 0600) — captured via
+    /// `POST /api/endpoints/{name}/credentials` — not the org record. For a
+    /// resource-only EMA endpoint the record's `client_id` is empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_client_id: Option<String>,
+    /// Optional EMA **resource** client secret paired with `resource_client_id`,
+    /// presented via `client_secret_post` at the MAS in Step 3. Never sent on
+    /// the IdP-facing legs and never substituted by the requesting secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_client_secret: Option<String>,
 }
 
 /// Per-IdP credentials captured during EMA Step 1 (IdP SSO). Holds the ID Token
@@ -431,6 +448,7 @@ mod tests {
             client_secret_expires_at: 0,
             registered_at: 1700000000,
             issuer: Some("https://auth.example.com".to_string()),
+            ..Default::default()
         }
     }
 
@@ -537,6 +555,7 @@ mod tests {
             client_secret_expires_at: 0,
             registered_at: 1700000000,
             issuer: None,
+            ..Default::default()
         };
 
         mgr.save_dcr("public-ep", &creds).await.unwrap();
