@@ -21,6 +21,8 @@ Add servers, manage OAuth, connect any AI client — all from one place.
 - **One endpoint, not N** — point every AI client at `localhost:9400` instead of pasting the same MCP server config into each app.
 - **Works out of the box** — the `[relay]` table is optional; `machine_name` defaults to your system hostname, so a fresh install runs with nothing but a list of endpoints.
 - **OAuth managed for you** — Relay handles token storage and refresh for servers that need it, and signs you in just in time when an upstream returns `401`.
+- **Enterprise SSO (EMA)** — Enterprise-Managed Authorization lets endpoints authenticate through your organization's identity provider (Okta, Entra, Google, Ping) with `[[organizations]]` blocks and `[endpoints.auth] type = "ema"`.
+- **Resources & prompts too** — not just tools: upstream MCP resources and prompts are merged and proxied with reversible namespacing, so MCP Apps and prompt catalogs work through the relay.
 - **Run servers in containers** — opt-in Docker / Podman isolation for STDIO servers, with a direct-spawn fallback when no runtime is present.
 - **Hot-reload config** — edit your TOML, save, and Relay picks up the change without a restart.
 - **Automatic restart on crash** — flaky STDIO servers come back on their own with exponential backoff.
@@ -34,7 +36,7 @@ Add servers, manage OAuth, connect any AI client — all from one place.
 
 Endara Relay is a single Rust binary that sits between your AI assistant (Claude Desktop, Cursor, or any MCP client) and all the MCP servers you use. Instead of configuring each server individually in your client, you point your client at one local endpoint — `localhost:9400` — and Relay handles the rest.
 
-It connects to each MCP server using the appropriate transport (STDIO, SSE, or HTTP), merges their tool catalogs into a unified list, and prefixes tool names to avoid collisions. If a server crashes, Relay restarts it automatically. If you edit the config file, Relay picks up the changes without a restart.
+It connects to each MCP server using the appropriate transport (STDIO, SSE, or HTTP), merges their tool, resource, and prompt catalogs into a unified view, and prefixes names to avoid collisions. If a server crashes, Relay restarts it automatically. If you edit the config file, Relay picks up the changes without a restart.
 
 No cloud. No accounts. Everything runs on your machine.
 
@@ -163,6 +165,29 @@ oauth_server_url = "https://accounts.google.com"
 client_id = "$GOOGLE_CLIENT_ID"
 server_type_override = "google-drive"  # Optional — overrides upstream-derived server_type
 
+# Enterprise-Managed Authorization (EMA) — authenticate an endpoint through
+# your organization's identity provider instead of a per-server OAuth flow.
+# Declare the org once, then reference it from any number of endpoints.
+[[organizations]]
+name = "Acme Corp"                # Required — stable key referenced by endpoints
+provider = "okta"                 # Required — "okta", "entra", "google", "ping", or "custom"
+idp = "https://acme.okta.com"     # Required — IdP issuer URL
+# client_id = "..."               # Optional — pre-registered OAuth client_id for this IdP;
+                                  # when omitted, the relay falls back to CIMD → DCR
+
+[[endpoints]]
+name = "github-acme"
+transport = "http"
+url = "https://api.githubcopilot.com/mcp/"
+
+[endpoints.auth]
+type = "ema"                      # Required — currently the only supported auth type
+organization = "Acme Corp"        # Required — references an [[organizations]] entry
+resource = "https://api.githubcopilot.com/mcp/"  # Required — MCP server URL the token is scoped to
+# Optional per-endpoint resource client_id/client_secret (needed by some MCP
+# Authorization Servers) are never stored in config.toml — supply them via
+# POST /api/endpoints/{name}/credentials on the management API.
+
 # Endpoint profiles — serve named subsets of the endpoints above
 # at /mcp/{path}. Clients pointed at the prefixed URL see only the
 # tools from the listed endpoints. See "Endpoint profiles" below.
@@ -214,6 +239,10 @@ Connect to any MCP server regardless of how it communicates:
 
 Every tool is automatically prefixed with its endpoint name to prevent collisions. If endpoint `github` exposes a tool called `list_repos`, it becomes `github__list_repos` in the merged catalog. This means you can connect multiple servers that expose identically-named tools without conflicts.
 
+### Resources & prompts proxying
+
+Tools aren't the only thing the relay aggregates. Upstream MCP **resources** and **prompts** are merged and proxied too: `resources/list`, `resources/read`, `resources/templates/list`, `prompts/list`, and `prompts/get` all route through the relay. Prompt names are prefixed with the endpoint name using the same scheme as tools, and resource URIs are wrapped in a reversible per-endpoint namespace (`mcp-relay://{endpoint}/{percent-encoded-uri}`) so reads route back to the right server without a lookup table. This makes MCP Apps (`ui://` resources) and prompt catalogs work through the relay, and it works in JS execution mode too — the meta-tool catalog reduction applies only to `tools/list`.
+
 ### Config hot-reload
 
 Relay watches your config file for changes using the [notify](https://crates.io/crates/notify) crate. When you save the file, Relay automatically:
@@ -227,7 +256,7 @@ No restart required.
 
 ### Crash recovery
 
-If a STDIO server process crashes, Relay automatically restarts it with exponential backoff. After repeated failures, the endpoint is marked unhealthy. This keeps your tool catalog available even when individual servers are flaky.
+If a STDIO server process crashes, Relay automatically restarts it with exponential backoff. After repeated failures, the endpoint is marked unhealthy. Plain HTTP servers get equivalent treatment: an upstream that stops responding is marked unhealthy after a few consecutive transport failures, and recovers automatically on the next successful request. This keeps your tool catalog available even when individual servers are flaky.
 
 ### Container isolation
 
