@@ -2014,6 +2014,41 @@ async fn oauth_callback(
         }
     }
 
+    // Superseded-flow guard (round-4 finding R4-3): reject an
+    // endpoint-installing flow (`idp_issuer.is_none()`, i.e. a regular
+    // resource OAuth flow) whose `flow.client_id` no longer matches the
+    // currently persisted DCR requesting `client_id`. A DCR-provenanced
+    // record with a non-empty `client_id` that differs from `flow.client_id`
+    // means a concurrent re-registration replaced the requesting pair
+    // between authorize and callback; exchanging this code against the
+    // stale pair would either fail with `invalid_client` (racing the newer
+    // registration into the self-heal path) or succeed with a token bound
+    // to an already-superseded client. Neither is desirable — the user
+    // should just re-Authorize against the current pair. EMA IdP flows
+    // (`idp_issuer.is_some()`) install IdP credentials, not endpoint DCR
+    // credentials, and are exempt from this check.
+    if flow.idp_issuer.is_none() {
+        if let Some(ref tm) = state.token_manager {
+            if let Ok(Some(persisted)) = tm.load_dcr(&flow.endpoint_name).await {
+                if persisted.registered_via_dcr
+                    && !persisted.client_id.is_empty()
+                    && persisted.client_id != flow.client_id
+                {
+                    warn!(
+                        endpoint = %flow.endpoint_name,
+                        flow_client_id = %flow.client_id,
+                        current_client_id = %persisted.client_id,
+                        "Rejecting superseded OAuth callback: DCR client_id changed between authorize and callback"
+                    );
+                    return oauth_html_response(
+                        "<html><body><h1>OAuth Error</h1><p>This login session was superseded by a newer client registration. Please click Authorize again.</p><p>You can close this window.</p></body></html>"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+
     // Exchange authorization code for tokens
     let client = reqwest::Client::new();
     let mut form_parts: Vec<(String, String)> = vec![
@@ -6007,6 +6042,106 @@ mod tests {
             loaded.resource_client_secret.as_deref(),
             Some("mas-resource-secret")
         );
+    }
+
+    /// Round-4 finding R4-3: if a fresh DCR re-registration lands
+    /// between authorize and callback, the persisted DCR `client_id`
+    /// will differ from the one baked into the pending flow. Exchanging
+    /// the auth code against the superseded `flow.client_id` would either
+    /// race the newer registration into the self-heal path or install a
+    /// token bound to an already-superseded client. The callback must
+    /// reject the flow with a clear "please Authorize again" error and
+    /// must NOT POST to the token endpoint.
+    #[tokio::test]
+    async fn oauth_callback_rejects_superseded_flow_when_dcr_client_id_changed() {
+        use crate::token_manager::DcrCredentials;
+        use axum::body::to_bytes;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Token endpoint counts POSTs so we can assert it was never hit.
+        let token_hits = Arc::new(AtomicUsize::new(0));
+        let hits = token_hits.clone();
+        let router = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    "{\"access_token\":\"unused\",\"token_type\":\"Bearer\",\"expires_in\":3600}"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let token_endpoint = format!("http://127.0.0.1:{}/token", addr.port());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let endpoint_name = "superseded-ep";
+        // The currently-persisted DCR record has the freshly re-registered
+        // client_id — a concurrent Authorize replaced the requesting pair
+        // while the older flow was still in flight.
+        tm.save_dcr(
+            endpoint_name,
+            &DcrCredentials {
+                client_id: "fresh-dcr-client".to_string(),
+                registered_via_dcr: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let pkce = crate::oauth::PkceChallenge::generate();
+        // The pending flow was started against the SUPERSEDED client_id.
+        let state_param = flow_mgr
+            .start_flow(
+                endpoint_name,
+                &token_endpoint,
+                "stale-dcr-client",
+                None,
+                pkce,
+                "http://127.0.0.1:9400/oauth/callback",
+                None,
+                false,
+            )
+            .await;
+
+        let mut app_state = test_app_state();
+        app_state.oauth_flow_manager = Some(flow_mgr);
+        app_state.token_manager = Some(tm.clone());
+
+        let params = OAuthCallbackParams {
+            code: Some("authcode".to_string()),
+            state: Some(state_param),
+            error: None,
+            iss: None,
+        };
+        let resp = oauth_callback(State(app_state), Query(params)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert_eq!(
+            token_hits.load(Ordering::SeqCst),
+            0,
+            "superseded-flow guard must reject before POSTing to the token endpoint"
+        );
+
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body_str.contains("superseded"),
+            "error page must explain the flow was superseded: {body_str}"
+        );
+
+        // The persisted DCR record is untouched by the rejected callback.
+        let loaded = tm.load_dcr(endpoint_name).await.unwrap().unwrap();
+        assert_eq!(loaded.client_id, "fresh-dcr-client");
+        assert!(loaded.registered_via_dcr);
     }
 
     /// After a successful interactive re-authorization the callback must

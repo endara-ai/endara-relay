@@ -1297,14 +1297,38 @@ async fn oauth_start(
         None
     };
 
+    // Snapshot of the on-disk requesting `client_id` at load time.
+    // Used by R4-4's fresh-registration compare-and-update below so the
+    // save's expected value corresponds to what was actually on disk
+    // when we read it — the issuer-mismatch tombstone transformation
+    // below rewrites `persisted_dcr.client_id` to `""` in memory only
+    // and must NOT be treated as the on-disk snapshot for the compare.
+    let persisted_dcr_disk_client_id: Option<String> = persisted_dcr
+        .as_ref()
+        .filter(|c| c.registered_via_dcr)
+        .map(|c| c.client_id.clone());
+
     // Credential-to-issuer binding: if the stored DCR credentials were
     // registered against a DIFFERENT authorization server issuer than the one
-    // we just discovered, discard them so resolution falls through to dynamic
-    // re-registration (RFC 7591), exactly as if no creds existed. Legacy creds
-    // with no stored issuer are reused as-is (backward compatibility).
+    // we just discovered, invalidate them so resolution falls through to
+    // dynamic re-registration (RFC 7591). Legacy creds with no stored issuer
+    // are reused as-is (backward compatibility).
+    //
+    // Only the issuer-bound *requesting* pair
+    // (`client_id`/`client_secret`/`issuer`) is invalidated: the operator-set
+    // `resource_client_id`/`resource_client_secret` pair is a distinct
+    // registration at the MCP Authorization Server (Step 3, RFC 7523
+    // ID-JAG redemption) that has no dependency on the requesting client's
+    // IdP issuer, and must be carried forward. Converting to `None` here
+    // and letting the fresh-registration branch below build the record with
+    // `..Default::default()` would silently erase the operator's manual
+    // resource pair (round-4 finding R4-1). Instead we hand the resolver a
+    // tombstone whose `client_id` is empty (forcing the DCR re-register
+    // path, which already preserves `resource_*` via the record it carries
+    // forward) but whose resource pair is intact.
     //
     // Only DCR-provenanced records (`registered_via_dcr == true`) participate
-    // in the issuer-mismatch discard. Manually-supplied credentials and
+    // in the issuer-mismatch invalidation. Manually-supplied credentials and
     // legacy files (which deserialize with `registered_via_dcr = false`) are
     // preserved unconditionally — auto-discarding them and then silently
     // re-registering would break the "manual credentials survive" promise.
@@ -1317,9 +1341,18 @@ async fn oauth_start(
                 endpoint = %name,
                 stored_issuer = ?creds.issuer,
                 current_issuer = ?issuer,
-                "DCR credential issuer changed; discarding stored credentials and re-registering"
+                "DCR credential issuer changed; invalidating requesting pair (resource pair preserved) and re-registering"
             );
-            None
+            Some(DcrCredentials {
+                client_id: String::new(),
+                client_secret: None,
+                client_secret_expires_at: 0,
+                registered_at: creds.registered_at,
+                issuer: None,
+                resource_client_id: creds.resource_client_id,
+                resource_client_secret: creds.resource_client_secret,
+                registered_via_dcr: true,
+            })
         }
         other => other,
     };
@@ -1350,24 +1383,75 @@ async fn oauth_start(
         match dcr::register_client(reg_endpoint, &redirect_uri, &name, allow_insecure_oauth).await {
             Ok(resp) => {
                 if let Some(ref tm) = state.token_manager {
-                    let new_creds = DcrCredentials {
-                        client_id: resp.client_id.clone(),
-                        client_secret: resp.client_secret.clone(),
-                        client_secret_expires_at: resp.client_secret_expires_at,
-                        registered_at: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                        issuer: issuer.clone(),
-                        // Preserve the per-endpoint MAS resource
-                        // credential pair (captured separately via
-                        // POST /credentials); it is a distinct
-                        // registration from the requesting client.
-                        resource_client_id: creds.resource_client_id.clone(),
-                        resource_client_secret: creds.resource_client_secret.clone(),
-                        registered_via_dcr: true,
-                    };
-                    if let Err(e) = tm.save_dcr(&name, &new_creds).await {
+                    // Compare-and-update via the atomic helper: only replace
+                    // the on-disk record when it still has the DCR provenance
+                    // AND its `client_id` matches the snapshot we resolved
+                    // before calling `register_client`. If a concurrent
+                    // `POST /credentials` landed between our snapshot and
+                    // this save (rotating to manual creds or replacing
+                    // resource_*), the compare fails and we leave the newer
+                    // operator-managed record on disk instead of clobbering
+                    // it. Round-4 finding R4-4.
+                    //
+                    // Note: the returned `(client_id, client_secret)` still
+                    // reflects the fresh DCR registration for the pending
+                    // authorize flow; only the persisted record follows the
+                    // operator's newer state.
+                    //
+                    // `expected_client_id` is the ORIGINAL on-disk id
+                    // captured at load time — not `creds.client_id`, which
+                    // the R4-1 issuer-mismatch branch may have rewritten
+                    // to `""` in memory (the file itself still holds the
+                    // pre-invalidation id until we save).
+                    let expected_client_id = persisted_dcr_disk_client_id.clone();
+                    let new_client_id = resp.client_id.clone();
+                    let new_client_secret = resp.client_secret.clone();
+                    let expires_at = resp.client_secret_expires_at;
+                    let bind_issuer = issuer.clone();
+                    let update_res: Result<Option<DcrCredentials>, TokenError> = tm
+                        .update_dcr(&name, |current| {
+                            let matches_snapshot = match (current.as_ref(), expected_client_id.as_deref()) {
+                                (Some(c), Some(expected)) => {
+                                    c.registered_via_dcr && c.client_id == expected
+                                }
+                                (None, None) => true,
+                                _ => false,
+                            };
+                            if !matches_snapshot {
+                                info!(
+                                    endpoint = %name,
+                                    expected_client_id = expected_client_id.as_deref().unwrap_or("<absent>"),
+                                    current_client_id = current
+                                        .as_ref()
+                                        .map(|c| c.client_id.as_str())
+                                        .unwrap_or("<absent>"),
+                                    current_registered_via_dcr = current
+                                        .as_ref()
+                                        .map(|c| c.registered_via_dcr)
+                                        .unwrap_or(false),
+                                    "Skipping fresh-DCR save: on-disk record diverged from snapshot (concurrent operator write)"
+                                );
+                                return Ok(current);
+                            }
+                            let (resource_client_id, resource_client_secret) = current
+                                .map(|c| (c.resource_client_id, c.resource_client_secret))
+                                .unwrap_or_default();
+                            Ok(Some(DcrCredentials {
+                                client_id: new_client_id.clone(),
+                                client_secret: new_client_secret.clone(),
+                                client_secret_expires_at: expires_at,
+                                registered_at: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                                issuer: bind_issuer.clone(),
+                                resource_client_id,
+                                resource_client_secret,
+                                registered_via_dcr: true,
+                            }))
+                        })
+                        .await;
+                    if let Err(e) = update_res {
                         warn!(
                             endpoint = %name,
                             error = %e,
@@ -10644,6 +10728,213 @@ command = "echo"
         let persisted = token_manager.load_dcr("ep1").await.unwrap().unwrap();
         assert!(persisted.client_id.is_empty());
         assert!(persisted.registered_via_dcr);
+    }
+
+    /// Round-4 finding R4-1: when the AS issuer changes, the DCR
+    /// requesting pair (`client_id`/`client_secret`/`issuer`) is
+    /// invalidated so `oauth_start` re-registers via RFC 7591, but the
+    /// operator-set `resource_client_id`/`resource_client_secret` pair is
+    /// a distinct MAS registration and MUST be carried through the
+    /// invalidation. Prior to the fix the mismatched record was collapsed
+    /// to `None`, and the fresh-registration branch built the new record
+    /// with `..Default::default()`, silently dropping the resource pair.
+    #[tokio::test]
+    async fn oauth_start_issuer_mismatch_preserves_resource_pair() {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "registration_endpoint": format!("{issuer}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        async fn register() -> Json<Value> {
+            Json(serde_json::json!({
+                "client_id": "fresh-dcr-client",
+                "client_secret": "fresh-dcr-secret",
+            }))
+        }
+        let router = Router::new()
+            .route("/.well-known/oauth-authorization-server", get(well_known))
+            .route("/register", post(register));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        // Persisted DCR record bound to a DIFFERENT issuer than the AS
+        // will now advertise, alongside an operator-set MAS resource pair.
+        let stored = DcrCredentials {
+            client_id: "stale-dcr-client".to_string(),
+            client_secret: Some("stale-dcr-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 0,
+            issuer: Some("https://old-idp.example.com".to_string()),
+            resource_client_id: Some("mas-resource-client".to_string()),
+            resource_client_secret: Some("mas-resource-secret".to_string()),
+            registered_via_dcr: true,
+        };
+        token_manager.save_dcr("ep1", &stored).await.unwrap();
+
+        let (mut state, flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].client_id = None;
+            cfg.endpoints[0].client_secret = None;
+        }
+        state.token_manager = Some(token_manager.clone());
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending flow was registered");
+        assert_eq!(
+            flow.client_id, "fresh-dcr-client",
+            "issuer mismatch must invalidate the requesting pair and drive re-registration"
+        );
+
+        let persisted = token_manager.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(persisted.client_id, "fresh-dcr-client");
+        assert!(persisted.registered_via_dcr);
+        assert_eq!(persisted.issuer.as_deref(), Some(base_url.as_str()));
+        assert_eq!(
+            persisted.resource_client_id.as_deref(),
+            Some("mas-resource-client"),
+            "operator-set MAS resource pair must survive issuer-mismatch invalidation"
+        );
+        assert_eq!(
+            persisted.resource_client_secret.as_deref(),
+            Some("mas-resource-secret")
+        );
+    }
+
+    /// Round-4 finding R4-4: the persist of a freshly-registered DCR
+    /// requesting client uses `update_dcr` (compare-and-update) so a
+    /// concurrent operator write that lands between our snapshot and this
+    /// save — for example, a `POST /credentials` that rotated to manual
+    /// credentials — SURVIVES intact instead of being clobbered. This
+    /// test simulates the race by letting the mock `/register` handler
+    /// block until the test manually rotates the persisted record via
+    /// `save_dcr` to a manual-provenance record, then unblocks.
+    #[tokio::test]
+    async fn oauth_start_reregister_save_does_not_clobber_concurrent_manual_rotation() {
+        use tokio::sync::oneshot;
+
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "registration_endpoint": format!("{issuer}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        // `/register` waits for the test to signal (via `tx_ready`) that
+        // the operator's concurrent manual write has landed, then returns
+        // the fresh DCR response. This deterministically interleaves the
+        // manual write between the caller's snapshot and its save.
+        struct RegState {
+            ready_tx: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
+            proceed_rx: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        }
+        async fn register(
+            axum::extract::State(s): axum::extract::State<Arc<RegState>>,
+        ) -> Json<Value> {
+            if let Some(tx) = s.ready_tx.lock().await.take() {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = s.proceed_rx.lock().await.take() {
+                let _ = rx.await;
+            }
+            Json(serde_json::json!({
+                "client_id": "fresh-dcr-client",
+                "client_secret": "fresh-dcr-secret",
+            }))
+        }
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+        let (proceed_tx, proceed_rx) = oneshot::channel::<()>();
+        let reg_state = Arc::new(RegState {
+            ready_tx: tokio::sync::Mutex::new(Some(ready_tx)),
+            proceed_rx: tokio::sync::Mutex::new(Some(proceed_rx)),
+        });
+        let router = Router::new()
+            .route("/.well-known/oauth-authorization-server", get(well_known))
+            .route("/register", post(register))
+            .with_state(reg_state);
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let stored = DcrCredentials {
+            client_id: "stale-dcr-client".to_string(),
+            client_secret: Some("stale-dcr-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 0,
+            issuer: Some(base_url.clone()),
+            resource_client_id: None,
+            resource_client_secret: None,
+            registered_via_dcr: true,
+        };
+        token_manager.save_dcr("ep1", &stored).await.unwrap();
+
+        let (mut state, _flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].client_id = None;
+            cfg.endpoints[0].client_secret = None;
+        }
+        state.token_manager = Some(token_manager.clone());
+
+        let app = management_routes(state);
+        let start_fut = tokio::spawn(async move {
+            app.oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        });
+
+        // Wait until the register handler is entered (proves the caller
+        // already read its snapshot of the DCR file) before rotating.
+        ready_rx.await.expect("register endpoint reached");
+        let manual = DcrCredentials {
+            client_id: "operator-manual-client".to_string(),
+            client_secret: Some("operator-manual-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 1_700_000_000,
+            issuer: None,
+            resource_client_id: None,
+            resource_client_secret: None,
+            registered_via_dcr: false,
+        };
+        token_manager.save_dcr("ep1", &manual).await.unwrap();
+        // Now let the mock AS finish returning the fresh DCR response.
+        proceed_tx.send(()).unwrap();
+
+        let resp = start_fut.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The persisted record must be the operator's manual write, not
+        // the concurrent DCR re-registration result.
+        let persisted = token_manager.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(persisted, manual, "concurrent manual rotation must survive");
     }
 
     // -----------------------------------------------------------------------
