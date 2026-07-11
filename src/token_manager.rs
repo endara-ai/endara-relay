@@ -165,11 +165,21 @@ pub fn merge_scopes(prior: Option<&str>, requested: &str) -> String {
 /// its current access token in an `RwLock`.
 pub struct TokenManager {
     token_dir: PathBuf,
+    /// Serializes DCR read-modify-write operations (`save_dcr`, `delete_dcr`,
+    /// `clear_dcr_requesting_client`) so a self-heal cannot interleave with a
+    /// concurrent re-registration or manual credential update and either
+    /// overwrite a newer record or be overwritten itself. Read-only paths
+    /// (`load_dcr`) do not take this lock; they observe whichever
+    /// atomically-renamed snapshot is on disk when they run.
+    dcr_write_lock: tokio::sync::Mutex<()>,
 }
 
 impl TokenManager {
     pub fn new(token_dir: PathBuf) -> Self {
-        Self { token_dir }
+        Self {
+            token_dir,
+            dcr_write_lock: tokio::sync::Mutex::new(()),
+        }
     }
 
     /// Save tokens for an endpoint. File written atomically (write to .tmp, rename).
@@ -210,8 +220,23 @@ impl TokenManager {
     }
 
     /// Save DCR credentials for an endpoint. File written atomically (write to .tmp, rename).
-    /// File permissions: 0600 on Unix.
+    /// File permissions: 0600 on Unix. Serialized against other DCR writers
+    /// (`delete_dcr`, `clear_dcr_requesting_client`) via `dcr_write_lock` so
+    /// a self-heal running concurrently cannot delete/overwrite a newer
+    /// record persisted here.
     pub async fn save_dcr(
+        &self,
+        endpoint_name: &str,
+        creds: &DcrCredentials,
+    ) -> Result<(), TokenError> {
+        let _guard = self.dcr_write_lock.lock().await;
+        self.save_dcr_locked(endpoint_name, creds).await
+    }
+
+    /// Inner `save_dcr` body executed while the DCR write lock is held. Split
+    /// out so `clear_dcr_requesting_client` can perform its read-modify-write
+    /// (load → compare → save/delete) under a single lock acquisition.
+    async fn save_dcr_locked(
         &self,
         endpoint_name: &str,
         creds: &DcrCredentials,
@@ -245,7 +270,15 @@ impl TokenManager {
     }
 
     /// Delete DCR credentials for an endpoint. No-op if file doesn't exist.
+    /// Serialized against other DCR writers (`save_dcr`,
+    /// `clear_dcr_requesting_client`) via `dcr_write_lock`.
     pub async fn delete_dcr(&self, endpoint_name: &str) -> Result<(), TokenError> {
+        let _guard = self.dcr_write_lock.lock().await;
+        self.delete_dcr_locked(endpoint_name).await
+    }
+
+    /// Inner `delete_dcr` body executed while the DCR write lock is held.
+    async fn delete_dcr_locked(&self, endpoint_name: &str) -> Result<(), TokenError> {
         let path = self.token_dir.join(format!("{}.dcr.json", endpoint_name));
         match tokio::fs::remove_file(&path).await {
             Ok(()) => Ok(()),
@@ -262,13 +295,25 @@ impl TokenManager {
     /// re-registration that replaced the file with a NEWER `client_id` must
     /// survive this call. The optional `resource_client_id` /
     /// `resource_client_secret` pair is a distinct registration and is always
-    /// preserved. When clearing empties the record entirely (no resource
-    /// pair, no requesting id), the underlying file is deleted so the next
-    /// authorize triggers a fresh RFC 7591 registration.
+    /// preserved.
+    ///
+    /// The cleared record intentionally KEEPS `registered_via_dcr = true`
+    /// even for pure-DCR (no resource pair) records: it is the auth-start
+    /// resolution signal that this endpoint must re-register via RFC 7591
+    /// rather than reuse the stale `client_id` still baked into
+    /// `config.toml` by the setup commit. If the file were deleted (or
+    /// `registered_via_dcr` cleared to `false`), the next interactive
+    /// Authorize would fall through to the config-branch, POST the dead
+    /// TOML `client_id`, and loop.
+    ///
+    /// Serialized against concurrent `save_dcr` / `delete_dcr` /
+    /// `clear_dcr_requesting_client` via `dcr_write_lock`, so the
+    /// load-then-write sequence is race-free with respect to a concurrent
+    /// re-registration that replaced the record with a newer `client_id`.
     ///
     /// Returns:
-    /// * `Ok(true)` when the requesting pair was cleared (or the file
-    ///   removed) because `expected_client_id` matched.
+    /// * `Ok(true)` when the requesting pair was cleared because
+    ///   `expected_client_id` matched.
     /// * `Ok(false)` when the record was absent OR the stored `client_id`
     ///   did not match (nothing was mutated).
     /// * `Err(_)` on IO / serialization failure.
@@ -277,17 +322,12 @@ impl TokenManager {
         endpoint_name: &str,
         expected_client_id: &str,
     ) -> Result<bool, TokenError> {
+        let _guard = self.dcr_write_lock.lock().await;
         let Some(existing) = self.load_dcr(endpoint_name).await? else {
             return Ok(false);
         };
         if existing.client_id != expected_client_id {
             return Ok(false);
-        }
-        // Nothing worth keeping → drop the file so the next authorize starts
-        // clean without a stub record on disk.
-        if existing.resource_client_id.is_none() && existing.resource_client_secret.is_none() {
-            self.delete_dcr(endpoint_name).await?;
-            return Ok(true);
         }
         let cleared = DcrCredentials {
             client_id: String::new(),
@@ -297,9 +337,11 @@ impl TokenManager {
             issuer: None,
             resource_client_id: existing.resource_client_id,
             resource_client_secret: existing.resource_client_secret,
-            registered_via_dcr: false,
+            // Preserve the DCR provenance signal so the next interactive
+            // Authorize takes the RFC 7591 re-registration heal path.
+            registered_via_dcr: existing.registered_via_dcr,
         };
-        self.save_dcr(endpoint_name, &cleared).await?;
+        self.save_dcr_locked(endpoint_name, &cleared).await?;
         Ok(true)
     }
 
@@ -562,7 +604,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn clear_dcr_requesting_client_deletes_pure_dcr_record() {
+    async fn clear_dcr_requesting_client_pure_dcr_retains_provenance_stub() {
         let tmp = tempfile::tempdir().unwrap();
         let mgr = TokenManager::new(tmp.path().to_path_buf());
         let creds = DcrCredentials {
@@ -578,9 +620,17 @@ mod tests {
             .await
             .unwrap();
         assert!(cleared);
+        let loaded = mgr
+            .load_dcr("ep")
+            .await
+            .unwrap()
+            .expect("pure-DCR self-heal must retain a stub record so auth-start re-registers");
+        assert_eq!(loaded.client_id, "");
+        assert!(loaded.client_secret.is_none());
+        assert!(loaded.issuer.is_none());
         assert!(
-            mgr.load_dcr("ep").await.unwrap().is_none(),
-            "record with no resource_* pair must be removed entirely"
+            loaded.registered_via_dcr,
+            "registered_via_dcr must survive so auth-start prefers re-registration over the stale config.toml client_id"
         );
     }
 
@@ -609,7 +659,10 @@ mod tests {
         let loaded = mgr.load_dcr("ep").await.unwrap().expect("record persists");
         assert_eq!(loaded.client_id, "");
         assert!(loaded.client_secret.is_none());
-        assert!(!loaded.registered_via_dcr);
+        assert!(
+            loaded.registered_via_dcr,
+            "mixed-record self-heal must retain the DCR provenance flag so auth-start prefers re-registration over the stale config.toml client_id"
+        );
         assert!(loaded.issuer.is_none());
         assert_eq!(
             loaded.resource_client_id.as_deref(),

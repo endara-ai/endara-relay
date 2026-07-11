@@ -409,6 +409,23 @@ impl OAuthAdapterInner {
         }
     }
 
+    /// Snapshot the effective `(client_id, client_secret)` pair under a
+    /// single `client_credentials_override` read guard. Callers must use
+    /// this — not two `effective_client_*` reads — whenever they need both
+    /// halves atomically, because `set_client_credentials` can rotate the
+    /// pair between two separate acquisitions and let a refresh POST an
+    /// old id with a new secret (or vice-versa).
+    pub async fn effective_client_pair(&self) -> (String, Option<String>) {
+        if let Some((id, secret)) = self.client_credentials_override.read().await.as_ref() {
+            (id.clone(), secret.clone())
+        } else {
+            (
+                self.config.client_id.clone(),
+                self.config.client_secret.clone(),
+            )
+        }
+    }
+
     /// Install (or replace) the in-memory client-credentials override.
     ///
     /// Used by the management `/oauth/callback` handler to propagate the
@@ -498,12 +515,21 @@ impl OAuthAdapterInner {
         self.transition_to(OAuthState::Refreshing, "starting token refresh")
             .await;
 
+        // Snapshot the requesting (client_id, client_secret) under a single
+        // `client_credentials_override` read guard so a concurrent
+        // `set_client_credentials` cannot swap the pair between the two
+        // reads and let this refresh POST an old id with a new secret.
+        // The exact posted client_id is threaded into
+        // `handle_invalid_client_if_present` so an eventual `invalid_client`
+        // heal targets the id we actually presented — never one re-read
+        // after the fact.
+        let (posted_client_id, posted_client_secret) = self.effective_client_pair().await;
         let mut form_parts: Vec<(&str, String)> = vec![
             ("grant_type", "refresh_token".to_string()),
             ("refresh_token", refresh_token),
-            ("client_id", self.effective_client_id().await),
+            ("client_id", posted_client_id.clone()),
         ];
-        if let Some(secret) = self.effective_client_secret().await {
+        if let Some(secret) = posted_client_secret {
             form_parts.push(("client_secret", secret));
         }
 
@@ -525,8 +551,15 @@ impl OAuthAdapterInner {
                 Ok(token_set)
             }
             TokenPostOutcome::NotFound { status, body } => {
-                self.handle_refresh_404(&form_body, &initial_url, &correlation_id, status, body)
-                    .await
+                self.handle_refresh_404(
+                    &form_body,
+                    &initial_url,
+                    &correlation_id,
+                    &posted_client_id,
+                    status,
+                    body,
+                )
+                .await
             }
             TokenPostOutcome::HttpError { status, body } => {
                 error!(
@@ -536,7 +569,9 @@ impl OAuthAdapterInner {
                     "Token refresh failed"
                 );
                 self.metrics.inc_refresh_failure();
-                let reason = self.handle_invalid_client_if_present(&body).await;
+                let reason = self
+                    .handle_invalid_client_if_present(&body, &posted_client_id)
+                    .await;
                 self.transition_to(OAuthState::AuthRequired, reason).await;
                 Err(OAuthError::RefreshFailed { status, body })
             }
@@ -571,33 +606,41 @@ impl OAuthAdapterInner {
     /// Inspect an OAuth token-endpoint error body for `invalid_client` (RFC
     /// 6749 §5.2). If the current endpoint's DCR record was minted by the
     /// relay (`registered_via_dcr == true`) AND the stored `client_id` still
-    /// matches the one this refresh presented, atomically clear ONLY the
-    /// requesting `client_id`/`client_secret` pair (via
-    /// [`TokenManager::clear_dcr_requesting_client`]) so the next authorize
-    /// triggers a fresh RFC 7591 registration and returns a distinct
-    /// transition reason. Manually-supplied credentials
+    /// matches `posted_client_id` (the id this refresh actually presented),
+    /// atomically clear ONLY the requesting `client_id`/`client_secret`
+    /// pair (via [`TokenManager::clear_dcr_requesting_client`]) so the next
+    /// authorize triggers a fresh RFC 7591 registration and returns a
+    /// distinct transition reason. Manually-supplied credentials
     /// (`registered_via_dcr == false`), a stored `client_id` that no longer
     /// matches (i.e. a concurrent re-registration replaced the record), and
     /// endpoints with no DCR record are never auto-discarded; the caller
     /// receives the generic `"token refresh failed"` reason. Operator-set
     /// `resource_client_id`/`resource_client_secret` are preserved.
-    async fn handle_invalid_client_if_present(&self, body: &str) -> &'static str {
+    ///
+    /// `posted_client_id` is snapshotted by the caller under the same
+    /// `client_credentials_override` guard as the posted secret, so a
+    /// concurrent `set_client_credentials` cannot cause the self-heal to
+    /// target a different id than the one that actually failed.
+    async fn handle_invalid_client_if_present(
+        &self,
+        body: &str,
+        posted_client_id: &str,
+    ) -> &'static str {
         if !is_invalid_client_error(body) {
             return "token refresh failed";
         }
         let endpoint = &self.config.endpoint_name;
-        let requesting_client_id = self.effective_client_id().await;
         match self.token_manager.load_dcr(endpoint).await {
             Ok(Some(creds)) if creds.registered_via_dcr => {
                 match self
                     .token_manager
-                    .clear_dcr_requesting_client(endpoint, &requesting_client_id)
+                    .clear_dcr_requesting_client(endpoint, posted_client_id)
                     .await
                 {
                     Ok(true) => {
                         info!(
                             endpoint = %endpoint,
-                            client_id = %requesting_client_id,
+                            client_id = %posted_client_id,
                             "Cleared stale DCR requesting client after invalid_client at token endpoint"
                         );
                         "client registration invalidated; re-authorize to re-register"
@@ -605,7 +648,7 @@ impl OAuthAdapterInner {
                     Ok(false) => {
                         info!(
                             endpoint = %endpoint,
-                            failing_client_id = %requesting_client_id,
+                            failing_client_id = %posted_client_id,
                             stored_client_id = %creds.client_id,
                             "invalid_client for stale client_id; a newer registration is already persisted"
                         );
@@ -774,11 +817,19 @@ impl OAuthAdapterInner {
     /// endpoint and the retry succeeds; otherwise returns the original
     /// `RefreshFailed` error (the retry-failure path also transitions to
     /// `AuthRequired`, matching the pre-existing non-2xx behavior).
+    ///
+    /// `posted_client_id` is threaded through so that a retry against the
+    /// rediscovered token endpoint which returns an OAuth error body
+    /// containing `invalid_client` triggers the same self-heal as the
+    /// primary refresh path — otherwise a rediscovered endpoint proving the
+    /// requesting client dead would leave the stale DCR record intact and
+    /// loop.
     async fn handle_refresh_404(
         self: &Arc<Self>,
         form_body: &str,
         initial_url: &str,
         correlation_id: &str,
+        posted_client_id: &str,
         status: reqwest::StatusCode,
         body: String,
     ) -> Result<TokenSet, OAuthError> {
@@ -854,6 +905,27 @@ impl OAuthAdapterInner {
                     "Token refresh successful after rediscovery"
                 );
                 Ok(token_set)
+            }
+            // A rediscovered token endpoint may itself return an OAuth
+            // error body (e.g. `invalid_client` when the AS purged our
+            // registration); run the same self-heal as the primary refresh
+            // path so the rediscovery-and-retry route can also invalidate
+            // stale DCR credentials.
+            TokenPostOutcome::HttpError {
+                status: retry_status,
+                body: retry_body,
+            } => {
+                warn!(
+                    correlation_id = %correlation_id,
+                    %retry_status,
+                    "Token refresh retry after rediscovery failed with HTTP error; returning original 404"
+                );
+                self.metrics.inc_refresh_failure();
+                let reason = self
+                    .handle_invalid_client_if_present(&retry_body, posted_client_id)
+                    .await;
+                self.transition_to(OAuthState::AuthRequired, reason).await;
+                Err(original_err)
             }
             other => {
                 warn!(
@@ -2678,11 +2750,13 @@ mod tests {
 
     /// `invalid_client` (RFC 6749 §5.2) from the token endpoint with a
     /// DCR-registered record whose `client_id` matches the requesting
-    /// client must atomically clear the stale `{name}.dcr.json`, land in
+    /// client must atomically clear the stale requesting pair, land in
     /// `AuthRequired`, and record a distinct transition reason so callers
-    /// surface a re-authorize hint.
+    /// surface a re-authorize hint. The record itself is preserved as a
+    /// stub with `registered_via_dcr = true` so the next authorize prefers
+    /// re-registration over any stale `config.toml` `client_id`.
     #[tokio::test]
-    async fn do_token_refresh_invalid_client_deletes_dcr_registered_record() {
+    async fn do_token_refresh_invalid_client_clears_dcr_registered_record() {
         use crate::token_manager::DcrCredentials;
 
         let (url, server) = spawn_token_server("invalid_client").await;
@@ -2713,9 +2787,16 @@ mod tests {
             result
         );
 
+        let loaded = tm
+            .load_dcr("test")
+            .await
+            .unwrap()
+            .expect("pure-DCR self-heal must retain a stub record so auth-start re-registers");
+        assert_eq!(loaded.client_id, "");
+        assert!(loaded.client_secret.is_none());
         assert!(
-            tm.load_dcr("test").await.unwrap().is_none(),
-            "invalid_client with a matching DCR-registered record must remove {{name}}.dcr.json (no resource_* to preserve)"
+            loaded.registered_via_dcr,
+            "registered_via_dcr must survive so auth-start prefers re-registration over the stale config.toml client_id"
         );
         assert_eq!(
             adapter.inner.state.read().await.clone(),
@@ -2771,7 +2852,10 @@ mod tests {
             .expect("mixed record must persist so the resource pair is retained");
         assert_eq!(loaded.client_id, "");
         assert!(loaded.client_secret.is_none());
-        assert!(!loaded.registered_via_dcr);
+        assert!(
+            loaded.registered_via_dcr,
+            "mixed-record self-heal must retain the DCR provenance flag so auth-start prefers re-registration over the stale config.toml client_id"
+        );
         assert_eq!(loaded.resource_client_id.as_deref(), Some("mas-resource"));
         assert_eq!(
             loaded.resource_client_secret.as_deref(),
@@ -3435,6 +3519,12 @@ mod tests {
 
     /// Shared in/out counters and canned responses for the discovery test
     /// fixture. `None` for any of the metadata fields means "respond 404".
+    ///
+    /// `new_token_error_body`, when set, overrides `new_token_response` and
+    /// causes `/new/token` to respond with HTTP 400 and a raw OAuth error
+    /// body (e.g. `{"error":"invalid_client"}`) — used by the round-2 R6
+    /// regression that exercises `handle_refresh_404`'s retry path
+    /// self-heal.
     #[derive(Clone, Default)]
     struct DiscoveryFixtureOpts {
         new_token_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -3444,6 +3534,7 @@ mod tests {
         pr_metadata: Option<serde_json::Value>,
         as_metadata: Option<serde_json::Value>,
         new_token_response: Option<serde_json::Value>,
+        new_token_error_body: Option<String>,
     }
 
     /// Build a `DiscoveryFixtureOpts` pre-populated with a valid protected-
@@ -3503,6 +3594,7 @@ mod tests {
             pr_metadata: Arc<Option<Value>>,
             as_metadata: Arc<Option<Value>>,
             new_token_response: Arc<Option<Value>>,
+            new_token_error_body: Arc<Option<String>>,
         }
 
         async fn old_token(State(fx): State<Fx>) -> impl IntoResponse {
@@ -3513,6 +3605,9 @@ mod tests {
         async fn new_token(State(fx): State<Fx>) -> impl IntoResponse {
             fx.new_token_count
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(body) = fx.new_token_error_body.as_ref() {
+                return (StatusCode::BAD_REQUEST, body.clone()).into_response();
+            }
             match fx.new_token_response.as_ref() {
                 Some(v) => (StatusCode::OK, Json(v.clone())).into_response(),
                 None => (StatusCode::NOT_FOUND, "not found").into_response(),
@@ -3543,6 +3638,7 @@ mod tests {
             pr_metadata: Arc::new(opts.pr_metadata),
             as_metadata: Arc::new(opts.as_metadata),
             new_token_response: Arc::new(opts.new_token_response),
+            new_token_error_body: Arc::new(opts.new_token_error_body),
         };
 
         let router = Router::new()
@@ -3794,6 +3890,100 @@ mod tests {
             new_token_count.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "new token endpoint must NOT be POSTed without discovery"
+        );
+
+        server.abort();
+    }
+
+    /// Regression for PR #130 round-2 finding R6: when the primary token
+    /// endpoint returns 404 and OAuth discovery rediscovers a new endpoint,
+    /// but that retried endpoint returns an OAuth error body containing
+    /// `invalid_client`, `handle_refresh_404` must run the same self-heal
+    /// as the primary refresh path — clearing the requesting DCR pair and
+    /// emitting the "client registration invalidated" transition reason
+    /// — otherwise a rediscovery-and-retry route with a purged AS
+    /// registration would leave the stale DCR record intact and loop.
+    #[tokio::test]
+    async fn refresh_404_retry_invalid_client_triggers_self_heal() {
+        use crate::token_manager::DcrCredentials;
+
+        let (listener, base) = reserve_port().await;
+        let mut opts = happy_discovery_opts(&base);
+        opts.new_token_error_body = Some(
+            "{\"error\":\"invalid_client\",\"error_description\":\"unknown client\"}".to_string(),
+        );
+        // Clear the happy-path 200 body so we exercise the 400 branch.
+        opts.new_token_response = None;
+        let new_token_count = opts.new_token_count.clone();
+        let old_token_count = opts.old_token_count.clone();
+        let server = spawn_discovery_fixture_on(listener, opts).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        tm.save_dcr(
+            "test",
+            &DcrCredentials {
+                client_id: "test-client".to_string(),
+                client_secret: Some("test-secret".to_string()),
+                registered_via_dcr: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut config = make_config();
+        config.url = base.clone();
+        config.token_endpoint_url = format!("{}/old/token", base);
+        config.client_secret = Some("test-secret".to_string());
+        config.allow_insecure_oauth = true;
+        let adapter = make_adapter_with_shared_tm(config, tm.clone()).await;
+
+        let result = adapter.inner.do_token_refresh().await;
+        assert!(
+            matches!(result, Err(OAuthError::RefreshFailed { .. })),
+            "expected RefreshFailed after failed retry, got {:?}",
+            result
+        );
+
+        assert_eq!(
+            old_token_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "old token endpoint must be hit exactly once"
+        );
+        assert_eq!(
+            new_token_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "rediscovered token endpoint must be retried exactly once"
+        );
+
+        // Self-heal must fire even though the failure surfaced through the
+        // rediscovery-and-retry path: the record persists as a stub with
+        // the requesting pair cleared but the DCR provenance flag intact.
+        let loaded = tm
+            .load_dcr("test")
+            .await
+            .unwrap()
+            .expect("post-self-heal stub must persist");
+        assert_eq!(loaded.client_id, "");
+        assert!(loaded.client_secret.is_none());
+        assert!(
+            loaded.registered_via_dcr,
+            "registered_via_dcr must survive so the next authorize re-registers"
+        );
+
+        assert_eq!(
+            adapter.inner.state.read().await.clone(),
+            OAuthState::AuthRequired,
+            "retry-with-invalid_client must still land in AuthRequired"
+        );
+        let history = adapter.inner.transition_history.read().await;
+        assert!(
+            history
+                .iter()
+                .any(|r| r.reason == "client registration invalidated; re-authorize to re-register"),
+            "rediscovery/retry self-heal must emit the same distinct transition reason as the primary refresh path, got: {:?}",
+            history.iter().map(|r| r.reason.clone()).collect::<Vec<_>>()
         );
 
         server.abort();

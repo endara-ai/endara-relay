@@ -5819,7 +5819,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oauth_callback_invalid_client_deletes_dcr_registered_record() {
+    async fn oauth_callback_invalid_client_clears_dcr_registered_record() {
         use crate::token_manager::DcrCredentials;
         use axum::body::to_bytes;
 
@@ -5866,9 +5866,14 @@ mod tests {
         let resp = oauth_callback(State(app_state), Query(params)).await;
         assert_eq!(resp.status(), StatusCode::OK);
 
+        let loaded = tm.load_dcr(endpoint_name).await.unwrap().expect(
+            "pure-DCR self-heal must retain a stub record so the next authorize re-registers",
+        );
+        assert_eq!(loaded.client_id, "");
+        assert!(loaded.client_secret.is_none());
         assert!(
-            tm.load_dcr(endpoint_name).await.unwrap().is_none(),
-            "invalid_client at code exchange must delete the DCR-registered record"
+            loaded.registered_via_dcr,
+            "registered_via_dcr must survive so the next authorize prefers re-registration over the stale config.toml client_id"
         );
 
         let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
@@ -5993,7 +5998,10 @@ mod tests {
             .expect("mixed record must persist so the resource pair is retained");
         assert_eq!(loaded.client_id, "");
         assert!(loaded.client_secret.is_none());
-        assert!(!loaded.registered_via_dcr);
+        assert!(
+            loaded.registered_via_dcr,
+            "mixed-record self-heal must retain the DCR provenance flag so the next authorize prefers re-registration over the stale config.toml client_id"
+        );
         assert_eq!(loaded.resource_client_id.as_deref(), Some("mas-resource"));
         assert_eq!(
             loaded.resource_client_secret.as_deref(),
