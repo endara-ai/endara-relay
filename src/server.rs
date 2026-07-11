@@ -2052,11 +2052,49 @@ async fn oauth_callback(
         let status = token_response.status();
         let body = token_response.text().await.unwrap_or_default();
         error!(%status, body = %body, "Token endpoint returned error");
-        return oauth_html_response(format!(
-            "<html><body><h1>OAuth Error</h1><p>Token endpoint returned {}: {}</p><p>You can close this window.</p></body></html>",
-            html_escape(status.as_str()),
-            html_escape(&body)
-        ));
+
+        // RFC 6749 §5.2: `invalid_client` means the AS no longer recognizes
+        // the presented `client_id`. If this endpoint's credentials were
+        // minted via DCR (`registered_via_dcr == true`), discard the stale
+        // record so the next Authorize triggers a fresh RFC 7591
+        // registration. Manually-supplied credentials
+        // (`registered_via_dcr == false`) are never auto-deleted.
+        let mut discarded_dcr = false;
+        if crate::adapter::oauth::is_invalid_client_error(&body) {
+            if let Some(ref tm) = state.token_manager {
+                if let Ok(Some(creds)) = tm.load_dcr(&flow.endpoint_name).await {
+                    if creds.registered_via_dcr {
+                        if let Err(e) = tm.delete_dcr(&flow.endpoint_name).await {
+                            error!(
+                                endpoint = %flow.endpoint_name,
+                                error = %e,
+                                "Failed to delete stale DCR credentials after invalid_client"
+                            );
+                        } else {
+                            discarded_dcr = true;
+                            info!(
+                                endpoint = %flow.endpoint_name,
+                                "Discarded stale DCR credentials after invalid_client during code exchange"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let error_html = if discarded_dcr {
+            format!(
+                "<html><body><h1>OAuth Error</h1><p>The authorization server no longer recognizes this client (<code>invalid_client</code>). The stale client registration for <strong>{}</strong> has been discarded — please click <em>Authorize</em> again to register a fresh client.</p><p>You can close this window.</p></body></html>",
+                html_escape(&flow.endpoint_name)
+            )
+        } else {
+            format!(
+                "<html><body><h1>OAuth Error</h1><p>Token endpoint returned {}: {}</p><p>You can close this window.</p></body></html>",
+                html_escape(status.as_str()),
+                html_escape(&body)
+            )
+        };
+        return oauth_html_response(error_html);
     }
 
     let token_json: serde_json::Value = match token_response.json().await {
@@ -5726,6 +5764,143 @@ mod tests {
             .is_none());
         // But the ordinary access token was still saved for the endpoint.
         assert!(tm.load("regular-ep").await.unwrap().is_some());
+    }
+
+    // --- invalid_client detection at the code-exchange step ---
+
+    /// Spawn a mock OAuth token endpoint that always returns HTTP 401 with
+    /// `{"error":"invalid_client"}`, mirroring an authorization server that
+    /// has purged the relay's dynamically-registered client.
+    async fn spawn_invalid_client_token_endpoint() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::http::StatusCode;
+        use axum::{response::IntoResponse, routing::post, Router};
+        async fn handler() -> impl IntoResponse {
+            (StatusCode::UNAUTHORIZED, "{\"error\":\"invalid_client\"}")
+        }
+        let router = Router::new().route("/token", post(handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}/token", addr.port()), handle)
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_invalid_client_deletes_dcr_registered_record() {
+        use crate::token_manager::DcrCredentials;
+        use axum::body::to_bytes;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let endpoint_name = "invalid-client-ep";
+        tm.save_dcr(
+            endpoint_name,
+            &DcrCredentials {
+                client_id: "dcr-client-123".to_string(),
+                registered_via_dcr: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let (token_endpoint, _server) = spawn_invalid_client_token_endpoint().await;
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let pkce = crate::oauth::PkceChallenge::generate();
+        let state_param = flow_mgr
+            .start_flow(
+                endpoint_name,
+                &token_endpoint,
+                "dcr-client-123",
+                None,
+                pkce,
+                "http://127.0.0.1:9400/oauth/callback",
+                None,
+                false,
+            )
+            .await;
+
+        let mut app_state = test_app_state();
+        app_state.oauth_flow_manager = Some(flow_mgr);
+        app_state.token_manager = Some(tm.clone());
+
+        let params = OAuthCallbackParams {
+            code: Some("authcode".to_string()),
+            state: Some(state_param),
+            error: None,
+            iss: None,
+        };
+        let resp = oauth_callback(State(app_state), Query(params)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert!(
+            tm.load_dcr(endpoint_name).await.unwrap().is_none(),
+            "invalid_client at code exchange must delete the DCR-registered record"
+        );
+
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body_str.contains("invalid_client"),
+            "error page should surface the invalid_client cause: {body_str}"
+        );
+        assert!(
+            body_str.contains("Authorize"),
+            "error page should invite the user to click Authorize again: {body_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_callback_invalid_client_preserves_manual_record() {
+        use crate::token_manager::DcrCredentials;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let endpoint_name = "manual-ep";
+        let manual = DcrCredentials {
+            client_id: "manual-client-abc".to_string(),
+            registered_via_dcr: false,
+            ..Default::default()
+        };
+        tm.save_dcr(endpoint_name, &manual).await.unwrap();
+
+        let (token_endpoint, _server) = spawn_invalid_client_token_endpoint().await;
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let pkce = crate::oauth::PkceChallenge::generate();
+        let state_param = flow_mgr
+            .start_flow(
+                endpoint_name,
+                &token_endpoint,
+                "manual-client-abc",
+                None,
+                pkce,
+                "http://127.0.0.1:9400/oauth/callback",
+                None,
+                false,
+            )
+            .await;
+
+        let mut app_state = test_app_state();
+        app_state.oauth_flow_manager = Some(flow_mgr);
+        app_state.token_manager = Some(tm.clone());
+
+        let params = OAuthCallbackParams {
+            code: Some("authcode".to_string()),
+            state: Some(state_param),
+            error: None,
+            iss: None,
+        };
+        let resp = oauth_callback(State(app_state), Query(params)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let loaded = tm
+            .load_dcr(endpoint_name)
+            .await
+            .unwrap()
+            .expect("manual credential record must be preserved on invalid_client");
+        assert_eq!(loaded, manual);
     }
 
     // --- /mcp/sse + initialize tools.listChanged capability ---

@@ -55,6 +55,22 @@ fn form_urlencode(s: &str) -> String {
 /// against and forces a deliberate review of any future change.
 const REFRESH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Detect an RFC 6749 §5.2 `invalid_client` token-endpoint error body.
+///
+/// Returns `true` iff `body` parses as JSON with a top-level `"error"` string
+/// exactly equal to `"invalid_client"`. Non-JSON bodies, missing/other error
+/// codes, and non-string `error` values all return `false`, so this sniff is
+/// safe to run on any token-endpoint response body without accidentally
+/// triggering the DCR self-heal on unrelated errors (`invalid_grant`,
+/// `invalid_request`, HTML error pages, etc.).
+pub(crate) fn is_invalid_client_error(body: &str) -> bool {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(str::to_owned))
+        .as_deref()
+        == Some("invalid_client")
+}
+
 /// Resolved Enterprise-Managed Authorization (EMA, END-18) parameters for an
 /// endpoint whose `[endpoints.auth] type = "ema"`. Present on
 /// [`OAuthAdapterConfig::ema`] only for EMA endpoints; `None` leaves the adapter
@@ -472,8 +488,8 @@ impl OAuthAdapterInner {
                     "Token refresh failed"
                 );
                 self.metrics.inc_refresh_failure();
-                self.transition_to(OAuthState::AuthRequired, "token refresh failed")
-                    .await;
+                let reason = self.handle_invalid_client_if_present(&body).await;
+                self.transition_to(OAuthState::AuthRequired, reason).await;
                 Err(OAuthError::RefreshFailed { status, body })
             }
             TokenPostOutcome::Network(e) => {
@@ -501,6 +517,40 @@ impl OAuthAdapterInner {
                 .await;
                 Err(OAuthError::Http(e))
             }
+        }
+    }
+
+    /// Inspect an OAuth token-endpoint error body for `invalid_client` (RFC
+    /// 6749 §5.2). If the current endpoint's DCR record was minted by the
+    /// relay (`registered_via_dcr == true`), delete the stale record so the
+    /// next authorize triggers a fresh RFC 7591 registration and returns a
+    /// distinct transition reason. Manually-supplied credentials
+    /// (`registered_via_dcr == false`) and endpoints with no DCR record are
+    /// never auto-discarded; the caller receives the generic
+    /// `"token refresh failed"` reason.
+    async fn handle_invalid_client_if_present(&self, body: &str) -> &'static str {
+        if !is_invalid_client_error(body) {
+            return "token refresh failed";
+        }
+        let endpoint = &self.config.endpoint_name;
+        match self.token_manager.load_dcr(endpoint).await {
+            Ok(Some(creds)) if creds.registered_via_dcr => {
+                if let Err(e) = self.token_manager.delete_dcr(endpoint).await {
+                    error!(
+                        endpoint = %endpoint,
+                        error = %e,
+                        "Failed to delete stale DCR credentials after invalid_client"
+                    );
+                    "token refresh failed"
+                } else {
+                    info!(
+                        endpoint = %endpoint,
+                        "Discarded stale DCR credentials after invalid_client at token endpoint"
+                    );
+                    "client registration invalidated; re-authorize to re-register"
+                }
+            }
+            _ => "token refresh failed",
         }
     }
 
@@ -2292,10 +2342,14 @@ mod tests {
         async fn malformed() -> impl IntoResponse {
             (StatusCode::OK, "not json")
         }
+        async fn invalid_client() -> impl IntoResponse {
+            (StatusCode::UNAUTHORIZED, "{\"error\":\"invalid_client\"}")
+        }
 
         let router = match mode {
             "400" => Router::new().route("/token", post(bad_request)),
             "malformed" => Router::new().route("/token", post(malformed)),
+            "invalid_client" => Router::new().route("/token", post(invalid_client)),
             other => panic!("unknown spawn_token_server mode: {}", other),
         };
 
@@ -2423,6 +2477,177 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    /// Helper: build an adapter that shares the given `TokenManager` (so the
+    /// test can pre-seed `{endpoint}.dcr.json`) and is pre-loaded with a
+    /// refresh token so `do_token_refresh` reaches the network call.
+    async fn make_adapter_with_shared_tm(
+        config: OAuthAdapterConfig,
+        tm: Arc<TokenManager>,
+    ) -> OAuthAdapter {
+        let adapter = OAuthAdapter::new(config, tm);
+        *adapter.inner.tokens.write().await = Some(TokenSet {
+            access_token: "old-access".to_string(),
+            refresh_token: Some("test-refresh".to_string()),
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        });
+        adapter
+    }
+
+    /// `invalid_client` (RFC 6749 §5.2) from the token endpoint with a
+    /// DCR-registered record must delete the stale `{name}.dcr.json`, land
+    /// in `AuthRequired`, and record a distinct transition reason so
+    /// callers surface a re-authorize hint.
+    #[tokio::test]
+    async fn do_token_refresh_invalid_client_deletes_dcr_registered_record() {
+        use crate::token_manager::DcrCredentials;
+
+        let (url, server) = spawn_token_server("invalid_client").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        // Seed a DCR-minted credential record for the endpoint.
+        tm.save_dcr(
+            "test",
+            &DcrCredentials {
+                client_id: "dcr-client-123".to_string(),
+                registered_via_dcr: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let mut config = make_config();
+        config.token_endpoint_url = url;
+        let adapter = make_adapter_with_shared_tm(config, tm.clone()).await;
+
+        let result = adapter.inner.do_token_refresh().await;
+        assert!(
+            matches!(result, Err(OAuthError::RefreshFailed { .. })),
+            "expected RefreshFailed, got {:?}",
+            result
+        );
+
+        assert!(
+            tm.load_dcr("test").await.unwrap().is_none(),
+            "invalid_client with a DCR-registered record must delete {{name}}.dcr.json"
+        );
+        assert_eq!(
+            adapter.inner.state.read().await.clone(),
+            OAuthState::AuthRequired,
+            "invalid_client must still land in AuthRequired"
+        );
+        let history = adapter.inner.transition_history.read().await;
+        assert!(
+            history
+                .iter()
+                .any(|r| r.reason == "client registration invalidated; re-authorize to re-register"),
+            "expected the distinct invalid_client transition reason, got: {:?}",
+            history.iter().map(|r| r.reason.clone()).collect::<Vec<_>>()
+        );
+
+        server.abort();
+    }
+
+    /// A manually-supplied credential record (`registered_via_dcr == false`)
+    /// must survive an `invalid_client` at the token endpoint — only
+    /// DCR-minted records are auto-discarded.
+    #[tokio::test]
+    async fn do_token_refresh_invalid_client_preserves_manual_record() {
+        use crate::token_manager::DcrCredentials;
+
+        let (url, server) = spawn_token_server("invalid_client").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        // Seed a manually-supplied credential record (registered_via_dcr = false).
+        let manual = DcrCredentials {
+            client_id: "manual-client-abc".to_string(),
+            registered_via_dcr: false,
+            ..Default::default()
+        };
+        tm.save_dcr("test", &manual).await.unwrap();
+
+        let mut config = make_config();
+        config.token_endpoint_url = url;
+        let adapter = make_adapter_with_shared_tm(config, tm.clone()).await;
+
+        let result = adapter.inner.do_token_refresh().await;
+        assert!(matches!(result, Err(OAuthError::RefreshFailed { .. })));
+
+        let loaded = tm
+            .load_dcr("test")
+            .await
+            .unwrap()
+            .expect("manual credential record must be preserved");
+        assert_eq!(loaded, manual);
+        assert_eq!(
+            adapter.inner.state.read().await.clone(),
+            OAuthState::AuthRequired
+        );
+        let history = adapter.inner.transition_history.read().await;
+        assert!(
+            !history
+                .iter()
+                .any(|r| r.reason == "client registration invalidated; re-authorize to re-register"),
+            "manual credential must NOT trigger the invalid_client re-register reason"
+        );
+
+        server.abort();
+    }
+
+    /// Other OAuth errors (e.g. `invalid_grant`) must never touch a
+    /// DCR-registered credential record — only `invalid_client` triggers
+    /// the self-heal.
+    #[tokio::test]
+    async fn do_token_refresh_invalid_grant_preserves_dcr_registered_record() {
+        use crate::token_manager::DcrCredentials;
+
+        let (url, server) = spawn_token_server("400").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let dcr = DcrCredentials {
+            client_id: "dcr-client-xyz".to_string(),
+            registered_via_dcr: true,
+            ..Default::default()
+        };
+        tm.save_dcr("test", &dcr).await.unwrap();
+
+        let mut config = make_config();
+        config.token_endpoint_url = url;
+        let adapter = make_adapter_with_shared_tm(config, tm.clone()).await;
+
+        let result = adapter.inner.do_token_refresh().await;
+        assert!(matches!(result, Err(OAuthError::RefreshFailed { .. })));
+
+        let loaded = tm
+            .load_dcr("test")
+            .await
+            .unwrap()
+            .expect("invalid_grant must not delete the DCR credential record");
+        assert_eq!(loaded, dcr);
+
+        server.abort();
+    }
+
+    /// The token-body sniff must be strictly `error == "invalid_client"`:
+    /// unrelated JSON shapes and non-JSON bodies must not trigger deletion.
+    #[test]
+    fn is_invalid_client_error_shape_and_negatives() {
+        assert!(is_invalid_client_error("{\"error\":\"invalid_client\"}"));
+        assert!(is_invalid_client_error(
+            "{\"error\":\"invalid_client\",\"error_description\":\"unknown client\"}"
+        ));
+        assert!(!is_invalid_client_error("{\"error\":\"invalid_grant\"}"));
+        assert!(!is_invalid_client_error("{\"error\":\"invalid_request\"}"));
+        assert!(!is_invalid_client_error("{}"));
+        assert!(!is_invalid_client_error(""));
+        assert!(!is_invalid_client_error("not json"));
+        assert!(!is_invalid_client_error("<html>error</html>"));
+        assert!(!is_invalid_client_error("{\"error\":123}"));
     }
 
     /// Wait until the shared call counter reaches `target`. Drives the
