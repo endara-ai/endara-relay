@@ -1332,7 +1332,58 @@ async fn oauth_start(
             None => (cid, config_client_secret, false),
         }
     } else if let Some(creds) = persisted_dcr {
-        (creds.client_id, creds.client_secret, true)
+        // Interactive auth-start heals a purged server-side registration by
+        // re-registering a FRESH client_id whenever the persisted record was
+        // itself minted via DCR AND a live `registration_endpoint` is
+        // available. Manual credentials (`registered_via_dcr == false`) and
+        // the no-registration-endpoint case reuse the stored record
+        // unchanged. See spec: Root cause analysis / Approach Part 2.
+        match (creds.registered_via_dcr, registration_endpoint.as_ref()) {
+            (true, Some(reg_endpoint)) => {
+                match dcr::register_client(reg_endpoint, &redirect_uri, &name, allow_insecure_oauth)
+                    .await
+                {
+                    Ok(resp) => {
+                        if let Some(ref tm) = state.token_manager {
+                            let new_creds = DcrCredentials {
+                                client_id: resp.client_id.clone(),
+                                client_secret: resp.client_secret.clone(),
+                                client_secret_expires_at: resp.client_secret_expires_at,
+                                registered_at: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                                issuer: issuer.clone(),
+                                // Preserve the per-endpoint MAS resource
+                                // credential pair (captured separately via
+                                // POST /credentials); it is a distinct
+                                // registration from the requesting client.
+                                resource_client_id: creds.resource_client_id.clone(),
+                                resource_client_secret: creds.resource_client_secret.clone(),
+                                registered_via_dcr: true,
+                            };
+                            if let Err(e) = tm.save_dcr(&name, &new_creds).await {
+                                warn!(
+                                    endpoint = %name,
+                                    error = %e,
+                                    "Failed to persist re-registered DCR credentials"
+                                );
+                            }
+                        }
+                        (resp.client_id, resp.client_secret, true)
+                    }
+                    Err(e) => {
+                        warn!(
+                            endpoint = %name,
+                            error = %e,
+                            "DCR re-registration failed; falling back to stored credentials"
+                        );
+                        (creds.client_id, creds.client_secret, true)
+                    }
+                }
+            }
+            _ => (creds.client_id, creds.client_secret, true),
+        }
     } else if let Some(ref reg_endpoint) = registration_endpoint {
         // Attempt dynamic client registration (URL guard + pinned client inside)
         match dcr::register_client(reg_endpoint, &redirect_uri, &name, allow_insecure_oauth).await {
@@ -9697,6 +9748,258 @@ command = "echo"
             .expect("pending flow was registered");
         assert_eq!(flow.client_id, "toml-id");
         assert_eq!(flow.client_secret, Some("toml-secret".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Approach Part 2: interactive auth-start re-registers a fresh DCR client
+    // when the persisted record is DCR-provenanced and a live
+    // registration_endpoint is advertised. Manual credentials must never be
+    // re-registered, and a failed re-registration must fall back to the
+    // stored credentials so the flow still produces an authorize URL.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn oauth_start_reregisters_when_persisted_creds_are_dcr_and_registration_endpoint_available(
+    ) {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "registration_endpoint": format!("{issuer}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        async fn register() -> Json<Value> {
+            Json(serde_json::json!({
+                "client_id": "fresh-dcr-client",
+                "client_secret": "fresh-dcr-secret",
+            }))
+        }
+        let router = Router::new()
+            .route("/.well-known/oauth-authorization-server", get(well_known))
+            .route("/register", post(register));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+
+        // Seed a per-endpoint MAS resource credential pair alongside the
+        // stale DCR client so we can assert re-registration preserves it
+        // (that pair is captured separately via POST /credentials and is a
+        // distinct registration from the requesting client).
+        let stored = DcrCredentials {
+            client_id: "stale-dcr-client".to_string(),
+            client_secret: Some("stale-dcr-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 0,
+            issuer: Some(base_url.clone()),
+            resource_client_id: Some("mas-resource-client".to_string()),
+            resource_client_secret: Some("mas-resource-secret".to_string()),
+            registered_via_dcr: true,
+        };
+        token_manager.save_dcr("ep1", &stored).await.unwrap();
+
+        let (mut state, flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].client_id = None;
+            cfg.endpoints[0].client_secret = None;
+        }
+        state.token_manager = Some(token_manager.clone());
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending flow was registered");
+        assert_eq!(
+            flow.client_id, "fresh-dcr-client",
+            "auth-start must use the freshly-registered client_id, not the stored one"
+        );
+        assert_eq!(flow.client_secret, Some("fresh-dcr-secret".to_string()));
+
+        let persisted = token_manager.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(persisted.client_id, "fresh-dcr-client");
+        assert_eq!(
+            persisted.client_secret,
+            Some("fresh-dcr-secret".to_string())
+        );
+        assert!(persisted.registered_via_dcr);
+        assert_eq!(persisted.issuer.as_deref(), Some(base_url.as_str()));
+        // The MAS resource credential pair is a distinct registration and
+        // must survive re-registration of the requesting client.
+        assert_eq!(
+            persisted.resource_client_id.as_deref(),
+            Some("mas-resource-client")
+        );
+        assert_eq!(
+            persisted.resource_client_secret.as_deref(),
+            Some("mas-resource-secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_start_dcr_reregistration_falls_back_to_stored_creds_on_failure() {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "registration_endpoint": format!("{issuer}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        async fn register() -> (StatusCode, Json<Value>) {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({})),
+            )
+        }
+        let router = Router::new()
+            .route("/.well-known/oauth-authorization-server", get(well_known))
+            .route("/register", post(register));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+
+        let stored = DcrCredentials {
+            client_id: "stored-dcr-client".to_string(),
+            client_secret: Some("stored-dcr-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 42,
+            issuer: Some(base_url.clone()),
+            registered_via_dcr: true,
+            ..Default::default()
+        };
+        token_manager.save_dcr("ep1", &stored).await.unwrap();
+
+        let (mut state, flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].client_id = None;
+            cfg.endpoints[0].client_secret = None;
+        }
+        state.token_manager = Some(token_manager.clone());
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "DCR re-registration failure must fall back, not hard-fail the flow"
+        );
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending flow was registered");
+        assert_eq!(flow.client_id, "stored-dcr-client");
+        assert_eq!(flow.client_secret, Some("stored-dcr-secret".to_string()));
+
+        let persisted = token_manager.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(persisted.client_id, "stored-dcr-client");
+        assert_eq!(
+            persisted.registered_at, 42,
+            "failed re-registration must not overwrite the persisted record"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_start_does_not_reregister_manual_persisted_credentials() {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "registration_endpoint": format!("{issuer}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        // If the code path ever hits /register, the persisted record and the
+        // flow would end up with this client_id — the asserts below would fail.
+        async fn register() -> Json<Value> {
+            Json(serde_json::json!({ "client_id": "should-not-be-used" }))
+        }
+        let router = Router::new()
+            .route("/.well-known/oauth-authorization-server", get(well_known))
+            .route("/register", post(register));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+
+        let stored = DcrCredentials {
+            client_id: "manual-client".to_string(),
+            client_secret: Some("manual-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 7,
+            issuer: Some(base_url.clone()),
+            registered_via_dcr: false,
+            ..Default::default()
+        };
+        token_manager.save_dcr("ep1", &stored).await.unwrap();
+
+        let (mut state, flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].client_id = None;
+            cfg.endpoints[0].client_secret = None;
+        }
+        state.token_manager = Some(token_manager.clone());
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending flow was registered");
+        assert_eq!(
+            flow.client_id, "manual-client",
+            "manual credentials must be reused as-is; never re-registered"
+        );
+        assert_eq!(flow.client_secret, Some("manual-secret".to_string()));
+
+        let persisted = token_manager.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(persisted.client_id, "manual-client");
+        assert_eq!(persisted.registered_at, 7);
+        assert!(!persisted.registered_via_dcr);
     }
 
     // -----------------------------------------------------------------------
