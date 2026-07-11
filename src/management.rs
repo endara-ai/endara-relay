@@ -1348,6 +1348,7 @@ async fn oauth_start(
                             .unwrap_or_default()
                             .as_secs(),
                         issuer: issuer.clone(),
+                        registered_via_dcr: true,
                         ..Default::default()
                     };
                     if let Err(e) = tm.save_dcr(&name, &creds).await {
@@ -1491,6 +1492,8 @@ async fn oauth_credentials(
         // Manually-supplied credentials are user-managed, not bound to a
         // discovered issuer; leave None so they are always reused as-is.
         issuer: None,
+        // User-supplied via /oauth/credentials → never auto-discard.
+        registered_via_dcr: false,
         ..Default::default()
     };
 
@@ -1638,6 +1641,20 @@ async fn set_endpoint_credentials(
         .into_response();
     }
 
+    // If the caller touched the requesting client_id/secret at all (set OR
+    // clear), the requesting creds are now user-managed → force the DCR
+    // provenance flag off. Updates that only touch the resource_* pair leave
+    // the requesting creds untouched, so preserve the existing flag.
+    let requesting_touched = body.client_id.is_some() || body.client_secret.is_some();
+    let registered_via_dcr = if requesting_touched {
+        false
+    } else {
+        existing
+            .as_ref()
+            .map(|c| c.registered_via_dcr)
+            .unwrap_or(false)
+    };
+
     let creds = DcrCredentials {
         client_id: merged_client_id,
         client_secret,
@@ -1659,6 +1676,7 @@ async fn set_endpoint_credentials(
         issuer: existing.as_ref().and_then(|c| c.issuer.clone()),
         resource_client_id,
         resource_client_secret,
+        registered_via_dcr,
     };
 
     if let Err(e) = tm.save_dcr(&name, &creds).await {
@@ -2656,6 +2674,9 @@ async fn oauth_setup(
                         ClientRegistration::Manual => None,
                         _ => Some(issuer.clone()),
                     },
+                    // Only true DCR (RFC 7591) counts as DCR provenance;
+                    // CIMD and manual paths are never auto-discarded.
+                    registered_via_dcr: used_dcr,
                     ..Default::default()
                 };
                 if let Err(e) = tm.save_dcr(&body.name, &creds).await {
@@ -2833,6 +2854,8 @@ async fn oauth_setup_credentials(
                 .as_secs(),
             // Manually-supplied credentials are user-managed; not issuer-bound.
             issuer: None,
+            // Manual credentials from the setup session → never auto-discard.
+            registered_via_dcr: false,
             ..Default::default()
         };
         if let Err(e) = tm.save_dcr(&name, &creds).await {
@@ -5424,6 +5447,8 @@ async fn create_organization(
                 client_secret_expires_at: 0,
                 registered_at: now,
                 issuer: Some(issuer.clone()),
+                // Org SSO secret is user-supplied via the create route.
+                registered_via_dcr: false,
                 ..Default::default()
             };
             if let Err(e) = tm.save_dcr(&name, &creds).await {
@@ -5721,6 +5746,8 @@ async fn update_organization(
                     client_secret_expires_at: 0,
                     registered_at: now,
                     issuer: Some(new_issuer.clone()),
+                    // Org SSO secret is user-supplied via the update route.
+                    registered_via_dcr: false,
                     ..Default::default()
                 };
                 if let Err(e) = tm.save_dcr(&new_name, &creds).await {

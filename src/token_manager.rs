@@ -75,6 +75,16 @@ pub struct DcrCredentials {
     /// the IdP-facing legs and never substituted by the requesting secret.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_client_secret: Option<String>,
+    /// Provenance marker: `true` only when the requesting `client_id` came
+    /// from a dynamic client registration (RFC 7591) — i.e. the relay minted
+    /// it against a discovered `registration_endpoint`. `false` for
+    /// manually-supplied credentials (config.toml, `POST
+    /// /api/endpoints/{name}/credentials`, or `POST
+    /// /api/endpoints/{name}/oauth/credentials`) and for CIMD-resolved
+    /// clients. Legacy files predating this field deserialize as `false`
+    /// (conservative: never auto-discarded, same style as `issuer`).
+    #[serde(default)]
+    pub registered_via_dcr: bool,
 }
 
 /// Per-IdP credentials captured during EMA Step 1 (IdP SSO). Holds the ID Token
@@ -585,6 +595,36 @@ mod tests {
         let creds: DcrCredentials = serde_json::from_str(json).unwrap();
         assert_eq!(creds.client_id, "legacy-id");
         assert_eq!(creds.issuer, None);
+    }
+
+    #[test]
+    fn dcr_legacy_file_without_registered_via_dcr_loads_as_false() {
+        // Credential files written before the `registered_via_dcr` field
+        // existed must still deserialize, with the flag = false (treated as
+        // manual: never auto-discarded).
+        let json = r#"{"client_id":"legacy-id","client_secret":"legacy-secret","client_secret_expires_at":0,"registered_at":1700000000,"issuer":"https://auth.example.com"}"#;
+        let creds: DcrCredentials = serde_json::from_str(json).unwrap();
+        assert_eq!(creds.client_id, "legacy-id");
+        assert!(!creds.registered_via_dcr);
+    }
+
+    #[tokio::test]
+    async fn dcr_round_trip_preserves_registered_via_dcr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        let creds = DcrCredentials {
+            client_id: "dcr-minted".to_string(),
+            client_secret: Some("dcr-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 1_700_000_000,
+            issuer: Some("https://auth.example.com".to_string()),
+            registered_via_dcr: true,
+            ..Default::default()
+        };
+        mgr.save_dcr("dcr-ep", &creds).await.unwrap();
+        let loaded = mgr.load_dcr("dcr-ep").await.unwrap().unwrap();
+        assert!(loaded.registered_via_dcr);
+        assert_eq!(loaded, creds);
     }
 
     // --- dcr_issuer_allows_reuse() decision tests ---

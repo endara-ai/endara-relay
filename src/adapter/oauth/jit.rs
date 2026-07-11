@@ -401,6 +401,9 @@ impl JitInterceptor {
                     client_secret_expires_at: resolved.client_secret_expires_at,
                     registered_at: now_secs(),
                     issuer: Some(disc.issuer.clone()),
+                    // Only true DCR (RFC 7591) counts as DCR provenance;
+                    // CIMD-resolved clients are never auto-discarded.
+                    registered_via_dcr: matches!(resolved.registration, ClientRegistration::Dcr),
                     ..Default::default()
                 };
                 if let Err(e) = tm.save_dcr(endpoint_name, &creds).await {
