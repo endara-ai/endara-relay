@@ -1393,10 +1393,18 @@ async fn oauth_start(
                     // operator-managed record on disk instead of clobbering
                     // it. Round-4 finding R4-4.
                     //
-                    // Note: the returned `(client_id, client_secret)` still
-                    // reflects the fresh DCR registration for the pending
-                    // authorize flow; only the persisted record follows the
-                    // operator's newer state.
+                    // On compare failure we ALSO refuse to continue the
+                    // auth-start with the unpersisted fresh DCR pair
+                    // (round-5 finding R5-2): otherwise a successful
+                    // callback would install `set_client_credentials`
+                    // on the running adapter and save a token set bound
+                    // to a `client_id` that never made it to disk,
+                    // bypassing the R5-3 callback guard when the
+                    // concurrent write was a manual rotation
+                    // (`registered_via_dcr = false`). `snapshot_matched`
+                    // uses `AtomicBool` (not `Cell`) so the future
+                    // produced by this async fn stays `Send` for axum's
+                    // `Handler` bound.
                     //
                     // `expected_client_id` is the ORIGINAL on-disk id
                     // captured at load time — not `creds.client_id`, which
@@ -1408,6 +1416,10 @@ async fn oauth_start(
                     let new_client_secret = resp.client_secret.clone();
                     let expires_at = resp.client_secret_expires_at;
                     let bind_issuer = issuer.clone();
+                    // `AtomicBool` (not `Cell`) so the future produced by
+                    // this async fn stays `Send` for axum's `Handler`
+                    // bound.
+                    let snapshot_matched = std::sync::atomic::AtomicBool::new(true);
                     let update_res: Result<Option<DcrCredentials>, TokenError> = tm
                         .update_dcr(&name, |current| {
                             let matches_snapshot = match (current.as_ref(), expected_client_id.as_deref()) {
@@ -1418,6 +1430,7 @@ async fn oauth_start(
                                 _ => false,
                             };
                             if !matches_snapshot {
+                                snapshot_matched.store(false, std::sync::atomic::Ordering::SeqCst);
                                 info!(
                                     endpoint = %name,
                                     expected_client_id = expected_client_id.as_deref().unwrap_or("<absent>"),
@@ -1457,6 +1470,21 @@ async fn oauth_start(
                             error = %e,
                             "Failed to persist re-registered DCR credentials"
                         );
+                    }
+                    if !snapshot_matched.load(std::sync::atomic::Ordering::SeqCst) {
+                        warn!(
+                            endpoint = %name,
+                            "Auth-start superseded by concurrent credential rotation; refusing to continue with unpersisted fresh DCR pair (R5-2)"
+                        );
+                        return error_response(
+                            StatusCode::CONFLICT,
+                            "auth_start_superseded",
+                            Some(
+                                "Endpoint credentials were rotated by a concurrent operation \
+                                 during this Authorize. Please click Authorize again.",
+                            ),
+                        )
+                        .into_response();
                     }
                 }
                 if config_client_id
@@ -10822,14 +10850,19 @@ command = "echo"
         );
     }
 
-    /// Round-4 finding R4-4: the persist of a freshly-registered DCR
-    /// requesting client uses `update_dcr` (compare-and-update) so a
-    /// concurrent operator write that lands between our snapshot and this
-    /// save — for example, a `POST /credentials` that rotated to manual
-    /// credentials — SURVIVES intact instead of being clobbered. This
-    /// test simulates the race by letting the mock `/register` handler
-    /// block until the test manually rotates the persisted record via
-    /// `save_dcr` to a manual-provenance record, then unblocks.
+    /// Round-4 finding R4-4 + round-5 finding R5-2: the persist of a
+    /// freshly-registered DCR requesting client uses `update_dcr`
+    /// (compare-and-update) so a concurrent operator write that lands
+    /// between our snapshot and this save — for example, a
+    /// `POST /credentials` that rotated to manual credentials — SURVIVES
+    /// intact instead of being clobbered (R4-4); AND the auth-start
+    /// handler refuses to continue with the unpersisted fresh DCR pair
+    /// on compare-failure, returning a `CONFLICT` superseded response
+    /// so no callback can install credentials into the running adapter
+    /// that never made it to disk (R5-2). This test simulates the race
+    /// by letting the mock `/register` handler block until the test
+    /// manually rotates the persisted record via `save_dcr` to a
+    /// manual-provenance record, then unblocks.
     #[tokio::test]
     async fn oauth_start_reregister_save_does_not_clobber_concurrent_manual_rotation() {
         use tokio::sync::oneshot;
@@ -10929,7 +10962,19 @@ command = "echo"
         proceed_tx.send(()).unwrap();
 
         let resp = start_fut.await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        // R5-2: the auth-start handler MUST refuse to continue with the
+        // unpersisted fresh DCR pair when the on-disk record was rotated
+        // out from under it. Otherwise a successful callback would install
+        // credentials on the running adapter that never made it to disk,
+        // bypassing the R5-3 callback guard (the manual write has
+        // `registered_via_dcr = false`, so the guard's provenance check
+        // never fires).
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body_json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["error"], "auth_start_superseded");
 
         // The persisted record must be the operator's manual write, not
         // the concurrent DCR re-registration result.
