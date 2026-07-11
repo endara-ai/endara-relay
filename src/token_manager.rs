@@ -277,6 +277,43 @@ impl TokenManager {
         self.delete_dcr_locked(endpoint_name).await
     }
 
+    /// Atomically load-then-{save|delete} a DCR record for `endpoint_name`.
+    /// The `update` closure receives the freshly-loaded record (or `None`
+    /// when the file does not exist) and returns a decision:
+    /// * `Ok(Some(creds))` — persist `creds` via an atomic write.
+    /// * `Ok(None)` — remove the DCR file if it exists.
+    /// * `Err(e)` — propagate to the caller without touching disk.
+    ///
+    /// The load and the subsequent write both happen while
+    /// `dcr_write_lock` is held so no other writer (`save_dcr`,
+    /// `delete_dcr`, `clear_dcr_requesting_client`, another `update_dcr`)
+    /// can interleave a stale-write clobber between the read and the
+    /// write. This is the helper `set_endpoint_credentials` uses to fold
+    /// caller-supplied fields into the existing record without racing a
+    /// concurrent `invalid_client` self-heal.
+    pub async fn update_dcr<F, E>(
+        &self,
+        endpoint_name: &str,
+        update: F,
+    ) -> Result<Option<DcrCredentials>, E>
+    where
+        F: FnOnce(Option<DcrCredentials>) -> Result<Option<DcrCredentials>, E>,
+        E: From<TokenError>,
+    {
+        let _guard = self.dcr_write_lock.lock().await;
+        let existing = self.load_dcr(endpoint_name).await?;
+        match update(existing)? {
+            Some(creds) => {
+                self.save_dcr_locked(endpoint_name, &creds).await?;
+                Ok(Some(creds))
+            }
+            None => {
+                self.delete_dcr_locked(endpoint_name).await?;
+                Ok(None)
+            }
+        }
+    }
+
     /// Inner `delete_dcr` body executed while the DCR write lock is held.
     async fn delete_dcr_locked(&self, endpoint_name: &str) -> Result<(), TokenError> {
         let path = self.token_dir.join(format!("{}.dcr.json", endpoint_name));
@@ -311,11 +348,22 @@ impl TokenManager {
     /// load-then-write sequence is race-free with respect to a concurrent
     /// re-registration that replaced the record with a newer `client_id`.
     ///
+    /// The provenance check is re-evaluated on the freshly-loaded record
+    /// under the lock. Callers already gate on `registered_via_dcr`
+    /// before invoking this method, but that check reads a snapshot taken
+    /// outside the lock; between the caller's read and the lock
+    /// acquisition here, an operator can rotate to manual credentials
+    /// with the same `client_id` via `POST /api/endpoints/{name}/credentials`
+    /// (which sets `registered_via_dcr = false`). Re-checking under the
+    /// lock preserves the "manual credentials are never auto-discarded"
+    /// promise even for that same-id rotation race.
+    ///
     /// Returns:
     /// * `Ok(true)` when the requesting pair was cleared because
     ///   `expected_client_id` matched.
-    /// * `Ok(false)` when the record was absent OR the stored `client_id`
-    ///   did not match (nothing was mutated).
+    /// * `Ok(false)` when the record was absent, is no longer
+    ///   `registered_via_dcr`, OR the stored `client_id` did not match
+    ///   (nothing was mutated).
     /// * `Err(_)` on IO / serialization failure.
     pub async fn clear_dcr_requesting_client(
         &self,
@@ -326,6 +374,12 @@ impl TokenManager {
         let Some(existing) = self.load_dcr(endpoint_name).await? else {
             return Ok(false);
         };
+        if !existing.registered_via_dcr {
+            // Same-id rotation to manual creds landed between the caller's
+            // provenance check and this lock acquisition. Manually-supplied
+            // credentials are never auto-discarded.
+            return Ok(false);
+        }
         if existing.client_id != expected_client_id {
             return Ok(false);
         }
@@ -703,6 +757,172 @@ mod tests {
         assert_eq!(loaded.client_id, "fresh-client");
         assert_eq!(loaded.client_secret.as_deref(), Some("fresh-secret"));
         assert!(loaded.registered_via_dcr);
+    }
+
+    /// R3-1: an operator can rotate to manual credentials with the SAME
+    /// `client_id` between the self-heal caller's provenance snapshot and
+    /// `clear_dcr_requesting_client` acquiring `dcr_write_lock`. The
+    /// re-check under the lock must observe the flipped provenance flag
+    /// and leave the newly-manual credentials untouched.
+    #[tokio::test]
+    async fn clear_dcr_requesting_client_manual_same_id_rotation_is_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        // Same client_id as the caller's failing id, but the record has
+        // just been rotated to manual (registered_via_dcr = false) via
+        // POST /credentials.
+        let rotated_manual = DcrCredentials {
+            client_id: "shared-id".to_string(),
+            client_secret: Some("operator-secret".to_string()),
+            registered_via_dcr: false,
+            ..make_dcr_creds()
+        };
+        mgr.save_dcr("ep", &rotated_manual).await.unwrap();
+
+        let cleared = mgr
+            .clear_dcr_requesting_client("ep", "shared-id")
+            .await
+            .unwrap();
+        assert!(
+            !cleared,
+            "manual credentials with a matching client_id must survive the self-heal"
+        );
+
+        let loaded = mgr.load_dcr("ep").await.unwrap().unwrap();
+        assert_eq!(loaded.client_id, "shared-id");
+        assert_eq!(loaded.client_secret.as_deref(), Some("operator-secret"));
+        assert!(!loaded.registered_via_dcr);
+    }
+
+    /// R3-5: `update_dcr` must serialize its load-modify-save cycle
+    /// against a concurrent `clear_dcr_requesting_client`. Simulates the
+    /// race between a `POST /credentials` update that only touches the
+    /// resource pair and a token-endpoint `invalid_client` self-heal
+    /// firing on the same record: whichever writer runs second must
+    /// observe the other's committed state, never a pre-lock snapshot.
+    #[tokio::test]
+    async fn update_dcr_and_clear_dcr_requesting_client_serialize_via_write_lock() {
+        use std::sync::Arc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        // Seed a mixed record: DCR-provenanced requesting pair alongside a
+        // separately-configured resource pair.
+        let seed = DcrCredentials {
+            client_id: "dcr-client".to_string(),
+            client_secret: Some("dcr-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 100,
+            issuer: Some("https://as.example.com".to_string()),
+            resource_client_id: Some("res-client".to_string()),
+            resource_client_secret: Some("res-secret".to_string()),
+            registered_via_dcr: true,
+        };
+        mgr.save_dcr("ep", &seed).await.unwrap();
+
+        // Concurrent writers: (A) resource-only manual update that must
+        // preserve the requesting pair, (B) invalid_client self-heal that
+        // clears the requesting pair. Both fight over `dcr_write_lock`.
+        let a_mgr = mgr.clone();
+        let a = tokio::spawn(async move {
+            a_mgr
+                .update_dcr(
+                    "ep",
+                    |existing| -> Result<Option<DcrCredentials>, TokenError> {
+                        let base = existing.unwrap();
+                        Ok(Some(DcrCredentials {
+                            resource_client_secret: Some("res-secret-v2".to_string()),
+                            ..base
+                        }))
+                    },
+                )
+                .await
+        });
+        let b_mgr = mgr.clone();
+        let b = tokio::spawn(
+            async move { b_mgr.clear_dcr_requesting_client("ep", "dcr-client").await },
+        );
+        let (a_res, b_res) = tokio::join!(a, b);
+        a_res.unwrap().unwrap();
+        b_res.unwrap().unwrap();
+
+        // Regardless of interleaving, the on-disk record must be a
+        // consistent product of the two serialized writes:
+        //   * If A ran first: A wrote {dcr-client, dcr-secret,
+        //     res-secret-v2}; B then cleared the requesting pair,
+        //     leaving {"", None, res-secret-v2}.
+        //   * If B ran first: B cleared to {"", None, res-secret}; A then
+        //     merged onto the tombstone → {"", None, res-secret-v2}.
+        // Either way the resource_client_secret bump survives, and the
+        // requesting pair ends up cleared (B always runs at some point).
+        let final_state = mgr.load_dcr("ep").await.unwrap().unwrap();
+        assert!(
+            final_state.client_id.is_empty(),
+            "self-heal must have cleared the requesting client_id"
+        );
+        assert!(
+            final_state.client_secret.is_none(),
+            "self-heal must have cleared the requesting client_secret"
+        );
+        assert_eq!(
+            final_state.resource_client_secret.as_deref(),
+            Some("res-secret-v2"),
+            "the manual resource update must not be silently clobbered by the self-heal"
+        );
+        assert!(
+            final_state.registered_via_dcr,
+            "post-self-heal record retains DCR provenance"
+        );
+    }
+
+    /// `update_dcr` deletes the DCR file when the closure returns `Ok(None)`.
+    #[tokio::test]
+    async fn update_dcr_deletes_when_closure_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        mgr.save_dcr("ep", &make_dcr_creds()).await.unwrap();
+
+        let outcome = mgr
+            .update_dcr("ep", |existing| -> Result<_, TokenError> {
+                assert!(existing.is_some());
+                Ok(None)
+            })
+            .await
+            .unwrap();
+        assert!(outcome.is_none());
+        assert!(mgr.load_dcr("ep").await.unwrap().is_none());
+    }
+
+    /// `update_dcr` propagates closure errors without touching disk.
+    #[tokio::test]
+    async fn update_dcr_propagates_closure_errors_without_writing() {
+        #[derive(Debug)]
+        enum E {
+            Business,
+            #[allow(dead_code)]
+            Token(TokenError),
+        }
+        impl From<TokenError> for E {
+            fn from(e: TokenError) -> Self {
+                E::Token(e)
+            }
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        let seed = make_dcr_creds();
+        mgr.save_dcr("ep", &seed).await.unwrap();
+
+        let outcome = mgr
+            .update_dcr("ep", |_existing| -> Result<Option<DcrCredentials>, E> {
+                Err(E::Business)
+            })
+            .await;
+        assert!(matches!(outcome, Err(E::Business)));
+
+        // On-disk record is untouched.
+        let loaded = mgr.load_dcr("ep").await.unwrap().unwrap();
+        assert_eq!(loaded, seed);
     }
 
     // --- Token construction tests (mirrors server.rs logic) ---

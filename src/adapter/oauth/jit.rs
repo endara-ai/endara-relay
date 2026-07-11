@@ -338,6 +338,13 @@ impl JitInterceptor {
         // legacy files (which deserialize with `registered_via_dcr = false`)
         // are reused unconditionally — auto-discarding them and re-registering
         // would break the "manual credentials survive" promise.
+        //
+        // A DCR-provenanced record with an empty `client_id` is a
+        // post-self-heal tombstone left by `clear_dcr_requesting_client`
+        // (issuer cleared, resource pair possibly preserved). Its
+        // `issuer == None` would satisfy `dcr_issuer_allows_reuse`, but
+        // the empty id is not a usable requesting client — treat it as
+        // absent so JIT falls through to CIMD / fresh DCR registration.
         let preregistered = if let Some(ref tm) = self.token_manager {
             match tm.load_dcr(endpoint_name).await {
                 Ok(Some(creds)) => {
@@ -345,7 +352,14 @@ impl JitInterceptor {
                         creds.issuer.as_deref(),
                         Some(disc.issuer.as_str()),
                     );
-                    if !creds.registered_via_dcr || issuer_allows_reuse {
+                    let is_dcr_tombstone = creds.registered_via_dcr && creds.client_id.is_empty();
+                    if is_dcr_tombstone {
+                        info!(
+                            endpoint = %endpoint_name,
+                            "DCR post-self-heal tombstone detected; falling through to CIMD/DCR"
+                        );
+                        None
+                    } else if !creds.registered_via_dcr || issuer_allows_reuse {
                         Some((creds.client_id, creds.client_secret))
                     } else {
                         info!(
@@ -854,6 +868,58 @@ mod tests {
     /// authorize URL's `client_id` is the Endara CIMD URL — no DCR is attempted
     /// (the fixture serves no `/register`), and the pending flow carries no
     /// client_secret (public client).
+    /// R3-2: a post-self-heal DCR tombstone (`registered_via_dcr = true`,
+    /// `client_id = ""`, `issuer = None`) must NOT be reused as
+    /// pre-registered credentials — JIT must fall through to fresh DCR
+    /// registration and the resulting authorize URL must carry the newly
+    /// minted client_id, not an empty one.
+    #[tokio::test]
+    async fn intercept_falls_through_to_dcr_when_stored_creds_are_tombstone() {
+        let (base, server) = spawn_oauth_fixture().await;
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        // Seed the post-self-heal tombstone shape that
+        // `clear_dcr_requesting_client` leaves on disk.
+        let tombstone = DcrCredentials {
+            client_id: String::new(),
+            client_secret: None,
+            client_secret_expires_at: 0,
+            registered_at: 0,
+            issuer: None,
+            resource_client_id: None,
+            resource_client_secret: None,
+            registered_via_dcr: true,
+        };
+        tm.save_dcr("tombstone-ep", &tombstone).await.unwrap();
+
+        let interceptor = JitInterceptor::new(9400, flow_mgr.clone(), Some(tm.clone()), true);
+
+        let www_authenticate = format!(
+            "Bearer realm=\"Test\", resource_metadata=\"{}/.well-known/oauth-protected-resource\"",
+            base
+        );
+        let resource_url = format!("{}/mcp", base);
+        let authorize_url = interceptor
+            .intercept(&resource_url, &www_authenticate, "tombstone-ep")
+            .await
+            .expect("intercept should fall through to fresh DCR registration");
+
+        let url = Url::parse(&authorize_url).unwrap();
+        let q: std::collections::HashMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(
+            q.get("client_id").map(String::as_str),
+            Some("jit-client-123"),
+            "tombstone must be treated as absent; fresh DCR client_id must appear in the authorize URL"
+        );
+        // And the DCR file has been rewritten with the fresh id.
+        let stored = tm.load_dcr("tombstone-ep").await.unwrap().unwrap();
+        assert_eq!(stored.client_id, "jit-client-123");
+        assert!(stored.registered_via_dcr);
+
+        server.abort();
+    }
+
     #[tokio::test]
     async fn intercept_uses_cimd_client_id_when_advertised() {
         let (base, server) = spawn_oauth_fixture_cimd().await;

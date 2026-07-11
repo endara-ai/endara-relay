@@ -28,7 +28,9 @@ use crate::observability::payloads::StoredPayloads;
 use crate::observability::store::{AggregateBucket, CallRecord, QueryFilter};
 use crate::profile_registry::ProfileRegistry;
 use crate::registry::AdapterRegistry;
-use crate::token_manager::{dcr_issuer_allows_reuse, merge_scopes, DcrCredentials, TokenManager};
+use crate::token_manager::{
+    dcr_issuer_allows_reuse, merge_scopes, DcrCredentials, TokenError, TokenManager,
+};
 use crate::OAuthAdapterInners;
 
 // ---------------------------------------------------------------------------
@@ -1390,6 +1392,29 @@ async fn oauth_start(
                 (resp.client_id, resp.client_secret, true)
             }
             Err(e) => {
+                if creds.client_id.is_empty() {
+                    // Post-self-heal tombstone: the stored requesting
+                    // pair was cleared by a prior `invalid_client`
+                    // self-heal and there is nothing to fall back to.
+                    // Producing an authorize URL with `client_id=`
+                    // cannot succeed; surface a clear error so the
+                    // caller can retry once the registration endpoint
+                    // is reachable again.
+                    warn!(
+                        endpoint = %name,
+                        error = %e,
+                        "DCR re-registration failed and stored requesting client is a self-heal tombstone (no fallback)"
+                    );
+                    return error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "dcr_registration_unavailable",
+                        Some(&format!(
+                            "DCR re-registration failed and no viable stored client_id remains. \
+                             Retry once the registration endpoint is reachable. Details: {e}"
+                        )),
+                    )
+                    .into_response();
+                }
                 warn!(
                     endpoint = %name,
                     error = %e,
@@ -1642,157 +1667,159 @@ async fn set_endpoint_credentials(
         .into_response();
     };
 
-    // Load the existing record so unspecified fields are preserved.
-    let existing = match tm.load_dcr(&name).await {
-        Ok(creds) => creds,
-        Err(e) => {
-            warn!(endpoint = %name, error = %e, "Failed to load endpoint DCR record during credential update");
-            None
+    // The requesting_touched flag depends only on the request body, so
+    // compute it once and reuse it inside the closure below.
+    let requesting_touched = body.client_id.is_some() || body.client_secret.is_some();
+
+    // Read-modify-write the DCR record under `dcr_write_lock` so that a
+    // concurrent `invalid_client` self-heal
+    // (`TokenManager::clear_dcr_requesting_client`) cannot land between
+    // our load and save and be silently clobbered by the merged record
+    // computed from the pre-heal snapshot.
+    let outcome = tm
+        .update_dcr(
+            &name,
+            |existing| -> Result<Option<DcrCredentials>, SetCredsError> {
+                // keep (absent) / clear (empty) / set (non-empty) per field.
+                let merge = |action: Option<&str>, current: Option<String>| match action {
+                    None => current,
+                    Some("") => None,
+                    Some(s) => Some(s.to_string()),
+                };
+
+                // client_id is a plain (non-optional) field on the record: absent
+                // keeps the stored id (empty for a resource-only EMA endpoint), a
+                // value replaces it.
+                let merged_client_id = match body.client_id.as_deref().map(str::trim) {
+                    None => existing
+                        .as_ref()
+                        .map(|c| c.client_id.clone())
+                        .unwrap_or_default(),
+                    Some(s) => s.to_string(),
+                };
+                let client_secret = merge(
+                    body.client_secret.as_deref().map(str::trim),
+                    existing.as_ref().and_then(|c| c.client_secret.clone()),
+                );
+                let resource_client_id = merge(
+                    body.resource_client_id.as_deref().map(str::trim),
+                    existing.as_ref().and_then(|c| c.resource_client_id.clone()),
+                );
+                let resource_client_secret = merge(
+                    body.resource_client_secret.as_deref().map(str::trim),
+                    existing
+                        .as_ref()
+                        .and_then(|c| c.resource_client_secret.clone()),
+                );
+
+                // A requesting secret has no meaning without a client_id to pair it with.
+                if client_secret.is_some() && merged_client_id.is_empty() {
+                    return Err(SetCredsError::Validation(
+                        "client_id must not be empty when setting client_secret",
+                    ));
+                }
+
+                // Symmetric guard: a resource secret must be paired with a resource client_id.
+                if resource_client_secret.is_some()
+                    && resource_client_id
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .is_empty()
+                {
+                    return Err(SetCredsError::Validation(
+                        "resource_client_id must not be empty when setting resource_client_secret",
+                    ));
+                }
+
+                // Nothing left to persist → remove the DCR record entirely.
+                if merged_client_id.is_empty()
+                    && client_secret.is_none()
+                    && resource_client_id.is_none()
+                    && resource_client_secret.is_none()
+                {
+                    return Ok(None);
+                }
+
+                // If the caller touched the requesting client_id/secret at all
+                // (set OR clear), the requesting creds are now user-managed →
+                // force the DCR provenance flag off AND clear any previous
+                // `issuer` binding. The provenance flag alone is not enough:
+                // `oauth_start` rejects a credential whose stored `issuer`
+                // differs from the currently discovered one BEFORE it checks
+                // the provenance flag, so a manual replace that left the
+                // DCR-era `issuer` in place would be discarded on a later
+                // issuer change and silently overwritten by a fresh DCR
+                // registration — exactly the "manual credentials survive"
+                // promise this endpoint makes to callers. Updates that only
+                // touch the `resource_*` pair leave the requesting creds
+                // untouched, so preserve the existing provenance flag AND
+                // `issuer`.
+                let registered_via_dcr = if requesting_touched {
+                    false
+                } else {
+                    existing
+                        .as_ref()
+                        .map(|c| c.registered_via_dcr)
+                        .unwrap_or(false)
+                };
+                let issuer = if requesting_touched {
+                    None
+                } else {
+                    existing.as_ref().and_then(|c| c.issuer.clone())
+                };
+
+                Ok(Some(DcrCredentials {
+                    client_id: merged_client_id,
+                    client_secret,
+                    client_secret_expires_at: existing
+                        .as_ref()
+                        .map(|c| c.client_secret_expires_at)
+                        .unwrap_or(0),
+                    registered_at: existing.as_ref().map(|c| c.registered_at).unwrap_or_else(
+                        || {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                        },
+                    ),
+                    // Manually-supplied credentials are user-managed and not
+                    // bound to a discovered issuer; preserve any existing
+                    // binding only when the requesting pair was not touched,
+                    // and never invent one.
+                    issuer,
+                    resource_client_id,
+                    resource_client_secret,
+                    registered_via_dcr,
+                }))
+            },
+        )
+        .await;
+
+    let saved = match outcome {
+        Ok(saved) => saved,
+        Err(SetCredsError::Validation(msg)) => {
+            return error_response(StatusCode::BAD_REQUEST, msg, None).into_response();
         }
-    };
-
-    // keep (absent) / clear (empty) / set (non-empty) per field.
-    let merge = |action: Option<&str>, current: Option<String>| match action {
-        None => current,
-        Some("") => None,
-        Some(s) => Some(s.to_string()),
-    };
-
-    // client_id is a plain (non-optional) field on the record: absent keeps the
-    // stored id (empty for a resource-only EMA endpoint), a value replaces it.
-    let merged_client_id = match body.client_id.as_deref().map(str::trim) {
-        None => existing
-            .as_ref()
-            .map(|c| c.client_id.clone())
-            .unwrap_or_default(),
-        Some(s) => s.to_string(),
-    };
-    let client_secret = merge(
-        body.client_secret.as_deref().map(str::trim),
-        existing.as_ref().and_then(|c| c.client_secret.clone()),
-    );
-    let resource_client_id = merge(
-        body.resource_client_id.as_deref().map(str::trim),
-        existing.as_ref().and_then(|c| c.resource_client_id.clone()),
-    );
-    let resource_client_secret = merge(
-        body.resource_client_secret.as_deref().map(str::trim),
-        existing
-            .as_ref()
-            .and_then(|c| c.resource_client_secret.clone()),
-    );
-
-    // A requesting secret has no meaning without a client_id to pair it with.
-    if client_secret.is_some() && merged_client_id.is_empty() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "client_id must not be empty when setting client_secret",
-            None,
-        )
-        .into_response();
-    }
-
-    // Symmetric guard: a resource secret must be paired with a resource client_id.
-    if resource_client_secret.is_some()
-        && resource_client_id
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .is_empty()
-    {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "resource_client_id must not be empty when setting resource_client_secret",
-            None,
-        )
-        .into_response();
-    }
-
-    let client_secret_set = client_secret.is_some();
-    let resource_client_secret_set = resource_client_secret.is_some();
-
-    // Nothing left to persist → remove the DCR record entirely.
-    if merged_client_id.is_empty()
-        && client_secret.is_none()
-        && resource_client_id.is_none()
-        && resource_client_secret.is_none()
-    {
-        if let Err(e) = tm.delete_dcr(&name).await {
+        Err(SetCredsError::Storage(e)) => {
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to clear credentials",
+                "Failed to persist credentials",
                 Some(&e.to_string()),
             )
             .into_response();
         }
-        return Json(serde_json::json!({
-            "ok": true,
-            "client_secret_set": false,
-            "resource_client_secret_set": false,
-        }))
-        .into_response();
-    }
-
-    // If the caller touched the requesting client_id/secret at all (set OR
-    // clear), the requesting creds are now user-managed → force the DCR
-    // provenance flag off AND clear any previous `issuer` binding. The
-    // provenance flag alone is not enough: `oauth_start` rejects a
-    // credential whose stored `issuer` differs from the currently
-    // discovered one BEFORE it checks the provenance flag, so a manual
-    // replace that left the DCR-era `issuer` in place would be discarded
-    // on a later issuer change and silently overwritten by a fresh DCR
-    // registration — exactly the "manual credentials survive" promise
-    // this endpoint makes to callers. Updates that only touch the
-    // `resource_*` pair leave the requesting creds untouched, so
-    // preserve the existing provenance flag AND `issuer`.
-    let requesting_touched = body.client_id.is_some() || body.client_secret.is_some();
-    let registered_via_dcr = if requesting_touched {
-        false
-    } else {
-        existing
-            .as_ref()
-            .map(|c| c.registered_via_dcr)
-            .unwrap_or(false)
-    };
-    let issuer = if requesting_touched {
-        None
-    } else {
-        existing.as_ref().and_then(|c| c.issuer.clone())
     };
 
-    let creds = DcrCredentials {
-        client_id: merged_client_id,
-        client_secret,
-        client_secret_expires_at: existing
-            .as_ref()
-            .map(|c| c.client_secret_expires_at)
-            .unwrap_or(0),
-        registered_at: existing
-            .as_ref()
-            .map(|c| c.registered_at)
-            .unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-            }),
-        // Manually-supplied credentials are user-managed and not bound to
-        // a discovered issuer; preserve any existing binding only when
-        // the requesting pair was not touched, and never invent one.
-        issuer,
-        resource_client_id,
-        resource_client_secret,
-        registered_via_dcr,
-    };
-
-    if let Err(e) = tm.save_dcr(&name, &creds).await {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to save credentials",
-            Some(&e.to_string()),
-        )
-        .into_response();
-    }
+    let client_secret_set = saved
+        .as_ref()
+        .and_then(|c| c.client_secret.as_ref())
+        .is_some();
+    let resource_client_secret_set = saved
+        .as_ref()
+        .and_then(|c| c.resource_client_secret.as_ref())
+        .is_some();
 
     Json(serde_json::json!({
         "ok": true,
@@ -1800,6 +1827,22 @@ async fn set_endpoint_credentials(
         "resource_client_secret_set": resource_client_secret_set,
     }))
     .into_response()
+}
+
+/// Error surface for the `set_endpoint_credentials` update closure. Split
+/// so the caller can render a `400 Bad Request` for validation failures
+/// (with the exact message) and a `500 Internal Server Error` for storage
+/// failures, while `From<TokenError>` lets `TokenManager::update_dcr`
+/// propagate IO/serde errors transparently.
+enum SetCredsError {
+    Validation(&'static str),
+    Storage(TokenError),
+}
+
+impl From<TokenError> for SetCredsError {
+    fn from(e: TokenError) -> Self {
+        SetCredsError::Storage(e)
+    }
 }
 
 /// GET /api/endpoints/:name/credentials
@@ -10524,6 +10567,83 @@ command = "echo"
         assert_eq!(persisted.client_id, "legacy-client");
         assert_eq!(persisted.registered_at, 42);
         assert!(!persisted.registered_via_dcr);
+    }
+
+    /// Regression for PR #130 round-3 finding R3-4: when a
+    /// post-self-heal DCR tombstone (`client_id=""`,
+    /// `registered_via_dcr=true`) triggers the re-registration heal path
+    /// and the registration endpoint is temporarily unreachable, the
+    /// auth-start handler must NOT fall back to the empty stored id
+    /// (which would yield an unusable `client_id=` authorize URL). It
+    /// must surface a clear `503 dcr_registration_unavailable` error
+    /// instead, leaving the tombstone in place for retry.
+    #[tokio::test]
+    async fn oauth_start_dcr_failure_on_tombstone_returns_error_not_empty_authorize_url() {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "registration_endpoint": format!("{issuer}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        // Simulate the AS's registration endpoint being temporarily down.
+        async fn register() -> (StatusCode, Json<Value>) {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "server_error"})),
+            )
+        }
+        let router = Router::new()
+            .route("/.well-known/oauth-authorization-server", get(well_known))
+            .route("/register", post(register));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let tombstone = DcrCredentials {
+            client_id: String::new(),
+            client_secret: None,
+            client_secret_expires_at: 0,
+            registered_at: 0,
+            issuer: None,
+            resource_client_id: None,
+            resource_client_secret: None,
+            registered_via_dcr: true,
+        };
+        token_manager.save_dcr("ep1", &tombstone).await.unwrap();
+
+        let (mut state, _flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].client_id = Some("stale-dcr-client".to_string());
+            cfg.endpoints[0].client_secret = Some("stale-dcr-secret".to_string());
+        }
+        state.token_manager = Some(token_manager.clone());
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "DCR failure on a tombstone must not fall back to the empty stored id"
+        );
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "dcr_registration_unavailable");
+
+        // Tombstone is preserved on disk so a retry can re-attempt registration.
+        let persisted = token_manager.load_dcr("ep1").await.unwrap().unwrap();
+        assert!(persisted.client_id.is_empty());
+        assert!(persisted.registered_via_dcr);
     }
 
     // -----------------------------------------------------------------------
