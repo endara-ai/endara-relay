@@ -221,6 +221,14 @@ pub struct OAuthAdapterInner {
     /// URL. Cleared only on adapter reconstruction; not persisted to disk
     /// (that is handled separately by the startup-time migration path).
     token_endpoint_override: RwLock<Option<String>>,
+    /// In-memory override of `config.client_id` / `config.client_secret`.
+    /// Populated by the management `/oauth/callback` handler after a
+    /// successful interactive re-authorization that produced a fresh RFC
+    /// 7591 registration, so subsequent proactive refreshes POST the newly
+    /// minted requesting client credentials instead of the stale ones baked
+    /// into `config.toml` at startup. Cleared only on adapter reconstruction;
+    /// not persisted to disk (config-file coherence is handled separately).
+    client_credentials_override: RwLock<Option<(String, Option<String>)>>,
     /// The inner HTTP/SSE adapter that talks to the upstream MCP server.
     inner_adapter: RwLock<Option<HttpAdapter>>,
     /// Token persistence layer.
@@ -373,6 +381,46 @@ impl OAuthAdapterInner {
         *self.token_endpoint_override.write().await = Some(url);
     }
 
+    /// Resolve the `client_id` that the next token-refresh POST should
+    /// present.
+    ///
+    /// Returns the in-memory `client_credentials_override` if a previous
+    /// interactive re-authorization propagated a freshly re-registered
+    /// client, otherwise the immutable `config.client_id` baked in at
+    /// adapter construction. Checked at the top of every refresh attempt
+    /// so subsequent refreshes after a successful re-registration go
+    /// straight to the new `client_id` without needing to rebuild the
+    /// adapter.
+    pub async fn effective_client_id(&self) -> String {
+        if let Some((id, _)) = self.client_credentials_override.read().await.as_ref() {
+            id.clone()
+        } else {
+            self.config.client_id.clone()
+        }
+    }
+
+    /// Resolve the `client_secret` that the next token-refresh POST should
+    /// present, mirroring [`Self::effective_client_id`].
+    pub async fn effective_client_secret(&self) -> Option<String> {
+        if let Some((_, secret)) = self.client_credentials_override.read().await.as_ref() {
+            secret.clone()
+        } else {
+            self.config.client_secret.clone()
+        }
+    }
+
+    /// Install (or replace) the in-memory client-credentials override.
+    ///
+    /// Used by the management `/oauth/callback` handler to propagate the
+    /// requesting `client_id` / `client_secret` freshly minted by an RFC
+    /// 7591 re-registration during an interactive re-authorization, so
+    /// that the next proactive refresh POSTs the new credentials instead
+    /// of the stale ones from startup config. Mirrors
+    /// [`Self::set_token_endpoint_override`].
+    pub async fn set_client_credentials(&self, client_id: String, client_secret: Option<String>) {
+        *self.client_credentials_override.write().await = Some((client_id, client_secret));
+    }
+
     /// Perform a token refresh using the refresh_token grant.
     ///
     /// POSTs to the token endpoint (using `effective_token_endpoint`) with
@@ -453,10 +501,10 @@ impl OAuthAdapterInner {
         let mut form_parts: Vec<(&str, String)> = vec![
             ("grant_type", "refresh_token".to_string()),
             ("refresh_token", refresh_token),
-            ("client_id", self.config.client_id.clone()),
+            ("client_id", self.effective_client_id().await),
         ];
-        if let Some(ref secret) = self.config.client_secret {
-            form_parts.push(("client_secret", secret.clone()));
+        if let Some(secret) = self.effective_client_secret().await {
+            form_parts.push(("client_secret", secret));
         }
 
         let form_body: String = url::form_urlencoded::Serializer::new(String::new())
@@ -538,7 +586,7 @@ impl OAuthAdapterInner {
             return "token refresh failed";
         }
         let endpoint = &self.config.endpoint_name;
-        let requesting_client_id = self.config.client_id.clone();
+        let requesting_client_id = self.effective_client_id().await;
         match self.token_manager.load_dcr(endpoint).await {
             Ok(Some(creds)) if creds.registered_via_dcr => {
                 match self
@@ -1217,6 +1265,7 @@ impl OAuthAdapter {
                 tokens: RwLock::new(None),
                 config,
                 token_endpoint_override: RwLock::new(None),
+                client_credentials_override: RwLock::new(None),
                 inner_adapter: RwLock::new(None),
                 token_manager,
                 http_client: Client::builder()
@@ -1982,6 +2031,112 @@ mod tests {
             adapter.inner.effective_token_endpoint().await,
             "https://oauth2.googleapis.com/v2/token"
         );
+    }
+
+    /// `set_client_credentials` installs an in-memory override that
+    /// supersedes `config.client_id` / `config.client_secret` for every
+    /// subsequent `effective_client_*` read. Mirrors the behaviour of
+    /// `set_token_endpoint_override`.
+    #[tokio::test]
+    async fn set_client_credentials_takes_effect() {
+        let adapter = make_adapter(make_config());
+        assert_eq!(adapter.inner.effective_client_id().await, "test-client");
+        assert!(adapter.inner.effective_client_secret().await.is_none());
+
+        adapter
+            .inner
+            .set_client_credentials("fresh-client".to_string(), Some("fresh-secret".to_string()))
+            .await;
+
+        assert_eq!(adapter.inner.effective_client_id().await, "fresh-client");
+        assert_eq!(
+            adapter.inner.effective_client_secret().await.as_deref(),
+            Some("fresh-secret")
+        );
+
+        // Replacing again overwrites the previous value (idempotent setter).
+        adapter
+            .inner
+            .set_client_credentials("even-fresher".to_string(), None)
+            .await;
+        assert_eq!(adapter.inner.effective_client_id().await, "even-fresher");
+        assert!(adapter.inner.effective_client_secret().await.is_none());
+    }
+
+    /// After `set_client_credentials`, the refresh POST body must carry
+    /// the override `client_id` (and `client_secret` when present) — not
+    /// the stale `config.client_id` / `config.client_secret` baked in at
+    /// adapter construction. Guards Finding 2 of PR #130: without the
+    /// propagation, the next refresh after a DCR re-registration would
+    /// keep POSTing the pre-re-registration client_id and loop through
+    /// the `invalid_client` self-heal.
+    #[tokio::test]
+    async fn refresh_uses_overridden_client_credentials() {
+        use axum::extract::Form;
+        use axum::http::StatusCode;
+        use axum::{response::IntoResponse, routing::post, Router};
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        // Mock token endpoint that captures the last POSTed form and
+        // always returns 401 invalid_client (we only care about the body
+        // this adapter sent, not the response shape).
+        type CapturedForm = Arc<Mutex<Option<HashMap<String, String>>>>;
+        let captured: CapturedForm = Arc::new(Mutex::new(None));
+        let captured_clone = captured.clone();
+        async fn handler(
+            axum::extract::State(cap): axum::extract::State<CapturedForm>,
+            Form(form): Form<HashMap<String, String>>,
+        ) -> impl IntoResponse {
+            *cap.lock().unwrap() = Some(form);
+            (StatusCode::UNAUTHORIZED, "{\"error\":\"invalid_client\"}")
+        }
+        let router = Router::new()
+            .route("/token", post(handler))
+            .with_state(captured_clone);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let url = format!("http://127.0.0.1:{}/token", addr.port());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let mut config = make_config();
+        config.token_endpoint_url = url;
+        // Config baked in at startup carries the STALE credentials.
+        config.client_id = "stale-client".to_string();
+        config.client_secret = Some("stale-secret".to_string());
+        let adapter = make_adapter_with_shared_tm(config, tm.clone()).await;
+
+        // A successful interactive re-authorization propagated the
+        // freshly re-registered credentials into the override.
+        adapter
+            .inner
+            .set_client_credentials("fresh-client".to_string(), Some("fresh-secret".to_string()))
+            .await;
+
+        let _ = adapter.inner.do_token_refresh().await;
+
+        let form = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("refresh POST must have reached the mock token endpoint");
+        assert_eq!(
+            form.get("client_id").map(String::as_str),
+            Some("fresh-client"),
+            "refresh must POST the overridden client_id, not the stale config value"
+        );
+        assert_eq!(
+            form.get("client_secret").map(String::as_str),
+            Some("fresh-secret"),
+            "refresh must POST the overridden client_secret, not the stale config value"
+        );
+
+        server.abort();
     }
 
     #[tokio::test]

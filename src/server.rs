@@ -2242,18 +2242,29 @@ async fn oauth_callback(
     // freshly discovered token endpoint used for this code exchange into the
     // adapter's in-memory override so the next proactive refresh POSTs to
     // the same URL we just succeeded against — without depending on whether
-    // startup-time discovery ran or returned the same result.
+    // startup-time discovery ran or returned the same result. Finally,
+    // propagate the requesting `client_id` / `client_secret` this exchange
+    // presented into the adapter's in-memory client-credentials override
+    // so the next proactive refresh POSTs the freshly re-registered
+    // credentials — otherwise a DCR re-registration during auth-start
+    // would leave the running adapter still posting the stale (now
+    // invalid) client_id, tripping the `invalid_client` self-heal on the
+    // very next refresh and looping.
     if let Some(ref inners) = state.oauth_adapter_inners {
         let inners = inners.read().await;
         if let Some(inner) = inners.get(&flow.endpoint_name) {
             inner
                 .set_token_endpoint_override(flow.token_endpoint.clone())
                 .await;
+            inner
+                .set_client_credentials(flow.client_id.clone(), flow.client_secret.clone())
+                .await;
             inner.apply_tokens(token_set.clone()).await;
             info!(
                 endpoint = %flow.endpoint_name,
                 token_endpoint = %flow.token_endpoint,
-                "Tokens applied to OAuth adapter; token endpoint override updated"
+                client_id = %flow.client_id,
+                "Tokens applied to OAuth adapter; token endpoint and client credentials overrides updated"
             );
         }
     }
@@ -5987,6 +5998,111 @@ mod tests {
         assert_eq!(
             loaded.resource_client_secret.as_deref(),
             Some("mas-resource-secret")
+        );
+    }
+
+    /// After a successful interactive re-authorization the callback must
+    /// propagate the requesting `client_id` / `client_secret` this exchange
+    /// presented into the running adapter's `client_credentials_override`,
+    /// so the next proactive refresh POSTs the freshly re-registered pair
+    /// (not the stale one from startup config) and does not immediately
+    /// loop through the `invalid_client` self-heal. Guards Finding 2 of
+    /// PR #130.
+    #[tokio::test]
+    async fn oauth_callback_success_propagates_client_credentials_to_running_adapter() {
+        use crate::adapter::oauth::{OAuthAdapter, OAuthAdapterConfig};
+        use axum::{routing::post, Router};
+
+        // Mock token endpoint that returns a valid access-token response.
+        let router = Router::new().route(
+            "/token",
+            post(|| async {
+                "{\"access_token\":\"fresh-access\",\"refresh_token\":\"fresh-refresh\",\"token_type\":\"Bearer\",\"expires_in\":3600}"
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let token_endpoint = format!("http://127.0.0.1:{}/token", addr.port());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let endpoint_name = "propagate-ep";
+
+        // Build a real OAuthAdapter whose config carries the STALE
+        // client_id/client_secret baked in at startup, and register its
+        // inner in the shared `oauth_adapter_inners` map exactly like
+        // `main.rs` does.
+        let config = OAuthAdapterConfig {
+            endpoint_name: endpoint_name.to_string(),
+            url: "http://127.0.0.1:1/mcp".to_string(),
+            token_endpoint_url: token_endpoint.clone(),
+            client_id: "stale-client".to_string(),
+            client_secret: Some("stale-secret".to_string()),
+            heartbeat_interval_secs: 30,
+            probe_timeout_secs: 10,
+            probe_failure_threshold: 3,
+            server_type_override: None,
+            allow_insecure_oauth: true,
+            ema: None,
+        };
+        let adapter = OAuthAdapter::new(config, tm.clone());
+        let shared_inner = adapter.shared_inner();
+        let inners: OAuthAdapterInners = Arc::new(tokio::sync::RwLock::new(HashMap::new()));
+        inners
+            .write()
+            .await
+            .insert(endpoint_name.to_string(), shared_inner.clone());
+
+        // Pre-condition: the adapter's effective client credentials come
+        // from static config until the override is installed.
+        assert_eq!(shared_inner.effective_client_id().await, "stale-client");
+        assert_eq!(
+            shared_inner.effective_client_secret().await.as_deref(),
+            Some("stale-secret")
+        );
+
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let pkce = crate::oauth::PkceChallenge::generate();
+        // The pending flow carries the FRESH credentials minted by the
+        // DCR re-registration during auth-start.
+        let state_param = flow_mgr
+            .start_flow(
+                endpoint_name,
+                &token_endpoint,
+                "fresh-client",
+                Some("fresh-secret"),
+                pkce,
+                "http://127.0.0.1:9400/oauth/callback",
+                None,
+                false,
+            )
+            .await;
+
+        let mut app_state = test_app_state();
+        app_state.oauth_flow_manager = Some(flow_mgr);
+        app_state.token_manager = Some(tm.clone());
+        app_state.oauth_adapter_inners = Some(inners);
+
+        let params = OAuthCallbackParams {
+            code: Some("authcode".to_string()),
+            state: Some(state_param),
+            error: None,
+            iss: None,
+        };
+        let resp = oauth_callback(State(app_state), Query(params)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Post-condition: the callback propagated the fresh credentials
+        // into the adapter's in-memory override so the next refresh will
+        // POST them.
+        assert_eq!(shared_inner.effective_client_id().await, "fresh-client");
+        assert_eq!(
+            shared_inner.effective_client_secret().await.as_deref(),
+            Some("fresh-secret")
         );
     }
 
