@@ -332,15 +332,20 @@ impl JitInterceptor {
         endpoint_name: &str,
     ) -> Result<ResolvedClient, JitError> {
         // Pre-registered (issuer-bound) stored credentials, validated for reuse.
+        //
+        // The issuer-mismatch discard only fires for DCR-provenanced records
+        // (`registered_via_dcr == true`). Manually-supplied credentials and
+        // legacy files (which deserialize with `registered_via_dcr = false`)
+        // are reused unconditionally — auto-discarding them and re-registering
+        // would break the "manual credentials survive" promise.
         let preregistered = if let Some(ref tm) = self.token_manager {
             match tm.load_dcr(endpoint_name).await {
                 Ok(Some(creds)) => {
-                    // Credential-to-issuer binding: only reuse a stored client_id
-                    // with the SAME authorization server that issued it. If the
-                    // AS issuer changed, discard and fall through (CIMD/DCR).
-                    // Legacy creds with no stored issuer are reused as-is.
-                    if dcr_issuer_allows_reuse(creds.issuer.as_deref(), Some(disc.issuer.as_str()))
-                    {
+                    let issuer_allows_reuse = dcr_issuer_allows_reuse(
+                        creds.issuer.as_deref(),
+                        Some(disc.issuer.as_str()),
+                    );
+                    if !creds.registered_via_dcr || issuer_allows_reuse {
                         Some((creds.client_id, creds.client_secret))
                     } else {
                         info!(
