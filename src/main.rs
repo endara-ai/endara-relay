@@ -882,7 +882,7 @@ async fn main() {
                 let mut ready = 0usize;
                 let mut failed = 0usize;
                 let mut initializing = 0usize;
-                for (_, entry) in entries.iter() {
+                for entry in entries.values() {
                     if entry.disabled {
                         continue;
                     }

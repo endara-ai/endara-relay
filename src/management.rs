@@ -28,7 +28,9 @@ use crate::observability::payloads::StoredPayloads;
 use crate::observability::store::{AggregateBucket, CallRecord, QueryFilter};
 use crate::profile_registry::ProfileRegistry;
 use crate::registry::AdapterRegistry;
-use crate::token_manager::{dcr_issuer_allows_reuse, merge_scopes, DcrCredentials, TokenManager};
+use crate::token_manager::{
+    dcr_issuer_allows_reuse, merge_scopes, DcrCredentials, TokenError, TokenManager,
+};
 use crate::OAuthAdapterInners;
 
 // ---------------------------------------------------------------------------
@@ -1295,29 +1297,252 @@ async fn oauth_start(
         None
     };
 
+    // Snapshot of the on-disk requesting `client_id` at load time.
+    // Used by R4-4's fresh-registration compare-and-update below so the
+    // save's expected value corresponds to what was actually on disk
+    // when we read it — the issuer-mismatch tombstone transformation
+    // below rewrites `persisted_dcr.client_id` to `""` in memory only
+    // and must NOT be treated as the on-disk snapshot for the compare.
+    let persisted_dcr_disk_client_id: Option<String> = persisted_dcr
+        .as_ref()
+        .filter(|c| c.registered_via_dcr)
+        .map(|c| c.client_id.clone());
+
     // Credential-to-issuer binding: if the stored DCR credentials were
     // registered against a DIFFERENT authorization server issuer than the one
-    // we just discovered, discard them so resolution falls through to dynamic
-    // re-registration (RFC 7591), exactly as if no creds existed. Legacy creds
-    // with no stored issuer are reused as-is (backward compatibility).
+    // we just discovered, invalidate them so resolution falls through to
+    // dynamic re-registration (RFC 7591). Legacy creds with no stored issuer
+    // are reused as-is (backward compatibility).
+    //
+    // Only the issuer-bound *requesting* pair
+    // (`client_id`/`client_secret`/`issuer`) is invalidated: the operator-set
+    // `resource_client_id`/`resource_client_secret` pair is a distinct
+    // registration at the MCP Authorization Server (Step 3, RFC 7523
+    // ID-JAG redemption) that has no dependency on the requesting client's
+    // IdP issuer, and must be carried forward. Converting to `None` here
+    // and letting the fresh-registration branch below build the record with
+    // `..Default::default()` would silently erase the operator's manual
+    // resource pair (round-4 finding R4-1). Instead we hand the resolver a
+    // tombstone whose `client_id` is empty (forcing the DCR re-register
+    // path, which already preserves `resource_*` via the record it carries
+    // forward) but whose resource pair is intact.
+    //
+    // Only DCR-provenanced records (`registered_via_dcr == true`) participate
+    // in the issuer-mismatch invalidation. Manually-supplied credentials and
+    // legacy files (which deserialize with `registered_via_dcr = false`) are
+    // preserved unconditionally — auto-discarding them and then silently
+    // re-registering would break the "manual credentials survive" promise.
     let persisted_dcr = match persisted_dcr {
-        Some(creds) if !dcr_issuer_allows_reuse(creds.issuer.as_deref(), issuer.as_deref()) => {
+        Some(creds)
+            if creds.registered_via_dcr
+                && !dcr_issuer_allows_reuse(creds.issuer.as_deref(), issuer.as_deref()) =>
+        {
             info!(
                 endpoint = %name,
                 stored_issuer = ?creds.issuer,
                 current_issuer = ?issuer,
-                "DCR credential issuer changed; discarding stored credentials and re-registering"
+                "DCR credential issuer changed; invalidating requesting pair (resource pair preserved) and re-registering"
             );
-            None
+            Some(DcrCredentials {
+                client_id: String::new(),
+                client_secret: None,
+                client_secret_expires_at: 0,
+                registered_at: creds.registered_at,
+                issuer: None,
+                resource_client_id: creds.resource_client_id,
+                resource_client_secret: creds.resource_client_secret,
+                registered_via_dcr: true,
+            })
         }
         other => other,
     };
 
-    let (client_id, client_secret, dcr_used) = if let Some(cid) = config_client_id {
-        // TOML has a client_id. Prefer the DCR-persisted client_secret when
-        // the DCR record's client_id matches; otherwise fall back to whatever
-        // is in TOML (which may be None for endpoints added via the desktop
-        // UI — that is the bug this branch fixes).
+    // A DCR-provenanced record (`registered_via_dcr == true`) with a live
+    // `registration_endpoint` always takes the interactive re-registration
+    // heal path — including when `config.toml` still carries a stale DCR
+    // `client_id` from the initial setup commit (setup persists the DCR
+    // pair to TOML alongside the `.dcr.json` file, so `config_client_id`
+    // is `Some` for every setup-created endpoint and would otherwise skip
+    // this branch, breaking the RFC 7591 re-registration promise for the
+    // most common shape of DCR endpoint). The DCR file is the authoritative
+    // source for DCR-provenanced credentials — `watcher::resolve_oauth_client_creds`
+    // already prefers it at startup — so we do not need to rewrite `config.toml`
+    // here for the running adapter (Finding 2's `set_client_credentials`
+    // override propagates the newly minted pair after the callback succeeds,
+    // and the DCR file is what a restart consults). See spec: Root cause
+    // analysis / Approach Part 2.
+    let dcr_reregister = matches!(
+        (persisted_dcr.as_ref(), registration_endpoint.as_ref()),
+        (Some(creds), Some(_)) if creds.registered_via_dcr
+    );
+
+    let (client_id, client_secret, dcr_used) = if dcr_reregister {
+        // Safe: the `matches!` above proved both are `Some`.
+        let creds = persisted_dcr.as_ref().unwrap();
+        let reg_endpoint = registration_endpoint.as_ref().unwrap();
+        match dcr::register_client(reg_endpoint, &redirect_uri, &name, allow_insecure_oauth).await {
+            Ok(resp) => {
+                if let Some(ref tm) = state.token_manager {
+                    // Compare-and-update via the atomic helper: only replace
+                    // the on-disk record when it still has the DCR provenance
+                    // AND its `client_id` matches the snapshot we resolved
+                    // before calling `register_client`. If a concurrent
+                    // `POST /credentials` landed between our snapshot and
+                    // this save (rotating to manual creds or replacing
+                    // resource_*), the compare fails and we leave the newer
+                    // operator-managed record on disk instead of clobbering
+                    // it. Round-4 finding R4-4.
+                    //
+                    // On compare failure we ALSO refuse to continue the
+                    // auth-start with the unpersisted fresh DCR pair
+                    // (round-5 finding R5-2): otherwise a successful
+                    // callback would install `set_client_credentials`
+                    // on the running adapter and save a token set bound
+                    // to a `client_id` that never made it to disk,
+                    // bypassing the R5-3 callback guard when the
+                    // concurrent write was a manual rotation
+                    // (`registered_via_dcr = false`). `snapshot_matched`
+                    // uses `AtomicBool` (not `Cell`) so the future
+                    // produced by this async fn stays `Send` for axum's
+                    // `Handler` bound.
+                    //
+                    // `expected_client_id` is the ORIGINAL on-disk id
+                    // captured at load time — not `creds.client_id`, which
+                    // the R4-1 issuer-mismatch branch may have rewritten
+                    // to `""` in memory (the file itself still holds the
+                    // pre-invalidation id until we save).
+                    let expected_client_id = persisted_dcr_disk_client_id.clone();
+                    let new_client_id = resp.client_id.clone();
+                    let new_client_secret = resp.client_secret.clone();
+                    let expires_at = resp.client_secret_expires_at;
+                    let bind_issuer = issuer.clone();
+                    // `AtomicBool` (not `Cell`) so the future produced by
+                    // this async fn stays `Send` for axum's `Handler`
+                    // bound.
+                    let snapshot_matched = std::sync::atomic::AtomicBool::new(true);
+                    let update_res: Result<Option<DcrCredentials>, TokenError> = tm
+                        .update_dcr(&name, |current| {
+                            let matches_snapshot = match (current.as_ref(), expected_client_id.as_deref()) {
+                                (Some(c), Some(expected)) => {
+                                    c.registered_via_dcr && c.client_id == expected
+                                }
+                                (None, None) => true,
+                                _ => false,
+                            };
+                            if !matches_snapshot {
+                                snapshot_matched.store(false, std::sync::atomic::Ordering::SeqCst);
+                                info!(
+                                    endpoint = %name,
+                                    expected_client_id = expected_client_id.as_deref().unwrap_or("<absent>"),
+                                    current_client_id = current
+                                        .as_ref()
+                                        .map(|c| c.client_id.as_str())
+                                        .unwrap_or("<absent>"),
+                                    current_registered_via_dcr = current
+                                        .as_ref()
+                                        .map(|c| c.registered_via_dcr)
+                                        .unwrap_or(false),
+                                    "Skipping fresh-DCR save: on-disk record diverged from snapshot (concurrent operator write)"
+                                );
+                                return Ok(current);
+                            }
+                            let (resource_client_id, resource_client_secret) = current
+                                .map(|c| (c.resource_client_id, c.resource_client_secret))
+                                .unwrap_or_default();
+                            Ok(Some(DcrCredentials {
+                                client_id: new_client_id.clone(),
+                                client_secret: new_client_secret.clone(),
+                                client_secret_expires_at: expires_at,
+                                registered_at: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                                issuer: bind_issuer.clone(),
+                                resource_client_id,
+                                resource_client_secret,
+                                registered_via_dcr: true,
+                            }))
+                        })
+                        .await;
+                    if let Err(e) = update_res {
+                        warn!(
+                            endpoint = %name,
+                            error = %e,
+                            "Failed to persist re-registered DCR credentials"
+                        );
+                    }
+                    if !snapshot_matched.load(std::sync::atomic::Ordering::SeqCst) {
+                        warn!(
+                            endpoint = %name,
+                            "Auth-start superseded by concurrent credential rotation; refusing to continue with unpersisted fresh DCR pair (R5-2)"
+                        );
+                        return error_response(
+                            StatusCode::CONFLICT,
+                            "auth_start_superseded",
+                            Some(
+                                "Endpoint credentials were rotated by a concurrent operation \
+                                 during this Authorize. Please click Authorize again.",
+                            ),
+                        )
+                        .into_response();
+                    }
+                }
+                if config_client_id
+                    .as_ref()
+                    .is_some_and(|cid| cid != &resp.client_id)
+                {
+                    info!(
+                        endpoint = %name,
+                        stale_config_client_id = ?config_client_id,
+                        fresh_dcr_client_id = %resp.client_id,
+                        "DCR re-registration minted a new client_id; config.toml still \
+                         carries the previous id — the running adapter's in-memory \
+                         override and the DCR file are the authoritative sources \
+                         (resolve_oauth_client_creds prefers the DCR file on restart)"
+                    );
+                }
+                (resp.client_id, resp.client_secret, true)
+            }
+            Err(e) => {
+                if creds.client_id.is_empty() {
+                    // Post-self-heal tombstone: the stored requesting
+                    // pair was cleared by a prior `invalid_client`
+                    // self-heal and there is nothing to fall back to.
+                    // Producing an authorize URL with `client_id=`
+                    // cannot succeed; surface a clear error so the
+                    // caller can retry once the registration endpoint
+                    // is reachable again.
+                    warn!(
+                        endpoint = %name,
+                        error = %e,
+                        "DCR re-registration failed and stored requesting client is a self-heal tombstone (no fallback)"
+                    );
+                    return error_response(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "dcr_registration_unavailable",
+                        Some(&format!(
+                            "DCR re-registration failed and no viable stored client_id remains. \
+                             Retry once the registration endpoint is reachable. Details: {e}"
+                        )),
+                    )
+                    .into_response();
+                }
+                warn!(
+                    endpoint = %name,
+                    error = %e,
+                    "DCR re-registration failed; falling back to stored credentials"
+                );
+                (creds.client_id.clone(), creds.client_secret.clone(), true)
+            }
+        }
+    } else if let Some(cid) = config_client_id {
+        // TOML has a client_id and the DCR record (if any) is either
+        // manually supplied (`registered_via_dcr == false`) or the
+        // authorization server does not expose a registration endpoint —
+        // in both cases we reuse the record as-is. Prefer the
+        // DCR-persisted `client_secret` when the DCR `client_id` matches;
+        // otherwise fall back to whatever is in TOML (which may be `None`
+        // for endpoints added via the desktop UI).
         match persisted_dcr {
             Some(creds) if creds.client_id == cid => (cid, creds.client_secret, false),
             Some(creds) => {
@@ -1332,6 +1557,10 @@ async fn oauth_start(
             None => (cid, config_client_secret, false),
         }
     } else if let Some(creds) = persisted_dcr {
+        // No config `client_id`, and either the record is
+        // manually-supplied (`registered_via_dcr == false`) or there is
+        // no live registration endpoint to re-register against. Reuse
+        // the stored record unchanged.
         (creds.client_id, creds.client_secret, true)
     } else if let Some(ref reg_endpoint) = registration_endpoint {
         // Attempt dynamic client registration (URL guard + pinned client inside)
@@ -1348,6 +1577,7 @@ async fn oauth_start(
                             .unwrap_or_default()
                             .as_secs(),
                         issuer: issuer.clone(),
+                        registered_via_dcr: true,
                         ..Default::default()
                     };
                     if let Err(e) = tm.save_dcr(&name, &creds).await {
@@ -1491,6 +1721,8 @@ async fn oauth_credentials(
         // Manually-supplied credentials are user-managed, not bound to a
         // discovered issuer; leave None so they are always reused as-is.
         issuer: None,
+        // User-supplied via /oauth/credentials → never auto-discard.
+        registered_via_dcr: false,
         ..Default::default()
     };
 
@@ -1547,128 +1779,159 @@ async fn set_endpoint_credentials(
         .into_response();
     };
 
-    // Load the existing record so unspecified fields are preserved.
-    let existing = match tm.load_dcr(&name).await {
-        Ok(creds) => creds,
-        Err(e) => {
-            warn!(endpoint = %name, error = %e, "Failed to load endpoint DCR record during credential update");
-            None
+    // The requesting_touched flag depends only on the request body, so
+    // compute it once and reuse it inside the closure below.
+    let requesting_touched = body.client_id.is_some() || body.client_secret.is_some();
+
+    // Read-modify-write the DCR record under `dcr_write_lock` so that a
+    // concurrent `invalid_client` self-heal
+    // (`TokenManager::clear_dcr_requesting_client`) cannot land between
+    // our load and save and be silently clobbered by the merged record
+    // computed from the pre-heal snapshot.
+    let outcome = tm
+        .update_dcr(
+            &name,
+            |existing| -> Result<Option<DcrCredentials>, SetCredsError> {
+                // keep (absent) / clear (empty) / set (non-empty) per field.
+                let merge = |action: Option<&str>, current: Option<String>| match action {
+                    None => current,
+                    Some("") => None,
+                    Some(s) => Some(s.to_string()),
+                };
+
+                // client_id is a plain (non-optional) field on the record: absent
+                // keeps the stored id (empty for a resource-only EMA endpoint), a
+                // value replaces it.
+                let merged_client_id = match body.client_id.as_deref().map(str::trim) {
+                    None => existing
+                        .as_ref()
+                        .map(|c| c.client_id.clone())
+                        .unwrap_or_default(),
+                    Some(s) => s.to_string(),
+                };
+                let client_secret = merge(
+                    body.client_secret.as_deref().map(str::trim),
+                    existing.as_ref().and_then(|c| c.client_secret.clone()),
+                );
+                let resource_client_id = merge(
+                    body.resource_client_id.as_deref().map(str::trim),
+                    existing.as_ref().and_then(|c| c.resource_client_id.clone()),
+                );
+                let resource_client_secret = merge(
+                    body.resource_client_secret.as_deref().map(str::trim),
+                    existing
+                        .as_ref()
+                        .and_then(|c| c.resource_client_secret.clone()),
+                );
+
+                // A requesting secret has no meaning without a client_id to pair it with.
+                if client_secret.is_some() && merged_client_id.is_empty() {
+                    return Err(SetCredsError::Validation(
+                        "client_id must not be empty when setting client_secret",
+                    ));
+                }
+
+                // Symmetric guard: a resource secret must be paired with a resource client_id.
+                if resource_client_secret.is_some()
+                    && resource_client_id
+                        .as_deref()
+                        .map(str::trim)
+                        .unwrap_or("")
+                        .is_empty()
+                {
+                    return Err(SetCredsError::Validation(
+                        "resource_client_id must not be empty when setting resource_client_secret",
+                    ));
+                }
+
+                // Nothing left to persist → remove the DCR record entirely.
+                if merged_client_id.is_empty()
+                    && client_secret.is_none()
+                    && resource_client_id.is_none()
+                    && resource_client_secret.is_none()
+                {
+                    return Ok(None);
+                }
+
+                // If the caller touched the requesting client_id/secret at all
+                // (set OR clear), the requesting creds are now user-managed →
+                // force the DCR provenance flag off AND clear any previous
+                // `issuer` binding. The provenance flag alone is not enough:
+                // `oauth_start` rejects a credential whose stored `issuer`
+                // differs from the currently discovered one BEFORE it checks
+                // the provenance flag, so a manual replace that left the
+                // DCR-era `issuer` in place would be discarded on a later
+                // issuer change and silently overwritten by a fresh DCR
+                // registration — exactly the "manual credentials survive"
+                // promise this endpoint makes to callers. Updates that only
+                // touch the `resource_*` pair leave the requesting creds
+                // untouched, so preserve the existing provenance flag AND
+                // `issuer`.
+                let registered_via_dcr = if requesting_touched {
+                    false
+                } else {
+                    existing
+                        .as_ref()
+                        .map(|c| c.registered_via_dcr)
+                        .unwrap_or(false)
+                };
+                let issuer = if requesting_touched {
+                    None
+                } else {
+                    existing.as_ref().and_then(|c| c.issuer.clone())
+                };
+
+                Ok(Some(DcrCredentials {
+                    client_id: merged_client_id,
+                    client_secret,
+                    client_secret_expires_at: existing
+                        .as_ref()
+                        .map(|c| c.client_secret_expires_at)
+                        .unwrap_or(0),
+                    registered_at: existing.as_ref().map(|c| c.registered_at).unwrap_or_else(
+                        || {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                        },
+                    ),
+                    // Manually-supplied credentials are user-managed and not
+                    // bound to a discovered issuer; preserve any existing
+                    // binding only when the requesting pair was not touched,
+                    // and never invent one.
+                    issuer,
+                    resource_client_id,
+                    resource_client_secret,
+                    registered_via_dcr,
+                }))
+            },
+        )
+        .await;
+
+    let saved = match outcome {
+        Ok(saved) => saved,
+        Err(SetCredsError::Validation(msg)) => {
+            return error_response(StatusCode::BAD_REQUEST, msg, None).into_response();
         }
-    };
-
-    // keep (absent) / clear (empty) / set (non-empty) per field.
-    let merge = |action: Option<&str>, current: Option<String>| match action {
-        None => current,
-        Some("") => None,
-        Some(s) => Some(s.to_string()),
-    };
-
-    // client_id is a plain (non-optional) field on the record: absent keeps the
-    // stored id (empty for a resource-only EMA endpoint), a value replaces it.
-    let merged_client_id = match body.client_id.as_deref().map(str::trim) {
-        None => existing
-            .as_ref()
-            .map(|c| c.client_id.clone())
-            .unwrap_or_default(),
-        Some(s) => s.to_string(),
-    };
-    let client_secret = merge(
-        body.client_secret.as_deref().map(str::trim),
-        existing.as_ref().and_then(|c| c.client_secret.clone()),
-    );
-    let resource_client_id = merge(
-        body.resource_client_id.as_deref().map(str::trim),
-        existing.as_ref().and_then(|c| c.resource_client_id.clone()),
-    );
-    let resource_client_secret = merge(
-        body.resource_client_secret.as_deref().map(str::trim),
-        existing
-            .as_ref()
-            .and_then(|c| c.resource_client_secret.clone()),
-    );
-
-    // A requesting secret has no meaning without a client_id to pair it with.
-    if client_secret.is_some() && merged_client_id.is_empty() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "client_id must not be empty when setting client_secret",
-            None,
-        )
-        .into_response();
-    }
-
-    // Symmetric guard: a resource secret must be paired with a resource client_id.
-    if resource_client_secret.is_some()
-        && resource_client_id
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .is_empty()
-    {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "resource_client_id must not be empty when setting resource_client_secret",
-            None,
-        )
-        .into_response();
-    }
-
-    let client_secret_set = client_secret.is_some();
-    let resource_client_secret_set = resource_client_secret.is_some();
-
-    // Nothing left to persist → remove the DCR record entirely.
-    if merged_client_id.is_empty()
-        && client_secret.is_none()
-        && resource_client_id.is_none()
-        && resource_client_secret.is_none()
-    {
-        if let Err(e) = tm.delete_dcr(&name).await {
+        Err(SetCredsError::Storage(e)) => {
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                "Failed to clear credentials",
+                "Failed to persist credentials",
                 Some(&e.to_string()),
             )
             .into_response();
         }
-        return Json(serde_json::json!({
-            "ok": true,
-            "client_secret_set": false,
-            "resource_client_secret_set": false,
-        }))
-        .into_response();
-    }
-
-    let creds = DcrCredentials {
-        client_id: merged_client_id,
-        client_secret,
-        client_secret_expires_at: existing
-            .as_ref()
-            .map(|c| c.client_secret_expires_at)
-            .unwrap_or(0),
-        registered_at: existing
-            .as_ref()
-            .map(|c| c.registered_at)
-            .unwrap_or_else(|| {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-            }),
-        // Manually-supplied credentials are user-managed, not bound to a
-        // discovered issuer; preserve any existing binding but never invent one.
-        issuer: existing.as_ref().and_then(|c| c.issuer.clone()),
-        resource_client_id,
-        resource_client_secret,
     };
 
-    if let Err(e) = tm.save_dcr(&name, &creds).await {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to save credentials",
-            Some(&e.to_string()),
-        )
-        .into_response();
-    }
+    let client_secret_set = saved
+        .as_ref()
+        .and_then(|c| c.client_secret.as_ref())
+        .is_some();
+    let resource_client_secret_set = saved
+        .as_ref()
+        .and_then(|c| c.resource_client_secret.as_ref())
+        .is_some();
 
     Json(serde_json::json!({
         "ok": true,
@@ -1676,6 +1939,22 @@ async fn set_endpoint_credentials(
         "resource_client_secret_set": resource_client_secret_set,
     }))
     .into_response()
+}
+
+/// Error surface for the `set_endpoint_credentials` update closure. Split
+/// so the caller can render a `400 Bad Request` for validation failures
+/// (with the exact message) and a `500 Internal Server Error` for storage
+/// failures, while `From<TokenError>` lets `TokenManager::update_dcr`
+/// propagate IO/serde errors transparently.
+enum SetCredsError {
+    Validation(&'static str),
+    Storage(TokenError),
+}
+
+impl From<TokenError> for SetCredsError {
+    fn from(e: TokenError) -> Self {
+        SetCredsError::Storage(e)
+    }
 }
 
 /// GET /api/endpoints/:name/credentials
@@ -2656,6 +2935,9 @@ async fn oauth_setup(
                         ClientRegistration::Manual => None,
                         _ => Some(issuer.clone()),
                     },
+                    // Only true DCR (RFC 7591) counts as DCR provenance;
+                    // CIMD and manual paths are never auto-discarded.
+                    registered_via_dcr: used_dcr,
                     ..Default::default()
                 };
                 if let Err(e) = tm.save_dcr(&body.name, &creds).await {
@@ -2833,6 +3115,8 @@ async fn oauth_setup_credentials(
                 .as_secs(),
             // Manually-supplied credentials are user-managed; not issuer-bound.
             issuer: None,
+            // Manual credentials from the setup session → never auto-discard.
+            registered_via_dcr: false,
             ..Default::default()
         };
         if let Err(e) = tm.save_dcr(&name, &creds).await {
@@ -5424,6 +5708,8 @@ async fn create_organization(
                 client_secret_expires_at: 0,
                 registered_at: now,
                 issuer: Some(issuer.clone()),
+                // Org SSO secret is user-supplied via the create route.
+                registered_via_dcr: false,
                 ..Default::default()
             };
             if let Err(e) = tm.save_dcr(&name, &creds).await {
@@ -5721,6 +6007,8 @@ async fn update_organization(
                     client_secret_expires_at: 0,
                     registered_at: now,
                     issuer: Some(new_issuer.clone()),
+                    // Org SSO secret is user-supplied via the update route.
+                    registered_via_dcr: false,
                     ..Default::default()
                 };
                 if let Err(e) = tm.save_dcr(&new_name, &creds).await {
@@ -9143,6 +9431,119 @@ command = "echo"
         );
     }
 
+    /// Regression for PR #130 Finding 4: replacing a DCR-provenanced
+    /// requesting pair with a manual pair must clear the stored `issuer`
+    /// binding, not just flip `registered_via_dcr = false`. `oauth_start`
+    /// rejects a persisted DCR record whose `issuer` differs from the
+    /// currently discovered one BEFORE it checks the provenance flag, so
+    /// leaving the DCR-era issuer on the record would let a later issuer
+    /// change silently discard the manual credentials and overwrite them
+    /// with a fresh DCR registration — breaking the "manual credentials
+    /// survive" promise this endpoint makes.
+    #[tokio::test]
+    async fn endpoint_credentials_manual_replace_clears_issuer_binding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, tm) = test_state_with_token_manager("ep1", tmp.path(), None, None).await;
+
+        // Seed a DCR-provenanced record with an `issuer` binding.
+        let stored = DcrCredentials {
+            client_id: "old-dcr-client".to_string(),
+            client_secret: Some("old-dcr-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 42,
+            issuer: Some("https://as.example.com".to_string()),
+            resource_client_id: Some("res-client".to_string()),
+            resource_client_secret: Some("res-secret".to_string()),
+            registered_via_dcr: true,
+        };
+        tm.save_dcr("ep1", &stored).await.unwrap();
+
+        let app = management_routes(state);
+        // Manually replace the requesting pair only.
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/credentials")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "client_id": "manual-client",
+                            "client_secret": "manual-secret",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let loaded = tm.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(loaded.client_id, "manual-client");
+        assert_eq!(loaded.client_secret.as_deref(), Some("manual-secret"));
+        assert!(
+            !loaded.registered_via_dcr,
+            "manual replace must flip the provenance flag off"
+        );
+        assert!(
+            loaded.issuer.is_none(),
+            "manual replace must clear the DCR-era issuer binding so a later \
+             issuer change does not silently discard the manual credentials"
+        );
+        // The MAS resource pair is untouched by a requesting-pair replace.
+        assert_eq!(loaded.resource_client_id.as_deref(), Some("res-client"));
+        assert_eq!(loaded.resource_client_secret.as_deref(), Some("res-secret"));
+    }
+
+    /// A resource-only update must NOT clear the stored `issuer` binding —
+    /// the DCR-provenanced requesting pair is untouched, so its issuer
+    /// binding stays valid.
+    #[tokio::test]
+    async fn endpoint_credentials_resource_only_update_preserves_issuer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, tm) = test_state_with_token_manager("ep1", tmp.path(), None, None).await;
+
+        let stored = DcrCredentials {
+            client_id: "dcr-client".to_string(),
+            client_secret: Some("dcr-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 42,
+            issuer: Some("https://as.example.com".to_string()),
+            resource_client_id: None,
+            resource_client_secret: None,
+            registered_via_dcr: true,
+        };
+        tm.save_dcr("ep1", &stored).await.unwrap();
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/credentials")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "resource_client_id": "res-client",
+                            "resource_client_secret": "res-secret",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let loaded = tm.load_dcr("ep1").await.unwrap().unwrap();
+        assert!(
+            loaded.registered_via_dcr,
+            "resource-only update must preserve the DCR provenance flag"
+        );
+        assert_eq!(
+            loaded.issuer.as_deref(),
+            Some("https://as.example.com"),
+            "resource-only update must preserve the existing issuer binding"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // oauth_start: AS discovery when oauth_server_url is set
     // -----------------------------------------------------------------------
@@ -9670,6 +10071,915 @@ command = "echo"
             .expect("pending flow was registered");
         assert_eq!(flow.client_id, "toml-id");
         assert_eq!(flow.client_secret, Some("toml-secret".to_string()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Approach Part 2: interactive auth-start re-registers a fresh DCR client
+    // when the persisted record is DCR-provenanced and a live
+    // registration_endpoint is advertised. Manual credentials must never be
+    // re-registered, and a failed re-registration must fall back to the
+    // stored credentials so the flow still produces an authorize URL.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn oauth_start_reregisters_when_persisted_creds_are_dcr_and_registration_endpoint_available(
+    ) {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "registration_endpoint": format!("{issuer}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        async fn register() -> Json<Value> {
+            Json(serde_json::json!({
+                "client_id": "fresh-dcr-client",
+                "client_secret": "fresh-dcr-secret",
+            }))
+        }
+        let router = Router::new()
+            .route("/.well-known/oauth-authorization-server", get(well_known))
+            .route("/register", post(register));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+
+        // Seed a per-endpoint MAS resource credential pair alongside the
+        // stale DCR client so we can assert re-registration preserves it
+        // (that pair is captured separately via POST /credentials and is a
+        // distinct registration from the requesting client).
+        let stored = DcrCredentials {
+            client_id: "stale-dcr-client".to_string(),
+            client_secret: Some("stale-dcr-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 0,
+            issuer: Some(base_url.clone()),
+            resource_client_id: Some("mas-resource-client".to_string()),
+            resource_client_secret: Some("mas-resource-secret".to_string()),
+            registered_via_dcr: true,
+        };
+        token_manager.save_dcr("ep1", &stored).await.unwrap();
+
+        let (mut state, flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].client_id = None;
+            cfg.endpoints[0].client_secret = None;
+        }
+        state.token_manager = Some(token_manager.clone());
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending flow was registered");
+        assert_eq!(
+            flow.client_id, "fresh-dcr-client",
+            "auth-start must use the freshly-registered client_id, not the stored one"
+        );
+        assert_eq!(flow.client_secret, Some("fresh-dcr-secret".to_string()));
+
+        let persisted = token_manager.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(persisted.client_id, "fresh-dcr-client");
+        assert_eq!(
+            persisted.client_secret,
+            Some("fresh-dcr-secret".to_string())
+        );
+        assert!(persisted.registered_via_dcr);
+        assert_eq!(persisted.issuer.as_deref(), Some(base_url.as_str()));
+        // The MAS resource credential pair is a distinct registration and
+        // must survive re-registration of the requesting client.
+        assert_eq!(
+            persisted.resource_client_id.as_deref(),
+            Some("mas-resource-client")
+        );
+        assert_eq!(
+            persisted.resource_client_secret.as_deref(),
+            Some("mas-resource-secret")
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_start_dcr_reregistration_falls_back_to_stored_creds_on_failure() {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "registration_endpoint": format!("{issuer}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        async fn register() -> (StatusCode, Json<Value>) {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({})),
+            )
+        }
+        let router = Router::new()
+            .route("/.well-known/oauth-authorization-server", get(well_known))
+            .route("/register", post(register));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+
+        let stored = DcrCredentials {
+            client_id: "stored-dcr-client".to_string(),
+            client_secret: Some("stored-dcr-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 42,
+            issuer: Some(base_url.clone()),
+            registered_via_dcr: true,
+            ..Default::default()
+        };
+        token_manager.save_dcr("ep1", &stored).await.unwrap();
+
+        let (mut state, flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].client_id = None;
+            cfg.endpoints[0].client_secret = None;
+        }
+        state.token_manager = Some(token_manager.clone());
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "DCR re-registration failure must fall back, not hard-fail the flow"
+        );
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending flow was registered");
+        assert_eq!(flow.client_id, "stored-dcr-client");
+        assert_eq!(flow.client_secret, Some("stored-dcr-secret".to_string()));
+
+        let persisted = token_manager.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(persisted.client_id, "stored-dcr-client");
+        assert_eq!(
+            persisted.registered_at, 42,
+            "failed re-registration must not overwrite the persisted record"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_start_does_not_reregister_manual_persisted_credentials() {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "registration_endpoint": format!("{issuer}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        // If the code path ever hits /register, the persisted record and the
+        // flow would end up with this client_id — the asserts below would fail.
+        async fn register() -> Json<Value> {
+            Json(serde_json::json!({ "client_id": "should-not-be-used" }))
+        }
+        let router = Router::new()
+            .route("/.well-known/oauth-authorization-server", get(well_known))
+            .route("/register", post(register));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+
+        let stored = DcrCredentials {
+            client_id: "manual-client".to_string(),
+            client_secret: Some("manual-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 7,
+            issuer: Some(base_url.clone()),
+            registered_via_dcr: false,
+            ..Default::default()
+        };
+        token_manager.save_dcr("ep1", &stored).await.unwrap();
+
+        let (mut state, flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].client_id = None;
+            cfg.endpoints[0].client_secret = None;
+        }
+        state.token_manager = Some(token_manager.clone());
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending flow was registered");
+        assert_eq!(
+            flow.client_id, "manual-client",
+            "manual credentials must be reused as-is; never re-registered"
+        );
+        assert_eq!(flow.client_secret, Some("manual-secret".to_string()));
+
+        let persisted = token_manager.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(persisted.client_id, "manual-client");
+        assert_eq!(persisted.registered_at, 7);
+        assert!(!persisted.registered_via_dcr);
+    }
+
+    /// Regression for PR #130 Finding 1: setup-created endpoints persist
+    /// the DCR `client_id`/`client_secret` into `config.toml` alongside
+    /// the `.dcr.json` file, so `config_client_id.is_some()` is true for
+    /// every setup-created endpoint. If the config-branch is checked
+    /// first, the DCR-provenanced re-registration heal path is
+    /// unreachable and stale server-side registrations loop forever. The
+    /// resolution must check DCR-provenanced re-registration BEFORE the
+    /// config branch and mint a fresh client_id.
+    #[tokio::test]
+    async fn oauth_start_reregisters_dcr_record_even_when_config_carries_stale_client_id() {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "registration_endpoint": format!("{issuer}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        async fn register() -> Json<Value> {
+            Json(serde_json::json!({
+                "client_id": "fresh-dcr-client",
+                "client_secret": "fresh-dcr-secret",
+            }))
+        }
+        let router = Router::new()
+            .route("/.well-known/oauth-authorization-server", get(well_known))
+            .route("/register", post(register));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+
+        // The DCR record and `config.toml` BOTH carry the same stale
+        // `client_id` — this is exactly what setup writes on commit
+        // (see `oauth_setup_commit` in this module: DCR pair persisted
+        // to disk AND stamped into `config.toml`). The record is
+        // DCR-provenanced so the RFC 7591 heal path applies.
+        let stored = DcrCredentials {
+            client_id: "stale-dcr-client".to_string(),
+            client_secret: Some("stale-dcr-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 0,
+            issuer: Some(base_url.clone()),
+            registered_via_dcr: true,
+            ..Default::default()
+        };
+        token_manager.save_dcr("ep1", &stored).await.unwrap();
+
+        let (mut state, flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].client_id = Some("stale-dcr-client".to_string());
+            cfg.endpoints[0].client_secret = Some("stale-dcr-secret".to_string());
+        }
+        state.token_manager = Some(token_manager.clone());
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending flow was registered");
+        assert_eq!(
+            flow.client_id, "fresh-dcr-client",
+            "config.toml carrying the same stale DCR client_id must NOT block \
+             the DCR-provenanced re-registration heal path"
+        );
+        assert_eq!(flow.client_secret, Some("fresh-dcr-secret".to_string()));
+
+        let persisted = token_manager.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(persisted.client_id, "fresh-dcr-client");
+        assert!(persisted.registered_via_dcr);
+    }
+
+    /// Regression for PR #130 round-2 finding R2: after a token-endpoint
+    /// `invalid_client` self-heal on a pure-DCR record the on-disk record
+    /// keeps `client_id=""` / `client_secret=None` with
+    /// `registered_via_dcr = true` (rather than being deleted outright).
+    /// This test asserts that the next interactive Authorize on an endpoint
+    /// whose `config.toml` still carries the previous DCR `client_id`
+    /// still takes the DCR-provenanced re-registration heal path and
+    /// mints a fresh `client_id` — never falls back to the stale
+    /// config value.
+    #[tokio::test]
+    async fn oauth_start_after_self_heal_reregisters_pure_dcr_stub_ignoring_stale_config_client_id()
+    {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "registration_endpoint": format!("{issuer}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        async fn register() -> Json<Value> {
+            Json(serde_json::json!({
+                "client_id": "fresh-dcr-client",
+                "client_secret": "fresh-dcr-secret",
+            }))
+        }
+        let router = Router::new()
+            .route("/.well-known/oauth-authorization-server", get(well_known))
+            .route("/register", post(register));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+
+        // Post-self-heal stub: cleared requesting pair, cleared issuer,
+        // provenance flag retained. This is exactly what
+        // `TokenManager::clear_dcr_requesting_client` leaves on disk after
+        // a token-endpoint `invalid_client`.
+        let post_heal = DcrCredentials {
+            client_id: String::new(),
+            client_secret: None,
+            client_secret_expires_at: 0,
+            registered_at: 0,
+            issuer: None,
+            resource_client_id: None,
+            resource_client_secret: None,
+            registered_via_dcr: true,
+        };
+        token_manager.save_dcr("ep1", &post_heal).await.unwrap();
+
+        let (mut state, flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].client_id = Some("stale-dcr-client".to_string());
+            cfg.endpoints[0].client_secret = Some("stale-dcr-secret".to_string());
+        }
+        state.token_manager = Some(token_manager.clone());
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending flow was registered");
+        assert_eq!(
+            flow.client_id, "fresh-dcr-client",
+            "post-self-heal stub with registered_via_dcr=true must still \
+             drive DCR re-registration; the stale config.toml client_id \
+             must NOT be used"
+        );
+        assert_eq!(flow.client_secret, Some("fresh-dcr-secret".to_string()));
+
+        let persisted = token_manager.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(persisted.client_id, "fresh-dcr-client");
+        assert!(persisted.registered_via_dcr);
+    }
+
+    /// Regression for PR #130 round-2 finding R3: after a token-endpoint
+    /// `invalid_client` self-heal on a MIXED record (requesting pair
+    /// alongside an operator-set MAS resource pair), the on-disk record
+    /// keeps `client_id=""` / `client_secret=None` / `resource_*` intact
+    /// with `registered_via_dcr = true`. The next interactive Authorize
+    /// on an endpoint whose `config.toml` still carries the previous
+    /// DCR `client_id` must take the DCR-provenanced re-registration
+    /// heal path (mint a fresh id) while preserving the resource pair.
+    #[tokio::test]
+    async fn oauth_start_after_self_heal_reregisters_mixed_record_and_preserves_resource_pair() {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "registration_endpoint": format!("{issuer}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        async fn register() -> Json<Value> {
+            Json(serde_json::json!({
+                "client_id": "fresh-dcr-client",
+                "client_secret": "fresh-dcr-secret",
+            }))
+        }
+        let router = Router::new()
+            .route("/.well-known/oauth-authorization-server", get(well_known))
+            .route("/register", post(register));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+
+        // Post-self-heal state on a mixed record: requesting pair cleared,
+        // MAS resource pair retained, provenance flag retained.
+        let post_heal = DcrCredentials {
+            client_id: String::new(),
+            client_secret: None,
+            client_secret_expires_at: 0,
+            registered_at: 0,
+            issuer: None,
+            resource_client_id: Some("mas-resource-client".to_string()),
+            resource_client_secret: Some("mas-resource-secret".to_string()),
+            registered_via_dcr: true,
+        };
+        token_manager.save_dcr("ep1", &post_heal).await.unwrap();
+
+        let (mut state, flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].client_id = Some("stale-dcr-client".to_string());
+            cfg.endpoints[0].client_secret = Some("stale-dcr-secret".to_string());
+        }
+        state.token_manager = Some(token_manager.clone());
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending flow was registered");
+        assert_eq!(
+            flow.client_id, "fresh-dcr-client",
+            "post-self-heal mixed stub must still drive DCR re-registration \
+             (registered_via_dcr survives the clear); the stale config.toml \
+             client_id must NOT be used"
+        );
+
+        let persisted = token_manager.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(persisted.client_id, "fresh-dcr-client");
+        assert!(persisted.registered_via_dcr);
+        assert_eq!(
+            persisted.resource_client_id.as_deref(),
+            Some("mas-resource-client"),
+            "operator-set MAS resource pair must survive self-heal + re-registration"
+        );
+        assert_eq!(
+            persisted.resource_client_secret.as_deref(),
+            Some("mas-resource-secret")
+        );
+    }
+
+    /// Regression for PR #130 round-2 finding R4: a legacy `.dcr.json`
+    /// record (one with no `registered_via_dcr` field, which deserializes
+    /// as `false`) must survive an issuer change on the AS. Auto-discarding
+    /// it and silently re-registering would break the "manual/legacy
+    /// credentials survive" promise — the issuer-mismatch discard only
+    /// applies to DCR-provenanced records.
+    #[tokio::test]
+    async fn oauth_start_preserves_legacy_record_across_issuer_change() {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "registration_endpoint": format!("{issuer}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        // If the code path ever falls through to /register the flow would
+        // end up with this id — the assertion below would fail.
+        async fn register() -> Json<Value> {
+            Json(serde_json::json!({ "client_id": "should-not-be-used" }))
+        }
+        let router = Router::new()
+            .route("/.well-known/oauth-authorization-server", get(well_known))
+            .route("/register", post(register));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+
+        // Legacy record: bound to a DIFFERENT issuer than the currently
+        // discovered one, `registered_via_dcr = false` (this is what
+        // pre-provenance-flag `.dcr.json` files deserialize as).
+        let stored = DcrCredentials {
+            client_id: "legacy-client".to_string(),
+            client_secret: Some("legacy-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 42,
+            issuer: Some("https://old-as.example.com".to_string()),
+            resource_client_id: None,
+            resource_client_secret: None,
+            registered_via_dcr: false,
+        };
+        token_manager.save_dcr("ep1", &stored).await.unwrap();
+
+        let (mut state, flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].client_id = None;
+            cfg.endpoints[0].client_secret = None;
+        }
+        state.token_manager = Some(token_manager.clone());
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending flow was registered");
+        assert_eq!(
+            flow.client_id, "legacy-client",
+            "legacy records (registered_via_dcr=false) must survive an issuer \
+             change; only DCR-provenanced records participate in the \
+             issuer-mismatch discard"
+        );
+        assert_eq!(flow.client_secret, Some("legacy-secret".to_string()));
+
+        let persisted = token_manager.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(persisted.client_id, "legacy-client");
+        assert_eq!(persisted.registered_at, 42);
+        assert!(!persisted.registered_via_dcr);
+    }
+
+    /// Regression for PR #130 round-3 finding R3-4: when a
+    /// post-self-heal DCR tombstone (`client_id=""`,
+    /// `registered_via_dcr=true`) triggers the re-registration heal path
+    /// and the registration endpoint is temporarily unreachable, the
+    /// auth-start handler must NOT fall back to the empty stored id
+    /// (which would yield an unusable `client_id=` authorize URL). It
+    /// must surface a clear `503 dcr_registration_unavailable` error
+    /// instead, leaving the tombstone in place for retry.
+    #[tokio::test]
+    async fn oauth_start_dcr_failure_on_tombstone_returns_error_not_empty_authorize_url() {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "registration_endpoint": format!("{issuer}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        // Simulate the AS's registration endpoint being temporarily down.
+        async fn register() -> (StatusCode, Json<Value>) {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "server_error"})),
+            )
+        }
+        let router = Router::new()
+            .route("/.well-known/oauth-authorization-server", get(well_known))
+            .route("/register", post(register));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let tombstone = DcrCredentials {
+            client_id: String::new(),
+            client_secret: None,
+            client_secret_expires_at: 0,
+            registered_at: 0,
+            issuer: None,
+            resource_client_id: None,
+            resource_client_secret: None,
+            registered_via_dcr: true,
+        };
+        token_manager.save_dcr("ep1", &tombstone).await.unwrap();
+
+        let (mut state, _flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].client_id = Some("stale-dcr-client".to_string());
+            cfg.endpoints[0].client_secret = Some("stale-dcr-secret".to_string());
+        }
+        state.token_manager = Some(token_manager.clone());
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "DCR failure on a tombstone must not fall back to the empty stored id"
+        );
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "dcr_registration_unavailable");
+
+        // Tombstone is preserved on disk so a retry can re-attempt registration.
+        let persisted = token_manager.load_dcr("ep1").await.unwrap().unwrap();
+        assert!(persisted.client_id.is_empty());
+        assert!(persisted.registered_via_dcr);
+    }
+
+    /// Round-4 finding R4-1: when the AS issuer changes, the DCR
+    /// requesting pair (`client_id`/`client_secret`/`issuer`) is
+    /// invalidated so `oauth_start` re-registers via RFC 7591, but the
+    /// operator-set `resource_client_id`/`resource_client_secret` pair is
+    /// a distinct MAS registration and MUST be carried through the
+    /// invalidation. Prior to the fix the mismatched record was collapsed
+    /// to `None`, and the fresh-registration branch built the new record
+    /// with `..Default::default()`, silently dropping the resource pair.
+    #[tokio::test]
+    async fn oauth_start_issuer_mismatch_preserves_resource_pair() {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "registration_endpoint": format!("{issuer}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        async fn register() -> Json<Value> {
+            Json(serde_json::json!({
+                "client_id": "fresh-dcr-client",
+                "client_secret": "fresh-dcr-secret",
+            }))
+        }
+        let router = Router::new()
+            .route("/.well-known/oauth-authorization-server", get(well_known))
+            .route("/register", post(register));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        // Persisted DCR record bound to a DIFFERENT issuer than the AS
+        // will now advertise, alongside an operator-set MAS resource pair.
+        let stored = DcrCredentials {
+            client_id: "stale-dcr-client".to_string(),
+            client_secret: Some("stale-dcr-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 0,
+            issuer: Some("https://old-idp.example.com".to_string()),
+            resource_client_id: Some("mas-resource-client".to_string()),
+            resource_client_secret: Some("mas-resource-secret".to_string()),
+            registered_via_dcr: true,
+        };
+        token_manager.save_dcr("ep1", &stored).await.unwrap();
+
+        let (mut state, flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].client_id = None;
+            cfg.endpoints[0].client_secret = None;
+        }
+        state.token_manager = Some(token_manager.clone());
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        let state_param = extract_state_param(authorize_url);
+        let flow = flow_mgr
+            .consume_flow(&state_param)
+            .await
+            .expect("pending flow was registered");
+        assert_eq!(
+            flow.client_id, "fresh-dcr-client",
+            "issuer mismatch must invalidate the requesting pair and drive re-registration"
+        );
+
+        let persisted = token_manager.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(persisted.client_id, "fresh-dcr-client");
+        assert!(persisted.registered_via_dcr);
+        assert_eq!(persisted.issuer.as_deref(), Some(base_url.as_str()));
+        assert_eq!(
+            persisted.resource_client_id.as_deref(),
+            Some("mas-resource-client"),
+            "operator-set MAS resource pair must survive issuer-mismatch invalidation"
+        );
+        assert_eq!(
+            persisted.resource_client_secret.as_deref(),
+            Some("mas-resource-secret")
+        );
+    }
+
+    /// Round-4 finding R4-4 + round-5 finding R5-2: the persist of a
+    /// freshly-registered DCR requesting client uses `update_dcr`
+    /// (compare-and-update) so a concurrent operator write that lands
+    /// between our snapshot and this save — for example, a
+    /// `POST /credentials` that rotated to manual credentials — SURVIVES
+    /// intact instead of being clobbered (R4-4); AND the auth-start
+    /// handler refuses to continue with the unpersisted fresh DCR pair
+    /// on compare-failure, returning a `CONFLICT` superseded response
+    /// so no callback can install credentials into the running adapter
+    /// that never made it to disk (R5-2). This test simulates the race
+    /// by letting the mock `/register` handler block until the test
+    /// manually rotates the persisted record via `save_dcr` to a
+    /// manual-provenance record, then unblocks.
+    #[tokio::test]
+    async fn oauth_start_reregister_save_does_not_clobber_concurrent_manual_rotation() {
+        use tokio::sync::oneshot;
+
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let issuer = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": issuer,
+                "authorization_endpoint": format!("{issuer}/authorize"),
+                "token_endpoint": format!("{issuer}/token"),
+                "registration_endpoint": format!("{issuer}/register"),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        // `/register` waits for the test to signal (via `tx_ready`) that
+        // the operator's concurrent manual write has landed, then returns
+        // the fresh DCR response. This deterministically interleaves the
+        // manual write between the caller's snapshot and its save.
+        struct RegState {
+            ready_tx: tokio::sync::Mutex<Option<oneshot::Sender<()>>>,
+            proceed_rx: tokio::sync::Mutex<Option<oneshot::Receiver<()>>>,
+        }
+        async fn register(
+            axum::extract::State(s): axum::extract::State<Arc<RegState>>,
+        ) -> Json<Value> {
+            if let Some(tx) = s.ready_tx.lock().await.take() {
+                let _ = tx.send(());
+            }
+            if let Some(rx) = s.proceed_rx.lock().await.take() {
+                let _ = rx.await;
+            }
+            Json(serde_json::json!({
+                "client_id": "fresh-dcr-client",
+                "client_secret": "fresh-dcr-secret",
+            }))
+        }
+        let (ready_tx, ready_rx) = oneshot::channel::<()>();
+        let (proceed_tx, proceed_rx) = oneshot::channel::<()>();
+        let reg_state = Arc::new(RegState {
+            ready_tx: tokio::sync::Mutex::new(Some(ready_tx)),
+            proceed_rx: tokio::sync::Mutex::new(Some(proceed_rx)),
+        });
+        let router = Router::new()
+            .route("/.well-known/oauth-authorization-server", get(well_known))
+            .route("/register", post(register))
+            .with_state(reg_state);
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let stored = DcrCredentials {
+            client_id: "stale-dcr-client".to_string(),
+            client_secret: Some("stale-dcr-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 0,
+            issuer: Some(base_url.clone()),
+            resource_client_id: None,
+            resource_client_secret: None,
+            registered_via_dcr: true,
+        };
+        token_manager.save_dcr("ep1", &stored).await.unwrap();
+
+        let (mut state, _flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        {
+            let mut cfg = state.config.write().await;
+            cfg.endpoints[0].client_id = None;
+            cfg.endpoints[0].client_secret = None;
+        }
+        state.token_manager = Some(token_manager.clone());
+
+        let app = management_routes(state);
+        let start_fut = tokio::spawn(async move {
+            app.oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        });
+
+        // Wait until the register handler is entered (proves the caller
+        // already read its snapshot of the DCR file) before rotating.
+        ready_rx.await.expect("register endpoint reached");
+        let manual = DcrCredentials {
+            client_id: "operator-manual-client".to_string(),
+            client_secret: Some("operator-manual-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 1_700_000_000,
+            issuer: None,
+            resource_client_id: None,
+            resource_client_secret: None,
+            registered_via_dcr: false,
+        };
+        token_manager.save_dcr("ep1", &manual).await.unwrap();
+        // Now let the mock AS finish returning the fresh DCR response.
+        proceed_tx.send(()).unwrap();
+
+        let resp = start_fut.await.unwrap();
+        // R5-2: the auth-start handler MUST refuse to continue with the
+        // unpersisted fresh DCR pair when the on-disk record was rotated
+        // out from under it. Otherwise a successful callback would install
+        // credentials on the running adapter that never made it to disk,
+        // bypassing the R5-3 callback guard (the manual write has
+        // `registered_via_dcr = false`, so the guard's provenance check
+        // never fires).
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let body_json: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body_json["error"], "auth_start_superseded");
+
+        // The persisted record must be the operator's manual write, not
+        // the concurrent DCR re-registration result.
+        let persisted = token_manager.load_dcr("ep1").await.unwrap().unwrap();
+        assert_eq!(persisted, manual, "concurrent manual rotation must survive");
     }
 
     // -----------------------------------------------------------------------
