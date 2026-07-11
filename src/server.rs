@@ -2055,27 +2055,47 @@ async fn oauth_callback(
 
         // RFC 6749 §5.2: `invalid_client` means the AS no longer recognizes
         // the presented `client_id`. If this endpoint's credentials were
-        // minted via DCR (`registered_via_dcr == true`), discard the stale
-        // record so the next Authorize triggers a fresh RFC 7591
-        // registration. Manually-supplied credentials
-        // (`registered_via_dcr == false`) are never auto-deleted.
+        // minted via DCR (`registered_via_dcr == true`) AND the stored
+        // `client_id` still matches the one this exchange presented,
+        // atomically clear ONLY the requesting `client_id`/`client_secret`
+        // pair so the next Authorize triggers a fresh RFC 7591 registration.
+        // Manually-supplied credentials (`registered_via_dcr == false`) and
+        // a stored `client_id` that no longer matches (concurrent
+        // re-registration replaced the record) are never auto-discarded;
+        // operator-set `resource_client_id`/`resource_client_secret` are
+        // preserved.
         let mut discarded_dcr = false;
         if crate::adapter::oauth::is_invalid_client_error(&body) {
             if let Some(ref tm) = state.token_manager {
                 if let Ok(Some(creds)) = tm.load_dcr(&flow.endpoint_name).await {
                     if creds.registered_via_dcr {
-                        if let Err(e) = tm.delete_dcr(&flow.endpoint_name).await {
-                            error!(
-                                endpoint = %flow.endpoint_name,
-                                error = %e,
-                                "Failed to delete stale DCR credentials after invalid_client"
-                            );
-                        } else {
-                            discarded_dcr = true;
-                            info!(
-                                endpoint = %flow.endpoint_name,
-                                "Discarded stale DCR credentials after invalid_client during code exchange"
-                            );
+                        match tm
+                            .clear_dcr_requesting_client(&flow.endpoint_name, &flow.client_id)
+                            .await
+                        {
+                            Ok(true) => {
+                                discarded_dcr = true;
+                                info!(
+                                    endpoint = %flow.endpoint_name,
+                                    client_id = %flow.client_id,
+                                    "Cleared stale DCR requesting client after invalid_client during code exchange"
+                                );
+                            }
+                            Ok(false) => {
+                                info!(
+                                    endpoint = %flow.endpoint_name,
+                                    failing_client_id = %flow.client_id,
+                                    stored_client_id = %creds.client_id,
+                                    "invalid_client for stale client_id at code exchange; a newer registration is already persisted"
+                                );
+                            }
+                            Err(e) => {
+                                error!(
+                                    endpoint = %flow.endpoint_name,
+                                    error = %e,
+                                    "Failed to clear stale DCR requesting client after invalid_client"
+                                );
+                            }
                         }
                     }
                 }
@@ -5901,6 +5921,132 @@ mod tests {
             .unwrap()
             .expect("manual credential record must be preserved on invalid_client");
         assert_eq!(loaded, manual);
+    }
+
+    /// A mixed DCR record (requesting `client_id`/`client_secret` alongside
+    /// operator-set `resource_client_id`/`resource_client_secret`) must have
+    /// only the requesting pair cleared on `invalid_client` at code exchange;
+    /// the resource pair is a separate MAS registration and must survive.
+    #[tokio::test]
+    async fn oauth_callback_invalid_client_preserves_resource_pair() {
+        use crate::token_manager::DcrCredentials;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let endpoint_name = "mixed-ep";
+        let mixed = DcrCredentials {
+            client_id: "dcr-client-123".to_string(),
+            client_secret: Some("dcr-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 1_700_000_000,
+            issuer: Some("https://as.example.com".to_string()),
+            resource_client_id: Some("mas-resource".to_string()),
+            resource_client_secret: Some("mas-resource-secret".to_string()),
+            registered_via_dcr: true,
+        };
+        tm.save_dcr(endpoint_name, &mixed).await.unwrap();
+
+        let (token_endpoint, _server) = spawn_invalid_client_token_endpoint().await;
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let pkce = crate::oauth::PkceChallenge::generate();
+        let state_param = flow_mgr
+            .start_flow(
+                endpoint_name,
+                &token_endpoint,
+                "dcr-client-123",
+                Some("dcr-secret"),
+                pkce,
+                "http://127.0.0.1:9400/oauth/callback",
+                None,
+                false,
+            )
+            .await;
+
+        let mut app_state = test_app_state();
+        app_state.oauth_flow_manager = Some(flow_mgr);
+        app_state.token_manager = Some(tm.clone());
+
+        let params = OAuthCallbackParams {
+            code: Some("authcode".to_string()),
+            state: Some(state_param),
+            error: None,
+            iss: None,
+        };
+        let resp = oauth_callback(State(app_state), Query(params)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let loaded = tm
+            .load_dcr(endpoint_name)
+            .await
+            .unwrap()
+            .expect("mixed record must persist so the resource pair is retained");
+        assert_eq!(loaded.client_id, "");
+        assert!(loaded.client_secret.is_none());
+        assert!(!loaded.registered_via_dcr);
+        assert_eq!(loaded.resource_client_id.as_deref(), Some("mas-resource"));
+        assert_eq!(
+            loaded.resource_client_secret.as_deref(),
+            Some("mas-resource-secret")
+        );
+    }
+
+    /// A concurrent re-registration replaced the DCR record with a NEWER
+    /// `client_id` while the in-flight code exchange is still using the
+    /// previous one. When that stale exchange returns `invalid_client`, the
+    /// self-heal must not touch the newer record.
+    #[tokio::test]
+    async fn oauth_callback_invalid_client_leaves_newer_registration_intact() {
+        use crate::token_manager::DcrCredentials;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let endpoint_name = "raced-ep";
+        // On-disk record is the newer registration; the flow below still
+        // presents the stale client_id it was started with.
+        let newer = DcrCredentials {
+            client_id: "fresh-client".to_string(),
+            client_secret: Some("fresh-secret".to_string()),
+            registered_via_dcr: true,
+            ..Default::default()
+        };
+        tm.save_dcr(endpoint_name, &newer).await.unwrap();
+
+        let (token_endpoint, _server) = spawn_invalid_client_token_endpoint().await;
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let pkce = crate::oauth::PkceChallenge::generate();
+        let state_param = flow_mgr
+            .start_flow(
+                endpoint_name,
+                &token_endpoint,
+                "stale-client",
+                None,
+                pkce,
+                "http://127.0.0.1:9400/oauth/callback",
+                None,
+                false,
+            )
+            .await;
+
+        let mut app_state = test_app_state();
+        app_state.oauth_flow_manager = Some(flow_mgr);
+        app_state.token_manager = Some(tm.clone());
+
+        let params = OAuthCallbackParams {
+            code: Some("authcode".to_string()),
+            state: Some(state_param),
+            error: None,
+            iss: None,
+        };
+        let _ = oauth_callback(State(app_state), Query(params)).await;
+
+        let loaded = tm
+            .load_dcr(endpoint_name)
+            .await
+            .unwrap()
+            .expect("newer registration must survive stale invalid_client");
+        assert_eq!(loaded.client_id, "fresh-client");
+        assert_eq!(loaded.client_secret.as_deref(), Some("fresh-secret"));
+        assert!(loaded.registered_via_dcr);
     }
 
     // --- /mcp/sse + initialize tools.listChanged capability ---

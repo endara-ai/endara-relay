@@ -522,32 +522,55 @@ impl OAuthAdapterInner {
 
     /// Inspect an OAuth token-endpoint error body for `invalid_client` (RFC
     /// 6749 §5.2). If the current endpoint's DCR record was minted by the
-    /// relay (`registered_via_dcr == true`), delete the stale record so the
-    /// next authorize triggers a fresh RFC 7591 registration and returns a
-    /// distinct transition reason. Manually-supplied credentials
-    /// (`registered_via_dcr == false`) and endpoints with no DCR record are
-    /// never auto-discarded; the caller receives the generic
-    /// `"token refresh failed"` reason.
+    /// relay (`registered_via_dcr == true`) AND the stored `client_id` still
+    /// matches the one this refresh presented, atomically clear ONLY the
+    /// requesting `client_id`/`client_secret` pair (via
+    /// [`TokenManager::clear_dcr_requesting_client`]) so the next authorize
+    /// triggers a fresh RFC 7591 registration and returns a distinct
+    /// transition reason. Manually-supplied credentials
+    /// (`registered_via_dcr == false`), a stored `client_id` that no longer
+    /// matches (i.e. a concurrent re-registration replaced the record), and
+    /// endpoints with no DCR record are never auto-discarded; the caller
+    /// receives the generic `"token refresh failed"` reason. Operator-set
+    /// `resource_client_id`/`resource_client_secret` are preserved.
     async fn handle_invalid_client_if_present(&self, body: &str) -> &'static str {
         if !is_invalid_client_error(body) {
             return "token refresh failed";
         }
         let endpoint = &self.config.endpoint_name;
+        let requesting_client_id = self.config.client_id.clone();
         match self.token_manager.load_dcr(endpoint).await {
             Ok(Some(creds)) if creds.registered_via_dcr => {
-                if let Err(e) = self.token_manager.delete_dcr(endpoint).await {
-                    error!(
-                        endpoint = %endpoint,
-                        error = %e,
-                        "Failed to delete stale DCR credentials after invalid_client"
-                    );
-                    "token refresh failed"
-                } else {
-                    info!(
-                        endpoint = %endpoint,
-                        "Discarded stale DCR credentials after invalid_client at token endpoint"
-                    );
-                    "client registration invalidated; re-authorize to re-register"
+                match self
+                    .token_manager
+                    .clear_dcr_requesting_client(endpoint, &requesting_client_id)
+                    .await
+                {
+                    Ok(true) => {
+                        info!(
+                            endpoint = %endpoint,
+                            client_id = %requesting_client_id,
+                            "Cleared stale DCR requesting client after invalid_client at token endpoint"
+                        );
+                        "client registration invalidated; re-authorize to re-register"
+                    }
+                    Ok(false) => {
+                        info!(
+                            endpoint = %endpoint,
+                            failing_client_id = %requesting_client_id,
+                            stored_client_id = %creds.client_id,
+                            "invalid_client for stale client_id; a newer registration is already persisted"
+                        );
+                        "token refresh failed"
+                    }
+                    Err(e) => {
+                        error!(
+                            endpoint = %endpoint,
+                            error = %e,
+                            "Failed to clear stale DCR requesting client after invalid_client"
+                        );
+                        "token refresh failed"
+                    }
                 }
             }
             _ => "token refresh failed",
@@ -2499,9 +2522,10 @@ mod tests {
     }
 
     /// `invalid_client` (RFC 6749 §5.2) from the token endpoint with a
-    /// DCR-registered record must delete the stale `{name}.dcr.json`, land
-    /// in `AuthRequired`, and record a distinct transition reason so
-    /// callers surface a re-authorize hint.
+    /// DCR-registered record whose `client_id` matches the requesting
+    /// client must atomically clear the stale `{name}.dcr.json`, land in
+    /// `AuthRequired`, and record a distinct transition reason so callers
+    /// surface a re-authorize hint.
     #[tokio::test]
     async fn do_token_refresh_invalid_client_deletes_dcr_registered_record() {
         use crate::token_manager::DcrCredentials;
@@ -2509,11 +2533,13 @@ mod tests {
         let (url, server) = spawn_token_server("invalid_client").await;
         let tmp = tempfile::tempdir().unwrap();
         let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
-        // Seed a DCR-minted credential record for the endpoint.
+        // Seed a DCR-minted credential record that matches the adapter's
+        // configured `client_id` — that pair is what the refresh POST will
+        // present to the token endpoint.
         tm.save_dcr(
             "test",
             &DcrCredentials {
-                client_id: "dcr-client-123".to_string(),
+                client_id: "test-client".to_string(),
                 registered_via_dcr: true,
                 ..Default::default()
             },
@@ -2534,7 +2560,7 @@ mod tests {
 
         assert!(
             tm.load_dcr("test").await.unwrap().is_none(),
-            "invalid_client with a DCR-registered record must delete {{name}}.dcr.json"
+            "invalid_client with a matching DCR-registered record must remove {{name}}.dcr.json (no resource_* to preserve)"
         );
         assert_eq!(
             adapter.inner.state.read().await.clone(),
@@ -2548,6 +2574,103 @@ mod tests {
                 .any(|r| r.reason == "client registration invalidated; re-authorize to re-register"),
             "expected the distinct invalid_client transition reason, got: {:?}",
             history.iter().map(|r| r.reason.clone()).collect::<Vec<_>>()
+        );
+
+        server.abort();
+    }
+
+    /// A mixed DCR record (the requesting `client_id`/`client_secret` sits
+    /// alongside an operator-set `resource_client_id`/`resource_client_secret`)
+    /// must have its requesting pair cleared on `invalid_client` while the
+    /// resource pair survives — the resource credential is a distinct
+    /// registration used only at the MAS in Step 3.
+    #[tokio::test]
+    async fn do_token_refresh_invalid_client_preserves_resource_pair() {
+        use crate::token_manager::DcrCredentials;
+
+        let (url, server) = spawn_token_server("invalid_client").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let mixed = DcrCredentials {
+            client_id: "test-client".to_string(),
+            client_secret: Some("test-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 1_700_000_000,
+            issuer: Some("https://as.example.com".to_string()),
+            resource_client_id: Some("mas-resource".to_string()),
+            resource_client_secret: Some("mas-resource-secret".to_string()),
+            registered_via_dcr: true,
+        };
+        tm.save_dcr("test", &mixed).await.unwrap();
+
+        let mut config = make_config();
+        config.token_endpoint_url = url;
+        let adapter = make_adapter_with_shared_tm(config, tm.clone()).await;
+
+        let _ = adapter.inner.do_token_refresh().await;
+
+        let loaded = tm
+            .load_dcr("test")
+            .await
+            .unwrap()
+            .expect("mixed record must persist so the resource pair is retained");
+        assert_eq!(loaded.client_id, "");
+        assert!(loaded.client_secret.is_none());
+        assert!(!loaded.registered_via_dcr);
+        assert_eq!(loaded.resource_client_id.as_deref(), Some("mas-resource"));
+        assert_eq!(
+            loaded.resource_client_secret.as_deref(),
+            Some("mas-resource-secret")
+        );
+
+        server.abort();
+    }
+
+    /// A concurrent re-registration replaces the DCR record with a NEWER
+    /// `client_id` while an in-flight refresh is still using the previous
+    /// one. When that stale refresh eventually returns `invalid_client`,
+    /// the self-heal must not touch the newer record: `invalid_client`
+    /// only proves the presented `client_id` is gone.
+    #[tokio::test]
+    async fn do_token_refresh_invalid_client_leaves_newer_registration_intact() {
+        use crate::token_manager::DcrCredentials;
+
+        let (url, server) = spawn_token_server("invalid_client").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        // Persisted record already carries a NEWER client_id (a concurrent
+        // re-registration succeeded first). The adapter's config still has
+        // the old client_id — that is the one this refresh will present.
+        let newer = DcrCredentials {
+            client_id: "fresh-client".to_string(),
+            client_secret: Some("fresh-secret".to_string()),
+            registered_via_dcr: true,
+            ..Default::default()
+        };
+        tm.save_dcr("test", &newer).await.unwrap();
+
+        let mut config = make_config();
+        config.token_endpoint_url = url;
+        assert_eq!(config.client_id, "test-client");
+        let adapter = make_adapter_with_shared_tm(config, tm.clone()).await;
+
+        let _ = adapter.inner.do_token_refresh().await;
+
+        let loaded = tm
+            .load_dcr("test")
+            .await
+            .unwrap()
+            .expect("newer registration must survive stale invalid_client");
+        assert_eq!(loaded.client_id, "fresh-client");
+        assert_eq!(loaded.client_secret.as_deref(), Some("fresh-secret"));
+        assert!(loaded.registered_via_dcr);
+
+        let history = adapter.inner.transition_history.read().await;
+        assert!(
+            !history
+                .iter()
+                .any(|r| r.reason == "client registration invalidated; re-authorize to re-register"),
+            "stale invalid_client for a superseded client_id must NOT emit the re-register reason"
         );
 
         server.abort();
