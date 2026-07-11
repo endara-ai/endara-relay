@@ -2014,31 +2014,36 @@ async fn oauth_callback(
         }
     }
 
-    // Superseded-flow guard (round-4 finding R4-3): reject an
-    // endpoint-installing flow (`idp_issuer.is_none()`, i.e. a regular
-    // resource OAuth flow) whose `flow.client_id` no longer matches the
-    // currently persisted DCR requesting `client_id`. A DCR-provenanced
-    // record with a non-empty `client_id` that differs from `flow.client_id`
-    // means a concurrent re-registration replaced the requesting pair
-    // between authorize and callback; exchanging this code against the
-    // stale pair would either fail with `invalid_client` (racing the newer
-    // registration into the self-heal path) or succeed with a token bound
-    // to an already-superseded client. Neither is desirable — the user
-    // should just re-Authorize against the current pair. EMA IdP flows
+    // Superseded-flow guard (round-4 finding R4-3, tightened by round-5
+    // finding R5-3): reject an endpoint-installing flow
+    // (`idp_issuer.is_none()`, i.e. a regular resource OAuth flow) whose
+    // `flow.client_id` no longer matches the currently persisted requesting
+    // `client_id`. A persisted record with a non-empty `client_id` that
+    // differs from `flow.client_id` — regardless of provenance — means a
+    // concurrent re-registration OR a manual rotation replaced the
+    // requesting pair between authorize and callback; exchanging this code
+    // against the stale pair would either fail with `invalid_client`
+    // (racing the newer credentials into the self-heal path) or succeed
+    // with a token bound to an already-superseded client. Neither is
+    // desirable — the user should just re-Authorize against the current
+    // pair. The R5-3 tightening drops the earlier `registered_via_dcr`
+    // gate so a `POST /credentials` rotation to manual creds
+    // (`registered_via_dcr = false`) also supersedes any in-flight DCR
+    // callback. Empty `client_id` on disk means the record was cleared
+    // by the `invalid_client` self-heal (R4-1) and we let this exchange
+    // proceed so the callback can re-install a valid pair. EMA IdP flows
     // (`idp_issuer.is_some()`) install IdP credentials, not endpoint DCR
     // credentials, and are exempt from this check.
     if flow.idp_issuer.is_none() {
         if let Some(ref tm) = state.token_manager {
             if let Ok(Some(persisted)) = tm.load_dcr(&flow.endpoint_name).await {
-                if persisted.registered_via_dcr
-                    && !persisted.client_id.is_empty()
-                    && persisted.client_id != flow.client_id
-                {
+                if !persisted.client_id.is_empty() && persisted.client_id != flow.client_id {
                     warn!(
                         endpoint = %flow.endpoint_name,
                         flow_client_id = %flow.client_id,
                         current_client_id = %persisted.client_id,
-                        "Rejecting superseded OAuth callback: DCR client_id changed between authorize and callback"
+                        current_registered_via_dcr = persisted.registered_via_dcr,
+                        "Rejecting superseded OAuth callback: persisted client_id changed between authorize and callback"
                     );
                     return oauth_html_response(
                         "<html><body><h1>OAuth Error</h1><p>This login session was superseded by a newer client registration. Please click Authorize again.</p><p>You can close this window.</p></body></html>"
@@ -2266,8 +2271,56 @@ async fn oauth_callback(
         );
     }
 
-    // Existing endpoint re-auth flow: save tokens to disk
+    // Existing endpoint re-auth flow: save tokens to disk.
+    //
+    // Round-5 finding R5-3: before committing the token set or applying it
+    // to the running adapter, atomically revalidate `flow.client_id`
+    // against the on-disk DCR requesting `client_id` while holding
+    // `dcr_write_lock` (via `update_dcr`). The pre-exchange guard above
+    // sees a stale snapshot — a manual rotation OR a newer DCR
+    // registration could still land between that load and here. If the
+    // on-disk `client_id` diverged (non-empty and different from
+    // `flow.client_id`), skip the token save and adapter overrides so
+    // the newer/current credentials win. `update_dcr` returns the record
+    // unchanged either way — the write it performs is a no-op re-save,
+    // which is acceptable at the once-per-login cadence of a callback.
     if let Some(ref tm) = state.token_manager {
+        let mut superseded_at_commit = false;
+        if flow.idp_issuer.is_none() {
+            let flow_client_id = flow.client_id.clone();
+            // `AtomicBool` (not `Cell`) so the future produced by this
+            // async fn stays `Send` for axum's `Handler` bound.
+            let mismatch = std::sync::atomic::AtomicBool::new(false);
+            let _ = tm
+                .update_dcr(&flow.endpoint_name, |current| {
+                    if let Some(ref c) = current {
+                        if !c.client_id.is_empty() && c.client_id != flow_client_id {
+                            mismatch.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    Ok::<
+                        Option<crate::token_manager::DcrCredentials>,
+                        crate::token_manager::TokenError,
+                    >(current)
+                })
+                .await;
+            if mismatch.load(std::sync::atomic::Ordering::SeqCst) {
+                warn!(
+                    endpoint = %flow.endpoint_name,
+                    flow_client_id = %flow.client_id,
+                    "Refusing to commit superseded OAuth callback: persisted client_id changed between pre-exchange guard and commit (R5-3)"
+                );
+                superseded_at_commit = true;
+            }
+        }
+
+        if superseded_at_commit {
+            return oauth_html_response(
+                "<html><body><h1>OAuth Error</h1><p>This login session was superseded by a newer client registration. Please click Authorize again.</p><p>You can close this window.</p></body></html>"
+                    .to_string(),
+            );
+        }
+
         if let Err(e) = tm.save(&flow.endpoint_name, &token_set).await {
             error!(endpoint = %flow.endpoint_name, error = %e, "Failed to save tokens");
         }
@@ -6142,6 +6195,106 @@ mod tests {
         let loaded = tm.load_dcr(endpoint_name).await.unwrap().unwrap();
         assert_eq!(loaded.client_id, "fresh-dcr-client");
         assert!(loaded.registered_via_dcr);
+    }
+
+    /// Round-5 finding R5-3: the pre-exchange superseded-flow guard must
+    /// also reject when a concurrent manual rotation
+    /// (`registered_via_dcr = false`) replaced the requesting `client_id`
+    /// between authorize and callback. Before R5-3 the guard was gated on
+    /// `persisted.registered_via_dcr`, so an old DCR callback whose
+    /// `flow.client_id` no longer matched a manually-rotated record would
+    /// proceed to POST the token endpoint and install its stale pair into
+    /// the running adapter, silently overwriting the operator's manual
+    /// credentials in memory.
+    #[tokio::test]
+    async fn oauth_callback_rejects_superseded_flow_when_manual_rotation_changed_client_id() {
+        use crate::token_manager::DcrCredentials;
+        use axum::body::to_bytes;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Token endpoint counts POSTs so we can assert it was never hit.
+        let token_hits = Arc::new(AtomicUsize::new(0));
+        let hits = token_hits.clone();
+        let router = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    "{\"access_token\":\"unused\",\"token_type\":\"Bearer\",\"expires_in\":3600}"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let token_endpoint = format!("http://127.0.0.1:{}/token", addr.port());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let endpoint_name = "superseded-ep-manual";
+        // The currently-persisted record is an operator-supplied MANUAL
+        // rotation (`registered_via_dcr = false`) with a different
+        // `client_id` than the older DCR flow captured at authorize time.
+        tm.save_dcr(
+            endpoint_name,
+            &DcrCredentials {
+                client_id: "operator-manual-client".to_string(),
+                registered_via_dcr: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let pkce = crate::oauth::PkceChallenge::generate();
+        let state_param = flow_mgr
+            .start_flow(
+                endpoint_name,
+                &token_endpoint,
+                "stale-dcr-client",
+                None,
+                pkce,
+                "http://127.0.0.1:9400/oauth/callback",
+                None,
+                false,
+            )
+            .await;
+
+        let mut app_state = test_app_state();
+        app_state.oauth_flow_manager = Some(flow_mgr);
+        app_state.token_manager = Some(tm.clone());
+
+        let params = OAuthCallbackParams {
+            code: Some("authcode".to_string()),
+            state: Some(state_param),
+            error: None,
+            iss: None,
+        };
+        let resp = oauth_callback(State(app_state), Query(params)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        assert_eq!(
+            token_hits.load(Ordering::SeqCst),
+            0,
+            "R5-3: guard must reject before POSTing to the token endpoint even when the current record is manual-provenance"
+        );
+
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body_str.contains("superseded"),
+            "error page must explain the flow was superseded: {body_str}"
+        );
+
+        // The operator's manual record survives untouched.
+        let loaded = tm.load_dcr(endpoint_name).await.unwrap().unwrap();
+        assert_eq!(loaded.client_id, "operator-manual-client");
+        assert!(!loaded.registered_via_dcr);
     }
 
     /// After a successful interactive re-authorization the callback must
