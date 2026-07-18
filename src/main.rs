@@ -95,7 +95,8 @@ enum Commands {
         #[arg(long)]
         file_log_level: Option<String>,
 
-        /// Number of days to retain daily-rotated relay log files (overrides config.toml)
+        /// Number of days to retain daily-rotated relay log files (overrides config.toml).
+        /// Cleanup runs at startup; long-running relays accumulate logs until restarted.
         #[arg(long)]
         log_retention_days: Option<u32>,
 
@@ -208,7 +209,6 @@ fn init_tracing(
     log_format: &str,
     file_log_level: Option<String>,
     log_dir: &std::path::Path,
-    retention_days: u32,
 ) {
     use std::io::IsTerminal;
     use tracing_subscriber::fmt;
@@ -231,20 +231,7 @@ fn init_tracing(
             .unwrap_or("debug,endara_relay=trace"),
     );
 
-    let file_appender = if retention_days > 0 {
-        // `max_log_files(N)` counts the currently-open dated file too, so
-        // `.max_log_files(7)` retains only 6 prior days plus today. Add 1 to
-        // `retention_days` so the appender reserves one slot for the live file,
-        // matching the sweep's semantics: "keep N days of prior history".
-        tracing_appender::rolling::Builder::new()
-            .rotation(tracing_appender::rolling::Rotation::DAILY)
-            .filename_prefix("relay.log")
-            .max_log_files((retention_days as usize).saturating_add(1))
-            .build(log_dir)
-            .expect("Failed to create rolling file appender")
-    } else {
-        tracing_appender::rolling::daily(log_dir, "relay.log")
-    };
+    let file_appender = tracing_appender::rolling::daily(log_dir, "relay.log");
     let file_layer = fmt::layer()
         .with_writer(file_appender)
         .with_ansi(false)
@@ -380,16 +367,14 @@ async fn main() {
                 .or(cfg.relay.log_retention_days)
                 .unwrap_or(DEFAULT_LOG_RETENTION_DAYS);
 
-            init_tracing(
-                color,
-                &log_format,
-                file_log_level.clone(),
-                &log_dir,
-                effective_retention,
-            );
+            init_tracing(color, &log_format, file_log_level.clone(), &log_dir);
             info!(config = %config_path.display(), data_dir = %data_dir_path.display(), "Starting endara-relay");
 
-            // Sweep old logs after tracing is initialized so warnings go through the tracing layer
+            // Sweep old logs after tracing is initialized so warnings go through the tracing layer.
+            // Retention is enforced by this startup sweep only — long-running relays that never
+            // restart will accumulate log files until the next restart. This is an accepted
+            // tradeoff to avoid tracing-appender 0.2.4's max_log_files prefix-based cleanup
+            // pitfalls (which can delete the live relay.log or unrelated files).
             sweep_old_logs(&log_dir, effective_retention);
 
             // Log config load success now that tracing is initialized

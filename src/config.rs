@@ -76,7 +76,8 @@ pub struct RelayConfig {
     pub observability: ObservabilityConfig,
     /// Number of days to retain daily-rotated relay log files. When `None`,
     /// defaults to 7 days at runtime. When `Some(0)`, log pruning is disabled
-    /// entirely.
+    /// entirely. Cleanup runs at startup; long-running relays accumulate logs
+    /// until restarted.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_retention_days: Option<u32>,
