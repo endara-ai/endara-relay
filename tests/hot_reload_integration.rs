@@ -69,6 +69,7 @@ async fn test_config_diff_add_endpoint() {
             session_identity_max_sessions: None,
             validate_inputs: None,
             observability: config::ObservabilityConfig::default(),
+            log_retention_days: None,
         },
         endpoints: vec![config::EndpointConfig {
             name: "echo-ep".to_string(),
@@ -108,6 +109,7 @@ async fn test_config_diff_add_endpoint() {
             session_identity_max_sessions: None,
             validate_inputs: None,
             observability: config::ObservabilityConfig::default(),
+            log_retention_days: None,
         },
         endpoints: vec![
             config::EndpointConfig {
@@ -261,6 +263,7 @@ async fn test_config_diff_remove_endpoint() {
             session_identity_max_sessions: None,
             validate_inputs: None,
             observability: config::ObservabilityConfig::default(),
+            log_retention_days: None,
         },
         endpoints: vec![
             config::EndpointConfig {
@@ -325,6 +328,7 @@ async fn test_config_diff_remove_endpoint() {
             session_identity_max_sessions: None,
             validate_inputs: None,
             observability: config::ObservabilityConfig::default(),
+            log_retention_days: None,
         },
         endpoints: vec![config::EndpointConfig {
             name: "echo-ep".to_string(),
