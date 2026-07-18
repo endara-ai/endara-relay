@@ -136,8 +136,14 @@ fn sweep_old_logs(log_dir: &std::path::Path, retention_days: u32) {
         return;
     }
 
-    let today = chrono::Local::now().date_naive();
-    let cutoff = today - chrono::Days::new(retention_days as u64);
+    let today = chrono::Utc::now().date_naive();
+    let cutoff = match today.checked_sub_days(chrono::Days::new(retention_days as u64)) {
+        Some(date) => date,
+        None => {
+            info!("Log retention window exceeds representable range; skipping sweep");
+            return;
+        }
+    };
 
     let entries = match std::fs::read_dir(log_dir) {
         Ok(e) => e,
@@ -226,10 +232,14 @@ fn init_tracing(
     );
 
     let file_appender = if retention_days > 0 {
+        // `max_log_files(N)` counts the currently-open dated file too, so
+        // `.max_log_files(7)` retains only 6 prior days plus today. Add 1 to
+        // `retention_days` so the appender reserves one slot for the live file,
+        // matching the sweep's semantics: "keep N days of prior history".
         tracing_appender::rolling::Builder::new()
             .rotation(tracing_appender::rolling::Rotation::DAILY)
             .filename_prefix("relay.log")
-            .max_log_files(retention_days as usize)
+            .max_log_files((retention_days as usize).saturating_add(1))
             .build(log_dir)
             .expect("Failed to create rolling file appender")
     } else {
@@ -292,6 +302,57 @@ async fn main() {
             let config_explicit = config.is_some();
             let config_path = config.unwrap_or_else(|| data_dir_path.join("config.toml"));
 
+            // First-run config copy: when using a non-default data dir without an
+            // explicit --config, copy the production config so dev instances inherit
+            // the same endpoint setup. This runs BEFORE config load so the copied
+            // file is picked up during load.
+            let default_data_dir = dirs::home_dir()
+                .map(|h| h.join(".endara"))
+                .unwrap_or_default();
+            if !config_explicit && data_dir_path != default_data_dir {
+                let resolved_config = config::expand_tilde(&config_path);
+                if !resolved_config.exists() {
+                    let production_config = default_data_dir.join("config.toml");
+                    if production_config.exists() {
+                        // Ensure the data dir and standard subdirs exist
+                        if let Err(e) = std::fs::create_dir_all(&data_dir_path) {
+                            eprintln!(
+                                "Warning: Failed to create data directory {}: {}",
+                                data_dir_path.display(),
+                                e
+                            );
+                        }
+                        for sub in &["logs", "tokens"] {
+                            let sub_path = data_dir_path.join(sub);
+                            if let Err(e) = std::fs::create_dir_all(&sub_path) {
+                                eprintln!(
+                                    "Warning: Failed to create subdirectory {}: {}",
+                                    sub_path.display(),
+                                    e
+                                );
+                            }
+                        }
+                        match std::fs::copy(&production_config, &resolved_config) {
+                            Ok(_) => {
+                                eprintln!(
+                                    "Copied production config from {} to {}",
+                                    production_config.display(),
+                                    resolved_config.display()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "Warning: Failed to copy production config from {} to {}: {}",
+                                    production_config.display(),
+                                    resolved_config.display(),
+                                    e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
             // Load config early to determine the effective log retention value
             // before initializing tracing. On error, use eprintln since tracing
             // isn't up yet, then exit.
@@ -330,48 +391,6 @@ async fn main() {
 
             // Sweep old logs after tracing is initialized so warnings go through the tracing layer
             sweep_old_logs(&log_dir, effective_retention);
-
-            // First-run config copy: when using a non-default data dir without an
-            // explicit --config, copy the production config so dev instances inherit
-            // the same endpoint setup.
-            let default_data_dir = dirs::home_dir()
-                .map(|h| h.join(".endara"))
-                .unwrap_or_default();
-            if !config_explicit && data_dir_path != default_data_dir {
-                let resolved_config = config::expand_tilde(&config_path);
-                if !resolved_config.exists() {
-                    let production_config = default_data_dir.join("config.toml");
-                    if production_config.exists() {
-                        // Ensure the data dir and standard subdirs exist
-                        if let Err(e) = std::fs::create_dir_all(&data_dir_path) {
-                            warn!(error = %e, path = %data_dir_path.display(), "Failed to create data directory");
-                        }
-                        for sub in &["logs", "tokens"] {
-                            let sub_path = data_dir_path.join(sub);
-                            if let Err(e) = std::fs::create_dir_all(&sub_path) {
-                                warn!(error = %e, path = %sub_path.display(), "Failed to create subdirectory");
-                            }
-                        }
-                        match std::fs::copy(&production_config, &resolved_config) {
-                            Ok(_) => {
-                                info!(
-                                    src = %production_config.display(),
-                                    dst = %resolved_config.display(),
-                                    "Copied production config to dev data directory"
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    error = %e,
-                                    src = %production_config.display(),
-                                    dst = %resolved_config.display(),
-                                    "Failed to copy production config"
-                                );
-                            }
-                        }
-                    }
-                }
-            }
 
             // Log config load success now that tracing is initialized
             info!(
@@ -1073,7 +1092,8 @@ mod tests {
         fs::write(log_dir.join("relay.log"), "current log").unwrap();
 
         // Create dated log files spanning 20 days (NOT including today)
-        let today = chrono::Local::now().date_naive();
+        // Use UTC dates to match sweep_old_logs timezone
+        let today = chrono::Utc::now().date_naive();
         for i in 1..=20 {
             let date = today - chrono::Days::new(i);
             let file_name = format!("relay.log.{}", date.format("%Y-%m-%d"));
@@ -1131,7 +1151,7 @@ mod tests {
         let log_dir = temp_dir.path();
 
         // Create some old log files
-        let today = chrono::Local::now().date_naive();
+        let today = chrono::Utc::now().date_naive();
         let old_date = today - chrono::Days::new(30);
         let file_name = format!("relay.log.{}", old_date.format("%Y-%m-%d"));
         fs::write(log_dir.join(&file_name), "old log").unwrap();
@@ -1156,5 +1176,33 @@ mod tests {
 
         // Live log should still exist
         assert!(log_dir.join("relay.log").exists());
+    }
+
+    #[test]
+    fn sweep_old_logs_handles_max_retention_without_panic() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path();
+
+        // Create a few old log files
+        let today = chrono::Utc::now().date_naive();
+        for i in 1..=5 {
+            let date = today - chrono::Days::new(i);
+            let file_name = format!("relay.log.{}", date.format("%Y-%m-%d"));
+            fs::write(log_dir.join(&file_name), format!("log from day {}", i)).unwrap();
+        }
+
+        // Call sweep with u32::MAX - should not panic, should retain everything
+        sweep_old_logs(log_dir, u32::MAX);
+
+        // All files should still exist (treated as "retain everything")
+        for i in 1..=5 {
+            let date = today - chrono::Days::new(i);
+            let file_name = format!("relay.log.{}", date.format("%Y-%m-%d"));
+            assert!(
+                log_dir.join(&file_name).exists(),
+                "Expected {} to exist after max retention sweep",
+                file_name
+            );
+        }
     }
 }
