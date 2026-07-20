@@ -13,7 +13,7 @@ async-trait = "0.1"
 axum = { version = "0.8", features = ["form", "json"] }
 base64 = "0.22"
 boa_engine = "0.20"
-chrono = { version = "0.4.44", default-features = false, features = ["clock"] }
+chrono = { version = "0.4.44", default-features = false, features = ["clock", "std"] }
 clap = { version = "4", features = ["derive"] }
 dirs = "6.0.0"
 futures-util = "0.3.32"

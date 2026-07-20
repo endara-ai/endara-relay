@@ -74,6 +74,13 @@ pub struct RelayConfig {
     /// falls back to [`ObservabilityConfig::default`].
     #[serde(default)]
     pub observability: ObservabilityConfig,
+    /// Number of days to retain daily-rotated relay log files. When `None`,
+    /// defaults to 7 days at runtime. When `Some(0)`, log pruning is disabled
+    /// entirely. Cleanup runs at startup; long-running relays accumulate logs
+    /// until restarted.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_retention_days: Option<u32>,
 }
 
 impl Default for RelayConfig {
@@ -97,6 +104,7 @@ impl Default for RelayConfig {
             session_identity_max_sessions: None,
             validate_inputs: None,
             observability: ObservabilityConfig::default(),
+            log_retention_days: None,
         }
     }
 }
@@ -1908,6 +1916,7 @@ js_execution = false
                 session_identity_max_sessions: None,
                 validate_inputs: None,
                 observability: ObservabilityConfig::default(),
+                log_retention_days: None,
             },
             endpoints,
             profiles: None,
@@ -3114,5 +3123,54 @@ resource = "https://api.githubcopilot.com/mcp/"
             !diff_configs(&with_org, &with_org).organizations_changed,
             "identical orgs should not be flagged as changed"
         );
+    }
+
+    #[test]
+    fn log_retention_days_defaults_to_none() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(config.relay.log_retention_days, None);
+    }
+
+    #[test]
+    fn log_retention_days_parses_nonzero() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+log_retention_days = 14
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(config.relay.log_retention_days, Some(14));
+    }
+
+    #[test]
+    fn log_retention_days_parses_zero() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+log_retention_days = 0
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(config.relay.log_retention_days, Some(0));
+    }
+
+    #[test]
+    fn log_retention_days_round_trips() {
+        let config = Config {
+            relay: RelayConfig {
+                machine_name: "test".to_string(),
+                log_retention_days: Some(14),
+                ..RelayConfig::default()
+            },
+            endpoints: vec![],
+            profiles: None,
+            organizations: Vec::new(),
+        };
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.relay.log_retention_days, Some(14));
     }
 }

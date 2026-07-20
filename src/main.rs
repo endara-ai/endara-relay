@@ -57,6 +57,9 @@ use tracing::{error, info, warn};
 pub type OAuthAdapterInners = Arc<RwLock<HashMap<String, Arc<OAuthAdapterInner>>>>;
 use watcher::ConfigWatcher;
 
+/// Default number of days to retain daily-rotated relay log files.
+const DEFAULT_LOG_RETENTION_DAYS: u32 = 7;
+
 #[derive(Parser)]
 #[command(name = "endara-relay", version, about = "Endara Relay agent")]
 struct Cli {
@@ -92,6 +95,11 @@ enum Commands {
         #[arg(long)]
         file_log_level: Option<String>,
 
+        /// Number of days to retain daily-rotated relay log files (overrides config.toml).
+        /// Cleanup runs at startup; long-running relays accumulate logs until restarted.
+        #[arg(long)]
+        log_retention_days: Option<u32>,
+
         /// Disable TOON (Token-Oriented Object Notation) conversion of JSON
         /// tool responses. Overrides `relay.toon_output` from config.toml.
         /// When unset, TOON conversion defaults to on.
@@ -117,6 +125,82 @@ fn expand_tilde(path: &str) -> PathBuf {
         dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
     } else {
         PathBuf::from(path)
+    }
+}
+
+/// Sweep old daily-rotated relay log files from the log directory.
+/// Enumerates `relay.log.YYYY-MM-DD` files, parses the trailing date, and
+/// deletes those older than `today - retention_days`. Never deletes the live
+/// `relay.log`. Best-effort: logs warnings on errors but never fails startup.
+fn sweep_old_logs(log_dir: &std::path::Path, retention_days: u32) {
+    if retention_days == 0 {
+        return;
+    }
+
+    let today = chrono::Utc::now().date_naive();
+    let cutoff = match today.checked_sub_days(chrono::Days::new(retention_days as u64)) {
+        Some(date) => date,
+        None => {
+            info!("Log retention window exceeds representable range; skipping sweep");
+            return;
+        }
+    };
+
+    let entries = match std::fs::read_dir(log_dir) {
+        Ok(e) => e,
+        Err(err) => {
+            warn!(error = %err, path = %log_dir.display(), "Failed to read log directory for cleanup");
+            return;
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                warn!(error = %err, "Failed to read directory entry during log cleanup");
+                continue;
+            }
+        };
+
+        let path = entry.path();
+        let file_name = match path.file_name().and_then(|n| n.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        // Only process files matching "relay.log.YYYY-MM-DD"
+        if !file_name.starts_with("relay.log.") {
+            continue;
+        }
+
+        // Never delete the live "relay.log" file
+        if file_name == "relay.log" {
+            continue;
+        }
+
+        // Extract the date suffix (everything after "relay.log.")
+        let date_str = &file_name["relay.log.".len()..];
+
+        // Parse as YYYY-MM-DD
+        let file_date = match chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+            Ok(d) => d,
+            Err(_) => {
+                // Skip files that don't match the expected date format
+                continue;
+            }
+        };
+
+        if file_date < cutoff {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    info!(path = %path.display(), "Deleted old log file");
+                }
+                Err(err) => {
+                    warn!(error = %err, path = %path.display(), "Failed to delete old log file");
+                }
+            }
+        }
     }
 }
 
@@ -197,6 +281,7 @@ async fn main() {
             log_format,
             color,
             file_log_level,
+            log_retention_days,
             no_toon,
         } => {
             let data_dir_path = expand_tilde(&data_dir);
@@ -204,12 +289,10 @@ async fn main() {
             let config_explicit = config.is_some();
             let config_path = config.unwrap_or_else(|| data_dir_path.join("config.toml"));
 
-            init_tracing(color, &log_format, file_log_level, &log_dir);
-            info!(config = %config_path.display(), data_dir = %data_dir_path.display(), "Starting endara-relay");
-
             // First-run config copy: when using a non-default data dir without an
             // explicit --config, copy the production config so dev instances inherit
-            // the same endpoint setup.
+            // the same endpoint setup. This runs BEFORE config load so the copied
+            // file is picked up during load.
             let default_data_dir = dirs::home_dir()
                 .map(|h| h.join(".endara"))
                 .unwrap_or_default();
@@ -220,28 +303,36 @@ async fn main() {
                     if production_config.exists() {
                         // Ensure the data dir and standard subdirs exist
                         if let Err(e) = std::fs::create_dir_all(&data_dir_path) {
-                            warn!(error = %e, path = %data_dir_path.display(), "Failed to create data directory");
+                            eprintln!(
+                                "Warning: Failed to create data directory {}: {}",
+                                data_dir_path.display(),
+                                e
+                            );
                         }
                         for sub in &["logs", "tokens"] {
                             let sub_path = data_dir_path.join(sub);
                             if let Err(e) = std::fs::create_dir_all(&sub_path) {
-                                warn!(error = %e, path = %sub_path.display(), "Failed to create subdirectory");
+                                eprintln!(
+                                    "Warning: Failed to create subdirectory {}: {}",
+                                    sub_path.display(),
+                                    e
+                                );
                             }
                         }
                         match std::fs::copy(&production_config, &resolved_config) {
                             Ok(_) => {
-                                info!(
-                                    src = %production_config.display(),
-                                    dst = %resolved_config.display(),
-                                    "Copied production config to dev data directory"
+                                eprintln!(
+                                    "Copied production config from {} to {}",
+                                    production_config.display(),
+                                    resolved_config.display()
                                 );
                             }
                             Err(e) => {
-                                warn!(
-                                    error = %e,
-                                    src = %production_config.display(),
-                                    dst = %resolved_config.display(),
-                                    "Failed to copy production config"
+                                eprintln!(
+                                    "Warning: Failed to copy production config from {} to {}: {}",
+                                    production_config.display(),
+                                    resolved_config.display(),
+                                    e
                                 );
                             }
                         }
@@ -249,46 +340,53 @@ async fn main() {
                 }
             }
 
+            // Load config early to determine the effective log retention value
+            // before initializing tracing. On error, use eprintln since tracing
+            // isn't up yet, then exit.
             let (cfg, validation_warnings) = match config::load_config_graceful(&config_path) {
-                Ok((cfg, warnings)) => {
-                    info!(
-                        machine_name = %cfg.relay.machine_name,
-                        endpoints = cfg.endpoints.len(),
-                        warnings = warnings.len(),
-                        "Configuration loaded successfully"
-                    );
-                    for w in &warnings {
-                        warn!("{}", w);
-                    }
-                    (cfg, warnings)
-                }
+                Ok((cfg, warnings)) => (cfg, warnings),
                 Err(config::ConfigError::IoError(ref io_err))
                     if io_err.kind() == std::io::ErrorKind::NotFound =>
                 {
-                    info!(
-                        path = %config_path.display(),
-                        "Config file not found, creating default configuration"
-                    );
                     match config::create_default_config_file(&config_path) {
-                        Ok(cfg) => {
-                            info!(
-                                machine_name = %cfg.relay.machine_name,
-                                path = %config_path.display(),
-                                "Created default configuration"
-                            );
-                            (cfg, Vec::new())
-                        }
+                        Ok(cfg) => (cfg, Vec::new()),
                         Err(e) => {
-                            error!(error = %e, "Failed to create default configuration");
+                            eprintln!("Failed to create default configuration: {}", e);
                             std::process::exit(1);
                         }
                     }
                 }
                 Err(e) => {
-                    error!(error = %e, "Failed to load configuration");
+                    eprintln!("Failed to load configuration: {}", e);
                     std::process::exit(1);
                 }
             };
+
+            // Resolve effective retention: CLI → config → default
+            let effective_retention = log_retention_days
+                .or(cfg.relay.log_retention_days)
+                .unwrap_or(DEFAULT_LOG_RETENTION_DAYS);
+
+            init_tracing(color, &log_format, file_log_level.clone(), &log_dir);
+            info!(config = %config_path.display(), data_dir = %data_dir_path.display(), "Starting endara-relay");
+
+            // Sweep old logs after tracing is initialized so warnings go through the tracing layer.
+            // Retention is enforced by this startup sweep only — long-running relays that never
+            // restart will accumulate log files until the next restart. This is an accepted
+            // tradeoff to avoid tracing-appender 0.2.4's max_log_files prefix-based cleanup
+            // pitfalls (which can delete the live relay.log or unrelated files).
+            sweep_old_logs(&log_dir, effective_retention);
+
+            // Log config load success now that tracing is initialized
+            info!(
+                machine_name = %cfg.relay.machine_name,
+                endpoints = cfg.endpoints.len(),
+                warnings = validation_warnings.len(),
+                "Configuration loaded successfully"
+            );
+            for w in &validation_warnings {
+                warn!("{}", w);
+            }
 
             // Collect endpoint names that have validation warnings
             let warned_names = config::warned_endpoint_names(&validation_warnings);
@@ -960,6 +1058,136 @@ async fn main() {
                     std::process::exit(1);
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn sweep_old_logs_removes_old_files() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path();
+
+        // Create a live relay.log file
+        fs::write(log_dir.join("relay.log"), "current log").unwrap();
+
+        // Create dated log files spanning 20 days (NOT including today)
+        // Use UTC dates to match sweep_old_logs timezone
+        let today = chrono::Utc::now().date_naive();
+        for i in 1..=20 {
+            let date = today - chrono::Days::new(i);
+            let file_name = format!("relay.log.{}", date.format("%Y-%m-%d"));
+            fs::write(log_dir.join(&file_name), format!("log from day {}", i)).unwrap();
+        }
+
+        // Sweep with retention of 7 days (keeps files from the last 7 days, not counting today)
+        sweep_old_logs(log_dir, 7);
+
+        // Check that the live log is still there
+        assert!(log_dir.join("relay.log").exists());
+
+        // Check that only the 7 most recent dated files remain
+        let mut remaining = Vec::new();
+        for entry in fs::read_dir(log_dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            if name.starts_with("relay.log.") {
+                remaining.push(name);
+            }
+        }
+        assert_eq!(
+            remaining.len(),
+            7,
+            "Expected 7 dated files, got: {:?}",
+            remaining
+        );
+
+        // Verify the newest 7 dated files are kept (days 1-7 ago)
+        for i in 1..=7 {
+            let date = today - chrono::Days::new(i);
+            let file_name = format!("relay.log.{}", date.format("%Y-%m-%d"));
+            assert!(
+                log_dir.join(&file_name).exists(),
+                "Expected {} to exist",
+                file_name
+            );
+        }
+
+        // Verify files older than 7 days are deleted (days 8-20 ago)
+        for i in 8..=20 {
+            let date = today - chrono::Days::new(i);
+            let file_name = format!("relay.log.{}", date.format("%Y-%m-%d"));
+            assert!(
+                !log_dir.join(&file_name).exists(),
+                "Expected {} to be deleted",
+                file_name
+            );
+        }
+    }
+
+    #[test]
+    fn sweep_old_logs_retention_zero_is_noop() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path();
+
+        // Create some old log files
+        let today = chrono::Utc::now().date_naive();
+        let old_date = today - chrono::Days::new(30);
+        let file_name = format!("relay.log.{}", old_date.format("%Y-%m-%d"));
+        fs::write(log_dir.join(&file_name), "old log").unwrap();
+
+        // Sweep with retention of 0 (disabled)
+        sweep_old_logs(log_dir, 0);
+
+        // File should still exist
+        assert!(log_dir.join(&file_name).exists());
+    }
+
+    #[test]
+    fn sweep_old_logs_never_deletes_live_log() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path();
+
+        // Create the live relay.log file
+        fs::write(log_dir.join("relay.log"), "current log").unwrap();
+
+        // Sweep with retention of 1 day
+        sweep_old_logs(log_dir, 1);
+
+        // Live log should still exist
+        assert!(log_dir.join("relay.log").exists());
+    }
+
+    #[test]
+    fn sweep_old_logs_handles_max_retention_without_panic() {
+        let temp_dir = TempDir::new().unwrap();
+        let log_dir = temp_dir.path();
+
+        // Create a few old log files
+        let today = chrono::Utc::now().date_naive();
+        for i in 1..=5 {
+            let date = today - chrono::Days::new(i);
+            let file_name = format!("relay.log.{}", date.format("%Y-%m-%d"));
+            fs::write(log_dir.join(&file_name), format!("log from day {}", i)).unwrap();
+        }
+
+        // Call sweep with u32::MAX - should not panic, should retain everything
+        sweep_old_logs(log_dir, u32::MAX);
+
+        // All files should still exist (treated as "retain everything")
+        for i in 1..=5 {
+            let date = today - chrono::Days::new(i);
+            let file_name = format!("relay.log.{}", date.format("%Y-%m-%d"));
+            assert!(
+                log_dir.join(&file_name).exists(),
+                "Expected {} to exist after max retention sweep",
+                file_name
+            );
         }
     }
 }

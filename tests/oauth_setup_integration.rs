@@ -30,6 +30,7 @@ fn empty_config() -> Config {
             session_identity_max_sessions: None,
             validate_inputs: None,
             observability: ObservabilityConfig::default(),
+            log_retention_days: None,
         },
         endpoints: vec![EndpointConfig {
             name: "echo".to_string(),

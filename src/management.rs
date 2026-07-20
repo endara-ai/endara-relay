@@ -6589,6 +6589,7 @@ mod tests {
                 session_identity_max_sessions: None,
                 validate_inputs: None,
                 observability: crate::config::ObservabilityConfig::default(),
+                log_retention_days: None,
             },
             endpoints: vec![EndpointConfig {
                 name: "echo".to_string(),
@@ -9046,6 +9047,7 @@ command = "echo"
                 session_identity_max_sessions: None,
                 validate_inputs: None,
                 observability: crate::config::ObservabilityConfig::default(),
+                log_retention_days: None,
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
@@ -9590,6 +9592,7 @@ command = "echo"
                 session_identity_max_sessions: None,
                 validate_inputs: None,
                 observability: crate::config::ObservabilityConfig::default(),
+                log_retention_days: None,
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
@@ -11020,6 +11023,7 @@ command = "echo"
                 session_identity_max_sessions: None,
                 validate_inputs: None,
                 observability: crate::config::ObservabilityConfig::default(),
+                log_retention_days: None,
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
@@ -11145,6 +11149,7 @@ client_id = "client123"
                 session_identity_max_sessions: None,
                 validate_inputs: None,
                 observability: crate::config::ObservabilityConfig::default(),
+                log_retention_days: None,
             },
             endpoints: vec![],
             profiles: None,
@@ -11210,6 +11215,7 @@ client_id = "client123"
                 session_identity_max_sessions: None,
                 validate_inputs: None,
                 observability: crate::config::ObservabilityConfig::default(),
+                log_retention_days: None,
             },
             endpoints: endpoint_names
                 .iter()
@@ -11773,6 +11779,7 @@ client_id = "client123"
                 session_identity_max_sessions: None,
                 validate_inputs: None,
                 observability: crate::config::ObservabilityConfig::default(),
+                log_retention_days: None,
             },
             endpoints: vec![EndpointConfig {
                 name: "existing".to_string(),
