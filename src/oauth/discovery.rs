@@ -109,8 +109,9 @@ pub enum DiscoveryError {
 }
 
 impl DiscoveryError {
-    /// Whether this failure is transient (network unreachable / timed out)
-    /// rather than a genuine absence of metadata (404-class).
+    /// Whether this failure is transient (network unreachable / timed out /
+    /// DNS failure / server-side 5xx) rather than a genuine absence of
+    /// metadata (404-class).
     ///
     /// Callers that fall back to convention-based endpoints when a server
     /// doesn't publish RFC 8414 metadata must NOT do so on a transient
@@ -119,7 +120,18 @@ impl DiscoveryError {
     pub fn is_transient(&self) -> bool {
         match self {
             DiscoveryError::Timeout(_) => true,
-            DiscoveryError::Http(e) => e.is_timeout() || e.is_connect(),
+            // `fetch_well_known` maps only 404 to MetadataNotFound; a 5xx
+            // from a gateway/CDN while the origin is down surfaces here as
+            // a status error and is just as transient as a timeout.
+            DiscoveryError::Http(e) => {
+                e.is_timeout() || e.is_connect() || e.status().is_some_and(|s| s.is_server_error())
+            }
+            // DNS failures never reach reqwest: `validated_client` resolves
+            // the host up front and wraps them in these two variants. Policy
+            // rejections (scheme / address not allowed) stay non-transient.
+            DiscoveryError::UrlGuard(
+                UrlGuardError::ResolveFailed { .. } | UrlGuardError::NoAddresses { .. },
+            ) => true,
             _ => false,
         }
     }
@@ -1067,6 +1079,79 @@ mod tests {
             .await
             .expect_err("connection should be refused");
         assert!(DiscoveryError::Http(err).is_transient());
+    }
+
+    /// A 5xx status error wrapped in `Http` is transient (gateway/CDN in
+    /// front of a down origin); a non-404 4xx status stays non-transient.
+    #[tokio::test]
+    async fn is_transient_classifies_5xx_status_error() {
+        use axum::routing::get;
+        use axum::Router;
+
+        let router = Router::new()
+            .route(
+                "/unavailable",
+                get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+            )
+            .route(
+                "/forbidden",
+                get(|| async { axum::http::StatusCode::FORBIDDEN }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let err_503 = reqwest::get(format!("http://{addr}/unavailable"))
+            .await
+            .unwrap()
+            .error_for_status()
+            .expect_err("503 should be a status error");
+        assert!(DiscoveryError::Http(err_503).is_transient());
+
+        let err_403 = reqwest::get(format!("http://{addr}/forbidden"))
+            .await
+            .unwrap()
+            .error_for_status()
+            .expect_err("403 should be a status error");
+        assert!(!DiscoveryError::Http(err_403).is_transient());
+
+        server.abort();
+    }
+
+    /// DNS failures surface as `UrlGuard(ResolveFailed/NoAddresses)` (the
+    /// URL guard resolves the host before reqwest ever runs) and are
+    /// transient; URL-policy rejections are not.
+    #[test]
+    fn is_transient_classifies_url_guard_dns_failures() {
+        assert!(DiscoveryError::UrlGuard(UrlGuardError::ResolveFailed {
+            host: "as.example.com".into(),
+            source: std::io::Error::other("dns outage"),
+        })
+        .is_transient());
+        assert!(DiscoveryError::UrlGuard(UrlGuardError::NoAddresses {
+            host: "as.example.com".into(),
+        })
+        .is_transient());
+
+        // Policy rejections establish the URL is disallowed, not that the
+        // network hiccuped — never transient.
+        assert!(!DiscoveryError::UrlGuard(UrlGuardError::InvalidUrl {
+            url: "not-a-url".into(),
+        })
+        .is_transient());
+        assert!(!DiscoveryError::UrlGuard(UrlGuardError::SchemeNotAllowed {
+            scheme: "http".into(),
+            url: "http://as.example.com".into(),
+        })
+        .is_transient());
+        assert!(!DiscoveryError::UrlGuard(UrlGuardError::AddressNotAllowed {
+            addr: "127.0.0.1".parse().unwrap(),
+            host: "as.example.com".into(),
+        })
+        .is_transient());
     }
 
     // --- build_openid_configuration_url tests --------------------------------
