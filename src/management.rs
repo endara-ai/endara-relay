@@ -7103,9 +7103,17 @@ mod tests {
                 Some("echo".to_string()),
             )
             .await;
+        // Point the config entry at a nonexistent command so the background
+        // create_adapter rebuild fails at spawn() with ENOENT — instantly and
+        // deterministically — instead of spawning a real `echo` subprocess
+        // whose MCP handshake stalls through DISCOVER_PROBE_TIMEOUT plus a
+        // stderr drain, the documented source of flakiness on loaded CI.
+        let mut cfg = test_config();
+        cfg.endpoints[0].command = Some("endara-nonexistent-command-for-tests".to_string());
+        cfg.endpoints[0].args = None;
         let state = ManagementState {
             registry: Arc::new(registry),
-            config: Arc::new(RwLock::new(test_config())),
+            config: Arc::new(RwLock::new(cfg)),
             start_time: Instant::now(),
             config_path: None,
             oauth_flow_manager: None,
@@ -7141,14 +7149,11 @@ mod tests {
         assert!(body["message"].as_str().unwrap().contains("restarted"));
 
         // Poll the registry until the background task swaps the adapter.
-        // "echo" is in test_config but is not a real MCP server, so
-        // create_adapter ends up producing a FailedAdapter (Unhealthy).
-        // Generous bound for the same reason as in
-        // restart_endpoint_returns_quickly_during_slow_shutdown: the
-        // create_adapter/`echo` handshake can stall up to
-        // DISCOVER_PROBE_TIMEOUT plus a stderr drain under CI load, and this
-        // poll only checks eventual convergence (the non-blocking invariant
-        // is the <500ms response assertion above).
+        // The config points "echo" at a nonexistent command, so create_adapter
+        // fails at spawn() and produces a FailedAdapter (Unhealthy) with no
+        // handshake timing involved. The generous bound only absorbs CI
+        // scheduling noise; the non-blocking invariant is the <500ms response
+        // assertion above.
         let swapped = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 {
@@ -7244,9 +7249,17 @@ mod tests {
                 Some("echo".to_string()),
             )
             .await;
+        // Point the config entry at a nonexistent command so the background
+        // create_adapter rebuild fails at spawn() with ENOENT — instantly and
+        // deterministically — instead of spawning a real `echo` subprocess
+        // whose MCP handshake stalls through DISCOVER_PROBE_TIMEOUT plus a
+        // stderr drain, the documented source of flakiness on loaded CI.
+        let mut cfg = test_config();
+        cfg.endpoints[0].command = Some("endara-nonexistent-command-for-tests".to_string());
+        cfg.endpoints[0].args = None;
         let state = ManagementState {
             registry: Arc::new(registry),
-            config: Arc::new(RwLock::new(test_config())),
+            config: Arc::new(RwLock::new(cfg)),
             start_time: Instant::now(),
             config_path: None,
             oauth_flow_manager: None,
@@ -7315,18 +7328,12 @@ mod tests {
         );
 
         // Item B (4): once the background spawn completes, the registry
-        // should hold the new adapter. With test_config()'s "echo" entry
-        // (command = "echo", no MCP server), create_adapter ends up with a
-        // FailedAdapter whose health is Unhealthy.
-        //
-        // Generous bound: this convergence path stacks the fixed 1.5s slow
-        // shutdown, a real `echo` subprocess spawn via create_adapter, and an
-        // MCP handshake whose discover probe can stall up to
-        // DISCOVER_PROBE_TIMEOUT (3s) plus a 500ms stderr drain — ~5.5s worst
-        // case before CI load (the create_adapter/`echo` handshake is the
-        // known-flaky-on-loaded-CI path documented in the test below). The
-        // non-blocking invariant is asserted above; this poll only checks
-        // eventual convergence, so the loose bound weakens nothing.
+        // should hold the new adapter. The config points "echo" at a
+        // nonexistent command, so create_adapter fails at spawn() with ENOENT
+        // and produces a FailedAdapter (Unhealthy) with no handshake timing
+        // involved — only the fixed 1.5s slow shutdown precedes the swap. The
+        // generous bound absorbs CI scheduling noise; the non-blocking
+        // invariant is asserted above.
         let final_state = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 {
