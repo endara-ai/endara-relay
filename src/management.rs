@@ -7143,7 +7143,13 @@ mod tests {
         // Poll the registry until the background task swaps the adapter.
         // "echo" is in test_config but is not a real MCP server, so
         // create_adapter ends up producing a FailedAdapter (Unhealthy).
-        let swapped = tokio::time::timeout(Duration::from_secs(5), async {
+        // Generous bound for the same reason as in
+        // restart_endpoint_returns_quickly_during_slow_shutdown: the
+        // create_adapter/`echo` handshake can stall up to
+        // DISCOVER_PROBE_TIMEOUT plus a stderr drain under CI load, and this
+        // poll only checks eventual convergence (the non-blocking invariant
+        // is the <500ms response assertion above).
+        let swapped = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 {
                     let entries = registry_for_poll.entries().read().await;
@@ -7160,7 +7166,7 @@ mod tests {
 
         assert!(
             swapped.is_ok(),
-            "registry never reflected new adapter within 5s"
+            "registry never reflected new adapter within 20s"
         );
     }
 
@@ -7312,7 +7318,16 @@ mod tests {
         // should hold the new adapter. With test_config()'s "echo" entry
         // (command = "echo", no MCP server), create_adapter ends up with a
         // FailedAdapter whose health is Unhealthy.
-        let final_state = tokio::time::timeout(Duration::from_secs(5), async {
+        //
+        // Generous bound: this convergence path stacks the fixed 1.5s slow
+        // shutdown, a real `echo` subprocess spawn via create_adapter, and an
+        // MCP handshake whose discover probe can stall up to
+        // DISCOVER_PROBE_TIMEOUT (3s) plus a 500ms stderr drain — ~5.5s worst
+        // case before CI load (the create_adapter/`echo` handshake is the
+        // known-flaky-on-loaded-CI path documented in the test below). The
+        // non-blocking invariant is asserted above; this poll only checks
+        // eventual convergence, so the loose bound weakens nothing.
+        let final_state = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
                 {
                     let entries = registry_for_poll.entries().read().await;
@@ -7328,7 +7343,7 @@ mod tests {
         .await;
         assert!(
             final_state.is_ok(),
-            "registry never reflected final swapped adapter within 5s"
+            "registry never reflected final swapped adapter within 20s"
         );
     }
 
