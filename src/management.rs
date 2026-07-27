@@ -1212,9 +1212,12 @@ async fn oauth_start(
     ) = if let Some(ref server_url) = oauth_server_url {
         // Prefer RFC 8414 discovery against the configured AS URL. If it
         // succeeds, use the discovered endpoints (explicit token_endpoint
-        // config still wins). On any error, fall back to the legacy
-        // convention-based construction so behavior is unchanged for
-        // servers that don't expose AS metadata.
+        // config still wins). On a 404-class failure (metadata genuinely
+        // absent), fall back to the legacy convention-based construction so
+        // behavior is unchanged for servers that don't expose AS metadata.
+        // On a transient failure (unreachable / timed out) do NOT guess —
+        // the server likely publishes metadata and the composed
+        // `{base}/authorize` URL would send the user to a dead page.
         match discovery::discover_authorization_server(server_url, allow_insecure_oauth).await {
             Ok(disc) => {
                 let token_url = config_token_endpoint
@@ -1230,11 +1233,32 @@ async fn oauth_start(
                     disc.authorization_response_iss_parameter_supported,
                 )
             }
-            Err(e) => {
+            Err(e) if e.is_transient() => {
                 warn!(
                     endpoint = %name,
                     error = %e,
-                    "RFC 8414 discovery against oauth_server_url failed; falling back to convention-based endpoints"
+                    "RFC 8414 discovery against oauth_server_url failed transiently; not composing a convention-based authorize URL"
+                );
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "discovery_unreachable",
+                    Some(&format!(
+                        "Could not reach the OAuth server to discover its endpoints. \
+                             Check connectivity and try again. Details: {e}"
+                    )),
+                )
+                .into_response();
+            }
+            Err(
+                e @ (discovery::DiscoveryError::MetadataNotFound { .. }
+                | discovery::DiscoveryError::AuthServerMetadataNotFound { .. }),
+            ) => {
+                // 404-class only: metadata is genuinely absent, so the legacy
+                // convention-based construction is the best we can do.
+                warn!(
+                    endpoint = %name,
+                    error = %e,
+                    "RFC 8414 discovery against oauth_server_url found no metadata; falling back to convention-based endpoints"
                 );
                 let base = server_url.trim_end_matches('/');
                 let token_url = config_token_endpoint
@@ -1249,6 +1273,27 @@ async fn oauth_start(
                     None::<String>,
                     false,
                 )
+            }
+            Err(e) => {
+                // Any other failure (non-404 HTTP status, malformed metadata,
+                // S256 unsupported, URL-policy rejection) does not establish
+                // that metadata is absent — composing `{base}/authorize`
+                // could produce the same dead or unsafe redirect.
+                warn!(
+                    endpoint = %name,
+                    error = %e,
+                    "RFC 8414 discovery against oauth_server_url failed; not composing a convention-based authorize URL"
+                );
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "discovery_failed",
+                    Some(&format!(
+                        "Could not discover OAuth server endpoints from \
+                             oauth_server_url. Fix the server metadata or the \
+                             configured URL and try again. Details: {e}"
+                    )),
+                )
+                .into_response();
             }
         }
     } else {
@@ -9833,6 +9878,142 @@ command = "echo"
         );
         // No discovery metadata on the fallback path.
         assert!(body.get("discovery").is_none() || body["discovery"].is_null());
+    }
+
+    #[tokio::test]
+    async fn oauth_start_with_oauth_server_url_errors_on_transient_discovery_failure() {
+        // Bind a listener to reserve a port, then drop it so nothing is
+        // listening: discovery hits a connection-refused (transient) error.
+        // Unlike a 404 (metadata genuinely absent), a transient failure must
+        // NOT fall back to the convention `{base}/authorize` — the guessed
+        // URL would send the user to a dead page. Expect a structured
+        // `discovery_unreachable` error instead.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let (state, _flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "discovery_unreachable");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap()
+                .contains("Could not reach the OAuth server"),
+            "detail should explain the connectivity failure, got: {}",
+            body["detail"]
+        );
+        assert!(
+            body.get("authorize_url").is_none(),
+            "no authorize URL may be composed on a transient discovery failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_start_with_oauth_server_url_errors_on_5xx_discovery_failure() {
+        // Mock AS: 503 on every route (gateway/CDN in front of a down
+        // origin). A 5xx is transient — the server likely does publish
+        // metadata — so oauth_start must return `discovery_unreachable`
+        // rather than compose the convention `{base}/authorize`.
+        let router = Router::new().fallback(|| async { StatusCode::SERVICE_UNAVAILABLE });
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let (state, _flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "discovery_unreachable");
+        assert!(
+            body.get("authorize_url").is_none(),
+            "no authorize URL may be composed when the AS returns 5xx"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_start_with_oauth_server_url_errors_on_non_404_discovery_failure() {
+        // Mock AS: 403 on every route. A non-404, non-transient failure does
+        // not establish that metadata is absent, so the convention fallback
+        // must NOT run — expect a structured `discovery_failed` error.
+        let router = Router::new().fallback(|| async { StatusCode::FORBIDDEN });
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let (state, _flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "discovery_failed");
+        assert!(
+            body.get("authorize_url").is_none(),
+            "no authorize URL may be composed on a non-404 discovery failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_start_with_oauth_server_url_errors_when_s256_unsupported() {
+        // Mock AS: metadata is served but only advertises the `plain` PKCE
+        // method. S256NotSupported is neither transient nor 404-class, so
+        // the convention fallback must NOT run.
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            Json(serde_json::json!({
+                "issuer": mock_issuer(&headers),
+                "authorization_endpoint": "http://example.test/authorize",
+                "token_endpoint": "http://example.test/token",
+                "code_challenge_methods_supported": ["plain"],
+            }))
+        }
+        let router =
+            Router::new().route("/.well-known/oauth-authorization-server", get(well_known));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let (state, _flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "discovery_failed");
+        assert!(
+            body["detail"].as_str().unwrap().contains("S256"),
+            "detail should surface the S256 failure, got: {}",
+            body["detail"]
+        );
+        assert!(
+            body.get("authorize_url").is_none(),
+            "no authorize URL may be composed when the AS lacks S256 support"
+        );
     }
 
     #[tokio::test]
