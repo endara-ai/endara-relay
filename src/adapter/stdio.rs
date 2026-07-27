@@ -32,6 +32,14 @@ pub const DEFAULT_CONTAINER_IMAGE: &str = "ghcr.io/endara-ai/mcp-runner:latest";
 /// crash banner stays a single readable sentence instead of a stderr dump.
 const CRASH_USER_MESSAGE: &str = "Server failed to start. See Logs tab for details.";
 
+/// Reason recorded on [`HealthStatus::Unhealthy`] when the auto-respawn
+/// supervisor detects a crash loop (3+ crashes within 60 seconds).
+const UNHEALTHY_REASON: &str = "3+ crashes in 60 seconds";
+
+/// Sentinel for [`StdioAdapter::pending_eof_gen`]: no stdout-reader EOF was
+/// observed while a respawn supervisor was already running.
+const NO_PENDING_EOF: u64 = u64::MAX;
+
 /// Process isolation mode for a stdio endpoint.
 ///
 /// `Container` spawns the server through a detected container runtime
@@ -257,10 +265,20 @@ impl RingBuffer {
 
 /// Crash tracking for exponential backoff.
 #[derive(Debug)]
-#[allow(dead_code)] // Used by try_respawn, kept for respawn support
 struct CrashTracker {
     timestamps: Vec<Instant>,
     consecutive_crashes: u32,
+    /// When the most recent crash was recorded. The consecutive-crash streak
+    /// deliberately survives a successful post-respawn handshake (a server
+    /// that handshakes and then crashes seconds later is still crash-looping)
+    /// and only resets after the child stays up for a full stability
+    /// interval — see [`Self::record_crash`].
+    last_crash: Option<Instant>,
+    /// Base unit of the backoff schedule (1 second in production). Tests
+    /// shrink it (via `StdioAdapter::set_backoff_unit_for_test`) so the full
+    /// 1-1-2-4-8-…-60 schedule and the stability interval — both expressed in
+    /// units — can be walked in milliseconds instead of real minutes.
+    backoff_unit: Duration,
 }
 
 impl CrashTracker {
@@ -268,14 +286,30 @@ impl CrashTracker {
         Self {
             timestamps: Vec::new(),
             consecutive_crashes: 0,
+            last_crash: None,
+            backoff_unit: Duration::from_secs(1),
         }
     }
 
-    /// Record a crash and return whether the adapter should be marked unhealthy.
-    #[allow(dead_code)] // Used by try_respawn
-    fn record_crash(&mut self) -> bool {
+    /// Record a crash. Returns `(unhealthy, backoff)`: whether the adapter
+    /// should be marked unhealthy (3+ crashes within 60 seconds), and how
+    /// long the supervisor should wait before the next respawn attempt.
+    ///
+    /// The backoff is derived from the PRE-increment streak so the delays run
+    /// 1s, 1s, 2s, 4s, 8s, then hold at the 60s cap — matching the documented
+    /// schedule. The streak resets only when the previous crash is at least a
+    /// stability interval old (2x the cap, so capped retries — which arrive
+    /// ~60s apart — never self-reset), not on every successful handshake.
+    fn record_crash(&mut self) -> (bool, Duration) {
         let now = Instant::now();
+        if let Some(last) = self.last_crash {
+            if now.duration_since(last) >= self.stability_interval() {
+                self.consecutive_crashes = 0;
+            }
+        }
+        let backoff = self.backoff_for(self.consecutive_crashes);
         self.consecutive_crashes += 1;
+        self.last_crash = Some(now);
         self.timestamps.push(now);
 
         // Remove crashes older than 60 seconds
@@ -283,25 +317,31 @@ impl CrashTracker {
         self.timestamps.retain(|t| *t >= cutoff);
 
         // If 3+ crashes in 60 seconds, mark unhealthy
-        self.timestamps.len() >= 3
+        (self.timestamps.len() >= 3, backoff)
     }
 
-    /// Calculate backoff duration based on consecutive crashes.
-    #[allow(dead_code)] // Used by try_respawn
-    fn backoff_duration(&self) -> Duration {
-        let secs = match self.consecutive_crashes {
-            0 => 1,
-            1 => 1,
+    /// Backoff before the (streak+1)-th consecutive respawn attempt, in
+    /// multiples of the backoff unit: 1, 1, 2, 4, 8, then capped at 60.
+    fn backoff_for(&self, streak: u32) -> Duration {
+        let units: u32 = match streak {
+            0 | 1 => 1,
             2 => 2,
             3 => 4,
             4 => 8,
             _ => 60,
         };
-        Duration::from_secs(secs)
+        self.backoff_unit * units
+    }
+
+    /// How long the child must stay up before the consecutive-crash streak
+    /// resets: twice the backoff cap (120 units = 2 minutes in production).
+    fn stability_interval(&self) -> Duration {
+        self.backoff_unit * 120
     }
 
     fn reset(&mut self) {
         self.consecutive_crashes = 0;
+        self.last_crash = None;
     }
 }
 
@@ -332,6 +372,12 @@ pub fn calculate_backoff(consecutive_crashes: u32) -> Duration {
 type PendingRequests = Arc<Mutex<HashMap<u64, tokio::sync::oneshot::Sender<String>>>>;
 
 /// STDIO MCP adapter — spawns a child process and communicates via stdin/stdout.
+///
+/// All state is `Arc`-shared, so `Clone` produces a second handle onto the
+/// SAME adapter (same child process, same health, same pending map). The
+/// auto-respawn supervisor relies on this: the stdout reader task holds a
+/// cloned handle and can drive a full respawn from `&self`.
+#[derive(Clone)]
 pub struct StdioAdapter {
     config: StdioConfig,
     child: Arc<Mutex<Option<Child>>>,
@@ -339,7 +385,7 @@ pub struct StdioAdapter {
     pending_requests: PendingRequests,
     stderr_buffer: Arc<RwLock<RingBuffer>>,
     health: Arc<RwLock<HealthStatus>>,
-    request_id: AtomicU64,
+    request_id: Arc<AtomicU64>,
     crash_tracker: Arc<Mutex<CrashTracker>>,
     /// Sanitized server name from the MCP initialize response.
     server_type: Arc<RwLock<Option<String>>>,
@@ -361,7 +407,41 @@ pub struct StdioAdapter {
     /// `endpoint{…}` header without bound. This flag is flipped the first
     /// time a non-empty `server_type` is written so subsequent handshakes
     /// skip the record call.
-    server_type_recorded: AtomicBool,
+    server_type_recorded: Arc<AtomicBool>,
+    /// Set at the top of [`Self::shutdown`] (before any teardown work) and
+    /// cleared when [`Self::initialize`] is called again. The auto-respawn
+    /// supervisor checks this flag at every decision point so an intentional
+    /// shutdown — including the manual restart endpoint in `management.rs`,
+    /// which shuts the old adapter down — always wins over an in-flight
+    /// respawn, even when the flag flips mid-attempt.
+    shutdown_requested: Arc<AtomicBool>,
+    /// Lifecycle generation (epoch) counter. Bumped by [`Self::initialize`]
+    /// and [`Self::shutdown`], and CAS-claimed by the respawn supervisor
+    /// before each respawn attempt, so every spawned child — and its stdout
+    /// reader — is tagged with the generation that created it. Stale actors
+    /// (an EOF hook from a previous child, a supervisor parked in a backoff
+    /// sleep across a shutdown→initialize restart, a raced health write)
+    /// compare their captured generation against the current value and stand
+    /// down on mismatch. This closes the restart race where a supervisor
+    /// sleeping through the brief `shutdown_requested` window would wake and
+    /// kill a freshly restarted healthy child, and the health-write races
+    /// where a stale respawn could overwrite `Stopped`/`Healthy` state owned
+    /// by a newer lifecycle.
+    generation: Arc<AtomicU64>,
+    /// Generation of a stdout-reader EOF that arrived while a supervisor was
+    /// already running (see [`Self::maybe_start_respawn_supervisor`]).
+    /// `NO_PENDING_EOF` means none. The finishing supervisor re-checks this
+    /// after clearing `respawning` so an EOF landing in that window re-arms a
+    /// fresh supervisor instead of being dropped.
+    pending_eof_gen: Arc<AtomicU64>,
+    /// True while an auto-respawn supervisor task is running for this
+    /// adapter. The stdout reader's EOF hook uses `swap` on this flag so at
+    /// most one supervisor exists at a time (each respawn attempt spawns a
+    /// fresh reader whose own EOF must not start a second supervisor); an
+    /// EOF observed while the flag is set is preserved via `pending_eof_gen`.
+    /// Also read by [`Self::send_external_request`] to fail external calls
+    /// fast while a respawn is in flight.
+    respawning: Arc<AtomicBool>,
     /// Shared typed event bus for the desktop overlay's SSE stream. Set
     /// once by [`Self::set_event_bus`] from `main.rs`/`watcher.rs` after
     /// construction; `None` keeps `call_tool` silent (no events published)
@@ -423,13 +503,17 @@ impl StdioAdapter {
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             stderr_buffer: Arc::new(RwLock::new(RingBuffer::new(1000))),
             health: Arc::new(RwLock::new(HealthStatus::Stopped)),
-            request_id: AtomicU64::new(1),
+            request_id: Arc::new(AtomicU64::new(1)),
             crash_tracker: Arc::new(Mutex::new(CrashTracker::new())),
             server_type: Arc::new(RwLock::new(None)),
             upstream_server_name: Arc::new(RwLock::new(None)),
             tools_changed_tx,
             span,
-            server_type_recorded: AtomicBool::new(false),
+            server_type_recorded: Arc::new(AtomicBool::new(false)),
+            shutdown_requested: Arc::new(AtomicBool::new(false)),
+            generation: Arc::new(AtomicU64::new(0)),
+            pending_eof_gen: Arc::new(AtomicU64::new(NO_PENDING_EOF)),
+            respawning: Arc::new(AtomicBool::new(false)),
             event_bus: Arc::new(OnceLock::new()),
             tool_annotations_cache: Arc::new(RwLock::new(HashMap::new())),
             container: Arc::new(Mutex::new(None)),
@@ -513,8 +597,31 @@ impl StdioAdapter {
     }
 
     /// Spawn the child process and set up I/O pipes.
+    ///
+    /// The spawn is tagged with the lifecycle generation current at entry
+    /// (callers — `initialize()` and the respawn supervisor — bump/claim the
+    /// generation immediately before calling). If the generation changes
+    /// mid-spawn (a concurrent `shutdown()` or `initialize()` took over the
+    /// lifecycle), the freshly spawned child is torn back down instead of
+    /// being installed where nothing would ever reap it.
     async fn spawn_process(&self) -> Result<(), AdapterError> {
-        *self.health.write().await = HealthStatus::Starting;
+        let spawn_gen = self.generation.load(Ordering::SeqCst);
+        {
+            // Checked under the write lock so a shutdown() that lands between
+            // the check and the write can't have its `Stopped` clobbered by a
+            // stale `Starting` (shutdown stores its flag before writing).
+            // On the supervisor's respawn path an `Unhealthy(reason)` is kept
+            // so a crash-looping endpoint reads steadily as unhealthy instead
+            // of flickering Unhealthy → Starting → Unhealthy once per backoff
+            // (the write still happens when the endpoint was Healthy — that
+            // transition is what arms the external-call fail-fast gate).
+            let mut health = self.health.write().await;
+            let keep_unhealthy = self.respawning.load(Ordering::SeqCst)
+                && matches!(*health, HealthStatus::Unhealthy(_));
+            if !self.shutdown_requested.load(Ordering::SeqCst) && !keep_unhealthy {
+                *health = HealthStatus::Starting;
+            }
+        }
 
         // Resolve the container runtime when isolation is requested. No
         // runtime found → fall back to direct spawn (never hard-fail an
@@ -627,7 +734,9 @@ impl StdioAdapter {
         // Set up stdout line reader that dispatches by JSON-RPC response ID
         let pending = self.pending_requests.clone();
         let tools_changed_tx = self.tools_changed_tx.clone();
-        // TODO: emit tick after post-restart handshake when auto-restart is added
+        // Cloned handle onto the same adapter (all state is Arc-shared) so
+        // the reader's EOF path can kick the auto-respawn supervisor.
+        let respawn_adapter = self.clone();
         let stdout_handle = tokio::spawn(async move {
             let reader = BufReader::new(stdout);
             let mut lines = reader.lines();
@@ -668,15 +777,29 @@ impl StdioAdapter {
                 }
             }
             // Stdout closed (process exited) — drop all pending senders so
-            // waiters immediately get a RecvError instead of hanging until timeout.
-            let mut map = pending.lock().await;
-            if !map.is_empty() {
-                debug!(
-                    count = map.len(),
-                    "stdout closed, dropping pending requests"
-                );
-                map.clear();
+            // waiters immediately get a RecvError instead of hanging until
+            // timeout. Gated on the generation (checked under the map lock)
+            // so a stale reader from a previous process generation can never
+            // clear entries registered by its successor: any entry inserted
+            // by a newer lifecycle is preceded by a generation bump, which
+            // this load would observe.
+            {
+                let mut map = pending.lock().await;
+                if respawn_adapter.generation.load(Ordering::SeqCst) == spawn_gen && !map.is_empty()
+                {
+                    debug!(
+                        count = map.len(),
+                        "stdout closed, dropping pending requests"
+                    );
+                    map.clear();
+                }
             }
+            // Unexpected exit (not an intentional shutdown) — kick the
+            // auto-respawn supervisor. No-op when shutdown was requested,
+            // the EOF is from a stale process generation, or the child never
+            // became healthy; preserved for later re-arm when a supervisor
+            // already runs.
+            respawn_adapter.maybe_start_respawn_supervisor(spawn_gen);
         });
 
         // Set up the stderr reader. Each line is BOTH pushed into the ring
@@ -701,10 +824,42 @@ impl StdioAdapter {
             .instrument(stderr_span),
         );
 
-        *self.child.lock().await = Some(child);
-        *self.stdin_writer.lock().await = Some(stdin);
-        *self._stdout_handle.lock().await = Some(stdout_handle);
-        *self._stderr_handle.lock().await = Some(stderr_handle);
+        {
+            let mut child_slot = self.child.lock().await;
+            if self.generation.load(Ordering::SeqCst) != spawn_gen {
+                // shutdown()/initialize() claimed the lifecycle while we were
+                // spawning: this child belongs to a dead generation. Tear it
+                // (and the state created above) back down instead of
+                // installing it where nothing would ever reap it.
+                drop(child_slot);
+                stdout_handle.abort();
+                stderr_handle.abort();
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                if let Some(h) = self.stats_poller_handle.lock().await.take() {
+                    h.abort();
+                }
+                if let Some((rt, name)) = self.container.lock().await.take() {
+                    let _ = tokio::time::timeout(
+                        Duration::from_secs(5),
+                        Command::new(&rt)
+                            .args(["rm", "-f", &name])
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status(),
+                    )
+                    .await;
+                }
+                return Err(AdapterError::ProcessSpawnFailed(
+                    "adapter lifecycle changed during spawn".into(),
+                ));
+            }
+            *child_slot = Some(child);
+            *self.stdin_writer.lock().await = Some(stdin);
+            *self._stdout_handle.lock().await = Some(stdout_handle);
+            *self._stderr_handle.lock().await = Some(stderr_handle);
+        }
 
         info!(command = %self.config.command, "MCP server process spawned");
         Ok(())
@@ -730,6 +885,30 @@ impl StdioAdapter {
     /// banner stays one readable sentence instead of a multi-line stderr dump.
     fn crashed_error() -> AdapterError {
         AdapterError::ProcessCrashed(CRASH_USER_MESSAGE.to_string())
+    }
+
+    /// Send a JSON-RPC request on behalf of an EXTERNAL caller (the
+    /// `McpAdapter` trait methods: tool calls, list/read requests).
+    ///
+    /// While the auto-respawn supervisor is mid-respawn the child is either
+    /// dead, in backoff, or has not finished its MCP handshake — an external
+    /// request written to its stdin would sit on the 30s request timeout (or
+    /// hit a protocol error from an uninitialized server). Fail fast with the
+    /// crash banner instead. The supervisor's own handshake traffic calls
+    /// [`Self::send_request`] directly and is not gated; once the
+    /// post-respawn handshake flips health back to `Healthy`, external
+    /// traffic resumes even if the supervisor task is still finishing up.
+    async fn send_external_request(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> Result<Value, AdapterError> {
+        if self.respawning.load(Ordering::SeqCst)
+            && !matches!(*self.health.read().await, HealthStatus::Healthy)
+        {
+            return Err(Self::crashed_error());
+        }
+        self.send_request(method, params).await
     }
 
     /// Send a JSON-RPC request and wait for the response.
@@ -1002,15 +1181,272 @@ impl StdioAdapter {
         info!("MCP initialize handshake complete");
         Ok(())
     }
+
+    /// Start the auto-respawn supervisor task for the process generation
+    /// whose stdout reader observed EOF, unless shutdown was requested, the
+    /// EOF is stale (a newer lifecycle already replaced that process), or a
+    /// supervisor is already running — in which case the EOF is preserved in
+    /// `pending_eof_gen` so the finishing supervisor re-arms for it instead
+    /// of dropping it. Called from the stdout reader's EOF path, which fires
+    /// exactly once per child process when its stdout pipe closes (i.e. the
+    /// process exited).
+    ///
+    /// Deliberately NOT `async`: the stdout reader's future is part of
+    /// `spawn_process`'s opaque return type, so awaiting a method here that
+    /// (transitively) re-enters `spawn_process` would form an async
+    /// opaque-type cycle the compiler rejects. Spawning from a sync method
+    /// keeps the supervisor's future out of the reader's type.
+    fn maybe_start_respawn_supervisor(&self, eof_gen: u64) {
+        if self.shutdown_requested.load(Ordering::SeqCst) {
+            debug!("process exited during shutdown, not respawning");
+            return;
+        }
+        if self.generation.load(Ordering::SeqCst) != eof_gen {
+            debug!("stale EOF from a previous process generation, ignoring");
+            return;
+        }
+        // At most one supervisor per adapter: each respawn attempt spawns a
+        // fresh stdout reader whose own EOF path lands here again while the
+        // supervisor loop is still driving retries.
+        if self.respawning.swap(true, Ordering::SeqCst) {
+            // A supervisor is already running. Preserve this EOF: the
+            // finishing supervisor re-checks `pending_eof_gen` after
+            // clearing `respawning`, so a replacement child that handshakes
+            // and then dies before the flag clears is re-supervised instead
+            // of being silently dropped.
+            self.pending_eof_gen.store(eof_gen, Ordering::SeqCst);
+            // Close the race where the supervisor cleared the flag between
+            // our first swap and the store above (it would have missed the
+            // pending EOF): try to claim the slot again. If it is still (or
+            // again) taken, whoever holds it is guaranteed to observe the
+            // pending value on exit.
+            if self.respawning.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            self.pending_eof_gen.store(NO_PENDING_EOF, Ordering::SeqCst);
+        }
+        let adapter = self.clone();
+        let span = self.span.clone();
+        tokio::spawn(
+            async move {
+                // Only supervise a child that completed its MCP handshake
+                // (health Healthy). A crash BEFORE that point surfaces as an
+                // `initialize` error to the caller (watcher/management),
+                // which swaps in a FailedAdapter and drops this one — a
+                // supervisor here would keep respawning a process nobody is
+                // registered to use.
+                //
+                // INVARIANT this gate relies on: between the EOF and this
+                // read, nothing else writes `health` — today only
+                // `initialize`/`shutdown` (which bump the generation, making
+                // this EOF stale) and the supervisor itself (at most one,
+                // guaranteed by `respawning`) ever write it. If a future
+                // change makes tool-call failures write health (as the HTTP
+                // adapter does), this gate would silently stop respawning
+                // after a crash observed first by a tool call.
+                if matches!(*adapter.health.read().await, HealthStatus::Healthy) {
+                    adapter.run_respawn_supervisor(eof_gen).await;
+                } else {
+                    debug!("process exited before becoming healthy, not respawning");
+                }
+                adapter.respawning.store(false, Ordering::SeqCst);
+                // An EOF that arrived while this supervisor ran was preserved
+                // above — re-arm for it now that the flag is clear (the gen
+                // check in the recursive call discards it if stale).
+                let pending = adapter
+                    .pending_eof_gen
+                    .swap(NO_PENDING_EOF, Ordering::SeqCst);
+                if pending != NO_PENDING_EOF {
+                    adapter.maybe_start_respawn_supervisor(pending);
+                }
+            }
+            .instrument(span),
+        );
+    }
+
+    /// Respawn loop: record the crash, back off exponentially (1s → 1s → 2s →
+    /// 4s → 8s → 60s cap), then respawn and re-run the MCP handshake. 3+
+    /// crashes within 60s mark the endpoint Unhealthy, but retries continue
+    /// indefinitely at the capped interval until success or intentional
+    /// shutdown — an Unhealthy endpoint recovers on its own when the
+    /// underlying failure clears.
+    ///
+    /// `supervisor_gen` is the generation of the dead child this supervisor
+    /// was armed for. Before each respawn attempt the loop CAS-claims the
+    /// next generation; a failed CAS (or any observed generation change)
+    /// means `shutdown()`/`initialize()` took over the lifecycle — e.g. the
+    /// manual-restart path restarting the endpoint while this loop was
+    /// parked in a backoff sleep — and the supervisor stands down instead of
+    /// killing the newer lifecycle's healthy child.
+    async fn run_respawn_supervisor(&self, mut supervisor_gen: u64) {
+        loop {
+            if self.shutdown_requested.load(Ordering::SeqCst) {
+                debug!("respawn supervisor exiting: shutdown requested");
+                return;
+            }
+            if self.generation.load(Ordering::SeqCst) != supervisor_gen {
+                debug!("respawn supervisor exiting: adapter lifecycle changed");
+                return;
+            }
+
+            let (unhealthy, backoff) = self.crash_tracker.lock().await.record_crash();
+            if unhealthy {
+                warn!(
+                    backoff = ?backoff,
+                    "server crash-looping, marking unhealthy (respawn attempts continue): {}",
+                    UNHEALTHY_REASON
+                );
+                self.write_health_if_current(
+                    supervisor_gen,
+                    HealthStatus::Unhealthy(UNHEALTHY_REASON.to_string()),
+                )
+                .await;
+            } else {
+                warn!(
+                    backoff = ?backoff,
+                    "server process exited unexpectedly, respawning after backoff"
+                );
+            }
+
+            tokio::time::sleep(backoff).await;
+
+            if self.shutdown_requested.load(Ordering::SeqCst) {
+                debug!("respawn supervisor exiting: shutdown requested during backoff");
+                return;
+            }
+            // Claim the next lifecycle generation for this attempt. A failed
+            // CAS means shutdown()/initialize() bumped it while we slept.
+            let next_gen = supervisor_gen + 1;
+            if self
+                .generation
+                .compare_exchange(supervisor_gen, next_gen, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                debug!("respawn supervisor exiting: lifecycle changed during backoff");
+                return;
+            }
+            supervisor_gen = next_gen;
+
+            match self.respawn_once(supervisor_gen).await {
+                Ok(()) => {
+                    if self.shutdown_requested.load(Ordering::SeqCst)
+                        || self.generation.load(Ordering::SeqCst) != supervisor_gen
+                    {
+                        // Shutdown raced with the respawn. The fresh child
+                        // was installed under our generation BEFORE the
+                        // shutdown bump (spawn_process's generation-guarded
+                        // store tears down any later spawn), so shutdown()'s
+                        // own take-and-kill reaps it; likewise the guarded
+                        // health write in respawn_once cannot clobber
+                        // shutdown's `Stopped`. Just stand down quietly.
+                        debug!("respawn supervisor exiting: shutdown raced with respawn");
+                        return;
+                    }
+                    info!("server process respawned and re-initialized");
+                    // Post-restart handshake succeeded — tick tools-changed so
+                    // the registry refreshes its tool cache (the restarted
+                    // server may advertise a different catalogue).
+                    let _ = self.tools_changed_tx.send(());
+                    return;
+                }
+                Err(e) => {
+                    warn!(error = %e, "respawn attempt failed, retrying");
+                }
+            }
+        }
+    }
+
+    /// One respawn attempt: reap the dead child, join its stdout reader,
+    /// respawn, and re-run the MCP handshake. Mirrors
+    /// [`McpAdapter::initialize`] but works from `&self` (all adapter state
+    /// is Arc-shared) so the supervisor task can drive it.
+    ///
+    /// The consecutive-crash streak is deliberately NOT reset on a successful
+    /// handshake — a server that handshakes and then crashes seconds later is
+    /// still crash-looping and must keep climbing toward the 60s backoff cap.
+    /// The streak resets inside [`CrashTracker::record_crash`] once the child
+    /// has stayed up for a full stability interval.
+    async fn respawn_once(&self, attempt_gen: u64) -> Result<(), AdapterError> {
+        self.kill_child_quiet().await;
+        *self.stdin_writer.lock().await = None;
+        // Join the previous generation's stdout reader before spawning the
+        // replacement: its EOF cleanup clears `pending_requests`, so letting
+        // it straggle past the new spawn could otherwise race requests
+        // registered by the next generation (the clear is generation-gated
+        // as a second line of defense). The child was killed above, so its
+        // stdout pipe is closed and the reader finishes promptly.
+        if let Some(handle) = self._stdout_handle.lock().await.take() {
+            let _ = tokio::time::timeout(Duration::from_secs(5), handle).await;
+        }
+        self.spawn_process().await?;
+        self.mcp_initialize().await?;
+        self.write_health_if_current(attempt_gen, HealthStatus::Healthy)
+            .await;
+        Ok(())
+    }
+
+    /// Write `status` into `health` only if the lifecycle generation still
+    /// matches `expected_gen` (and no shutdown is in flight) at write time,
+    /// checked under the write lock so a concurrent `shutdown()`/
+    /// `initialize()` health write can never be clobbered by a stale respawn
+    /// supervisor.
+    async fn write_health_if_current(&self, expected_gen: u64, status: HealthStatus) {
+        let mut health = self.health.write().await;
+        if self.generation.load(Ordering::SeqCst) == expected_gen
+            && !self.shutdown_requested.load(Ordering::SeqCst)
+        {
+            *health = status;
+        }
+    }
+
+    /// Test-only: shrink the crash tracker's backoff unit so tests can walk
+    /// the full backoff schedule (1-1-2-4-8-…-60 units) and the stability
+    /// interval (120 units) in milliseconds instead of real minutes.
+    #[doc(hidden)]
+    #[allow(dead_code)] // Used in integration tests
+    pub async fn set_backoff_unit_for_test(&self, unit: Duration) {
+        self.crash_tracker.lock().await.backoff_unit = unit;
+    }
+
+    /// Test-only: kill the current child WITHOUT flagging shutdown,
+    /// simulating an unexpected crash so tests can trigger the auto-respawn
+    /// supervisor on demand.
+    #[doc(hidden)]
+    #[allow(dead_code)] // Used in integration tests
+    pub async fn kill_child_for_test(&self) {
+        if let Some(child) = self.child.lock().await.as_mut() {
+            let _ = child.start_kill();
+        }
+    }
+
+    /// Best-effort kill + reap of the current child, if any. Used by the
+    /// respawn path to avoid leaking a zombie before spawning the replacement.
+    async fn kill_child_quiet(&self) {
+        if let Some(mut child) = self.child.lock().await.take() {
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+        }
+    }
 }
 
 #[async_trait]
 impl McpAdapter for StdioAdapter {
     async fn initialize(&mut self) -> Result<(), AdapterError> {
         async {
+            // Claim a fresh lifecycle generation FIRST: any supervisor still
+            // parked in a backoff sleep from the previous lifecycle (e.g.
+            // across the manual restart endpoint's shutdown() → initialize()
+            // sequence) fails its CAS on wake and stands down instead of
+            // killing the child spawned below.
+            let init_gen = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+            // Re-arm the auto-respawn supervisor: a previous shutdown() (e.g.
+            // the manual restart endpoint re-initializing this adapter) set
+            // the flag to suppress respawns of the old child.
+            self.shutdown_requested.store(false, Ordering::SeqCst);
             self.spawn_process().await?;
             self.mcp_initialize().await?;
-            *self.health.write().await = HealthStatus::Healthy;
+            self.write_health_if_current(init_gen, HealthStatus::Healthy)
+                .await;
             self.crash_tracker.lock().await.reset();
             Ok(())
         }
@@ -1020,7 +1456,7 @@ impl McpAdapter for StdioAdapter {
 
     async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
         async {
-            let result = self.send_request("tools/list", None).await?;
+            let result = self.send_external_request("tools/list", None).await?;
             let tools_value = result
                 .get("tools")
                 .ok_or_else(|| AdapterError::ProtocolError("missing 'tools' field".into()))?;
@@ -1058,7 +1494,7 @@ impl McpAdapter for StdioAdapter {
 
     async fn list_resources(&self) -> Result<Vec<Value>, AdapterError> {
         async {
-            let result = self.send_request("resources/list", None).await?;
+            let result = self.send_external_request("resources/list", None).await?;
             match result.get("resources") {
                 Some(Value::Array(items)) => Ok(items.clone()),
                 _ => Ok(vec![]),
@@ -1070,7 +1506,9 @@ impl McpAdapter for StdioAdapter {
 
     async fn list_resource_templates(&self) -> Result<Vec<Value>, AdapterError> {
         async {
-            let result = self.send_request("resources/templates/list", None).await?;
+            let result = self
+                .send_external_request("resources/templates/list", None)
+                .await?;
             match result.get("resourceTemplates") {
                 Some(Value::Array(items)) => Ok(items.clone()),
                 _ => Ok(vec![]),
@@ -1083,7 +1521,8 @@ impl McpAdapter for StdioAdapter {
     async fn read_resource(&self, uri: &str) -> Result<Value, AdapterError> {
         async {
             let params = serde_json::json!({ "uri": uri });
-            self.send_request("resources/read", Some(params)).await
+            self.send_external_request("resources/read", Some(params))
+                .await
         }
         .instrument(self.span.clone())
         .await
@@ -1091,7 +1530,7 @@ impl McpAdapter for StdioAdapter {
 
     async fn list_prompts(&self) -> Result<Vec<Value>, AdapterError> {
         async {
-            let result = self.send_request("prompts/list", None).await?;
+            let result = self.send_external_request("prompts/list", None).await?;
             match result.get("prompts") {
                 Some(Value::Array(items)) => Ok(items.clone()),
                 _ => Ok(vec![]),
@@ -1112,7 +1551,7 @@ impl McpAdapter for StdioAdapter {
             if let Some(args) = arguments {
                 params.insert("arguments".to_string(), args);
             }
-            self.send_request("prompts/get", Some(Value::Object(params)))
+            self.send_external_request("prompts/get", Some(Value::Object(params)))
                 .await
         }
         .instrument(self.span.clone())
@@ -1169,7 +1608,7 @@ impl McpAdapter for StdioAdapter {
             });
             crate::adapter::merge_request_params(&mut params, request_params);
             let start = Instant::now();
-            let result = self.send_request("tools/call", Some(params)).await;
+            let result = self.send_external_request("tools/call", Some(params)).await;
             let duration_ms = start.elapsed().as_millis();
             let client_name = span_ctx
                 .client
@@ -1280,6 +1719,16 @@ impl McpAdapter for StdioAdapter {
 
     async fn shutdown(&mut self) -> Result<(), AdapterError> {
         async {
+            // Flag intentional shutdown FIRST so the stdout reader's EOF hook
+            // (fired when we kill the child below) and any in-flight respawn
+            // supervisor stand down instead of respawning the process. Bump
+            // the lifecycle generation too: a supervisor parked in a backoff
+            // sleep across this whole shutdown (and a subsequent initialize)
+            // fails its CAS on wake, a mid-spawn respawn attempt tears its
+            // child back down instead of installing it, and any guarded
+            // health write from the old lifecycle becomes a no-op.
+            self.shutdown_requested.store(true, Ordering::SeqCst);
+            self.generation.fetch_add(1, Ordering::SeqCst);
             *self.health.write().await = HealthStatus::Stopped;
 
             // Try graceful close via stdin
@@ -1357,37 +1806,6 @@ impl McpAdapter for StdioAdapter {
     }
 }
 
-/// Attempt to respawn after a crash with exponential backoff.
-/// Returns Err if the adapter should be marked permanently unhealthy.
-#[allow(dead_code)] // Kept for future respawn support
-pub async fn try_respawn(adapter: &mut StdioAdapter) -> Result<(), AdapterError> {
-    let should_stop = {
-        let mut tracker = adapter.crash_tracker.lock().await;
-        let unhealthy = tracker.record_crash();
-        if unhealthy {
-            true
-        } else {
-            let backoff = tracker.backoff_duration();
-            info!(
-                backoff_secs = backoff.as_secs(),
-                "backing off before respawn"
-            );
-            drop(tracker);
-            tokio::time::sleep(backoff).await;
-            false
-        }
-    };
-
-    if should_stop {
-        let reason = "3+ crashes in 60 seconds".to_string();
-        *adapter.health.write().await = HealthStatus::Unhealthy(reason.clone());
-        error!("adapter marked unhealthy: {}", reason);
-        return Err(AdapterError::ProcessCrashed(reason));
-    }
-
-    adapter.initialize().await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1451,19 +1869,26 @@ mod tests {
     #[test]
     fn test_crash_tracker_marks_unhealthy_after_3_crashes() {
         let mut tracker = CrashTracker::new();
-        assert!(!tracker.record_crash()); // 1st crash
-        assert!(!tracker.record_crash()); // 2nd crash
-        assert!(tracker.record_crash()); // 3rd crash → unhealthy
+        assert!(!tracker.record_crash().0); // 1st crash
+        assert!(!tracker.record_crash().0); // 2nd crash
+        assert!(tracker.record_crash().0); // 3rd crash → unhealthy
     }
 
     #[test]
-    fn test_crash_tracker_backoff_increases() {
+    fn test_crash_tracker_backoff_schedule() {
+        // Delays are derived from the PRE-increment streak: 1, 1, 2, 4, 8,
+        // then held at the 60s cap.
         let mut tracker = CrashTracker::new();
-        assert_eq!(tracker.backoff_duration(), Duration::from_secs(1));
-        tracker.record_crash();
-        assert_eq!(tracker.backoff_duration(), Duration::from_secs(1));
-        tracker.record_crash();
-        assert_eq!(tracker.backoff_duration(), Duration::from_secs(2));
+        let expected = [1u64, 1, 2, 4, 8, 60, 60, 60];
+        for (i, secs) in expected.iter().enumerate() {
+            let (_, backoff) = tracker.record_crash();
+            assert_eq!(
+                backoff,
+                Duration::from_secs(*secs),
+                "wrong backoff for crash #{}",
+                i + 1
+            );
+        }
     }
 
     #[test]
@@ -1472,7 +1897,33 @@ mod tests {
         tracker.record_crash();
         tracker.record_crash();
         tracker.reset();
-        assert_eq!(tracker.backoff_duration(), Duration::from_secs(1));
+        assert_eq!(tracker.record_crash().1, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn test_crash_tracker_streak_survives_quick_recovery() {
+        // A crash arriving before the stability interval keeps climbing the
+        // schedule even though a successful handshake happened in between
+        // (the supervisor never calls reset() on respawn success).
+        let mut tracker = CrashTracker::new();
+        assert_eq!(tracker.record_crash().1, Duration::from_secs(1));
+        assert_eq!(tracker.record_crash().1, Duration::from_secs(1));
+        assert_eq!(tracker.record_crash().1, Duration::from_secs(2));
+        assert_eq!(tracker.record_crash().1, Duration::from_secs(4));
+    }
+
+    #[test]
+    fn test_crash_tracker_streak_resets_after_stability_interval() {
+        // With a tiny backoff unit the stability interval (120 units) is
+        // walkable in real time: after the child stays up that long, the
+        // next crash restarts the schedule from the first step.
+        let mut tracker = CrashTracker::new();
+        tracker.backoff_unit = Duration::from_millis(1);
+        assert_eq!(tracker.record_crash().1, Duration::from_millis(1));
+        assert_eq!(tracker.record_crash().1, Duration::from_millis(1));
+        assert_eq!(tracker.record_crash().1, Duration::from_millis(2));
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(tracker.record_crash().1, Duration::from_millis(1));
     }
 
     /// Repeated `initialize` calls (stdio respawns re-run the handshake) must
@@ -2133,6 +2584,163 @@ for line in sys.stdin:
         // The notification should be silently dropped, not returned as a response
         let result = adapter.send_request("tools/list", None).await.unwrap();
         assert_eq!(result["echo_method"], "tools/list");
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    // -----------------------------------------------------------------------
+    // Auto-respawn supervisor tests
+    // -----------------------------------------------------------------------
+
+    /// Create a StdioAdapter around a minimal Python MCP server that answers
+    /// the `initialize` handshake and `tools/list`, so the adapter reaches
+    /// `Healthy` — the state the auto-respawn supervisor requires.
+    fn make_mcp_server_adapter() -> StdioAdapter {
+        let script = r#"
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+    except Exception:
+        continue
+    method = req.get("method")
+    req_id = req.get("id")
+    if req_id is None:
+        continue
+    if method == "initialize":
+        resp = {
+            "jsonrpc": "2.0",
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "serverInfo": {"name": "respawn-test", "version": "0.1"},
+            },
+            "id": req_id,
+        }
+    elif method == "tools/list":
+        resp = {"jsonrpc": "2.0", "result": {"tools": []}, "id": req_id}
+    else:
+        resp = {"jsonrpc": "2.0", "result": {}, "id": req_id}
+    sys.stdout.write(json.dumps(resp) + "\n")
+    sys.stdout.flush()
+"#;
+        StdioAdapter::new(StdioConfig {
+            command: "python3".to_string(),
+            args: vec!["-u".to_string(), "-c".to_string(), script.to_string()],
+            env: HashMap::new(),
+            ..Default::default()
+        })
+    }
+
+    /// Kill the adapter's current child with SIGKILL to simulate a crash.
+    async fn kill_current_child(adapter: &StdioAdapter) {
+        let pid = adapter
+            .child
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|c| c.id())
+            .expect("adapter should have a running child");
+        let status = Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status()
+            .await
+            .expect("kill command should run");
+        assert!(status.success(), "kill -9 {} failed", pid);
+    }
+
+    /// A crashed child must be respawned automatically: health returns to
+    /// Healthy, a tools-changed tick fires after the post-restart handshake,
+    /// and the respawned process serves requests again.
+    #[tokio::test]
+    async fn test_stdio_auto_respawn_after_crash() {
+        let mut adapter = make_mcp_server_adapter();
+        (&mut adapter as &mut dyn McpAdapter)
+            .initialize()
+            .await
+            .unwrap();
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+        // Subscribe BEFORE the crash so the post-restart tick is captured.
+        let mut rx = (&adapter as &dyn McpAdapter)
+            .subscribe_tools_changed()
+            .unwrap();
+
+        kill_current_child(&adapter).await;
+
+        // First crash → 1s backoff, then respawn + re-handshake + tick. The
+        // generous timeout absorbs CI scheduling noise.
+        let tick = tokio::time::timeout(Duration::from_secs(15), rx.recv()).await;
+        assert!(
+            matches!(tick, Ok(Ok(()))),
+            "expected post-respawn tools-changed tick, got {tick:?}"
+        );
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+        // The respawned process answers requests.
+        let result = adapter.send_request("tools/list", None).await.unwrap();
+        assert!(result.get("tools").is_some());
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    /// An intentional shutdown must NOT trigger a respawn, and a later
+    /// re-initialize (the manual-restart path) must re-arm the supervisor.
+    #[tokio::test]
+    async fn test_stdio_shutdown_suppresses_respawn_and_reinit_rearms() {
+        let mut adapter = make_mcp_server_adapter();
+        (&mut adapter as &mut dyn McpAdapter)
+            .initialize()
+            .await
+            .unwrap();
+        adapter.shutdown().await.unwrap();
+
+        // Give an (erroneous) supervisor time to run its 1s first backoff.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(adapter.health(), HealthStatus::Stopped);
+        assert!(
+            adapter.child.lock().await.is_none(),
+            "no child may be respawned after an intentional shutdown"
+        );
+        assert!(
+            !adapter.respawning.load(Ordering::SeqCst),
+            "no supervisor may be running after an intentional shutdown"
+        );
+
+        // Manual-restart path: initialize() again must clear the shutdown
+        // flag and bring the adapter back to Healthy.
+        (&mut adapter as &mut dyn McpAdapter)
+            .initialize()
+            .await
+            .unwrap();
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert!(!adapter.shutdown_requested.load(Ordering::SeqCst));
+
+        adapter.shutdown().await.unwrap();
+    }
+
+    /// A child that exits before ever completing the handshake (initialize
+    /// fails) must not leave a supervisor respawning an orphaned process.
+    #[tokio::test]
+    async fn test_stdio_no_respawn_when_never_healthy() {
+        let mut adapter = StdioAdapter::new(StdioConfig {
+            command: "sh".to_string(),
+            args: vec!["-c".to_string(), "exit 1".to_string()],
+            env: HashMap::new(),
+            ..Default::default()
+        });
+        let result = (&mut adapter as &mut dyn McpAdapter).initialize().await;
+        assert!(result.is_err(), "initialize should fail for a dying child");
+
+        // The EOF hook fires, but the health gate must stop the supervisor.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            !adapter.respawning.load(Ordering::SeqCst),
+            "supervisor must not run for a child that never became healthy"
+        );
 
         adapter.shutdown().await.unwrap();
     }
