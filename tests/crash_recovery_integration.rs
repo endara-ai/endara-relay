@@ -2,7 +2,9 @@
 //!
 //! Starts a relay with crash-server fixture (--crash-after N),
 //! makes successful tool calls, verifies crash detection via errors,
-//! and checks that calls fail after the server exits.
+//! and exercises the auto-respawn supervisor: automatic recovery after a
+//! crash, suppression after an intentional shutdown, and the
+//! Unhealthy-but-retry-forever policy under rapid crash loops.
 
 use endara_relay::adapter::stdio::{StdioAdapter, StdioConfig};
 use endara_relay::adapter::{HealthStatus, McpAdapter};
@@ -13,6 +15,22 @@ use tokio::time::timeout;
 
 fn crash_server_bin() -> String {
     env!("CARGO_BIN_EXE_fixture-crash-server").to_string()
+}
+
+/// Drive `echo` tool calls until one fails (the crash), returning the number
+/// of successful calls before the error. Panics if no error is seen.
+async fn call_until_crash(adapter: &StdioAdapter) -> u32 {
+    let mut success_count = 0;
+    for i in 0..10 {
+        match adapter
+            .call_tool("echo", json!({"message": format!("call {}", i)}))
+            .await
+        {
+            Ok(_) => success_count += 1,
+            Err(_) => return success_count,
+        }
+    }
+    panic!("expected the crash server to crash, but all calls succeeded");
 }
 
 #[tokio::test]
@@ -74,11 +92,9 @@ async fn test_crash_server_successful_calls_then_failure() {
     // We should have hit an error (crash)
     assert!(got_error, "expected crash error but all calls succeeded");
 
-    // After the crash, subsequent calls should also fail
-    let result = adapter
-        .call_tool("echo", json!({"message": "after crash"}))
-        .await;
-    assert!(result.is_err(), "expected error after crash");
+    // NOTE: calls no longer fail forever after a crash — the auto-respawn
+    // supervisor recovers the server after its backoff (covered by
+    // test_crash_server_auto_respawn_recovers_tool_calls below).
 
     // Cleanup
     let _ = adapter.shutdown().await;
@@ -119,6 +135,183 @@ async fn test_crash_server_immediate_crash() {
     .expect("timed out waiting for crash detection");
 
     assert!(result, "expected crash to produce an error on tool call");
+
+    let _ = adapter.shutdown().await;
+}
+
+/// A crashed server recovers WITHOUT the management restart endpoint: the
+/// auto-respawn supervisor backs off, respawns the child, re-runs the MCP
+/// handshake, emits a tools-changed tick, and subsequent tool calls succeed.
+#[tokio::test]
+async fn test_crash_server_auto_respawn_recovers_tool_calls() {
+    // crash-after=5 leaves room for the handshake plus a couple of tool
+    // calls before each crash, so the respawned server can serve calls too.
+    let config = StdioConfig {
+        command: crash_server_bin(),
+        args: vec!["--crash-after".to_string(), "5".to_string()],
+        env: HashMap::new(),
+        server_type_override: None,
+        endpoint_name: "crash-auto-respawn".into(),
+        ..Default::default()
+    };
+
+    let mut adapter = StdioAdapter::new(config);
+    adapter.initialize().await.expect("initialize failed");
+    assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+    // Subscribe BEFORE the crash so the post-respawn handshake tick is
+    // buffered even if the respawn wins the race with `recv()`.
+    let mut tools_changed = adapter
+        .subscribe_tools_changed()
+        .expect("stdio adapter should expose tools-changed");
+
+    let success_count = call_until_crash(&adapter).await;
+    assert!(
+        success_count >= 1,
+        "expected at least 1 successful call before crash, got {}",
+        success_count
+    );
+
+    // First crash → 1s backoff, then respawn + re-handshake + tick. The
+    // generous timeout absorbs CI scheduling noise; no POST /restart is
+    // involved anywhere in this test.
+    let tick = timeout(Duration::from_secs(20), tools_changed.recv()).await;
+    assert!(
+        matches!(tick, Ok(Ok(()))),
+        "expected post-respawn tools-changed tick, got {tick:?}"
+    );
+    assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+    // The respawned server answers tool calls again.
+    let result = adapter
+        .call_tool("echo", json!({"message": "recovered"}))
+        .await
+        .expect("tool call should succeed after auto-respawn");
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("recovered"), "expected echo, got: {}", text);
+
+    let _ = adapter.shutdown().await;
+}
+
+/// An intentional `shutdown()` must NOT trigger a respawn: killing the child
+/// during teardown fires the same stdout-EOF hook as a crash, but the
+/// shutdown_requested flag makes the supervisor stand down.
+#[tokio::test]
+async fn test_crash_server_no_respawn_after_shutdown() {
+    // crash-after=100: the server never crashes on its own; the only child
+    // exit in this test is the intentional shutdown.
+    let config = StdioConfig {
+        command: crash_server_bin(),
+        args: vec!["--crash-after".to_string(), "100".to_string()],
+        env: HashMap::new(),
+        server_type_override: None,
+        endpoint_name: "crash-shutdown".into(),
+        ..Default::default()
+    };
+
+    let mut adapter = StdioAdapter::new(config);
+    adapter.initialize().await.expect("initialize failed");
+    assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+    adapter.shutdown().await.expect("shutdown failed");
+    assert_eq!(adapter.health(), HealthStatus::Stopped);
+
+    // Give an (erroneous) supervisor time to run its 1s first backoff and
+    // complete a respawn — if one ran, health would flip back to Healthy
+    // and the call below would succeed.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        adapter.health(),
+        HealthStatus::Stopped,
+        "health must stay Stopped after an intentional shutdown"
+    );
+    let result = adapter
+        .call_tool("echo", json!({"message": "zombie"}))
+        .await;
+    assert!(
+        result.is_err(),
+        "no child may serve calls after an intentional shutdown"
+    );
+}
+
+/// Retry policy: repeated rapid crashes mark the endpoint Unhealthy (3+
+/// crashes within 60s), but the supervisor keeps retrying indefinitely and
+/// recovers on its own once the underlying failure clears — confirmed
+/// retry-forever-at-60s-cap policy, no manual restart involved.
+#[tokio::test]
+async fn test_crash_server_rapid_crashes_mark_unhealthy_then_recover() {
+    // Wrapper script: while the marker file exists every (re)spawn dies
+    // immediately, producing a rapid crash loop; removing the marker lets
+    // the next respawn attempt succeed.
+    let marker_dir = tempfile::tempdir().expect("tempdir");
+    let marker = marker_dir.path().join("respawn-blocked");
+
+    let mut env = HashMap::new();
+    env.insert("CRASH_BIN".to_string(), crash_server_bin());
+    env.insert(
+        "CRASH_MARKER".to_string(),
+        marker.to_string_lossy().to_string(),
+    );
+
+    let config = StdioConfig {
+        command: "/bin/sh".to_string(),
+        args: vec![
+            "-c".to_string(),
+            r#"if [ -e "$CRASH_MARKER" ]; then exit 1; fi; exec "$CRASH_BIN" --crash-after 5"#
+                .to_string(),
+        ],
+        env,
+        server_type_override: None,
+        endpoint_name: "crash-unhealthy-policy".into(),
+        ..Default::default()
+    };
+
+    let mut adapter = StdioAdapter::new(config);
+    adapter.initialize().await.expect("initialize failed");
+    assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+    let mut tools_changed = adapter
+        .subscribe_tools_changed()
+        .expect("stdio adapter should expose tools-changed");
+
+    // Block respawns, then crash the running child via tool calls.
+    std::fs::write(&marker, b"blocked").expect("write marker");
+    call_until_crash(&adapter).await;
+
+    // Crashes stack up on the early backoff steps (1s → 2s): the 3rd crash
+    // within 60s flips health to Unhealthy while retries continue.
+    let unhealthy = timeout(Duration::from_secs(30), async {
+        loop {
+            if matches!(adapter.health(), HealthStatus::Unhealthy(_)) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    assert!(
+        unhealthy.is_ok(),
+        "expected Unhealthy after 3 rapid crashes, still {:?}",
+        adapter.health()
+    );
+
+    // Clear the failure. The supervisor is still retrying (next attempt is
+    // on the 4s backoff step), so the endpoint recovers with no manual
+    // restart: respawn + re-handshake + tools-changed tick.
+    std::fs::remove_file(&marker).expect("remove marker");
+    let tick = timeout(Duration::from_secs(40), tools_changed.recv()).await;
+    assert!(
+        matches!(tick, Ok(Ok(()))),
+        "expected tools-changed tick after recovery, got {tick:?}"
+    );
+    assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+    let result = adapter
+        .call_tool("echo", json!({"message": "back alive"}))
+        .await
+        .expect("tool call should succeed after crash-loop recovery");
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("back alive"), "expected echo, got: {}", text);
 
     let _ = adapter.shutdown().await;
 }
