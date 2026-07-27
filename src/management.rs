@@ -1212,9 +1212,12 @@ async fn oauth_start(
     ) = if let Some(ref server_url) = oauth_server_url {
         // Prefer RFC 8414 discovery against the configured AS URL. If it
         // succeeds, use the discovered endpoints (explicit token_endpoint
-        // config still wins). On any error, fall back to the legacy
-        // convention-based construction so behavior is unchanged for
-        // servers that don't expose AS metadata.
+        // config still wins). On a 404-class failure (metadata genuinely
+        // absent), fall back to the legacy convention-based construction so
+        // behavior is unchanged for servers that don't expose AS metadata.
+        // On a transient failure (unreachable / timed out) do NOT guess —
+        // the server likely publishes metadata and the composed
+        // `{base}/authorize` URL would send the user to a dead page.
         match discovery::discover_authorization_server(server_url, allow_insecure_oauth).await {
             Ok(disc) => {
                 let token_url = config_token_endpoint
@@ -1229,6 +1232,22 @@ async fn oauth_start(
                     Some(disc.issuer),
                     disc.authorization_response_iss_parameter_supported,
                 )
+            }
+            Err(e) if e.is_transient() => {
+                warn!(
+                    endpoint = %name,
+                    error = %e,
+                    "RFC 8414 discovery against oauth_server_url failed transiently; not composing a convention-based authorize URL"
+                );
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    "discovery_unreachable",
+                    Some(&format!(
+                        "Could not reach the OAuth server to discover its endpoints. \
+                             Check connectivity and try again. Details: {e}"
+                    )),
+                )
+                .into_response();
             }
             Err(e) => {
                 warn!(
@@ -9833,6 +9852,46 @@ command = "echo"
         );
         // No discovery metadata on the fallback path.
         assert!(body.get("discovery").is_none() || body["discovery"].is_null());
+    }
+
+    #[tokio::test]
+    async fn oauth_start_with_oauth_server_url_errors_on_transient_discovery_failure() {
+        // Bind a listener to reserve a port, then drop it so nothing is
+        // listening: discovery hits a connection-refused (transient) error.
+        // Unlike a 404 (metadata genuinely absent), a transient failure must
+        // NOT fall back to the convention `{base}/authorize` — the guessed
+        // URL would send the user to a dead page. Expect a structured
+        // `discovery_unreachable` error instead.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let (state, _flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "discovery_unreachable");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap()
+                .contains("Could not reach the OAuth server"),
+            "detail should explain the connectivity failure, got: {}",
+            body["detail"]
+        );
+        assert!(
+            body.get("authorize_url").is_none(),
+            "no authorize URL may be composed on a transient discovery failure"
+        );
     }
 
     #[tokio::test]

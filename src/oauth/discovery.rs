@@ -108,6 +108,23 @@ pub enum DiscoveryError {
     UrlGuard(#[from] UrlGuardError),
 }
 
+impl DiscoveryError {
+    /// Whether this failure is transient (network unreachable / timed out)
+    /// rather than a genuine absence of metadata (404-class).
+    ///
+    /// Callers that fall back to convention-based endpoints when a server
+    /// doesn't publish RFC 8414 metadata must NOT do so on a transient
+    /// failure: the server likely does publish metadata and the guessed
+    /// endpoints would be wrong.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            DiscoveryError::Timeout(_) => true,
+            DiscoveryError::Http(e) => e.is_timeout() || e.is_connect(),
+            _ => false,
+        }
+    }
+}
+
 /// Build a well-known URL per RFC 5785 §3 and RFC 8414 §3.1.
 ///
 /// The `.well-known` segment is inserted between the host (with port) and any
@@ -1017,6 +1034,39 @@ mod tests {
             Err(other) => panic!("expected DiscoveryError::UrlGuard, got {:?}", other),
             Ok(_) => panic!("expected DiscoveryError::UrlGuard, got Ok(_)"),
         }
+    }
+
+    // --- DiscoveryError::is_transient classification -------------------------
+
+    /// Timeout is transient; 404-class metadata absence is not.
+    #[test]
+    fn is_transient_classifies_timeout_and_not_found() {
+        assert!(DiscoveryError::Timeout(10).is_transient());
+        assert!(!DiscoveryError::MetadataNotFound {
+            url: "https://x".into()
+        }
+        .is_transient());
+        assert!(!DiscoveryError::AuthServerMetadataNotFound {
+            url: "https://x".into()
+        }
+        .is_transient());
+        assert!(!DiscoveryError::NoAuthorizationServer.is_transient());
+        assert!(!DiscoveryError::S256NotSupported.is_transient());
+    }
+
+    /// A connection-refused reqwest error wrapped in `Http` is transient.
+    #[tokio::test]
+    async fn is_transient_classifies_connect_error() {
+        // Bind a listener to reserve a port, then drop it so the connection
+        // is refused.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let err = reqwest::get(format!("http://127.0.0.1:{port}/"))
+            .await
+            .expect_err("connection should be refused");
+        assert!(DiscoveryError::Http(err).is_transient());
     }
 
     // --- build_openid_configuration_url tests --------------------------------
