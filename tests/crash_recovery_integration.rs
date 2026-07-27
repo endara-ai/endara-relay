@@ -270,6 +270,14 @@ async fn test_crash_server_rapid_crashes_mark_unhealthy_then_recover() {
     adapter.initialize().await.expect("initialize failed");
     assert_eq!(adapter.health(), HealthStatus::Healthy);
 
+    // Shrink the backoff unit so the whole schedule (1-1-2-4-8-…-60 units)
+    // plays out in milliseconds: even if a loaded CI runner delays the
+    // Unhealthy poll below past the capped step, recovery still lands well
+    // inside the recv() timeout instead of flaking on a real 60s wait.
+    adapter
+        .set_backoff_unit_for_test(Duration::from_millis(50))
+        .await;
+
     let mut tools_changed = adapter
         .subscribe_tools_changed()
         .expect("stdio adapter should expose tools-changed");
@@ -278,14 +286,14 @@ async fn test_crash_server_rapid_crashes_mark_unhealthy_then_recover() {
     std::fs::write(&marker, b"blocked").expect("write marker");
     call_until_crash(&adapter).await;
 
-    // Crashes stack up on the early backoff steps (1s → 2s): the 3rd crash
-    // within 60s flips health to Unhealthy while retries continue.
+    // Crashes stack up on the early backoff steps: the 3rd crash within the
+    // rolling window flips health to Unhealthy while retries continue.
     let unhealthy = timeout(Duration::from_secs(30), async {
         loop {
             if matches!(adapter.health(), HealthStatus::Unhealthy(_)) {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await;
@@ -295,9 +303,9 @@ async fn test_crash_server_rapid_crashes_mark_unhealthy_then_recover() {
         adapter.health()
     );
 
-    // Clear the failure. The supervisor is still retrying (next attempt is
-    // on the 4s backoff step), so the endpoint recovers with no manual
-    // restart: respawn + re-handshake + tools-changed tick.
+    // Clear the failure. The supervisor is still retrying, so the endpoint
+    // recovers with no manual restart: respawn + re-handshake +
+    // tools-changed tick.
     std::fs::remove_file(&marker).expect("remove marker");
     let tick = timeout(Duration::from_secs(40), tools_changed.recv()).await;
     assert!(
@@ -312,6 +320,115 @@ async fn test_crash_server_rapid_crashes_mark_unhealthy_then_recover() {
         .expect("tool call should succeed after crash-loop recovery");
     let text = result["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("back alive"), "expected echo, got: {}", text);
+
+    let _ = adapter.shutdown().await;
+}
+
+/// Retry-forever-at-the-cap policy, time-controlled: with an injected
+/// backoff unit the supervisor walks the entire 1-1-2-4-8 schedule, reaches
+/// the 60-unit cap, keeps retrying at that capped interval for multiple
+/// attempts, and still recovers once the failure clears. An implementation
+/// that gave up after a fixed number of attempts — or never reached the cap —
+/// fails this test.
+#[tokio::test]
+async fn test_crash_server_retries_at_backoff_cap_then_recovers() {
+    let marker_dir = tempfile::tempdir().expect("tempdir");
+    let marker = marker_dir.path().join("respawn-blocked");
+    let attempts = marker_dir.path().join("spawn-attempts");
+
+    let mut env = HashMap::new();
+    env.insert("CRASH_BIN".to_string(), crash_server_bin());
+    env.insert(
+        "CRASH_MARKER".to_string(),
+        marker.to_string_lossy().to_string(),
+    );
+    env.insert(
+        "CRASH_ATTEMPTS".to_string(),
+        attempts.to_string_lossy().to_string(),
+    );
+
+    // Every spawn appends a line to the attempts file, so the test can count
+    // how many respawns happened while blocked at the cap.
+    let config = StdioConfig {
+        command: "/bin/sh".to_string(),
+        args: vec![
+            "-c".to_string(),
+            r#"echo x >> "$CRASH_ATTEMPTS"; if [ -e "$CRASH_MARKER" ]; then exit 1; fi; exec "$CRASH_BIN" --crash-after 100"#
+                .to_string(),
+        ],
+        env,
+        server_type_override: None,
+        endpoint_name: "crash-backoff-cap".into(),
+        ..Default::default()
+    };
+
+    let count_attempts = |path: &std::path::Path| -> usize {
+        std::fs::read_to_string(path)
+            .map(|s| s.lines().count())
+            .unwrap_or(0)
+    };
+
+    let mut adapter = StdioAdapter::new(config);
+    adapter.initialize().await.expect("initialize failed");
+    assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+    // 25ms unit: schedule = 25,25,50,100,200ms then capped at 1500ms.
+    adapter
+        .set_backoff_unit_for_test(Duration::from_millis(25))
+        .await;
+
+    let mut tools_changed = adapter
+        .subscribe_tools_changed()
+        .expect("stdio adapter should expose tools-changed");
+
+    // Block respawns, then simulate an unexpected crash of the healthy
+    // child (crash-after=100 is never reached organically) so the supervisor
+    // arms and every subsequent respawn dies on the marker.
+    std::fs::write(&marker, b"blocked").expect("write marker");
+    let spawned_before = count_attempts(&attempts);
+    adapter.kill_child_for_test().await;
+
+    // Walking 25+25+50+100+200ms puts the supervisor at the 1500ms cap in
+    // well under a second of backoff time. Wait long enough to cover the
+    // ramp plus at least 3 capped retries.
+    let ramp_and_caps = Duration::from_millis(400 + 3 * 1500 + 1000);
+    tokio::time::sleep(ramp_and_caps).await;
+
+    let while_blocked = count_attempts(&attempts) - spawned_before;
+    // Ramp = 5 attempts (after the 25,25,50,100,200ms steps), then one
+    // attempt per 1500ms cap interval. Requiring >= 7 proves at least two
+    // capped retries happened; requiring it while the marker still exists
+    // proves it never stopped retrying.
+    assert!(
+        while_blocked >= 7,
+        "expected the supervisor to keep retrying at the cap, saw only {} respawn attempts",
+        while_blocked
+    );
+    assert!(
+        matches!(adapter.health(), HealthStatus::Unhealthy(_)),
+        "expected Unhealthy while crash-looping, got {:?}",
+        adapter.health()
+    );
+
+    // Clear the failure: the next capped retry (≤1500ms away) recovers.
+    std::fs::remove_file(&marker).expect("remove marker");
+    let tick = timeout(Duration::from_secs(10), tools_changed.recv()).await;
+    assert!(
+        matches!(tick, Ok(Ok(()))),
+        "expected tools-changed tick after cap recovery, got {tick:?}"
+    );
+    assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+    let result = adapter
+        .call_tool("echo", json!({"message": "capped but alive"}))
+        .await
+        .expect("tool call should succeed after capped-retry recovery");
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("capped but alive"),
+        "expected echo, got: {}",
+        text
+    );
 
     let _ = adapter.shutdown().await;
 }
