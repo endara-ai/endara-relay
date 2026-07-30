@@ -95,7 +95,7 @@ EOF
 ### 3. Run
 
 ```bash
-endara-relay --config ~/.endara/config.toml
+endara-relay start --config ~/.endara/config.toml
 ```
 
 ### 4. Connect your MCP client
@@ -124,6 +124,9 @@ validate_inputs = true            # Optional — validate tools/call arguments a
                                   # tool's inputSchema before forwarding (default: true)
 startup_init_timeout_secs = 60    # Optional — cap on how long the MCP listener waits for
                                   # adapter init before binding 9400 anyway (default: 60)
+log_retention_days = 7            # Optional — days of daily-rotated relay.log.YYYY-MM-DD
+                                  # files to keep; older files are pruned at startup.
+                                  # 0 disables pruning (default: 7). CLI: --log-retention-days
 
 # STDIO endpoint — spawns a child process
 [[endpoints]]
@@ -256,7 +259,14 @@ No restart required.
 
 ### Crash recovery
 
-If a STDIO server process crashes, Relay automatically restarts it with exponential backoff. After repeated failures, the endpoint is marked unhealthy. Plain HTTP servers get equivalent treatment: an upstream that stops responding is marked unhealthy after a few consecutive transport failures, and recovers automatically on the next successful request. This keeps your tool catalog available even when individual servers are flaky.
+If a STDIO server process dies unexpectedly, Relay respawns it automatically with exponential backoff (1s doubling up to a 60s cap). After 3+ crashes in 60 seconds the endpoint is marked unhealthy — but Relay keeps retrying at the cap indefinitely, so a multi-minute outage (say, your container runtime restarting) self-heals without a manual restart. Once the server comes back, the merged tool catalog refreshes automatically. Plain HTTP servers get equivalent treatment: an upstream that stops responding is marked unhealthy after a few consecutive transport failures, and recovers automatically on the next successful request. This keeps your tool catalog available even when individual servers are flaky.
+
+### OAuth self-healing
+
+Two failure modes that used to require manual intervention now recover on their own:
+
+- **Stale dynamically-registered clients** — if an authorization server purges the OAuth client the relay registered via DCR, Relay registers a fresh client on the next interactive authorize and discards stale credentials when a token endpoint answers `invalid_client`. Manually-supplied credentials are never auto-discarded or re-registered.
+- **Transient discovery failures** — if the OAuth server is unreachable when an authorization flow starts, Relay reports a clear connectivity error (`discovery_unreachable`) instead of composing a guessed authorize URL that lands you on a dead page. Servers that genuinely publish no RFC 8414 metadata still fall back to convention-based endpoints.
 
 ### Container isolation
 
