@@ -892,7 +892,11 @@ async fn delete_endpoint(
 /// matching `[[endpoints]]` entries (by `name`) are updated, and the table is
 /// reserialized via [`crate::config::write_config_file`]. Sections and keys
 /// the typed [`Config`] struct does not model (e.g. `[desktop]`, `[meta]`)
-/// survive verbatim, and endpoints absent from the file are not re-added.
+/// are retained semantically rather than verbatim: `toml::to_string_pretty`
+/// reserializes the whole document, so comments and formatting are lost and
+/// sections may be reordered (the same caveat as
+/// `update_observability_config`). Endpoints absent from the file are not
+/// re-added.
 async fn persist_disabled_state(state: &ManagementState) {
     let Some(ref config_path) = state.config_path else {
         return;
