@@ -884,14 +884,25 @@ async fn delete_endpoint(
 // Persist disabled state
 // ---------------------------------------------------------------------------
 
-/// Read disabled/disabled_tools from the registry and write them back to config.toml.
+/// Read disabled/disabled_tools from the registry, mirror them into the
+/// in-memory config baseline, and write them back to config.toml.
+///
+/// The on-disk write is a targeted edit: the file is re-read and parsed into
+/// a raw `toml::Table`, only the `disabled` / `disabled_tools` keys on the
+/// matching `[[endpoints]]` entries (by `name`) are updated, and the table is
+/// reserialized via [`crate::config::write_config_file`]. Sections and keys
+/// the typed [`Config`] struct does not model (e.g. `[desktop]`, `[meta]`)
+/// survive verbatim, and endpoints absent from the file are not re-added.
 async fn persist_disabled_state(state: &ManagementState) {
     let Some(ref config_path) = state.config_path else {
         return;
     };
+    // Hold the config write lock across the file write so concurrent
+    // persists cannot interleave their read-modify-write cycles.
     let mut config = state.config.write().await;
 
-    // Read current disabled state from registry
+    // Read current disabled state from registry and update the in-memory
+    // baseline so GET handlers reflect the change immediately.
     let entries = state.registry.entries().read().await;
     for ep_config in &mut config.endpoints {
         if let Some(entry) = entries.get(&ep_config.name) {
@@ -901,12 +912,62 @@ async fn persist_disabled_state(state: &ManagementState) {
     }
     drop(entries);
 
-    // Write back to file
+    // Targeted on-disk edit so unknown sections/keys survive.
     let resolved = crate::config::expand_tilde(config_path);
-    if let Ok(toml_str) = toml::to_string_pretty(&*config) {
-        if let Err(e) = crate::config::write_config_file(&resolved, &toml_str) {
-            warn!(error = %e, "Failed to persist disabled state");
+    let contents = match std::fs::read_to_string(&resolved) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "Failed to persist disabled state: cannot read config file");
+            return;
         }
+    };
+    let mut parsed: toml::Table = match contents.parse() {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(error = %e, "Failed to persist disabled state: cannot parse config file");
+            return;
+        }
+    };
+    if let Some(toml::Value::Array(endpoints)) = parsed.get_mut("endpoints") {
+        for ep in endpoints.iter_mut() {
+            let Some(tbl) = ep.as_table_mut() else {
+                continue;
+            };
+            let Some(name) = tbl.get("name").and_then(|v| v.as_str()).map(String::from) else {
+                continue;
+            };
+            let Some(ep_config) = config.endpoints.iter().find(|e| e.name == name) else {
+                continue;
+            };
+            // `disabled` and `disabled_tools` are `#[serde(default)]` without
+            // `skip_serializing_if` on `EndpointConfig`, so the typed
+            // serializer always writes them; match that convention here.
+            tbl.insert(
+                "disabled".to_string(),
+                toml::Value::Boolean(ep_config.disabled),
+            );
+            tbl.insert(
+                "disabled_tools".to_string(),
+                toml::Value::Array(
+                    ep_config
+                        .disabled_tools
+                        .iter()
+                        .cloned()
+                        .map(toml::Value::String)
+                        .collect(),
+                ),
+            );
+        }
+    }
+    let new_contents = match toml::to_string_pretty(&parsed) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "Failed to persist disabled state: cannot serialize config");
+            return;
+        }
+    };
+    if let Err(e) = crate::config::write_config_file(&resolved, &new_contents) {
+        warn!(error = %e, "Failed to persist disabled state");
     }
 }
 
@@ -5102,11 +5163,11 @@ async fn get_observability_config(
 
 /// PUT /api/observability/config — persist new `[relay.observability]` settings
 /// to disk and swap the in-memory baseline. Like `persist_disabled_state`, this
-/// reparses the whole config file into a `toml::Table`, replaces the
-/// `[relay.observability]` table, and reserializes the entire file — so
-/// comments/formatting are not preserved and sections may be reordered. Runtime
-/// store sizing (windows, budgets, enable/disable) is re-read on the next relay
-/// restart.
+/// reparses the whole config file into a `toml::Table`, replaces only the
+/// `[relay.observability]` table, and reserializes the entire file — unknown
+/// sections and keys survive, though comments/formatting are not preserved and
+/// sections may be reordered. Runtime store sizing (windows, budgets,
+/// enable/disable) is re-read on the next relay restart.
 async fn update_observability_config(
     State(state): State<ManagementState>,
     Json(new_cfg): Json<ObservabilityConfig>,
@@ -7909,6 +7970,154 @@ command = "echo"
         let arr = body.as_array().unwrap();
         let read_tool = arr.iter().find(|t| t["name"] == "read").unwrap();
         assert_eq!(read_tool["disabled"], false);
+    }
+
+    // ---- persist_disabled_state raw-table surgery -------------------------
+    //
+    // Regression tests for the settings-reset bug: persist_disabled_state used
+    // to reserialize the whole typed `Config` to disk, silently dropping any
+    // sections the struct doesn't model ([desktop], [desktop.overlay], [meta],
+    // unknown keys). It now performs a targeted toml::Table edit, so those
+    // sections must survive a disable-server / disable-tool persist verbatim.
+
+    const PRESERVE_SECTIONS_TOML: &str = r#"[relay]
+machine_name = "test"
+
+[desktop]
+update_channel = "beta"
+
+[desktop.overlay]
+enabled = true
+
+[meta]
+config_version = 3
+
+[[endpoints]]
+name = "srv"
+transport = "stdio"
+command = "echo"
+custom_unknown_key = "keep-me"
+
+[[endpoints]]
+name = "other"
+transport = "stdio"
+command = "echo"
+"#;
+
+    /// Build a state whose registry and in-memory config carry `srv`, `other`,
+    /// and `ghost` (the latter intentionally absent from the on-disk TOML),
+    /// wired to `config_file` seeded with [`PRESERVE_SECTIONS_TOML`].
+    async fn persist_test_state(config_file: &std::path::Path) -> ManagementState {
+        std::fs::write(config_file, PRESERVE_SECTIONS_TOML).unwrap();
+        let mut state = test_state(vec![
+            ("srv", MockAdapter::healthy_with_tools(vec![])),
+            ("other", MockAdapter::healthy_with_tools(vec![])),
+            ("ghost", MockAdapter::healthy_with_tools(vec![])),
+        ])
+        .await;
+        state.config_path = Some(config_file.to_path_buf());
+        {
+            let mut cfg = state.config.write().await;
+            let template = cfg.endpoints[0].clone();
+            cfg.endpoints = vec![
+                EndpointConfig {
+                    name: "srv".into(),
+                    ..template.clone()
+                },
+                EndpointConfig {
+                    name: "other".into(),
+                    ..template.clone()
+                },
+                EndpointConfig {
+                    name: "ghost".into(),
+                    ..template
+                },
+            ];
+        }
+        state
+    }
+
+    #[tokio::test]
+    async fn persist_disabled_state_preserves_unknown_sections_on_server_disable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let state = persist_test_state(&config_file).await;
+
+        {
+            let mut entries = state.registry.entries().write().await;
+            entries.get_mut("srv").unwrap().disabled = true;
+        }
+        persist_disabled_state(&state).await;
+
+        let written: toml::Table = std::fs::read_to_string(&config_file)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let original: toml::Table = PRESERVE_SECTIONS_TOML.parse().unwrap();
+
+        // Unknown top-level sections survive verbatim (parse-and-compare).
+        assert_eq!(written["desktop"], original["desktop"]);
+        assert_eq!(written["meta"], original["meta"]);
+        assert_eq!(written["relay"], original["relay"]);
+
+        // The disabled flip is reflected on the right endpoint only, and the
+        // registry-only `ghost` endpoint is NOT re-added to the file.
+        let endpoints = written["endpoints"].as_array().unwrap();
+        assert_eq!(endpoints.len(), 2);
+        let srv = endpoints
+            .iter()
+            .find(|e| e["name"].as_str() == Some("srv"))
+            .unwrap();
+        assert_eq!(srv["disabled"].as_bool(), Some(true));
+        assert_eq!(srv["custom_unknown_key"].as_str(), Some("keep-me"));
+        let other = endpoints
+            .iter()
+            .find(|e| e["name"].as_str() == Some("other"))
+            .unwrap();
+        assert_eq!(other["disabled"].as_bool(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn persist_disabled_state_preserves_unknown_sections_on_tool_disable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let state = persist_test_state(&config_file).await;
+
+        {
+            let mut entries = state.registry.entries().write().await;
+            entries
+                .get_mut("srv")
+                .unwrap()
+                .disabled_tools
+                .insert("read".into());
+        }
+        persist_disabled_state(&state).await;
+
+        let written: toml::Table = std::fs::read_to_string(&config_file)
+            .unwrap()
+            .parse()
+            .unwrap();
+        let original: toml::Table = PRESERVE_SECTIONS_TOML.parse().unwrap();
+
+        // Unknown top-level sections survive verbatim (parse-and-compare).
+        assert_eq!(written["desktop"], original["desktop"]);
+        assert_eq!(written["meta"], original["meta"]);
+
+        let endpoints = written["endpoints"].as_array().unwrap();
+        assert_eq!(endpoints.len(), 2);
+        let srv = endpoints
+            .iter()
+            .find(|e| e["name"].as_str() == Some("srv"))
+            .unwrap();
+        let tools: Vec<&str> = srv["disabled_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(tools, vec!["read"]);
+        assert_eq!(srv["disabled"].as_bool(), Some(false));
+        assert_eq!(srv["custom_unknown_key"].as_str(), Some("keep-me"));
     }
 
     // ---- tools_changed_tx tick coverage (one tick per real flip; zero on no-op)
