@@ -1226,17 +1226,30 @@ fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
         ));
     }
     let final_dest = canonical_dir.join(file_name);
+    // Process-wide monotonic counter: concurrent writes to the same
+    // destination can observe the same SystemTime, so the timestamp alone
+    // does not make the temp name unique within this process.
+    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let tmp = canonical_dir.join(format!(
-        ".{}.{}.{}.tmp",
+        ".{}.{}.{}.{}.tmp",
         file_name.to_string_lossy(),
         std::process::id(),
-        unique
+        unique,
+        seq
     ));
-    if let Err(e) = std::fs::write(&tmp, bytes) {
+    // create_new(true) guarantees this call exclusively owns the temp file
+    // even if the name somehow collides (e.g. across processes).
+    let write_result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, bytes));
+    if let Err(e) = write_result {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!(
             "writeFile: failed to write '{}': {}",
