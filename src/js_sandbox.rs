@@ -1,10 +1,14 @@
 //! JavaScript execution sandbox using boa_engine.
 //!
 //! Provides a sandboxed JS runtime with access to MCP tools via a `tools` global object.
-//! No filesystem or network access is available from within the sandbox.
+//! No network access is available from within the sandbox. Filesystem access is
+//! limited to a single allowlisted write primitive: `writeFile(absPath, data, opts?)`
+//! accepts absolute paths only and validates the fully-resolved destination against
+//! the user-configured `relay.write_dirs` allowlist (empty allowlist = writing
+//! disabled). There is no read primitive.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -364,6 +368,7 @@ fn run_js(script: &str, catalog: &[ToolInfo]) -> Result<Value, JsSandboxError> {
 
     register_call_tool(&mut context)?;
     register_call_tool_with_retry(&mut context)?;
+    register_write_file(&mut context)?;
     register_tools_object(&mut context, catalog)?;
     register_json_parse_wrapper(&mut context)?;
 
@@ -864,6 +869,230 @@ fn register_json_parse_wrapper(context: &mut Context) -> Result<(), JsSandboxErr
         .map_err(|e| {
             JsSandboxError::Internal(format!("failed to install JSON.parse wrapper: {}", e))
         })?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Native function: __write_file(path, data, encoding) -> canonical_path_string
+//
+// Backs the JS-facing `writeFile(absPath, data, opts?)` global. Absolute
+// paths only; the fully-resolved destination must sit inside one of the
+// canonical `relay.write_dirs` roots carried in [`SandboxState`]. Every
+// rejection is a thrown JS Error and never leaves a partial file behind.
+// ---------------------------------------------------------------------------
+
+fn register_write_file(context: &mut Context) -> Result<(), JsSandboxError> {
+    let f = NativeFunction::from_fn_ptr(write_file_native);
+    let js_func = f.to_js_function(context.realm());
+    context
+        .register_global_property(
+            boa_engine::js_string!("__write_file"),
+            js_func,
+            Attribute::READONLY | Attribute::NON_ENUMERABLE,
+        )
+        .map_err(|e| JsSandboxError::Internal(format!("failed to register __write_file: {}", e)))?;
+    const SRC: &str = r#"
+function writeFile(path, data, opts) {
+  var encoding = (opts && opts.encoding !== undefined) ? opts.encoding : "utf8";
+  return __write_file(path, data, encoding);
+}
+"#;
+    context
+        .eval(Source::from_bytes(SRC.as_bytes()))
+        .map_err(|e| {
+            JsSandboxError::Internal(format!("failed to create writeFile helper: {}", e))
+        })?;
+    Ok(())
+}
+
+fn write_file_native(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let path_str = args
+        .first()
+        .ok_or_else(|| JsNativeError::typ().with_message("writeFile: missing path"))?
+        .to_string(context)?
+        .to_std_string_escaped();
+
+    let data = args
+        .get(1)
+        .ok_or_else(|| JsNativeError::typ().with_message("writeFile: missing data"))?
+        .to_string(context)?
+        .to_std_string_escaped();
+
+    let encoding = match args.get(2) {
+        Some(v) if !v.is_undefined() && !v.is_null() => {
+            v.to_string(context)?.to_std_string_escaped()
+        }
+        _ => "utf8".to_string(),
+    };
+
+    let bytes: Vec<u8> = match encoding.as_str() {
+        "utf8" => data.into_bytes(),
+        "base64" => {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(data.as_bytes())
+                .map_err(|e| {
+                    JsNativeError::error()
+                        .with_message(format!("writeFile: invalid base64 data: {}", e))
+                })?
+        }
+        other => {
+            return Err(JsNativeError::typ()
+                .with_message(format!(
+                    "writeFile: unsupported encoding '{}' (expected \"utf8\" or \"base64\")",
+                    other
+                ))
+                .into())
+        }
+    };
+
+    let write_roots = SANDBOX_STATE.with(|cell| {
+        let borrow = cell.borrow();
+        let state = borrow
+            .as_ref()
+            .ok_or_else(|| JsNativeError::error().with_message("sandbox state not initialised"))?;
+        Ok::<Vec<PathBuf>, JsError>(state.write_roots.clone())
+    })?;
+
+    let dest = resolve_write_path(&path_str, &write_roots)
+        .map_err(|msg| JsNativeError::error().with_message(msg))?;
+
+    write_atomic(&dest, &bytes).map_err(|msg| JsNativeError::error().with_message(msg))?;
+
+    let dest_str = dest.to_string_lossy();
+    Ok(JsValue::from(boa_engine::js_string!(dest_str.as_ref())))
+}
+
+/// Validate `path_str` against the allowlist and return the canonical
+/// destination path. Rejections (empty/NUL path, relative path, `..`
+/// components, destinations outside every root — including via symlinks)
+/// come back as `Err(message)` before anything touches the filesystem.
+fn resolve_write_path(path_str: &str, write_roots: &[PathBuf]) -> Result<PathBuf, String> {
+    if path_str.is_empty() {
+        return Err(
+            "writeFile: path must not be empty — writeFile requires an absolute \
+             path inside a configured write directory"
+                .to_string(),
+        );
+    }
+    if path_str.contains('\0') {
+        return Err("writeFile: path must not contain a NUL byte".to_string());
+    }
+    let path = Path::new(path_str);
+    if !path.is_absolute() {
+        return Err(format!(
+            "writeFile: '{}' is a relative path — writeFile requires an absolute path \
+             inside a configured write directory",
+            path_str
+        ));
+    }
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(format!(
+            "writeFile: '{}' contains a '..' path component, which is not allowed",
+            path_str
+        ));
+    }
+    if write_roots.is_empty() {
+        return Err(write_dirs_rejection_message(path_str, write_roots));
+    }
+
+    // Canonicalize the deepest existing ancestor, then re-append the
+    // not-yet-existing components. This resolves symlinks in every existing
+    // part of the path — so a symlink inside a root pointing outside is
+    // caught by the prefix check below — without requiring the destination
+    // itself to exist yet.
+    let mut existing: &Path = path;
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    while !existing.exists() {
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return Err(write_dirs_rejection_message(path_str, write_roots)),
+        }
+    }
+    let mut resolved = std::fs::canonicalize(existing)
+        .map_err(|e| format!("writeFile: failed to resolve '{}': {}", path_str, e))?;
+    for name in missing.iter().rev() {
+        resolved.push(name);
+    }
+
+    if !write_roots.iter().any(|root| resolved.starts_with(root)) {
+        return Err(write_dirs_rejection_message(path_str, write_roots));
+    }
+    Ok(resolved)
+}
+
+/// The actionable "not inside a configured write directory" message. When
+/// roots are configured, the currently-allowed directories are listed.
+fn write_dirs_rejection_message(path_str: &str, write_roots: &[PathBuf]) -> String {
+    let mut msg = format!(
+        "writeFile: {} is not inside a configured write directory. Add one under \
+         [relay] write_dirs in ~/.endara/config.toml, or in the Endara desktop app \
+         under Settings → Write directories.",
+        path_str
+    );
+    if !write_roots.is_empty() {
+        let list = write_roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        msg.push_str(&format!(" Currently allowed: {}.", list));
+    }
+    msg
+}
+
+/// Write `bytes` to `dest` via a temp file in the destination directory plus
+/// an atomic rename, creating missing parent directories first. `dest` must
+/// already be validated by [`resolve_write_path`], so any directories created
+/// here sit inside the matched root. On failure the temp file is removed —
+/// no partial destination file is ever observable.
+fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<(), String> {
+    let dir = dest
+        .parent()
+        .ok_or_else(|| format!("writeFile: '{}' has no parent directory", dest.display()))?;
+    let file_name = dest
+        .file_name()
+        .ok_or_else(|| format!("writeFile: '{}' does not name a file", dest.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| {
+        format!(
+            "writeFile: failed to create parent directories for '{}': {}",
+            dest.display(),
+            e
+        )
+    })?;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(
+        ".{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        unique
+    ));
+    if let Err(e) = std::fs::write(&tmp, bytes) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "writeFile: failed to write '{}': {}",
+            dest.display(),
+            e
+        ));
+    }
+    if let Err(e) = std::fs::rename(&tmp, dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "writeFile: failed to finalise '{}': {}",
+            dest.display(),
+            e
+        ));
+    }
     Ok(())
 }
 
@@ -2434,6 +2663,326 @@ mod tests {
         let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
         let result = sandbox.execute(r#"return typeof fetch;"#).await.unwrap();
         assert_eq!(result, json!("undefined"));
+    }
+
+    // --- writeFile tests ---
+
+    /// Build a sandbox whose `writeFile` allowlist is `roots`.
+    async fn write_sandbox(roots: Vec<PathBuf>) -> JsSandbox {
+        let reg = make_registry().await;
+        JsSandbox::new(reg, Duration::from_secs(10)).with_write_roots(roots)
+    }
+
+    /// Canonicalized tempdir path, matching what `resolve_write_roots`
+    /// produces for configured roots (on macOS `/var/...` → `/private/var/...`).
+    fn canonical_root(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().canonicalize().unwrap()
+    }
+
+    /// Quote a Rust string as a JS string literal (handles NUL, quotes, …).
+    fn js_quote(s: &str) -> String {
+        serde_json::to_string(s).unwrap()
+    }
+
+    /// Sorted file names directly inside `dir`.
+    fn dir_entries(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn test_write_file_utf8_returns_canonical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        // Pass the possibly non-canonical tempdir path; the returned path
+        // must be the canonical one and sit under the canonical root.
+        let raw = dir.path().join("out.txt");
+        let script = format!(
+            "return writeFile({}, \"hello ✓ writeFile\");",
+            js_quote(raw.to_str().unwrap())
+        );
+        let result = sandbox.execute(&script).await.unwrap();
+        let expected = root.join("out.txt");
+        assert_eq!(result, json!(expected.to_string_lossy()));
+        assert!(PathBuf::from(result.as_str().unwrap()).starts_with(&root));
+        assert_eq!(
+            std::fs::read(&expected).unwrap(),
+            "hello ✓ writeFile".as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_file_base64_decodes_bytes() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let dest = root.join("blob.bin");
+        let script = format!(
+            "return writeFile({}, {}, {{ encoding: \"base64\" }});",
+            js_quote(dest.to_str().unwrap()),
+            js_quote(&b64)
+        );
+        let result = sandbox.execute(&script).await.unwrap();
+        assert_eq!(result, json!(dest.to_string_lossy()));
+        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn test_write_file_creates_nested_parents_inside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let dest = root.join("a/b/c/file.txt");
+        let script = format!(
+            "return writeFile({}, \"nested\");",
+            js_quote(dest.to_str().unwrap())
+        );
+        sandbox.execute(&script).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"nested");
+        assert!(root.join("a/b/c").is_dir());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_overwrite_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let dest = root.join("out.txt");
+        for content in ["first", "second"] {
+            let script = format!(
+                "return writeFile({}, {});",
+                js_quote(dest.to_str().unwrap()),
+                js_quote(content)
+            );
+            sandbox.execute(&script).await.unwrap();
+        }
+        assert_eq!(std::fs::read(&dest).unwrap(), b"second");
+        assert_eq!(dir_entries(&root), vec!["out.txt".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_write_file_second_allowlisted_root_writable() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let root_a = canonical_root(&dir_a);
+        let root_b = canonical_root(&dir_b);
+        let sandbox = write_sandbox(vec![root_a.clone(), root_b.clone()]).await;
+        let dest = root_b.join("b.txt");
+        let script = format!(
+            "return writeFile({}, \"in b\");",
+            js_quote(dest.to_str().unwrap())
+        );
+        let result = sandbox.execute(&script).await.unwrap();
+        assert_eq!(result, json!(dest.to_string_lossy()));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"in b");
+        assert!(dir_entries(&root_a).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_rejects_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let err = sandbox
+            .execute(r#"return writeFile("relative/x.txt", "d");"#)
+            .await
+            .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("requires an absolute path"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(dir_entries(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_rejects_dotdot_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let path = format!("{}/sub/../x.txt", root.display());
+        let script = format!("return writeFile({}, \"d\");", js_quote(&path));
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("'..'"), "unexpected error: {}", msg);
+        assert!(dir_entries(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_rejects_root_prefix_string_trick() {
+        // "/tmp/rootXsibling/…" must not match root "/tmp/rootX" — the
+        // prefix check is component-wise, not a string prefix.
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let sibling = format!("{}sibling", root.display());
+        let path = format!("{}/x.txt", sibling);
+        let script = format!("return writeFile({}, \"d\");", js_quote(&path));
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("not inside a configured write directory"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(!PathBuf::from(&sibling).exists());
+        assert!(dir_entries(&root).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_write_file_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
+        let path = root.join("link/x.txt");
+        let script = format!(
+            "return writeFile({}, \"d\");",
+            js_quote(path.to_str().unwrap())
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("not inside a configured write directory"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(dir_entries(outside.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_rejects_empty_and_nul_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+
+        let err = sandbox
+            .execute(r#"return writeFile("", "d");"#)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("must not be empty"),
+            "unexpected error: {}",
+            err
+        );
+
+        let path = format!("{}/x\u{0}.txt", root.display());
+        let script = format!("return writeFile({}, \"d\");", js_quote(&path));
+        let err = sandbox.execute(&script).await.unwrap_err();
+        assert!(
+            format!("{}", err).contains("NUL"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(dir_entries(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_rejects_path_under_no_root_lists_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let path = outside.path().join("x.txt");
+        let script = format!(
+            "return writeFile({}, \"d\");",
+            js_quote(path.to_str().unwrap())
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("not inside a configured write directory"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            msg.contains("[relay] write_dirs in ~/.endara/config.toml"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Settings → Write directories"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            msg.contains(&format!("Currently allowed: {}", root.display())),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(dir_entries(outside.path()).is_empty());
+        assert!(dir_entries(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_rejects_when_no_roots_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = write_sandbox(Vec::new()).await;
+        let path = dir.path().join("x.txt");
+        let script = format!(
+            "return writeFile({}, \"d\");",
+            js_quote(path.to_str().unwrap())
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("not inside a configured write directory"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            msg.contains("[relay] write_dirs in ~/.endara/config.toml"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("Currently allowed"),
+            "empty allowlist must not list directories: {}",
+            msg
+        );
+        assert!(dir_entries(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_rejects_bad_encoding_and_bad_base64() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let dest = root.join("x.txt");
+
+        let script = format!(
+            "return writeFile({}, \"d\", {{ encoding: \"hex\" }});",
+            js_quote(dest.to_str().unwrap())
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        assert!(
+            format!("{}", err).contains("unsupported encoding"),
+            "unexpected error: {}",
+            err
+        );
+
+        let script = format!(
+            "return writeFile({}, \"not base64!!\", {{ encoding: \"base64\" }});",
+            js_quote(dest.to_str().unwrap())
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        assert!(
+            format!("{}", err).contains("invalid base64"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(dir_entries(&root).is_empty());
     }
 
     #[tokio::test]
