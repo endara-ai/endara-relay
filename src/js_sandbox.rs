@@ -131,10 +131,44 @@ struct SandboxState {
     /// Snapshot of the `relay.write_dirs` allowlist (canonical directory
     /// roots, resolved by [`crate::config::resolve_write_roots`]) taken when
     /// the script entered the sandbox. Empty means writing is disabled.
-    /// Read by the `writeFile` native function (Task 2) to validate absolute
-    /// destination paths; until that lands the field is populated but unread.
-    #[allow(dead_code)]
+    /// Read by the `writeFile` native function to validate absolute
+    /// destination paths.
     write_roots: Vec<PathBuf>,
+    /// Per-run `writeFile` resource limits. Production runs always use
+    /// [`WriteLimits::default`]; tests may shrink them via
+    /// [`JsSandbox::with_write_limits`].
+    write_limits: WriteLimits,
+    /// Number of files successfully written by `writeFile` during this run.
+    /// A fresh [`SandboxState`] is installed per run, so this resets per run.
+    files_written: usize,
+    /// Total bytes successfully written by `writeFile` during this run.
+    /// A fresh [`SandboxState`] is installed per run, so this resets per run.
+    bytes_written: usize,
+}
+
+/// Per-run `writeFile` resource limits. These are per-script-run only —
+/// there is no cross-run quota, no TTL sweep, and the relay never deletes
+/// files: a breach throws before the offending file is written and leaves
+/// every existing file untouched.
+#[derive(Clone, Copy)]
+struct WriteLimits {
+    /// Maximum size of a single written file, checked before base64 decoding
+    /// (payload size estimated as ≈3n/4 from the base64 string length).
+    max_file_bytes: usize,
+    /// Maximum number of files a single script run may write.
+    max_files_per_run: usize,
+    /// Maximum total bytes a single script run may write across all files.
+    max_total_bytes_per_run: usize,
+}
+
+impl Default for WriteLimits {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: 32 * 1024 * 1024,
+            max_files_per_run: 64,
+            max_total_bytes_per_run: 256 * 1024 * 1024,
+        }
+    }
 }
 
 thread_local! {
@@ -172,6 +206,10 @@ pub struct JsSandbox {
     /// empty (writing disabled); set via [`Self::with_write_roots`] by
     /// [`MetaToolHandler::execute_tools`].
     write_roots: Vec<PathBuf>,
+    /// Per-run `writeFile` resource limits carried into [`SandboxState`].
+    /// Defaults to [`WriteLimits::default`]; tests may shrink them via
+    /// [`Self::with_write_limits`].
+    write_limits: WriteLimits,
 }
 
 impl JsSandbox {
@@ -206,6 +244,7 @@ impl JsSandbox {
             client_json: String::new(),
             request_uid: String::new(),
             write_roots: Vec::new(),
+            write_limits: WriteLimits::default(),
         }
     }
 
@@ -247,6 +286,15 @@ impl JsSandbox {
         self
     }
 
+    /// Test-only: shrink the per-run `writeFile` limits so limit-boundary
+    /// behaviour can be exercised without multi-hundred-megabyte writes.
+    /// Production runs always use [`WriteLimits::default`].
+    #[cfg(test)]
+    fn with_write_limits(mut self, write_limits: WriteLimits) -> Self {
+        self.write_limits = write_limits;
+        self
+    }
+
     /// Execute a JavaScript script in the sandbox.
     pub async fn execute(&self, script: &str) -> Result<Value, JsSandboxError> {
         let registry = self.registry.clone();
@@ -255,6 +303,7 @@ impl JsSandbox {
         let client_json = self.client_json.clone();
         let request_uid = self.request_uid.clone();
         let write_roots = self.write_roots.clone();
+        let write_limits = self.write_limits;
         let script = script.to_string();
         let handle = tokio::runtime::Handle::current();
         let catalog = self.registry.merged_catalog().await;
@@ -272,6 +321,7 @@ impl JsSandbox {
                     client_json,
                     request_uid,
                     write_roots,
+                    write_limits,
                 )
             }),
         )
@@ -300,6 +350,7 @@ fn execute_in_sandbox(
     client_json: String,
     request_uid: String,
     write_roots: Vec<PathBuf>,
+    write_limits: WriteLimits,
 ) -> Result<Value, JsSandboxError> {
     let deadline = std::time::Instant::now() + sandbox_timeout;
     SANDBOX_STATE.with(|cell| {
@@ -311,6 +362,9 @@ fn execute_in_sandbox(
             client_json,
             request_uid,
             write_roots,
+            write_limits,
+            files_written: 0,
+            bytes_written: 0,
         });
     });
     let result = run_js(script, catalog);
@@ -877,8 +931,11 @@ fn register_json_parse_wrapper(context: &mut Context) -> Result<(), JsSandboxErr
 //
 // Backs the JS-facing `writeFile(absPath, data, opts?)` global. Absolute
 // paths only; the fully-resolved destination must sit inside one of the
-// canonical `relay.write_dirs` roots carried in [`SandboxState`]. Every
-// rejection is a thrown JS Error and never leaves a partial file behind.
+// canonical `relay.write_dirs` roots carried in [`SandboxState`]. Per-run
+// resource limits ([`WriteLimits`]) cap the size of each file, the number
+// of files, and the total bytes written by a single script run. Every
+// rejection is a thrown JS Error and never leaves a partial file behind;
+// the relay never deletes existing files.
 // ---------------------------------------------------------------------------
 
 fn register_write_file(context: &mut Context) -> Result<(), JsSandboxError> {
@@ -929,6 +986,56 @@ fn write_file_native(
         _ => "utf8".to_string(),
     };
 
+    let (write_roots, limits, files_written, bytes_written) = SANDBOX_STATE.with(|cell| {
+        let borrow = cell.borrow();
+        let state = borrow
+            .as_ref()
+            .ok_or_else(|| JsNativeError::error().with_message("sandbox state not initialised"))?;
+        Ok::<(Vec<PathBuf>, WriteLimits, usize, usize), JsError>((
+            state.write_roots.clone(),
+            state.write_limits,
+            state.files_written,
+            state.bytes_written,
+        ))
+    })?;
+
+    if files_written >= limits.max_files_per_run {
+        return Err(JsNativeError::error()
+            .with_message(format!(
+                "writeFile: per-run limit of {} files reached — no further files can \
+                 be written by this script run",
+                limits.max_files_per_run
+            ))
+            .into());
+    }
+
+    // Per-file size cap, checked before base64 decoding so an oversized
+    // payload is rejected without allocating the decoded bytes. Base64
+    // padding means the ≈3n/4 estimate is an upper bound on the decoded
+    // size, so a payload that passes here cannot exceed the cap once decoded.
+    let estimated_len = match encoding.as_str() {
+        "utf8" => Some(data.len()),
+        "base64" => Some(data.len().saturating_mul(3) / 4),
+        _ => None,
+    };
+    if let Some(estimated_len) = estimated_len {
+        if estimated_len > limits.max_file_bytes {
+            return Err(JsNativeError::error()
+                .with_message(format!(
+                    "writeFile: data is {}{} bytes, which exceeds the per-file limit \
+                     of {} bytes",
+                    if encoding == "base64" {
+                        "approximately "
+                    } else {
+                        ""
+                    },
+                    estimated_len,
+                    limits.max_file_bytes
+                ))
+                .into());
+        }
+    }
+
     let bytes: Vec<u8> = match encoding.as_str() {
         "utf8" => data.into_bytes(),
         "base64" => {
@@ -950,18 +1057,29 @@ fn write_file_native(
         }
     };
 
-    let write_roots = SANDBOX_STATE.with(|cell| {
-        let borrow = cell.borrow();
-        let state = borrow
-            .as_ref()
-            .ok_or_else(|| JsNativeError::error().with_message("sandbox state not initialised"))?;
-        Ok::<Vec<PathBuf>, JsError>(state.write_roots.clone())
-    })?;
+    if bytes_written.saturating_add(bytes.len()) > limits.max_total_bytes_per_run {
+        return Err(JsNativeError::error()
+            .with_message(format!(
+                "writeFile: writing {} more bytes would exceed the per-run total \
+                 write limit of {} bytes ({} bytes already written)",
+                bytes.len(),
+                limits.max_total_bytes_per_run,
+                bytes_written
+            ))
+            .into());
+    }
 
     let dest = resolve_write_path(&path_str, &write_roots)
         .map_err(|msg| JsNativeError::error().with_message(msg))?;
 
     write_atomic(&dest, &bytes).map_err(|msg| JsNativeError::error().with_message(msg))?;
+
+    SANDBOX_STATE.with(|cell| {
+        if let Some(state) = cell.borrow_mut().as_mut() {
+            state.files_written += 1;
+            state.bytes_written = state.bytes_written.saturating_add(bytes.len());
+        }
+    });
 
     let dest_str = dest.to_string_lossy();
     Ok(JsValue::from(boa_engine::js_string!(dest_str.as_ref())))
@@ -2983,6 +3101,151 @@ mod tests {
             err
         );
         assert!(dir_entries(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_per_file_cap_one_byte_over_throws() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let dest = root.join("big.txt");
+        // One byte over the 32 MB per-file cap.
+        let script = format!(
+            "return writeFile({}, \"a\".repeat({}));",
+            js_quote(dest.to_str().unwrap()),
+            32 * 1024 * 1024 + 1
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("exceeds the per-file limit"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(dir_entries(&root).is_empty(), "no partial file may remain");
+    }
+
+    #[tokio::test]
+    async fn test_write_file_per_file_cap_base64_checked_before_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let dest = root.join("big.bin");
+        // '!' is not valid base64: if the payload were decoded first this
+        // would fail with "invalid base64". The ≈3n/4 pre-decode estimate
+        // must reject it as oversized instead.
+        let repeat = (32usize * 1024 * 1024 / 3) * 4 + 8;
+        let script = format!(
+            "return writeFile({}, \"!\".repeat({}), {{ encoding: \"base64\" }});",
+            js_quote(dest.to_str().unwrap()),
+            repeat
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("exceeds the per-file limit"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("invalid base64"),
+            "size cap must fire before base64 decoding: {}",
+            msg
+        );
+        assert!(dir_entries(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_per_run_file_count_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let script = format!(
+            "for (var i = 0; i < 65; i++) {{ writeFile({} + \"/f\" + i + \".txt\", \"x\"); }}",
+            js_quote(root.to_str().unwrap())
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("per-run limit of 64 files"),
+            "unexpected error: {}",
+            msg
+        );
+        // The first 64 files remain intact; the 65th was never written.
+        let entries = dir_entries(&root);
+        assert_eq!(entries.len(), 64);
+        for i in 0..64 {
+            let f = root.join(format!("f{}.txt", i));
+            assert_eq!(std::fs::read(&f).unwrap(), b"x", "missing {}", f.display());
+        }
+        assert!(!root.join("f64.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_per_run_total_bytes_limit_preexisting_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()])
+            .await
+            .with_write_limits(WriteLimits {
+                max_file_bytes: 64,
+                max_files_per_run: 64,
+                max_total_bytes_per_run: 100,
+            });
+        // A pre-existing file the relay must never touch.
+        let existing = root.join("existing.txt");
+        std::fs::write(&existing, b"pre-existing").unwrap();
+        // 40 + 40 = 80 bytes fit; the third 40-byte write would reach 120.
+        let script = format!(
+            r#"
+var root = {};
+writeFile(root + "/a.txt", "a".repeat(40));
+writeFile(root + "/b.txt", "b".repeat(40));
+writeFile(root + "/c.txt", "c".repeat(40));
+"#,
+            js_quote(root.to_str().unwrap())
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("per-run total write limit"),
+            "unexpected error: {}",
+            msg
+        );
+        assert_eq!(std::fs::read(&existing).unwrap(), b"pre-existing");
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), vec![b'a'; 40]);
+        assert_eq!(std::fs::read(root.join("b.txt")).unwrap(), vec![b'b'; 40]);
+        assert!(!root.join("c.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_limits_reset_between_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()])
+            .await
+            .with_write_limits(WriteLimits {
+                max_file_bytes: 1024,
+                max_files_per_run: 2,
+                max_total_bytes_per_run: 100,
+            });
+        // Each run writes 2 files totalling 80 bytes — exactly at the
+        // per-run file limit and near the byte limit. If the counters did
+        // not reset between runs the second run would throw.
+        for run in ["first", "second"] {
+            let script = format!(
+                r#"
+var root = {};
+writeFile(root + "/{run}-1.txt", "x".repeat(40));
+writeFile(root + "/{run}-2.txt", "y".repeat(40));
+return "ok";
+"#,
+                js_quote(root.to_str().unwrap())
+            );
+            let result = sandbox.execute(&script).await.unwrap();
+            assert_eq!(result, json!("ok"), "run '{}' should succeed", run);
+        }
+        assert_eq!(dir_entries(&root).len(), 4);
     }
 
     #[tokio::test]
