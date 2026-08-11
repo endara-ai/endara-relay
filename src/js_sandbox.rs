@@ -1,9 +1,14 @@
 //! JavaScript execution sandbox using boa_engine.
 //!
 //! Provides a sandboxed JS runtime with access to MCP tools via a `tools` global object.
-//! No filesystem or network access is available from within the sandbox.
+//! No network access is available from within the sandbox. Filesystem access is
+//! limited to a single allowlisted write primitive: `writeFile(absPath, data, opts?)`
+//! accepts absolute paths only and validates the fully-resolved destination against
+//! the user-configured `relay.write_dirs` allowlist (empty allowlist = writing
+//! disabled). There is no read primitive.
 
 use std::cell::RefCell;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,6 +58,21 @@ fn jittered_backoff_ms(base: u64, rng: &mut impl rand::Rng) -> u64 {
     let factor: f64 = rng.random_range(0.75..=1.25);
     (base as f64 * factor) as u64
 }
+
+// ---------------------------------------------------------------------------
+// Shared write-roots handle
+// ---------------------------------------------------------------------------
+
+/// Shared, hot-reloadable allowlist of canonical directory roots the sandbox
+/// may write into (resolved from `relay.write_dirs` by
+/// [`crate::config::resolve_write_roots`]). A single handle is created in
+/// `main.rs` and shared by the global [`MetaToolHandler`], every per-profile
+/// handler (via [`crate::profile_registry::ProfileRegistry`]), and the config
+/// watcher — which swaps the contents on hot reload so all handlers observe
+/// the new allowlist without being rebuilt. Uses `std::sync::RwLock` (not
+/// tokio's): reads are brief snapshots taken without holding the guard across
+/// an `.await`.
+pub type SharedWriteRoots = Arc<std::sync::RwLock<Vec<PathBuf>>>;
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -108,6 +128,47 @@ struct SandboxState {
     /// event emitters (`ToolCallEvent::Started.request_uid`) — the
     /// blocking-thread hop otherwise drops the outer request span.
     request_uid: String,
+    /// Snapshot of the `relay.write_dirs` allowlist (canonical directory
+    /// roots, resolved by [`crate::config::resolve_write_roots`]) taken when
+    /// the script entered the sandbox. Empty means writing is disabled.
+    /// Read by the `writeFile` native function to validate absolute
+    /// destination paths.
+    write_roots: Vec<PathBuf>,
+    /// Per-run `writeFile` resource limits. Production runs always use
+    /// [`WriteLimits::default`]; tests may shrink them via
+    /// [`JsSandbox::with_write_limits`].
+    write_limits: WriteLimits,
+    /// Number of files successfully written by `writeFile` during this run.
+    /// A fresh [`SandboxState`] is installed per run, so this resets per run.
+    files_written: usize,
+    /// Total bytes successfully written by `writeFile` during this run.
+    /// A fresh [`SandboxState`] is installed per run, so this resets per run.
+    bytes_written: usize,
+}
+
+/// Per-run `writeFile` resource limits. These are per-script-run only —
+/// there is no cross-run quota, no TTL sweep, and the relay never deletes
+/// files: a breach throws before the offending file is written and leaves
+/// every existing file untouched.
+#[derive(Clone, Copy)]
+struct WriteLimits {
+    /// Maximum size of a single written file, checked before base64 decoding
+    /// (payload size estimated as ≈3n/4 from the base64 string length).
+    max_file_bytes: usize,
+    /// Maximum number of files a single script run may write.
+    max_files_per_run: usize,
+    /// Maximum total bytes a single script run may write across all files.
+    max_total_bytes_per_run: usize,
+}
+
+impl Default for WriteLimits {
+    fn default() -> Self {
+        Self {
+            max_file_bytes: 32 * 1024 * 1024,
+            max_files_per_run: 64,
+            max_total_bytes_per_run: 256 * 1024 * 1024,
+        }
+    }
 }
 
 thread_local! {
@@ -140,6 +201,15 @@ pub struct JsSandbox {
     /// [`MetaToolHandler::execute_tools`] so inner upstream tool calls
     /// re-establish the outer request's `request{request_uid=...}` span.
     request_uid: String,
+    /// `relay.write_dirs` allowlist snapshot (canonical directory roots)
+    /// carried into [`SandboxState`] for the running script. Defaults to
+    /// empty (writing disabled); set via [`Self::with_write_roots`] by
+    /// [`MetaToolHandler::execute_tools`].
+    write_roots: Vec<PathBuf>,
+    /// Per-run `writeFile` resource limits carried into [`SandboxState`].
+    /// Defaults to [`WriteLimits::default`]; tests may shrink them via
+    /// [`Self::with_write_limits`].
+    write_limits: WriteLimits,
 }
 
 impl JsSandbox {
@@ -173,6 +243,8 @@ impl JsSandbox {
             use_real_backoff: false,
             client_json: String::new(),
             request_uid: String::new(),
+            write_roots: Vec::new(),
+            write_limits: WriteLimits::default(),
         }
     }
 
@@ -195,12 +267,31 @@ impl JsSandbox {
         self
     }
 
+    /// Attach the `relay.write_dirs` allowlist snapshot (canonical directory
+    /// roots resolved by [`crate::config::resolve_write_roots`]) so the
+    /// running script's `writeFile` can validate destination paths. An empty
+    /// list means writing is disabled. Used by
+    /// [`MetaToolHandler::execute_tools`].
+    pub fn with_write_roots(mut self, write_roots: Vec<PathBuf>) -> Self {
+        self.write_roots = write_roots;
+        self
+    }
+
     /// Test-only: opt this sandbox into the real backoff schedule. Without
     /// this, `cfg(test)` builds short-circuit retry sleeps to zero so the
     /// suite stays fast. Used by the deadline-budget test.
     #[cfg(test)]
     pub(crate) fn with_real_backoff(mut self) -> Self {
         self.use_real_backoff = true;
+        self
+    }
+
+    /// Test-only: shrink the per-run `writeFile` limits so limit-boundary
+    /// behaviour can be exercised without multi-hundred-megabyte writes.
+    /// Production runs always use [`WriteLimits::default`].
+    #[cfg(test)]
+    fn with_write_limits(mut self, write_limits: WriteLimits) -> Self {
+        self.write_limits = write_limits;
         self
     }
 
@@ -211,6 +302,8 @@ impl JsSandbox {
         let use_real_backoff = self.use_real_backoff;
         let client_json = self.client_json.clone();
         let request_uid = self.request_uid.clone();
+        let write_roots = self.write_roots.clone();
+        let write_limits = self.write_limits;
         let script = script.to_string();
         let handle = tokio::runtime::Handle::current();
         let catalog = self.registry.merged_catalog().await;
@@ -227,6 +320,8 @@ impl JsSandbox {
                     use_real_backoff,
                     client_json,
                     request_uid,
+                    write_roots,
+                    write_limits,
                 )
             }),
         )
@@ -254,6 +349,8 @@ fn execute_in_sandbox(
     use_real_backoff: bool,
     client_json: String,
     request_uid: String,
+    write_roots: Vec<PathBuf>,
+    write_limits: WriteLimits,
 ) -> Result<Value, JsSandboxError> {
     let deadline = std::time::Instant::now() + sandbox_timeout;
     SANDBOX_STATE.with(|cell| {
@@ -264,6 +361,10 @@ fn execute_in_sandbox(
             use_real_backoff,
             client_json,
             request_uid,
+            write_roots,
+            write_limits,
+            files_written: 0,
+            bytes_written: 0,
         });
     });
     let result = run_js(script, catalog);
@@ -321,6 +422,7 @@ fn run_js(script: &str, catalog: &[ToolInfo]) -> Result<Value, JsSandboxError> {
 
     register_call_tool(&mut context)?;
     register_call_tool_with_retry(&mut context)?;
+    register_write_file(&mut context)?;
     register_tools_object(&mut context, catalog)?;
     register_json_parse_wrapper(&mut context)?;
 
@@ -825,6 +927,348 @@ fn register_json_parse_wrapper(context: &mut Context) -> Result<(), JsSandboxErr
 }
 
 // ---------------------------------------------------------------------------
+// Native function: __write_file(path, data, encoding) -> canonical_path_string
+//
+// Backs the JS-facing `writeFile(absPath, data, opts?)` global. Absolute
+// paths only; the fully-resolved destination must sit inside one of the
+// canonical `relay.write_dirs` roots carried in [`SandboxState`]. Per-run
+// resource limits ([`WriteLimits`]) cap the size of each file, the number
+// of files, and the total bytes written by a single script run. Every
+// rejection is a thrown JS Error and never leaves a partial file behind;
+// the relay never deletes existing files.
+// ---------------------------------------------------------------------------
+
+fn register_write_file(context: &mut Context) -> Result<(), JsSandboxError> {
+    let f = NativeFunction::from_fn_ptr(write_file_native);
+    let js_func = f.to_js_function(context.realm());
+    context
+        .register_global_property(
+            boa_engine::js_string!("__write_file"),
+            js_func,
+            Attribute::READONLY | Attribute::NON_ENUMERABLE,
+        )
+        .map_err(|e| JsSandboxError::Internal(format!("failed to register __write_file: {}", e)))?;
+    const SRC: &str = r#"
+function writeFile(path, data, opts) {
+  var encoding = (opts && opts.encoding !== undefined) ? opts.encoding : "utf8";
+  return __write_file(path, data, encoding);
+}
+"#;
+    context
+        .eval(Source::from_bytes(SRC.as_bytes()))
+        .map_err(|e| {
+            JsSandboxError::Internal(format!("failed to create writeFile helper: {}", e))
+        })?;
+    Ok(())
+}
+
+fn write_file_native(
+    _this: &JsValue,
+    args: &[JsValue],
+    context: &mut Context,
+) -> JsResult<JsValue> {
+    let path_str = args
+        .first()
+        .ok_or_else(|| JsNativeError::typ().with_message("writeFile: missing path"))?
+        .to_string(context)?
+        .to_std_string_escaped();
+
+    let data_val = args
+        .get(1)
+        .ok_or_else(|| JsNativeError::typ().with_message("writeFile: missing data"))?;
+    if !data_val.is_string() {
+        // Reject rather than coerce: ToString would silently write
+        // "[object Object]" for objects or "1,2,3" for arrays.
+        return Err(JsNativeError::typ()
+            .with_message("writeFile: data must be a string")
+            .into());
+    }
+    let data = data_val.to_string(context)?.to_std_string_escaped();
+
+    let encoding = match args.get(2) {
+        Some(v) if !v.is_undefined() && !v.is_null() => {
+            v.to_string(context)?.to_std_string_escaped()
+        }
+        _ => "utf8".to_string(),
+    };
+
+    let (write_roots, limits, files_written, bytes_written) = SANDBOX_STATE.with(|cell| {
+        let borrow = cell.borrow();
+        let state = borrow
+            .as_ref()
+            .ok_or_else(|| JsNativeError::error().with_message("sandbox state not initialised"))?;
+        Ok::<(Vec<PathBuf>, WriteLimits, usize, usize), JsError>((
+            state.write_roots.clone(),
+            state.write_limits,
+            state.files_written,
+            state.bytes_written,
+        ))
+    })?;
+
+    if files_written >= limits.max_files_per_run {
+        return Err(JsNativeError::error()
+            .with_message(format!(
+                "writeFile: per-run limit of {} file writes reached — no further files \
+                 can be written by this script run",
+                limits.max_files_per_run
+            ))
+            .into());
+    }
+
+    // Per-file size cap, checked before base64 decoding so an oversized
+    // payload is rejected without allocating the decoded bytes. The ≈3n/4
+    // estimate subtracts trailing '=' padding so it is an exact upper bound
+    // on the decoded size — a payload whose decoded length is exactly the
+    // cap is accepted, and one that passes here cannot exceed the cap.
+    let estimated_len = match encoding.as_str() {
+        "utf8" => Some(data.len()),
+        "base64" => {
+            let padding = data
+                .as_bytes()
+                .iter()
+                .rev()
+                .take(2)
+                .filter(|&&b| b == b'=')
+                .count();
+            Some((data.len().saturating_mul(3) / 4).saturating_sub(padding))
+        }
+        _ => None,
+    };
+    if let Some(estimated_len) = estimated_len {
+        if estimated_len > limits.max_file_bytes {
+            return Err(JsNativeError::error()
+                .with_message(format!(
+                    "writeFile: data is {}{} bytes, which exceeds the per-file limit \
+                     of {} bytes",
+                    if encoding == "base64" {
+                        "approximately "
+                    } else {
+                        ""
+                    },
+                    estimated_len,
+                    limits.max_file_bytes
+                ))
+                .into());
+        }
+    }
+
+    // Validate the destination before decoding: a disallowed path fails
+    // with the actionable path error (instead of a decode error) and never
+    // pays the decode allocation.
+    let (dest, matched_root) = resolve_write_path(&path_str, &write_roots)
+        .map_err(|msg| JsNativeError::error().with_message(msg))?;
+
+    let bytes: Vec<u8> = match encoding.as_str() {
+        "utf8" => data.into_bytes(),
+        "base64" => {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD
+                .decode(data.as_bytes())
+                .map_err(|e| {
+                    JsNativeError::error()
+                        .with_message(format!("writeFile: invalid base64 data: {}", e))
+                })?
+        }
+        other => {
+            return Err(JsNativeError::typ()
+                .with_message(format!(
+                    "writeFile: unsupported encoding '{}' (expected \"utf8\" or \"base64\")",
+                    other
+                ))
+                .into())
+        }
+    };
+
+    if bytes_written.saturating_add(bytes.len()) > limits.max_total_bytes_per_run {
+        return Err(JsNativeError::error()
+            .with_message(format!(
+                "writeFile: writing {} more bytes would exceed the per-run total \
+                 write limit of {} bytes ({} bytes already written)",
+                bytes.len(),
+                limits.max_total_bytes_per_run,
+                bytes_written
+            ))
+            .into());
+    }
+
+    write_atomic(&dest, &bytes, &matched_root)
+        .map_err(|msg| JsNativeError::error().with_message(msg))?;
+
+    SANDBOX_STATE.with(|cell| {
+        if let Some(state) = cell.borrow_mut().as_mut() {
+            state.files_written += 1;
+            state.bytes_written = state.bytes_written.saturating_add(bytes.len());
+        }
+    });
+
+    let dest_str = dest.to_string_lossy();
+    Ok(JsValue::from(boa_engine::js_string!(dest_str.as_ref())))
+}
+
+/// Validate `path_str` against the allowlist and return the canonical
+/// destination path together with the allowlisted root it matched.
+/// Rejections (empty/NUL path, relative path, `..` components, destinations
+/// outside every root — including via symlinks) come back as `Err(message)`
+/// before anything touches the filesystem.
+fn resolve_write_path(
+    path_str: &str,
+    write_roots: &[PathBuf],
+) -> Result<(PathBuf, PathBuf), String> {
+    if path_str.is_empty() {
+        return Err(
+            "writeFile: path must not be empty — writeFile requires an absolute \
+             path inside a configured write directory"
+                .to_string(),
+        );
+    }
+    if path_str.contains('\0') {
+        return Err("writeFile: path must not contain a NUL byte".to_string());
+    }
+    let path = Path::new(path_str);
+    if !path.is_absolute() {
+        return Err(format!(
+            "writeFile: '{}' is a relative path — writeFile requires an absolute path \
+             inside a configured write directory",
+            path_str
+        ));
+    }
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        return Err(format!(
+            "writeFile: '{}' contains a '..' path component, which is not allowed",
+            path_str
+        ));
+    }
+    if write_roots.is_empty() {
+        return Err(write_dirs_rejection_message(path_str, write_roots));
+    }
+
+    // Canonicalize the deepest existing ancestor, then re-append the
+    // not-yet-existing components. This resolves symlinks in every existing
+    // part of the path — so a symlink inside a root pointing outside is
+    // caught by the prefix check below — without requiring the destination
+    // itself to exist yet.
+    let mut existing: &Path = path;
+    let mut missing: Vec<std::ffi::OsString> = Vec::new();
+    while !existing.exists() {
+        match (existing.parent(), existing.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_os_string());
+                existing = parent;
+            }
+            _ => return Err(write_dirs_rejection_message(path_str, write_roots)),
+        }
+    }
+    let mut resolved = std::fs::canonicalize(existing)
+        .map_err(|e| format!("writeFile: failed to resolve '{}': {}", path_str, e))?;
+    for name in missing.iter().rev() {
+        resolved.push(name);
+    }
+
+    match write_roots.iter().find(|root| resolved.starts_with(root)) {
+        Some(root) => Ok((resolved, root.clone())),
+        None => Err(write_dirs_rejection_message(path_str, write_roots)),
+    }
+}
+
+/// The actionable "not inside a configured write directory" message. When
+/// roots are configured, the currently-allowed directories are listed.
+fn write_dirs_rejection_message(path_str: &str, write_roots: &[PathBuf]) -> String {
+    let mut msg = format!(
+        "writeFile: '{}' is not inside a configured write directory. Add one under \
+         [relay] write_dirs in ~/.endara/config.toml, or in the Endara desktop app \
+         under Settings → Write directories.",
+        path_str
+    );
+    if !write_roots.is_empty() {
+        let list = write_roots
+            .iter()
+            .map(|r| r.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        msg.push_str(&format!(" Currently allowed: {}.", list));
+    }
+    msg
+}
+
+/// Write `bytes` to `dest` via a temp file in the destination directory plus
+/// an atomic rename, creating missing parent directories first. `dest` must
+/// already be validated by [`resolve_write_path`] against `root` (the
+/// allowlisted root it matched), so any directories created here sit inside
+/// that root. After `create_dir_all` the destination directory is
+/// re-canonicalized and containment is re-asserted, closing the
+/// validate→write window in which a checked directory could be swapped for
+/// a symlink pointing outside the root. If the root itself was deleted
+/// after config resolution, `create_dir_all` recreates it — still inside
+/// the allowed prefix; the "directories are never auto-created" stance in
+/// [`crate::config::resolve_write_roots`] only covers resolution time. On
+/// failure the temp file is removed — no partial destination file is ever
+/// observable.
+fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
+    let dir = dest
+        .parent()
+        .ok_or_else(|| format!("writeFile: '{}' has no parent directory", dest.display()))?;
+    let file_name = dest
+        .file_name()
+        .ok_or_else(|| format!("writeFile: '{}' does not name a file", dest.display()))?;
+    std::fs::create_dir_all(dir).map_err(|e| {
+        format!(
+            "writeFile: failed to create parent directories for '{}': {}",
+            dest.display(),
+            e
+        )
+    })?;
+    let canonical_dir = std::fs::canonicalize(dir)
+        .map_err(|e| format!("writeFile: failed to resolve '{}': {}", dest.display(), e))?;
+    if !canonical_dir.starts_with(root) {
+        return Err(format!(
+            "writeFile: '{}' escaped the configured write directory during the write",
+            dest.display()
+        ));
+    }
+    let final_dest = canonical_dir.join(file_name);
+    // Process-wide monotonic counter: concurrent writes to the same
+    // destination can observe the same SystemTime, so the timestamp alone
+    // does not make the temp name unique within this process.
+    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = canonical_dir.join(format!(
+        ".{}.{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        unique,
+        seq
+    ));
+    // create_new(true) guarantees this call exclusively owns the temp file
+    // even if the name somehow collides (e.g. across processes).
+    let write_result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, bytes));
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "writeFile: failed to write '{}': {}",
+            dest.display(),
+            e
+        ));
+    }
+    if let Err(e) = std::fs::rename(&tmp, &final_dest) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!(
+            "writeFile: failed to finalise '{}': {}",
+            dest.display(),
+            e
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // JS value → serde_json::Value conversion
 // ---------------------------------------------------------------------------
 
@@ -1110,6 +1554,13 @@ pub struct MetaToolHandler {
     /// tools `execute_tools` can reach via the JS sandbox.
     registry: Arc<dyn MetaToolRegistry>,
     sandbox_timeout: Duration,
+    /// Shared, hot-reloadable `relay.write_dirs` allowlist handle. The
+    /// handler snapshots it per `execute_tools` call (see
+    /// [`Self::execute_tools`]) so a running script keeps the allowlist it
+    /// started with while later scripts observe a hot-reloaded value.
+    /// Defaults to an empty (writing-disabled) handle; production wiring
+    /// passes the process-wide handle via [`Self::with_write_roots`].
+    write_roots: SharedWriteRoots,
     /// Memoized per-tool search index reused across `search_tools` calls.
     /// Holds `(generation, docs)` where `generation` is the registry's
     /// `catalog_generation` at the time the docs were built. The `Arc` lets
@@ -1152,10 +1603,21 @@ impl MetaToolHandler {
         Self {
             registry,
             sandbox_timeout,
+            write_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
             search_index_cache: Arc::new(RwLock::new(None)),
             #[cfg(test)]
             search_index_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Attach the shared `relay.write_dirs` allowlist handle. The handle is
+    /// shared with the config watcher, which swaps its contents on hot
+    /// reload; the handler reads a snapshot per `execute_tools` call. Called
+    /// by `main.rs` (global handler) and `ProfileRegistry::rebuild`
+    /// (per-profile handlers).
+    pub fn with_write_roots(mut self, write_roots: SharedWriteRoots) -> Self {
+        self.write_roots = write_roots;
+        self
     }
 
     /// Test-only accessor returning the number of times the search index has
@@ -1305,9 +1767,19 @@ impl MetaToolHandler {
         client_json: &str,
         request_uid: &str,
     ) -> Result<Value, JsSandboxError> {
+        // Snapshot the shared allowlist for this script run. The brief
+        // std-RwLock read never crosses an `.await`; a poisoned lock (a
+        // writer panicked mid-swap) degrades to writing-disabled rather
+        // than propagating the panic into the request path.
+        let write_roots = self
+            .write_roots
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
         let sandbox = JsSandbox::from_dyn(self.registry.clone(), self.sandbox_timeout)
             .with_client(client_json.to_string())
-            .with_request_uid(request_uid.to_string());
+            .with_request_uid(request_uid.to_string())
+            .with_write_roots(write_roots);
         sandbox.execute(script).await
     }
 }
@@ -2363,6 +2835,538 @@ mod tests {
         let sandbox = JsSandbox::new(reg, Duration::from_secs(5));
         let result = sandbox.execute(r#"return typeof fetch;"#).await.unwrap();
         assert_eq!(result, json!("undefined"));
+    }
+
+    // --- writeFile tests ---
+
+    /// Build a sandbox whose `writeFile` allowlist is `roots`.
+    async fn write_sandbox(roots: Vec<PathBuf>) -> JsSandbox {
+        let reg = make_registry().await;
+        JsSandbox::new(reg, Duration::from_secs(10)).with_write_roots(roots)
+    }
+
+    /// Canonicalized tempdir path, matching what `resolve_write_roots`
+    /// produces for configured roots (on macOS `/var/...` → `/private/var/...`).
+    fn canonical_root(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().canonicalize().unwrap()
+    }
+
+    /// Quote a Rust string as a JS string literal (handles NUL, quotes, …).
+    fn js_quote(s: &str) -> String {
+        serde_json::to_string(s).unwrap()
+    }
+
+    /// Sorted file names directly inside `dir`.
+    fn dir_entries(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn test_write_file_utf8_returns_canonical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        // Pass the possibly non-canonical tempdir path; the returned path
+        // must be the canonical one and sit under the canonical root.
+        let raw = dir.path().join("out.txt");
+        let script = format!(
+            "return writeFile({}, \"hello ✓ writeFile\");",
+            js_quote(raw.to_str().unwrap())
+        );
+        let result = sandbox.execute(&script).await.unwrap();
+        let expected = root.join("out.txt");
+        assert_eq!(result, json!(expected.to_string_lossy()));
+        assert!(PathBuf::from(result.as_str().unwrap()).starts_with(&root));
+        assert_eq!(
+            std::fs::read(&expected).unwrap(),
+            "hello ✓ writeFile".as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_file_base64_decodes_bytes() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        let dest = root.join("blob.bin");
+        let script = format!(
+            "return writeFile({}, {}, {{ encoding: \"base64\" }});",
+            js_quote(dest.to_str().unwrap()),
+            js_quote(&b64)
+        );
+        let result = sandbox.execute(&script).await.unwrap();
+        assert_eq!(result, json!(dest.to_string_lossy()));
+        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn test_write_file_creates_nested_parents_inside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let dest = root.join("a/b/c/file.txt");
+        let script = format!(
+            "return writeFile({}, \"nested\");",
+            js_quote(dest.to_str().unwrap())
+        );
+        sandbox.execute(&script).await.unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"nested");
+        assert!(root.join("a/b/c").is_dir());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_overwrite_leaves_no_temp_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let dest = root.join("out.txt");
+        for content in ["first", "second"] {
+            let script = format!(
+                "return writeFile({}, {});",
+                js_quote(dest.to_str().unwrap()),
+                js_quote(content)
+            );
+            sandbox.execute(&script).await.unwrap();
+        }
+        assert_eq!(std::fs::read(&dest).unwrap(), b"second");
+        assert_eq!(dir_entries(&root), vec!["out.txt".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_write_file_second_allowlisted_root_writable() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let root_a = canonical_root(&dir_a);
+        let root_b = canonical_root(&dir_b);
+        let sandbox = write_sandbox(vec![root_a.clone(), root_b.clone()]).await;
+        let dest = root_b.join("b.txt");
+        let script = format!(
+            "return writeFile({}, \"in b\");",
+            js_quote(dest.to_str().unwrap())
+        );
+        let result = sandbox.execute(&script).await.unwrap();
+        assert_eq!(result, json!(dest.to_string_lossy()));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"in b");
+        assert!(dir_entries(&root_a).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_rejects_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let err = sandbox
+            .execute(r#"return writeFile("relative/x.txt", "d");"#)
+            .await
+            .unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("requires an absolute path"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(dir_entries(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_rejects_dotdot_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let path = format!("{}/sub/../x.txt", root.display());
+        let script = format!("return writeFile({}, \"d\");", js_quote(&path));
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(msg.contains("'..'"), "unexpected error: {}", msg);
+        assert!(dir_entries(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_rejects_root_prefix_string_trick() {
+        // "/tmp/rootXsibling/…" must not match root "/tmp/rootX" — the
+        // prefix check is component-wise, not a string prefix.
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let sibling = format!("{}sibling", root.display());
+        let path = format!("{}/x.txt", sibling);
+        let script = format!("return writeFile({}, \"d\");", js_quote(&path));
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("not inside a configured write directory"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(!PathBuf::from(&sibling).exists());
+        assert!(dir_entries(&root).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_write_file_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        std::os::unix::fs::symlink(outside.path(), root.join("link")).unwrap();
+        let path = root.join("link/x.txt");
+        let script = format!(
+            "return writeFile({}, \"d\");",
+            js_quote(path.to_str().unwrap())
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("not inside a configured write directory"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(dir_entries(outside.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_rejects_empty_and_nul_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+
+        let err = sandbox
+            .execute(r#"return writeFile("", "d");"#)
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{}", err).contains("must not be empty"),
+            "unexpected error: {}",
+            err
+        );
+
+        let path = format!("{}/x\u{0}.txt", root.display());
+        let script = format!("return writeFile({}, \"d\");", js_quote(&path));
+        let err = sandbox.execute(&script).await.unwrap_err();
+        assert!(
+            format!("{}", err).contains("NUL"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(dir_entries(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_rejects_path_under_no_root_lists_allowed() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let path = outside.path().join("x.txt");
+        let script = format!(
+            "return writeFile({}, \"d\");",
+            js_quote(path.to_str().unwrap())
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("not inside a configured write directory"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            msg.contains("[relay] write_dirs in ~/.endara/config.toml"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            msg.contains("Settings → Write directories"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            msg.contains(&format!("Currently allowed: {}", root.display())),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(dir_entries(outside.path()).is_empty());
+        assert!(dir_entries(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_rejects_when_no_roots_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        let sandbox = write_sandbox(Vec::new()).await;
+        let path = dir.path().join("x.txt");
+        let script = format!(
+            "return writeFile({}, \"d\");",
+            js_quote(path.to_str().unwrap())
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("not inside a configured write directory"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            msg.contains("[relay] write_dirs in ~/.endara/config.toml"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("Currently allowed"),
+            "empty allowlist must not list directories: {}",
+            msg
+        );
+        assert!(dir_entries(dir.path()).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_rejects_bad_encoding_and_bad_base64() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let dest = root.join("x.txt");
+
+        let script = format!(
+            "return writeFile({}, \"d\", {{ encoding: \"hex\" }});",
+            js_quote(dest.to_str().unwrap())
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        assert!(
+            format!("{}", err).contains("unsupported encoding"),
+            "unexpected error: {}",
+            err
+        );
+
+        let script = format!(
+            "return writeFile({}, \"not base64!!\", {{ encoding: \"base64\" }});",
+            js_quote(dest.to_str().unwrap())
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        assert!(
+            format!("{}", err).contains("invalid base64"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(dir_entries(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_per_file_cap_one_byte_over_throws() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let dest = root.join("big.txt");
+        // One byte over the 32 MB per-file cap.
+        let script = format!(
+            "return writeFile({}, \"a\".repeat({}));",
+            js_quote(dest.to_str().unwrap()),
+            32 * 1024 * 1024 + 1
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("exceeds the per-file limit"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(dir_entries(&root).is_empty(), "no partial file may remain");
+    }
+
+    #[tokio::test]
+    async fn test_write_file_per_file_cap_base64_checked_before_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let dest = root.join("big.bin");
+        // '!' is not valid base64: if the payload were decoded first this
+        // would fail with "invalid base64". The ≈3n/4 pre-decode estimate
+        // must reject it as oversized instead.
+        let repeat = (32usize * 1024 * 1024 / 3) * 4 + 8;
+        let script = format!(
+            "return writeFile({}, \"!\".repeat({}), {{ encoding: \"base64\" }});",
+            js_quote(dest.to_str().unwrap()),
+            repeat
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("exceeds the per-file limit"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("invalid base64"),
+            "size cap must fire before base64 decoding: {}",
+            msg
+        );
+        assert!(dir_entries(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_base64_exactly_at_cap_with_padding_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()])
+            .await
+            .with_write_limits(WriteLimits {
+                max_file_bytes: 4,
+                max_files_per_run: 64,
+                max_total_bytes_per_run: 1024,
+            });
+        let dest = root.join("exact.bin");
+        // "YWJjZA==" decodes to exactly 4 bytes ("abcd"). The naive 3n/4
+        // estimate (6) would over-count the two padding bytes and reject a
+        // payload that is exactly at the cap.
+        let script = format!(
+            "return writeFile({}, \"YWJjZA==\", {{ encoding: \"base64\" }});",
+            js_quote(dest.to_str().unwrap())
+        );
+        let result = sandbox.execute(&script).await.unwrap();
+        assert_eq!(result, json!(dest.to_str().unwrap()));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abcd");
+    }
+
+    #[tokio::test]
+    async fn test_write_file_rejects_non_string_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let dest = root.join("obj.txt");
+        let script = format!(
+            "return writeFile({}, {{ a: 1 }});",
+            js_quote(dest.to_str().unwrap())
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("data must be a string"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(dir_entries(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_path_error_precedes_decode_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        // Disallowed path AND invalid base64: the actionable path error
+        // must win, and the payload must never be decoded.
+        let script =
+            "return writeFile(\"/definitely/not/allowed/x.bin\", \"!!!!\", { encoding: \"base64\" });";
+        let err = sandbox.execute(script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("not inside a configured write directory"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("invalid base64"),
+            "path validation must precede base64 decoding: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_file_per_run_file_count_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let script = format!(
+            "for (var i = 0; i < 65; i++) {{ writeFile({} + \"/f\" + i + \".txt\", \"x\"); }}",
+            js_quote(root.to_str().unwrap())
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("per-run limit of 64 file writes"),
+            "unexpected error: {}",
+            msg
+        );
+        // The first 64 files remain intact; the 65th was never written.
+        let entries = dir_entries(&root);
+        assert_eq!(entries.len(), 64);
+        for i in 0..64 {
+            let f = root.join(format!("f{}.txt", i));
+            assert_eq!(std::fs::read(&f).unwrap(), b"x", "missing {}", f.display());
+        }
+        assert!(!root.join("f64.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_per_run_total_bytes_limit_preexisting_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()])
+            .await
+            .with_write_limits(WriteLimits {
+                max_file_bytes: 64,
+                max_files_per_run: 64,
+                max_total_bytes_per_run: 100,
+            });
+        // A pre-existing file the relay must never touch.
+        let existing = root.join("existing.txt");
+        std::fs::write(&existing, b"pre-existing").unwrap();
+        // 40 + 40 = 80 bytes fit; the third 40-byte write would reach 120.
+        let script = format!(
+            r#"
+var root = {};
+writeFile(root + "/a.txt", "a".repeat(40));
+writeFile(root + "/b.txt", "b".repeat(40));
+writeFile(root + "/c.txt", "c".repeat(40));
+"#,
+            js_quote(root.to_str().unwrap())
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("per-run total write limit"),
+            "unexpected error: {}",
+            msg
+        );
+        assert_eq!(std::fs::read(&existing).unwrap(), b"pre-existing");
+        assert_eq!(std::fs::read(root.join("a.txt")).unwrap(), vec![b'a'; 40]);
+        assert_eq!(std::fs::read(root.join("b.txt")).unwrap(), vec![b'b'; 40]);
+        assert!(!root.join("c.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_limits_reset_between_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()])
+            .await
+            .with_write_limits(WriteLimits {
+                max_file_bytes: 1024,
+                max_files_per_run: 2,
+                max_total_bytes_per_run: 100,
+            });
+        // Each run writes 2 files totalling 80 bytes — exactly at the
+        // per-run file limit and near the byte limit. If the counters did
+        // not reset between runs the second run would throw.
+        for run in ["first", "second"] {
+            let script = format!(
+                r#"
+var root = {};
+writeFile(root + "/{run}-1.txt", "x".repeat(40));
+writeFile(root + "/{run}-2.txt", "y".repeat(40));
+return "ok";
+"#,
+                js_quote(root.to_str().unwrap())
+            );
+            let result = sandbox.execute(&script).await.unwrap();
+            assert_eq!(result, json!("ok"), "run '{}' should succeed", run);
+        }
+        assert_eq!(dir_entries(&root).len(), 4);
     }
 
     #[tokio::test]

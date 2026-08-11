@@ -29,7 +29,7 @@ use tokio::sync::{broadcast, RwLock};
 
 use crate::adapter::{AdapterError, ToolInfo};
 use crate::config::ProfileConfig;
-use crate::js_sandbox::MetaToolHandler;
+use crate::js_sandbox::{MetaToolHandler, SharedWriteRoots};
 use crate::registry::{AdapterRegistry, MetaToolRegistry};
 
 /// Runtime state for a single resolved profile.
@@ -347,6 +347,13 @@ pub struct ProfileRegistry {
     /// each [`ProfileContext`]) so it stays in lockstep with the global
     /// handler's value and is reapplied on every hot reload.
     sandbox_timeout: Duration,
+    /// Shared `relay.write_dirs` allowlist handle passed through to each
+    /// profile's [`MetaToolHandler`] at rebuild time. The same handle backs
+    /// the global handler and is swapped in place by the config watcher on
+    /// hot reload, so per-profile sandboxes always observe the current
+    /// allowlist. Defaults to an empty (writing-disabled) handle; production
+    /// wiring installs the process-wide handle via [`Self::with_write_roots`].
+    write_roots: SharedWriteRoots,
     /// Profile-membership broadcast — fan-out for
     /// `notifications/tools/list_changed` on `/mcp/{profile}/sse` streams
     /// when the *profile itself* changes (endpoint added/removed from the
@@ -387,8 +394,19 @@ impl ProfileRegistry {
             profiles: Arc::new(RwLock::new(HashMap::new())),
             adapter_registry,
             sandbox_timeout,
+            write_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
             profiles_changed_tx,
         }
+    }
+
+    /// Install the shared `relay.write_dirs` allowlist handle used for every
+    /// per-profile [`MetaToolHandler`] built by [`Self::rebuild`]. Production
+    /// wiring in `main.rs` passes the same handle given to the global handler
+    /// and the config watcher, so hot reloads propagate to profile sandboxes
+    /// without a rebuild.
+    pub fn with_write_roots(mut self, write_roots: SharedWriteRoots) -> Self {
+        self.write_roots = write_roots;
+        self
     }
 
     /// Subscribe to the profile-membership broadcast. Each `recv()` yields
@@ -438,7 +456,8 @@ impl ProfileRegistry {
             // view (locked decision Relay #2). The handler's search-index
             // cache is private to this context, so per-profile catalogs
             // never bleed into a different profile's search results.
-            let handler = MetaToolHandler::new(Arc::new(view.clone()), self.sandbox_timeout);
+            let handler = MetaToolHandler::new(Arc::new(view.clone()), self.sandbox_timeout)
+                .with_write_roots(self.write_roots.clone());
             let ctx = ProfileContext {
                 config: profile.clone(),
                 registry_view: view,

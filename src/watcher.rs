@@ -6,6 +6,7 @@ use crate::adapter::stdio::{IsolationMode, StdioAdapter, StdioConfig};
 use crate::adapter::{FailedAdapter, McpAdapter, StartingAdapter};
 use crate::config::{self, Config, ConfigDiff, ConfigOrganization, EndpointConfig, Transport};
 use crate::events::ToolCallEventBus;
+use crate::js_sandbox::SharedWriteRoots;
 use crate::oauth::OAuthFlowManager;
 use crate::profile_registry::ProfileRegistry;
 use crate::registry::AdapterRegistry;
@@ -38,6 +39,7 @@ impl ConfigWatcher {
         registry: Arc<AdapterRegistry>,
         machine_name: String,
         js_execution_mode: Arc<AtomicBool>,
+        write_roots: SharedWriteRoots,
         profile_registry: Arc<ProfileRegistry>,
         token_manager: Arc<TokenManager>,
         oauth_flow_manager: Arc<OAuthFlowManager>,
@@ -60,6 +62,7 @@ impl ConfigWatcher {
                 registry,
                 machine_name,
                 js_execution_mode,
+                write_roots,
                 profile_registry,
                 token_manager,
                 oauth_adapter_inners,
@@ -81,6 +84,7 @@ async fn watch_loop(
     registry: Arc<AdapterRegistry>,
     _machine_name: String,
     js_execution_mode: Arc<AtomicBool>,
+    write_roots: SharedWriteRoots,
     profile_registry: Arc<ProfileRegistry>,
     token_manager: Arc<TokenManager>,
     oauth_adapter_inners: OAuthAdapterInners,
@@ -138,6 +142,7 @@ async fn watch_loop(
             &shared_config,
             &registry,
             &js_execution_mode,
+            &write_roots,
             &profile_registry,
             &token_manager,
             &oauth_adapter_inners,
@@ -169,6 +174,7 @@ async fn reload_and_apply(
     shared_config: &Arc<RwLock<Config>>,
     registry: &Arc<AdapterRegistry>,
     js_execution_mode: &Arc<AtomicBool>,
+    write_roots: &SharedWriteRoots,
     profile_registry: &Arc<ProfileRegistry>,
     token_manager: &Arc<TokenManager>,
     oauth_adapter_inners: &OAuthAdapterInners,
@@ -220,6 +226,30 @@ async fn reload_and_apply(
     if new_js_mode != old_js_mode {
         js_execution_mode.store(new_js_mode, Ordering::Relaxed);
         info!(js_execution_mode = new_js_mode, "JS execution mode updated");
+    }
+
+    // Re-resolve the write_dirs allowlist and swap the shared handle if it
+    // changed. Every MetaToolHandler (global and per-profile) holds this
+    // same handle, so the next execute_tools snapshot sees the new roots.
+    let new_write_roots = config::resolve_write_roots(&new_config);
+    {
+        let changed = write_roots
+            .read()
+            .map(|current| *current != new_write_roots)
+            .unwrap_or(true);
+        if changed {
+            // Recover from a poisoned lock instead of skipping the swap —
+            // otherwise the allowlist would be frozen on every subsequent
+            // reload. The guarded data is a plain Vec<PathBuf>, safe to
+            // overwrite. Mirrors the read-side poison-degrade choice in
+            // `MetaToolHandler::execute_tools`.
+            let mut guard = write_roots.write().unwrap_or_else(|p| p.into_inner());
+            *guard = new_write_roots;
+            info!(
+                write_roots = guard.len(),
+                "Sandbox write_dirs allowlist updated"
+            );
+        }
     }
 
     // Update the input-validation toggle if it changed. The flag lives on the
@@ -1396,6 +1426,10 @@ mod tests {
         // Leak the tempdir so it lives for the duration of the test
         std::mem::forget(tmp);
         (token_manager, inners)
+    }
+
+    fn empty_write_roots() -> SharedWriteRoots {
+        Arc::new(std::sync::RwLock::new(Vec::new()))
     }
 
     fn http_endpoint(name: &str, url: &str) -> EndpointConfig {
@@ -2774,6 +2808,7 @@ toon_output = true
                     &current_config,
                     &registry,
                     &js_mode,
+                    &empty_write_roots(),
                     &profile_registry,
                     &tm,
                     &inners,
@@ -2818,6 +2853,7 @@ toon_output = true
                     &current_config,
                     &registry,
                     &js_mode,
+                    &empty_write_roots(),
                     &profile_registry,
                     &tm,
                     &inners,
@@ -2878,6 +2914,7 @@ toon_output = true
                     &current_config,
                     &registry,
                     &js_mode,
+                    &empty_write_roots(),
                     &profile_registry,
                     &tm,
                     &inners,
@@ -2912,6 +2949,140 @@ toon_output = true
                     .map(|p| p.name.clone())
                     .collect();
                 assert_eq!(baseline_names, vec!["Work".to_string()]);
+            }
+        }
+
+        // ---- write_dirs hot reload -------------------------------------
+        //
+        // `relay.write_dirs` mirrors the `js_execution_mode` hot-reload
+        // wiring: `reload_and_apply` re-resolves the allowlist from the new
+        // config and swaps the shared handle in place, so every
+        // MetaToolHandler (global and per-profile) observes the update
+        // without being rebuilt.
+        mod write_dirs {
+            use super::super::*;
+            use crate::profile_registry::ProfileRegistry;
+            use std::sync::atomic::AtomicBool;
+            use std::sync::Arc;
+            use tokio::sync::RwLock;
+
+            const CONFIG_NO_WRITE_DIRS: &str = r#"
+[relay]
+machine_name = "test"
+"#;
+
+            /// Editing `relay.write_dirs` in `config.toml` and driving a
+            /// watcher reload swaps the shared handle: adding a dir
+            /// populates it (canonicalized), removing the key empties it.
+            #[tokio::test]
+            async fn write_dirs_hot_reload_updates_shared_handle() {
+                let tmp = tempfile::tempdir().unwrap();
+                let allowed_dir = tmp.path().join("media");
+                std::fs::create_dir(&allowed_dir).unwrap();
+                let path = tmp.path().join("config.toml");
+                std::fs::write(&path, CONFIG_NO_WRITE_DIRS).unwrap();
+                let (initial, _warnings) = config::load_config_graceful(&path).unwrap();
+
+                let registry = Arc::new(AdapterRegistry::new());
+                let profile_registry = Arc::new(ProfileRegistry::new((*registry).clone()));
+                let current_config = Arc::new(RwLock::new(initial));
+                let js_mode = Arc::new(AtomicBool::new(false));
+                let (tm, inners) = test_oauth_infra();
+                let write_roots = empty_write_roots();
+
+                // No write_dirs → allowlist stays empty.
+                assert!(write_roots.read().unwrap().is_empty());
+
+                // Add a write_dirs entry pointing at an existing dir.
+                let config_with_dir = format!(
+                    "[relay]\nmachine_name = \"test\"\nwrite_dirs = [\"{}\"]\n",
+                    allowed_dir.display()
+                );
+                std::fs::write(&path, config_with_dir).unwrap();
+                reload_and_apply(
+                    &path,
+                    &current_config,
+                    &registry,
+                    &js_mode,
+                    &write_roots,
+                    &profile_registry,
+                    &tm,
+                    &inners,
+                    None,
+                    None,
+                )
+                .await
+                .expect("reload adding write_dirs should succeed");
+                assert_eq!(
+                    *write_roots.read().unwrap(),
+                    vec![allowed_dir.canonicalize().unwrap()],
+                    "shared handle must carry the canonicalized new root"
+                );
+
+                // Remove the key again → allowlist empties.
+                std::fs::write(&path, CONFIG_NO_WRITE_DIRS).unwrap();
+                reload_and_apply(
+                    &path,
+                    &current_config,
+                    &registry,
+                    &js_mode,
+                    &write_roots,
+                    &profile_registry,
+                    &tm,
+                    &inners,
+                    None,
+                    None,
+                )
+                .await
+                .expect("reload removing write_dirs should succeed");
+                assert!(
+                    write_roots.read().unwrap().is_empty(),
+                    "removing write_dirs must empty the shared handle"
+                );
+            }
+
+            /// A reload whose write_dirs entry does not exist on disk
+            /// resolves to an empty allowlist (warn-and-skip) and never
+            /// creates the directory.
+            #[tokio::test]
+            async fn write_dirs_hot_reload_skips_missing_dir_without_creating() {
+                let tmp = tempfile::tempdir().unwrap();
+                let missing = tmp.path().join("never-created");
+                let path = tmp.path().join("config.toml");
+                let config_with_missing = format!(
+                    "[relay]\nmachine_name = \"test\"\nwrite_dirs = [\"{}\"]\n",
+                    missing.display()
+                );
+                std::fs::write(&path, CONFIG_NO_WRITE_DIRS).unwrap();
+                let (initial, _warnings) = config::load_config_graceful(&path).unwrap();
+
+                let registry = Arc::new(AdapterRegistry::new());
+                let profile_registry = Arc::new(ProfileRegistry::new((*registry).clone()));
+                let current_config = Arc::new(RwLock::new(initial));
+                let js_mode = Arc::new(AtomicBool::new(false));
+                let (tm, inners) = test_oauth_infra();
+                let write_roots = empty_write_roots();
+
+                std::fs::write(&path, config_with_missing).unwrap();
+                reload_and_apply(
+                    &path,
+                    &current_config,
+                    &registry,
+                    &js_mode,
+                    &write_roots,
+                    &profile_registry,
+                    &tm,
+                    &inners,
+                    None,
+                    None,
+                )
+                .await
+                .expect("reload with missing write_dirs entry still applies");
+                assert!(
+                    write_roots.read().unwrap().is_empty(),
+                    "missing dir must be skipped"
+                );
+                assert!(!missing.exists(), "reload must never create the directory");
             }
         }
 
@@ -3077,6 +3248,7 @@ command = "/bin/true"
                     &current_config,
                     &registry,
                     &js_mode,
+                    &empty_write_roots(),
                     &profile_registry,
                     &tm,
                     &inners,
@@ -3254,6 +3426,7 @@ validate_inputs = false
                     &current_config,
                     &registry,
                     &js_mode,
+                    &empty_write_roots(),
                     &profile_registry,
                     &tm,
                     &inners,
@@ -3278,6 +3451,7 @@ validate_inputs = false
                     &current_config,
                     &registry,
                     &js_mode,
+                    &empty_write_roots(),
                     &profile_registry,
                     &tm,
                     &inners,
@@ -3401,6 +3575,7 @@ command = "/bin/true"
                     &shared_config,
                     &registry,
                     &js_mode,
+                    &empty_write_roots(),
                     &profile_registry,
                     &token_manager,
                     &inners,

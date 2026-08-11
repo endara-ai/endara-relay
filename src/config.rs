@@ -81,6 +81,15 @@ pub struct RelayConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_retention_days: Option<u32>,
+    /// Allowlist of directories the JS sandbox's `writeFile` may write into.
+    /// Each entry must be an absolute path (a leading `~/` is expanded to the
+    /// user's home directory). Relative entries are a hard validation error.
+    /// Entries that do not exist or are not directories are warned about and
+    /// skipped at resolution time (see [`resolve_write_roots`]) — the relay
+    /// never creates them. `None`/empty means writing is disabled entirely.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub write_dirs: Option<Vec<PathBuf>>,
 }
 
 impl Default for RelayConfig {
@@ -105,6 +114,7 @@ impl Default for RelayConfig {
             validate_inputs: None,
             observability: ObservabilityConfig::default(),
             log_retention_days: None,
+            write_dirs: None,
         }
     }
 }
@@ -320,6 +330,35 @@ pub fn validate_profiles(config: &Config) -> Result<(), Vec<String>> {
             }
         }
     }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Validate `relay.write_dirs`: every entry must be an absolute path after
+/// tilde expansion. Fail-fast like [`validate_profiles`] — a relative entry
+/// is a configuration error, never a warning. Existence is deliberately NOT
+/// checked here; missing/non-directory entries are warned about and skipped
+/// at resolution time by [`resolve_write_roots`].
+pub fn validate_write_dirs(config: &Config) -> Result<(), Vec<String>> {
+    let dirs = match &config.relay.write_dirs {
+        Some(d) if !d.is_empty() => d,
+        _ => return Ok(()),
+    };
+
+    let errors: Vec<String> = dirs
+        .iter()
+        .filter(|d| !expand_tilde(d).is_absolute())
+        .map(|d| {
+            format!(
+                "relay.write_dirs entry '{}' must be an absolute path",
+                d.display()
+            )
+        })
+        .collect();
 
     if errors.is_empty() {
         Ok(())
@@ -569,15 +608,58 @@ impl From<toml::de::Error> for ConfigError {
     }
 }
 
-/// Expand `~` prefix to the user's home directory.
+/// Expand `~` prefix to the user's home directory. `HOME` takes precedence
+/// (tests override it); `dirs::home_dir()` covers platforms where `HOME`
+/// is unset, e.g. Windows.
 pub fn expand_tilde(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     if s.starts_with("~/") || s == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(s.strip_prefix("~/").unwrap_or(""));
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir);
+        if let Some(home) = home {
+            return home.join(s.strip_prefix("~/").unwrap_or(""));
         }
     }
     path.to_path_buf()
+}
+
+/// Resolve `relay.write_dirs` into the effective allowlist of write roots.
+///
+/// Each configured entry is tilde-expanded and canonicalized. Entries that do
+/// not exist or are not directories are **warned about and skipped** — the
+/// relay never creates them (locked design decision: warn-and-skip, no
+/// auto-creation). Canonicalization resolves symlinks so later path-containment
+/// checks against these roots cannot be escaped via a symlinked root.
+///
+/// Returns the (possibly empty) list of canonical, existing directory roots.
+pub fn resolve_write_roots(config: &Config) -> Vec<PathBuf> {
+    let dirs = match &config.relay.write_dirs {
+        Some(d) if !d.is_empty() => d,
+        _ => return Vec::new(),
+    };
+
+    let mut roots = Vec::new();
+    for dir in dirs {
+        let expanded = expand_tilde(dir);
+        match std::fs::canonicalize(&expanded) {
+            Ok(canonical) if canonical.is_dir() => roots.push(canonical),
+            Ok(_) => {
+                tracing::warn!(
+                    path = %expanded.display(),
+                    "relay.write_dirs entry is not a directory; skipping"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %expanded.display(),
+                    error = %e,
+                    "relay.write_dirs entry does not exist or is inaccessible; skipping (directories are never auto-created)"
+                );
+            }
+        }
+    }
+    roots
 }
 
 /// Create a default configuration with the system hostname and no endpoints.
@@ -635,6 +717,8 @@ pub fn parse_and_validate(contents: &str) -> Result<Config, ConfigError> {
     resolve_env_vars(&mut config)?;
     validate(&config)?;
     validate_profiles(&config).map_err(|errors| ConfigError::ValidationError(errors.join("; ")))?;
+    validate_write_dirs(&config)
+        .map_err(|errors| ConfigError::ValidationError(errors.join("; ")))?;
     Ok(config)
 }
 
@@ -664,6 +748,11 @@ pub fn parse_and_validate_graceful(
     // duplicate paths, and missing endpoint refs are hard startup errors,
     // never per-endpoint warnings.
     validate_profiles(&config).map_err(|errors| ConfigError::ValidationError(errors.join("; ")))?;
+
+    // write_dirs validation is also fail-fast: a relative entry is a
+    // configuration error, mirroring profile validation above.
+    validate_write_dirs(&config)
+        .map_err(|errors| ConfigError::ValidationError(errors.join("; ")))?;
 
     Ok((config, warnings))
 }
@@ -1917,6 +2006,7 @@ js_execution = false
                 validate_inputs: None,
                 observability: ObservabilityConfig::default(),
                 log_retention_days: None,
+                write_dirs: None,
             },
             endpoints,
             profiles: None,
@@ -3172,5 +3262,170 @@ log_retention_days = 0
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let parsed: Config = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.relay.log_retention_days, Some(14));
+    }
+
+    // --- write_dirs tests ---
+
+    #[test]
+    fn write_dirs_defaults_to_none() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(config.relay.write_dirs, None);
+    }
+
+    #[test]
+    fn write_dirs_parses_absolute_entries() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+write_dirs = ["/tmp/media", "/var/data/out"]
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(
+            config.relay.write_dirs,
+            Some(vec![
+                PathBuf::from("/tmp/media"),
+                PathBuf::from("/var/data/out")
+            ])
+        );
+    }
+
+    #[test]
+    fn write_dirs_relative_entry_is_hard_error() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+write_dirs = ["relative/path"]
+"#;
+        let err = parse_and_validate(toml_str).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ValidationError(ref msg) if msg.contains("relative/path")
+                && msg.contains("absolute")),
+            "expected write_dirs validation error, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn write_dirs_relative_entry_is_hard_error_in_graceful_path() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+write_dirs = ["relative/path"]
+"#;
+        let err = parse_and_validate_graceful(toml_str).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ValidationError(_)),
+            "graceful path must also fail-fast on relative write_dirs, got {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_dirs_tilde_entry_passes_validation() {
+        // `~/…` expands to an absolute path under $HOME, so validation
+        // accepts it even though the literal entry is not absolute.
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+write_dirs = ["~/endara-media"]
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(
+            config.relay.write_dirs,
+            Some(vec![PathBuf::from("~/endara-media")])
+        );
+    }
+
+    #[test]
+    fn write_dirs_empty_list_is_valid() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+write_dirs = []
+"#;
+        let config = parse_and_validate(toml_str).unwrap();
+        assert_eq!(config.relay.write_dirs, Some(vec![]));
+        assert!(resolve_write_roots(&config).is_empty());
+    }
+
+    #[test]
+    fn write_dirs_round_trips() {
+        let config = Config {
+            relay: RelayConfig {
+                machine_name: "test".to_string(),
+                write_dirs: Some(vec![PathBuf::from("/tmp/media")]),
+                ..RelayConfig::default()
+            },
+            endpoints: vec![],
+            profiles: None,
+            organizations: Vec::new(),
+        };
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(
+            parsed.relay.write_dirs,
+            Some(vec![PathBuf::from("/tmp/media")])
+        );
+    }
+
+    // --- resolve_write_roots tests ---
+
+    fn config_with_write_dirs(dirs: Vec<PathBuf>) -> Config {
+        Config {
+            relay: RelayConfig {
+                machine_name: "test".to_string(),
+                write_dirs: Some(dirs),
+                ..RelayConfig::default()
+            },
+            endpoints: vec![],
+            profiles: None,
+            organizations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_write_roots_none_yields_empty() {
+        let config = default_config();
+        assert!(resolve_write_roots(&config).is_empty());
+    }
+
+    #[test]
+    fn resolve_write_roots_keeps_existing_directories_canonicalized() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = config_with_write_dirs(vec![tmp.path().to_path_buf()]);
+        let roots = resolve_write_roots(&config);
+        assert_eq!(roots, vec![tmp.path().canonicalize().unwrap()]);
+    }
+
+    #[test]
+    fn resolve_write_roots_skips_missing_directories_without_creating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let config = config_with_write_dirs(vec![missing.clone(), tmp.path().to_path_buf()]);
+        let roots = resolve_write_roots(&config);
+        assert_eq!(
+            roots,
+            vec![tmp.path().canonicalize().unwrap()],
+            "missing entry must be skipped, existing one kept"
+        );
+        assert!(
+            !missing.exists(),
+            "resolve must never create the missing directory"
+        );
+    }
+
+    #[test]
+    fn resolve_write_roots_skips_plain_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("not-a-dir.txt");
+        std::fs::write(&file, "x").unwrap();
+        let config = config_with_write_dirs(vec![file]);
+        assert!(
+            resolve_write_roots(&config).is_empty(),
+            "a plain file must not become a write root"
+        );
     }
 }
