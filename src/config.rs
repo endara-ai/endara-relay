@@ -608,12 +608,17 @@ impl From<toml::de::Error> for ConfigError {
     }
 }
 
-/// Expand `~` prefix to the user's home directory.
+/// Expand `~` prefix to the user's home directory. `HOME` takes precedence
+/// (tests override it); `dirs::home_dir()` covers platforms where `HOME`
+/// is unset, e.g. Windows.
 pub fn expand_tilde(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     if s.starts_with("~/") || s == "~" {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(s.strip_prefix("~/").unwrap_or(""));
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .or_else(dirs::home_dir);
+        if let Some(home) = home {
+            return home.join(s.strip_prefix("~/").unwrap_or(""));
         }
     }
     path.to_path_buf()

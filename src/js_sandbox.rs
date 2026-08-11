@@ -973,11 +973,17 @@ fn write_file_native(
         .to_string(context)?
         .to_std_string_escaped();
 
-    let data = args
+    let data_val = args
         .get(1)
-        .ok_or_else(|| JsNativeError::typ().with_message("writeFile: missing data"))?
-        .to_string(context)?
-        .to_std_string_escaped();
+        .ok_or_else(|| JsNativeError::typ().with_message("writeFile: missing data"))?;
+    if !data_val.is_string() {
+        // Reject rather than coerce: ToString would silently write
+        // "[object Object]" for objects or "1,2,3" for arrays.
+        return Err(JsNativeError::typ()
+            .with_message("writeFile: data must be a string")
+            .into());
+    }
+    let data = data_val.to_string(context)?.to_std_string_escaped();
 
     let encoding = match args.get(2) {
         Some(v) if !v.is_undefined() && !v.is_null() => {
@@ -1002,20 +1008,30 @@ fn write_file_native(
     if files_written >= limits.max_files_per_run {
         return Err(JsNativeError::error()
             .with_message(format!(
-                "writeFile: per-run limit of {} files reached — no further files can \
-                 be written by this script run",
+                "writeFile: per-run limit of {} file writes reached — no further files \
+                 can be written by this script run",
                 limits.max_files_per_run
             ))
             .into());
     }
 
     // Per-file size cap, checked before base64 decoding so an oversized
-    // payload is rejected without allocating the decoded bytes. Base64
-    // padding means the ≈3n/4 estimate is an upper bound on the decoded
-    // size, so a payload that passes here cannot exceed the cap once decoded.
+    // payload is rejected without allocating the decoded bytes. The ≈3n/4
+    // estimate subtracts trailing '=' padding so it is an exact upper bound
+    // on the decoded size — a payload whose decoded length is exactly the
+    // cap is accepted, and one that passes here cannot exceed the cap.
     let estimated_len = match encoding.as_str() {
         "utf8" => Some(data.len()),
-        "base64" => Some(data.len().saturating_mul(3) / 4),
+        "base64" => {
+            let padding = data
+                .as_bytes()
+                .iter()
+                .rev()
+                .take(2)
+                .filter(|&&b| b == b'=')
+                .count();
+            Some((data.len().saturating_mul(3) / 4).saturating_sub(padding))
+        }
         _ => None,
     };
     if let Some(estimated_len) = estimated_len {
@@ -1035,6 +1051,12 @@ fn write_file_native(
                 .into());
         }
     }
+
+    // Validate the destination before decoding: a disallowed path fails
+    // with the actionable path error (instead of a decode error) and never
+    // pays the decode allocation.
+    let (dest, matched_root) = resolve_write_path(&path_str, &write_roots)
+        .map_err(|msg| JsNativeError::error().with_message(msg))?;
 
     let bytes: Vec<u8> = match encoding.as_str() {
         "utf8" => data.into_bytes(),
@@ -1069,10 +1091,8 @@ fn write_file_native(
             .into());
     }
 
-    let dest = resolve_write_path(&path_str, &write_roots)
+    write_atomic(&dest, &bytes, &matched_root)
         .map_err(|msg| JsNativeError::error().with_message(msg))?;
-
-    write_atomic(&dest, &bytes).map_err(|msg| JsNativeError::error().with_message(msg))?;
 
     SANDBOX_STATE.with(|cell| {
         if let Some(state) = cell.borrow_mut().as_mut() {
@@ -1086,10 +1106,14 @@ fn write_file_native(
 }
 
 /// Validate `path_str` against the allowlist and return the canonical
-/// destination path. Rejections (empty/NUL path, relative path, `..`
-/// components, destinations outside every root — including via symlinks)
-/// come back as `Err(message)` before anything touches the filesystem.
-fn resolve_write_path(path_str: &str, write_roots: &[PathBuf]) -> Result<PathBuf, String> {
+/// destination path together with the allowlisted root it matched.
+/// Rejections (empty/NUL path, relative path, `..` components, destinations
+/// outside every root — including via symlinks) come back as `Err(message)`
+/// before anything touches the filesystem.
+fn resolve_write_path(
+    path_str: &str,
+    write_roots: &[PathBuf],
+) -> Result<(PathBuf, PathBuf), String> {
     if path_str.is_empty() {
         return Err(
             "writeFile: path must not be empty — writeFile requires an absolute \
@@ -1140,17 +1164,17 @@ fn resolve_write_path(path_str: &str, write_roots: &[PathBuf]) -> Result<PathBuf
         resolved.push(name);
     }
 
-    if !write_roots.iter().any(|root| resolved.starts_with(root)) {
-        return Err(write_dirs_rejection_message(path_str, write_roots));
+    match write_roots.iter().find(|root| resolved.starts_with(root)) {
+        Some(root) => Ok((resolved, root.clone())),
+        None => Err(write_dirs_rejection_message(path_str, write_roots)),
     }
-    Ok(resolved)
 }
 
 /// The actionable "not inside a configured write directory" message. When
 /// roots are configured, the currently-allowed directories are listed.
 fn write_dirs_rejection_message(path_str: &str, write_roots: &[PathBuf]) -> String {
     let mut msg = format!(
-        "writeFile: {} is not inside a configured write directory. Add one under \
+        "writeFile: '{}' is not inside a configured write directory. Add one under \
          [relay] write_dirs in ~/.endara/config.toml, or in the Endara desktop app \
          under Settings → Write directories.",
         path_str
@@ -1168,10 +1192,18 @@ fn write_dirs_rejection_message(path_str: &str, write_roots: &[PathBuf]) -> Stri
 
 /// Write `bytes` to `dest` via a temp file in the destination directory plus
 /// an atomic rename, creating missing parent directories first. `dest` must
-/// already be validated by [`resolve_write_path`], so any directories created
-/// here sit inside the matched root. On failure the temp file is removed —
-/// no partial destination file is ever observable.
-fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<(), String> {
+/// already be validated by [`resolve_write_path`] against `root` (the
+/// allowlisted root it matched), so any directories created here sit inside
+/// that root. After `create_dir_all` the destination directory is
+/// re-canonicalized and containment is re-asserted, closing the
+/// validate→write window in which a checked directory could be swapped for
+/// a symlink pointing outside the root. If the root itself was deleted
+/// after config resolution, `create_dir_all` recreates it — still inside
+/// the allowed prefix; the "directories are never auto-created" stance in
+/// [`crate::config::resolve_write_roots`] only covers resolution time. On
+/// failure the temp file is removed — no partial destination file is ever
+/// observable.
+fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
     let dir = dest
         .parent()
         .ok_or_else(|| format!("writeFile: '{}' has no parent directory", dest.display()))?;
@@ -1185,11 +1217,20 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<(), String> {
             e
         )
     })?;
+    let canonical_dir = std::fs::canonicalize(dir)
+        .map_err(|e| format!("writeFile: failed to resolve '{}': {}", dest.display(), e))?;
+    if !canonical_dir.starts_with(root) {
+        return Err(format!(
+            "writeFile: '{}' escaped the configured write directory during the write",
+            dest.display()
+        ));
+    }
+    let final_dest = canonical_dir.join(file_name);
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp = dir.join(format!(
+    let tmp = canonical_dir.join(format!(
         ".{}.{}.{}.tmp",
         file_name.to_string_lossy(),
         std::process::id(),
@@ -1203,7 +1244,7 @@ fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<(), String> {
             e
         ));
     }
-    if let Err(e) = std::fs::rename(&tmp, dest) {
+    if let Err(e) = std::fs::rename(&tmp, &final_dest) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!(
             "writeFile: failed to finalise '{}': {}",
@@ -3156,6 +3197,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_write_file_base64_exactly_at_cap_with_padding_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()])
+            .await
+            .with_write_limits(WriteLimits {
+                max_file_bytes: 4,
+                max_files_per_run: 64,
+                max_total_bytes_per_run: 1024,
+            });
+        let dest = root.join("exact.bin");
+        // "YWJjZA==" decodes to exactly 4 bytes ("abcd"). The naive 3n/4
+        // estimate (6) would over-count the two padding bytes and reject a
+        // payload that is exactly at the cap.
+        let script = format!(
+            "return writeFile({}, \"YWJjZA==\", {{ encoding: \"base64\" }});",
+            js_quote(dest.to_str().unwrap())
+        );
+        let result = sandbox.execute(&script).await.unwrap();
+        assert_eq!(result, json!(dest.to_str().unwrap()));
+        assert_eq!(std::fs::read(&dest).unwrap(), b"abcd");
+    }
+
+    #[tokio::test]
+    async fn test_write_file_rejects_non_string_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let dest = root.join("obj.txt");
+        let script = format!(
+            "return writeFile({}, {{ a: 1 }});",
+            js_quote(dest.to_str().unwrap())
+        );
+        let err = sandbox.execute(&script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("data must be a string"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(dir_entries(&root).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_write_file_path_error_precedes_decode_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        // Disallowed path AND invalid base64: the actionable path error
+        // must win, and the payload must never be decoded.
+        let script =
+            "return writeFile(\"/definitely/not/allowed/x.bin\", \"!!!!\", { encoding: \"base64\" });";
+        let err = sandbox.execute(script).await.unwrap_err();
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("not inside a configured write directory"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
+            !msg.contains("invalid base64"),
+            "path validation must precede base64 decoding: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
     async fn test_write_file_per_run_file_count_limit() {
         let dir = tempfile::tempdir().unwrap();
         let root = canonical_root(&dir);
@@ -3167,7 +3275,7 @@ mod tests {
         let err = sandbox.execute(&script).await.unwrap_err();
         let msg = format!("{}", err);
         assert!(
-            msg.contains("per-run limit of 64 files"),
+            msg.contains("per-run limit of 64 file writes"),
             "unexpected error: {}",
             msg
         );

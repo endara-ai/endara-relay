@@ -238,13 +238,17 @@ async fn reload_and_apply(
             .map(|current| *current != new_write_roots)
             .unwrap_or(true);
         if changed {
-            if let Ok(mut guard) = write_roots.write() {
-                *guard = new_write_roots;
-                info!(
-                    write_roots = guard.len(),
-                    "Sandbox write_dirs allowlist updated"
-                );
-            }
+            // Recover from a poisoned lock instead of skipping the swap —
+            // otherwise the allowlist would be frozen on every subsequent
+            // reload. The guarded data is a plain Vec<PathBuf>, safe to
+            // overwrite. Mirrors the read-side poison-degrade choice in
+            // `MetaToolHandler::execute_tools`.
+            let mut guard = write_roots.write().unwrap_or_else(|p| p.into_inner());
+            *guard = new_write_roots;
+            info!(
+                write_roots = guard.len(),
+                "Sandbox write_dirs allowlist updated"
+            );
         }
     }
 

@@ -25,7 +25,10 @@ while IFS= read -r line; do
             echo "{\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"type\":\"image\",\"mimeType\":\"image/jpeg\",\"data\":\"$IMG_B64\"}]},\"id\":$id}"
             ;;
         *)
-            echo "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"Method not found\"},\"id\":$id}"
+            # Notifications (no id) must not produce a response.
+            if [ -n "$id" ]; then
+                echo "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32601,\"message\":\"Method not found\"},\"id\":$id}"
+            fi
             ;;
     esac
 done
