@@ -842,14 +842,22 @@ async fn main() {
             let js_execution_mode = Arc::new(AtomicBool::new(
                 cfg.relay.local_js_execution.unwrap_or(false),
             ));
-            let meta_tool_handler = Arc::new(MetaToolHandler::new(
-                registry.clone(),
-                Duration::from_secs(30),
-            ));
+            // Shared `relay.write_dirs` allowlist handle: one handle backs
+            // the global MetaToolHandler, every per-profile handler (via
+            // ProfileRegistry), and the config watcher — which swaps the
+            // contents on hot reload (mirroring `js_execution_mode`).
+            let write_roots: js_sandbox::SharedWriteRoots =
+                Arc::new(std::sync::RwLock::new(config::resolve_write_roots(&cfg)));
+            let meta_tool_handler = Arc::new(
+                MetaToolHandler::new(registry.clone(), Duration::from_secs(30))
+                    .with_write_roots(write_roots.clone()),
+            );
             // Build the relay-wide profile registry. R3.A will populate
             // `ProfileContext::meta_tool_handler` per profile; for now the
             // registry just exposes filtered views of `AdapterRegistry`.
-            let profile_registry = Arc::new(ProfileRegistry::new((*registry).clone()));
+            let profile_registry = Arc::new(
+                ProfileRegistry::new((*registry).clone()).with_write_roots(write_roots.clone()),
+            );
             profile_registry
                 .rebuild(cfg.profiles.as_deref().unwrap_or(&[]))
                 .await;
@@ -1031,6 +1039,7 @@ async fn main() {
                         registry.clone(),
                         cfg.relay.machine_name.clone(),
                         js_execution_mode.clone(),
+                        write_roots.clone(),
                         profile_registry.clone(),
                         token_manager.clone(),
                         oauth_flow_manager.clone(),

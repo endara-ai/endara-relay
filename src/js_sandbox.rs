@@ -4,6 +4,7 @@
 //! No filesystem or network access is available from within the sandbox.
 
 use std::cell::RefCell;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -53,6 +54,21 @@ fn jittered_backoff_ms(base: u64, rng: &mut impl rand::Rng) -> u64 {
     let factor: f64 = rng.random_range(0.75..=1.25);
     (base as f64 * factor) as u64
 }
+
+// ---------------------------------------------------------------------------
+// Shared write-roots handle
+// ---------------------------------------------------------------------------
+
+/// Shared, hot-reloadable allowlist of canonical directory roots the sandbox
+/// may write into (resolved from `relay.write_dirs` by
+/// [`crate::config::resolve_write_roots`]). A single handle is created in
+/// `main.rs` and shared by the global [`MetaToolHandler`], every per-profile
+/// handler (via [`crate::profile_registry::ProfileRegistry`]), and the config
+/// watcher — which swaps the contents on hot reload so all handlers observe
+/// the new allowlist without being rebuilt. Uses `std::sync::RwLock` (not
+/// tokio's): reads are brief snapshots taken without holding the guard across
+/// an `.await`.
+pub type SharedWriteRoots = Arc<std::sync::RwLock<Vec<PathBuf>>>;
 
 // ---------------------------------------------------------------------------
 // Error types
@@ -108,6 +124,13 @@ struct SandboxState {
     /// event emitters (`ToolCallEvent::Started.request_uid`) — the
     /// blocking-thread hop otherwise drops the outer request span.
     request_uid: String,
+    /// Snapshot of the `relay.write_dirs` allowlist (canonical directory
+    /// roots, resolved by [`crate::config::resolve_write_roots`]) taken when
+    /// the script entered the sandbox. Empty means writing is disabled.
+    /// Read by the `writeFile` native function (Task 2) to validate absolute
+    /// destination paths; until that lands the field is populated but unread.
+    #[allow(dead_code)]
+    write_roots: Vec<PathBuf>,
 }
 
 thread_local! {
@@ -140,6 +163,11 @@ pub struct JsSandbox {
     /// [`MetaToolHandler::execute_tools`] so inner upstream tool calls
     /// re-establish the outer request's `request{request_uid=...}` span.
     request_uid: String,
+    /// `relay.write_dirs` allowlist snapshot (canonical directory roots)
+    /// carried into [`SandboxState`] for the running script. Defaults to
+    /// empty (writing disabled); set via [`Self::with_write_roots`] by
+    /// [`MetaToolHandler::execute_tools`].
+    write_roots: Vec<PathBuf>,
 }
 
 impl JsSandbox {
@@ -173,6 +201,7 @@ impl JsSandbox {
             use_real_backoff: false,
             client_json: String::new(),
             request_uid: String::new(),
+            write_roots: Vec::new(),
         }
     }
 
@@ -195,6 +224,16 @@ impl JsSandbox {
         self
     }
 
+    /// Attach the `relay.write_dirs` allowlist snapshot (canonical directory
+    /// roots resolved by [`crate::config::resolve_write_roots`]) so the
+    /// running script's `writeFile` can validate destination paths. An empty
+    /// list means writing is disabled. Used by
+    /// [`MetaToolHandler::execute_tools`].
+    pub fn with_write_roots(mut self, write_roots: Vec<PathBuf>) -> Self {
+        self.write_roots = write_roots;
+        self
+    }
+
     /// Test-only: opt this sandbox into the real backoff schedule. Without
     /// this, `cfg(test)` builds short-circuit retry sleeps to zero so the
     /// suite stays fast. Used by the deadline-budget test.
@@ -211,6 +250,7 @@ impl JsSandbox {
         let use_real_backoff = self.use_real_backoff;
         let client_json = self.client_json.clone();
         let request_uid = self.request_uid.clone();
+        let write_roots = self.write_roots.clone();
         let script = script.to_string();
         let handle = tokio::runtime::Handle::current();
         let catalog = self.registry.merged_catalog().await;
@@ -227,6 +267,7 @@ impl JsSandbox {
                     use_real_backoff,
                     client_json,
                     request_uid,
+                    write_roots,
                 )
             }),
         )
@@ -254,6 +295,7 @@ fn execute_in_sandbox(
     use_real_backoff: bool,
     client_json: String,
     request_uid: String,
+    write_roots: Vec<PathBuf>,
 ) -> Result<Value, JsSandboxError> {
     let deadline = std::time::Instant::now() + sandbox_timeout;
     SANDBOX_STATE.with(|cell| {
@@ -264,6 +306,7 @@ fn execute_in_sandbox(
             use_real_backoff,
             client_json,
             request_uid,
+            write_roots,
         });
     });
     let result = run_js(script, catalog);
@@ -1110,6 +1153,13 @@ pub struct MetaToolHandler {
     /// tools `execute_tools` can reach via the JS sandbox.
     registry: Arc<dyn MetaToolRegistry>,
     sandbox_timeout: Duration,
+    /// Shared, hot-reloadable `relay.write_dirs` allowlist handle. The
+    /// handler snapshots it per `execute_tools` call (see
+    /// [`Self::execute_tools`]) so a running script keeps the allowlist it
+    /// started with while later scripts observe a hot-reloaded value.
+    /// Defaults to an empty (writing-disabled) handle; production wiring
+    /// passes the process-wide handle via [`Self::with_write_roots`].
+    write_roots: SharedWriteRoots,
     /// Memoized per-tool search index reused across `search_tools` calls.
     /// Holds `(generation, docs)` where `generation` is the registry's
     /// `catalog_generation` at the time the docs were built. The `Arc` lets
@@ -1152,10 +1202,21 @@ impl MetaToolHandler {
         Self {
             registry,
             sandbox_timeout,
+            write_roots: Arc::new(std::sync::RwLock::new(Vec::new())),
             search_index_cache: Arc::new(RwLock::new(None)),
             #[cfg(test)]
             search_index_rebuild_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Attach the shared `relay.write_dirs` allowlist handle. The handle is
+    /// shared with the config watcher, which swaps its contents on hot
+    /// reload; the handler reads a snapshot per `execute_tools` call. Called
+    /// by `main.rs` (global handler) and `ProfileRegistry::rebuild`
+    /// (per-profile handlers).
+    pub fn with_write_roots(mut self, write_roots: SharedWriteRoots) -> Self {
+        self.write_roots = write_roots;
+        self
     }
 
     /// Test-only accessor returning the number of times the search index has
@@ -1305,9 +1366,19 @@ impl MetaToolHandler {
         client_json: &str,
         request_uid: &str,
     ) -> Result<Value, JsSandboxError> {
+        // Snapshot the shared allowlist for this script run. The brief
+        // std-RwLock read never crosses an `.await`; a poisoned lock (a
+        // writer panicked mid-swap) degrades to writing-disabled rather
+        // than propagating the panic into the request path.
+        let write_roots = self
+            .write_roots
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default();
         let sandbox = JsSandbox::from_dyn(self.registry.clone(), self.sandbox_timeout)
             .with_client(client_json.to_string())
-            .with_request_uid(request_uid.to_string());
+            .with_request_uid(request_uid.to_string())
+            .with_write_roots(write_roots);
         sandbox.execute(script).await
     }
 }

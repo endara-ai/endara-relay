@@ -96,6 +96,7 @@ fn test_config() -> Config {
             validate_inputs: None,
             observability: ObservabilityConfig::default(),
             log_retention_days: None,
+            write_dirs: None,
         },
         endpoints: vec![EndpointConfig {
             name: "echo".to_string(),

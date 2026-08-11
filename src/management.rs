@@ -6700,6 +6700,7 @@ mod tests {
                 validate_inputs: None,
                 observability: crate::config::ObservabilityConfig::default(),
                 log_retention_days: None,
+                write_dirs: None,
             },
             endpoints: vec![EndpointConfig {
                 name: "echo".to_string(),
@@ -9328,6 +9329,7 @@ command = "echo"
                 validate_inputs: None,
                 observability: crate::config::ObservabilityConfig::default(),
                 log_retention_days: None,
+                write_dirs: None,
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
@@ -9873,6 +9875,7 @@ command = "echo"
                 validate_inputs: None,
                 observability: crate::config::ObservabilityConfig::default(),
                 log_retention_days: None,
+                write_dirs: None,
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
@@ -11440,6 +11443,7 @@ command = "echo"
                 validate_inputs: None,
                 observability: crate::config::ObservabilityConfig::default(),
                 log_retention_days: None,
+                write_dirs: None,
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
@@ -11566,6 +11570,7 @@ client_id = "client123"
                 validate_inputs: None,
                 observability: crate::config::ObservabilityConfig::default(),
                 log_retention_days: None,
+                write_dirs: None,
             },
             endpoints: vec![],
             profiles: None,
@@ -11632,6 +11637,7 @@ client_id = "client123"
                 validate_inputs: None,
                 observability: crate::config::ObservabilityConfig::default(),
                 log_retention_days: None,
+                write_dirs: None,
             },
             endpoints: endpoint_names
                 .iter()
@@ -12196,6 +12202,7 @@ client_id = "client123"
                 validate_inputs: None,
                 observability: crate::config::ObservabilityConfig::default(),
                 log_retention_days: None,
+                write_dirs: None,
             },
             endpoints: vec![EndpointConfig {
                 name: "existing".to_string(),
