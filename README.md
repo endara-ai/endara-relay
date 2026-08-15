@@ -127,6 +127,9 @@ startup_init_timeout_secs = 60    # Optional — cap on how long the MCP listene
 log_retention_days = 7            # Optional — days of daily-rotated relay.log.YYYY-MM-DD
                                   # files to keep; older files are pruned at startup.
                                   # 0 disables pruning (default: 7). CLI: --log-retention-days
+write_dirs = ["/Users/me/exports"] # Optional — allowlist of absolute directories that
+                                  # sandbox scripts may write into via writeFile()
+                                  # (default: none — writing disabled). Hot-reloadable.
 
 # STDIO endpoint — spawns a child process
 [[endpoints]]
@@ -311,6 +314,21 @@ return { repos: repos.length, firstRepoIssues: issues };
 ```
 
 The JS sandbox is powered by [boa_engine](https://crates.io/crates/boa_engine) and runs entirely in-process — no external runtime needed.
+
+#### Writing files from the sandbox
+
+Scripts can save results to disk with the `writeFile(absPath, data, opts?)` global — but only into directories you explicitly allowlist under `[relay] write_dirs` (absolute paths; also manageable from Endara Desktop's Settings). With no `write_dirs` configured, writing is disabled entirely.
+
+```javascript
+const report = await call("github__list_issues", { repo: "endara-relay" });
+writeFile("/Users/me/exports/issues.json", JSON.stringify(report));
+writeFile("/Users/me/exports/logo.png", pngBase64, { encoding: "base64" });
+```
+
+- **Allowlist enforcement** — the fully-resolved destination (symlinks and `..` included) must land inside one of the canonical `write_dirs` roots; escapes are rejected with a distinct error. Allowlisted directories are never auto-created, but missing parent directories *inside* a root are.
+- **Atomic writes** — data is written to a temp file in the destination directory and renamed into place, so readers never observe partial files.
+- **Encodings** — `utf8` (default) writes the string as-is; `base64` decodes the payload first.
+- **Per-run limits** — a single script run may write at most 64 files, 32 MB per file, and 256 MB in total; a breach throws before the offending file is written. The relay never deletes files it wrote.
 
 ### TOON tool output
 
