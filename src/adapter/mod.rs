@@ -136,7 +136,7 @@ pub fn truncate_for_display(s: &str, max_chars: usize) -> String {
 /// No route to host (os error 65)") lives in the source chain, so walk it and
 /// append every layer. Layers whose text is already embedded in the message
 /// are skipped to avoid duplication.
-pub fn format_error_chain(err: &dyn std::error::Error) -> String {
+pub(crate) fn format_error_chain(err: &dyn std::error::Error) -> String {
     let mut msg = err.to_string();
     let mut source = err.source();
     while let Some(s) = source {
@@ -148,6 +148,29 @@ pub fn format_error_chain(err: &dyn std::error::Error) -> String {
         source = s.source();
     }
     msg
+}
+
+/// Chain-format a connect error, prefixing `url` only when the chain does not
+/// already name it: reqwest's top-level `Display` usually embeds
+/// "for url (…)", so an unconditional prefix would duplicate the URL. The
+/// containment check also tries the parsed/normalized form of `url` (e.g.
+/// reqwest renders "http://host:1" as "http://host:1/").
+pub(crate) fn connect_error_message(url: &str, err: &dyn std::error::Error) -> String {
+    let chain = format_error_chain(err);
+    if message_names_url(url, &chain) {
+        chain
+    } else {
+        format!("{url}: {chain}")
+    }
+}
+
+/// True when `message` already contains `url`, either verbatim or in its
+/// parsed/normalized form.
+fn message_names_url(url: &str, message: &str) -> bool {
+    if message.contains(url) {
+        return true;
+    }
+    url::Url::parse(url).is_ok_and(|u| message.contains(u.as_str()))
 }
 
 /// Errors that can occur in adapter operations.
@@ -604,6 +627,42 @@ mod tests {
         assert_eq!(
             format_error_chain(&top),
             "error sending request: tcp connect error: No route to host (os error 65)"
+        );
+    }
+
+    /// When the chain already names the URL (reqwest's "for url (…)"), no
+    /// prefix is added — the URL must appear exactly once.
+    #[test]
+    fn connect_error_message_skips_prefix_when_chain_names_url() {
+        let url = "http://192.168.1.10:8123/mcp";
+        let err = std::io::Error::other(format!(
+            "error sending request for url ({url}): tcp connect error"
+        ));
+        let msg = connect_error_message(url, &err);
+        assert_eq!(msg, err.to_string());
+        assert_eq!(msg.matches(url).count(), 1);
+    }
+
+    /// reqwest renders the parsed URL, which may differ from the configured
+    /// string (e.g. a trailing slash added to an empty path) — the normalized
+    /// form also counts as "already named".
+    #[test]
+    fn connect_error_message_recognizes_normalized_url() {
+        let err = std::io::Error::other(
+            "error sending request for url (http://127.0.0.1:1/): tcp connect error",
+        );
+        let msg = connect_error_message("http://127.0.0.1:1", &err);
+        assert_eq!(msg, err.to_string());
+    }
+
+    /// When the chain does not mention the URL, it is prefixed so the message
+    /// still identifies the endpoint.
+    #[test]
+    fn connect_error_message_prefixes_url_when_absent_from_chain() {
+        let err = std::io::Error::other("tcp connect error: Connection refused (os error 111)");
+        assert_eq!(
+            connect_error_message("http://192.168.1.10:8123/mcp", &err),
+            "http://192.168.1.10:8123/mcp: tcp connect error: Connection refused (os error 111)"
         );
     }
 

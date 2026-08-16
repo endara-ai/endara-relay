@@ -3,7 +3,8 @@ use super::server_name::{sanitize_server_name, ServerNameError};
 use super::server_type_resolution::{effective_server_type, strip_mcp_server_suffix};
 use super::stdio::{iso8601_now, RingBuffer};
 use super::{
-    format_error_chain, AdapterError, HealthStatus, McpAdapter, ToolInfo, DISCOVER_PROBE_TIMEOUT,
+    connect_error_message, format_error_chain, AdapterError, HealthStatus, McpAdapter, ToolInfo,
+    DISCOVER_PROBE_TIMEOUT,
 };
 use crate::events::{
     annotations_from_value, current_request_context, ToolCallEvent, ToolCallEventBus,
@@ -587,7 +588,7 @@ impl HttpAdapter {
             } else if e.is_connect() {
                 AdapterError::ConnectionFailed(with_local_network_hint(
                     &self.config.url,
-                    format!("{}: {}", self.config.url, format_error_chain(&e)),
+                    connect_error_message(&self.config.url, &e),
                 ))
             } else {
                 AdapterError::HttpError {
@@ -739,7 +740,7 @@ impl HttpAdapter {
             } else if e.is_connect() {
                 AdapterError::ConnectionFailed(with_local_network_hint(
                     &self.config.url,
-                    format!("{}: {}", self.config.url, format_error_chain(&e)),
+                    connect_error_message(&self.config.url, &e),
                 ))
             } else {
                 AdapterError::HttpError {
@@ -1146,7 +1147,7 @@ impl McpAdapter for HttpAdapter {
                         } else if e.is_connect() {
                             AdapterError::ConnectionFailed(with_local_network_hint(
                                 &self.config.url,
-                                format!("{}: {}", self.config.url, format_error_chain(&e)),
+                                connect_error_message(&self.config.url, &e),
                             ))
                         } else {
                             AdapterError::HttpError {

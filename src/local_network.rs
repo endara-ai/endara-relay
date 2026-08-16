@@ -13,7 +13,8 @@ use url::{Host, Url};
 /// Hint appended to connect-failure messages for private/LAN targets on macOS.
 pub const LOCAL_NETWORK_HINT: &str = "this server is on your local network, so macOS may be \
     blocking the connection — check System Settings → Privacy & Security → Local Network and \
-    allow Endara Desktop, then restart the app after granting";
+    allow the Endara app (or the terminal that launched the relay), then restart it after \
+    granting";
 
 /// Returns true when `host` is a private/LAN target: an RFC 1918 or
 /// link-local IPv4 address, a unique-local or link-local IPv6 address, or an
@@ -35,8 +36,13 @@ fn is_private_ipv4(ip: Ipv4Addr) -> bool {
     ip.is_private() || ip.is_link_local()
 }
 
-/// IPv6 unique-local (`fc00::/7`) plus link-local (`fe80::/10`).
+/// IPv6 unique-local (`fc00::/7`) plus link-local (`fe80::/10`). An
+/// IPv4-mapped address (`::ffff:a.b.c.d`) classifies as its embedded IPv4
+/// address.
 fn is_private_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_private_ipv4(v4);
+    }
     let first = ip.segments()[0];
     (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80
 }
@@ -117,6 +123,14 @@ mod tests {
     fn public_ipv6_is_not_private() {
         assert!(!host("http://[2001:db8::1]/"));
         assert!(!host("http://[2606:4700::1111]/"));
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_classifies_as_embedded_ipv4() {
+        assert!(host("http://[::ffff:192.168.1.10]:8123/"));
+        assert!(host("http://[::ffff:10.0.0.5]/"));
+        assert!(!host("http://[::ffff:8.8.8.8]/"));
+        assert!(!host("http://[::ffff:127.0.0.1]/"));
     }
 
     #[test]
