@@ -9,6 +9,7 @@ use crate::events::{
     annotations_from_value, current_request_context, ToolCallEvent, ToolCallEventBus,
 };
 use crate::jsonrpc::{self, JsonRpcResponse};
+use crate::local_network::with_local_network_hint;
 use crate::protocol::{self, detect_upstream_dialect, ProtocolVersion};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -584,10 +585,9 @@ impl HttpAdapter {
             if e.is_timeout() {
                 AdapterError::Timeout(self.config.timeout_secs)
             } else if e.is_connect() {
-                AdapterError::ConnectionFailed(format!(
-                    "{}: {}",
-                    self.config.url,
-                    format_error_chain(&e)
+                AdapterError::ConnectionFailed(with_local_network_hint(
+                    &self.config.url,
+                    format!("{}: {}", self.config.url, format_error_chain(&e)),
                 ))
             } else {
                 AdapterError::HttpError {
@@ -737,10 +737,9 @@ impl HttpAdapter {
             if e.is_timeout() {
                 AdapterError::Timeout(self.config.timeout_secs)
             } else if e.is_connect() {
-                AdapterError::ConnectionFailed(format!(
-                    "{}: {}",
-                    self.config.url,
-                    format_error_chain(&e)
+                AdapterError::ConnectionFailed(with_local_network_hint(
+                    &self.config.url,
+                    format!("{}: {}", self.config.url, format_error_chain(&e)),
                 ))
             } else {
                 AdapterError::HttpError {
@@ -1145,10 +1144,9 @@ impl McpAdapter for HttpAdapter {
                         if e.is_timeout() {
                             AdapterError::Timeout(self.config.timeout_secs)
                         } else if e.is_connect() {
-                            AdapterError::ConnectionFailed(format!(
-                                "{}: {}",
-                                self.config.url,
-                                format_error_chain(&e)
+                            AdapterError::ConnectionFailed(with_local_network_hint(
+                                &self.config.url,
+                                format!("{}: {}", self.config.url, format_error_chain(&e)),
                             ))
                         } else {
                             AdapterError::HttpError {
