@@ -57,6 +57,10 @@ fn is_mdns_local_domain(domain: &str) -> bool {
 
 /// Appends [`LOCAL_NETWORK_HINT`] to `message` when running on macOS and
 /// `url` targets a private/LAN host; otherwise returns `message` unchanged.
+///
+/// Messages that clearly indicate ECONNREFUSED are excluded: a refused
+/// connection means the host was reachable, so the Local Network permission
+/// is not the cause (TCC denial surfaces as "No route to host" / os error 65).
 pub fn with_local_network_hint(url: &str, message: String) -> String {
     with_local_network_hint_inner(url, message, cfg!(target_os = "macos"))
 }
@@ -64,11 +68,16 @@ pub fn with_local_network_hint(url: &str, message: String) -> String {
 /// Testable core of [`with_local_network_hint`] with the platform gate as a
 /// parameter.
 fn with_local_network_hint_inner(url: &str, message: String, is_macos: bool) -> String {
-    if is_macos && url_targets_private_host(url) {
+    if is_macos && url_targets_private_host(url) && !is_connection_refused(&message) {
         format!("{message} ({LOCAL_NETWORK_HINT})")
     } else {
         message
     }
+}
+
+/// True when the error text clearly names ECONNREFUSED.
+fn is_connection_refused(message: &str) -> bool {
+    message.to_ascii_lowercase().contains("connection refused")
 }
 
 /// True when `url` parses and its host classifies as private/LAN.
@@ -145,6 +154,23 @@ mod tests {
         assert!(!host("https://example.com/mcp"));
         assert!(!host("https://api.example.local.com/"));
         assert!(!host("http://local/"));
+    }
+
+    #[test]
+    fn hint_suppressed_for_connection_refused() {
+        let refused =
+            "http://192.168.1.10:8123/: tcp connect error: Connection refused (os error 61)"
+                .to_string();
+        assert_eq!(
+            with_local_network_hint_inner("http://192.168.1.10:8123/", refused.clone(), true),
+            refused
+        );
+
+        let unreachable =
+            "http://192.168.1.10:8123/: tcp connect error: No route to host (os error 65)"
+                .to_string();
+        let hinted = with_local_network_hint_inner("http://192.168.1.10:8123/", unreachable, true);
+        assert!(hinted.contains("Privacy & Security → Local Network"));
     }
 
     #[test]

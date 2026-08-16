@@ -135,7 +135,10 @@ pub fn truncate_for_display(s: &str, max_chars: usize) -> String {
 /// request for url (…)" — the actionable detail (e.g. "tcp connect error:
 /// No route to host (os error 65)") lives in the source chain, so walk it and
 /// append every layer. Layers whose text is already embedded in the message
-/// are skipped to avoid duplication.
+/// are skipped to avoid duplication. The dedup is substring containment, so a
+/// layer with very generic text (e.g. just "error") that happens to appear in
+/// the accumulated message is silently dropped — an accepted tradeoff to keep
+/// the common reqwest/hyper chains clean.
 pub(crate) fn format_error_chain(err: &dyn std::error::Error) -> String {
     let mut msg = err.to_string();
     let mut source = err.source();
