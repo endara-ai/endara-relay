@@ -129,6 +129,27 @@ pub fn truncate_for_display(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Format an error together with its full `source()` chain, joined with ": ".
+///
+/// reqwest's top-level `Display` for transport failures is just "error sending
+/// request for url (…)" — the actionable detail (e.g. "tcp connect error:
+/// No route to host (os error 65)") lives in the source chain, so walk it and
+/// append every layer. Layers whose text is already embedded in the message
+/// are skipped to avoid duplication.
+pub fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut msg = err.to_string();
+    let mut source = err.source();
+    while let Some(s) = source {
+        let layer = s.to_string();
+        if !msg.contains(&layer) {
+            msg.push_str(": ");
+            msg.push_str(&layer);
+        }
+        source = s.source();
+    }
+    msg
+}
+
 /// Errors that can occur in adapter operations.
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterError {
@@ -546,6 +567,84 @@ mod tests {
     fn failed_adapter_without_override_returns_none() {
         let adapter = FailedAdapter::new("validation failed".to_string());
         assert_eq!(adapter.configured_server_type(), None);
+    }
+
+    /// `format_error_chain` walks the full `source()` chain, joining each
+    /// layer with ": " and skipping layers already embedded in the message.
+    #[test]
+    fn format_error_chain_joins_all_source_layers() {
+        #[derive(Debug)]
+        struct Layer {
+            msg: &'static str,
+            source: Option<Box<dyn std::error::Error>>,
+        }
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.msg)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.source.as_deref()
+            }
+        }
+
+        let root = Layer {
+            msg: "No route to host (os error 65)",
+            source: None,
+        };
+        let mid = Layer {
+            msg: "tcp connect error",
+            source: Some(Box::new(root)),
+        };
+        let top = Layer {
+            msg: "error sending request",
+            source: Some(Box::new(mid)),
+        };
+        assert_eq!(
+            format_error_chain(&top),
+            "error sending request: tcp connect error: No route to host (os error 65)"
+        );
+    }
+
+    /// A layer whose text is already embedded in the accumulated message is
+    /// not appended again (some errors include their source in `Display`).
+    #[test]
+    fn format_error_chain_skips_duplicated_layers() {
+        let io = std::io::Error::other("disk full");
+        let wrapped = std::io::Error::other(io);
+        assert_eq!(format_error_chain(&wrapped), "disk full");
+    }
+
+    /// End-to-end against a real reqwest transport failure: a request to a
+    /// closed local port must surface the OS-level cause (e.g. "Connection
+    /// refused"), not just reqwest's top-level "error sending request" text.
+    #[tokio::test]
+    async fn format_error_chain_surfaces_os_cause_for_connect_refused() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let err = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("request to a closed port must fail");
+        assert!(err.is_connect());
+
+        let chain = format_error_chain(&err);
+        assert!(
+            chain.starts_with(&err.to_string()),
+            "chain must begin with the top-level message, got {chain:?}"
+        );
+        assert!(
+            chain.len() > err.to_string().len(),
+            "chain must include more than the top-level message, got {chain:?}"
+        );
+        assert!(
+            chain.to_lowercase().contains("refused"),
+            "chain must name the OS-level cause, got {chain:?}"
+        );
     }
 
     #[test]
