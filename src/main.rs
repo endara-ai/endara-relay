@@ -21,6 +21,7 @@ mod advertise;
 mod container_runtime;
 mod container_stats;
 mod jsonrpc;
+mod local_network;
 mod prefix;
 mod profile_registry;
 mod protocol;

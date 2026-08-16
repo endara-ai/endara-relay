@@ -129,6 +129,53 @@ pub fn truncate_for_display(s: &str, max_chars: usize) -> String {
     }
 }
 
+/// Format an error together with its full `source()` chain, joined with ": ".
+///
+/// reqwest's top-level `Display` for transport failures is just "error sending
+/// request for url (…)" — the actionable detail (e.g. "tcp connect error:
+/// No route to host (os error 65)") lives in the source chain, so walk it and
+/// append every layer. Layers whose text is already embedded in the message
+/// are skipped to avoid duplication. The dedup is substring containment, so a
+/// layer with very generic text (e.g. just "error") that happens to appear in
+/// the accumulated message is silently dropped — an accepted tradeoff to keep
+/// the common reqwest/hyper chains clean.
+pub(crate) fn format_error_chain(err: &dyn std::error::Error) -> String {
+    let mut msg = err.to_string();
+    let mut source = err.source();
+    while let Some(s) = source {
+        let layer = s.to_string();
+        if !msg.contains(&layer) {
+            msg.push_str(": ");
+            msg.push_str(&layer);
+        }
+        source = s.source();
+    }
+    msg
+}
+
+/// Chain-format a connect error, prefixing `url` only when the chain does not
+/// already name it: reqwest's top-level `Display` usually embeds
+/// "for url (…)", so an unconditional prefix would duplicate the URL. The
+/// containment check also tries the parsed/normalized form of `url` (e.g.
+/// reqwest renders "http://host:1" as "http://host:1/").
+pub(crate) fn connect_error_message(url: &str, err: &dyn std::error::Error) -> String {
+    let chain = format_error_chain(err);
+    if message_names_url(url, &chain) {
+        chain
+    } else {
+        format!("{url}: {chain}")
+    }
+}
+
+/// True when `message` already contains `url`, either verbatim or in its
+/// parsed/normalized form.
+fn message_names_url(url: &str, message: &str) -> bool {
+    if message.contains(url) {
+        return true;
+    }
+    url::Url::parse(url).is_ok_and(|u| message.contains(u.as_str()))
+}
+
 /// Errors that can occur in adapter operations.
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterError {
@@ -546,6 +593,120 @@ mod tests {
     fn failed_adapter_without_override_returns_none() {
         let adapter = FailedAdapter::new("validation failed".to_string());
         assert_eq!(adapter.configured_server_type(), None);
+    }
+
+    /// `format_error_chain` walks the full `source()` chain, joining each
+    /// layer with ": " and skipping layers already embedded in the message.
+    #[test]
+    fn format_error_chain_joins_all_source_layers() {
+        #[derive(Debug)]
+        struct Layer {
+            msg: &'static str,
+            source: Option<Box<dyn std::error::Error>>,
+        }
+        impl std::fmt::Display for Layer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.msg)
+            }
+        }
+        impl std::error::Error for Layer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                self.source.as_deref()
+            }
+        }
+
+        let root = Layer {
+            msg: "No route to host (os error 65)",
+            source: None,
+        };
+        let mid = Layer {
+            msg: "tcp connect error",
+            source: Some(Box::new(root)),
+        };
+        let top = Layer {
+            msg: "error sending request",
+            source: Some(Box::new(mid)),
+        };
+        assert_eq!(
+            format_error_chain(&top),
+            "error sending request: tcp connect error: No route to host (os error 65)"
+        );
+    }
+
+    /// When the chain already names the URL (reqwest's "for url (…)"), no
+    /// prefix is added — the URL must appear exactly once.
+    #[test]
+    fn connect_error_message_skips_prefix_when_chain_names_url() {
+        let url = "http://192.168.1.10:8123/mcp";
+        let err = std::io::Error::other(format!(
+            "error sending request for url ({url}): tcp connect error"
+        ));
+        let msg = connect_error_message(url, &err);
+        assert_eq!(msg, err.to_string());
+        assert_eq!(msg.matches(url).count(), 1);
+    }
+
+    /// reqwest renders the parsed URL, which may differ from the configured
+    /// string (e.g. a trailing slash added to an empty path) — the normalized
+    /// form also counts as "already named".
+    #[test]
+    fn connect_error_message_recognizes_normalized_url() {
+        let err = std::io::Error::other(
+            "error sending request for url (http://127.0.0.1:1/): tcp connect error",
+        );
+        let msg = connect_error_message("http://127.0.0.1:1", &err);
+        assert_eq!(msg, err.to_string());
+    }
+
+    /// When the chain does not mention the URL, it is prefixed so the message
+    /// still identifies the endpoint.
+    #[test]
+    fn connect_error_message_prefixes_url_when_absent_from_chain() {
+        let err = std::io::Error::other("tcp connect error: Connection refused (os error 111)");
+        assert_eq!(
+            connect_error_message("http://192.168.1.10:8123/mcp", &err),
+            "http://192.168.1.10:8123/mcp: tcp connect error: Connection refused (os error 111)"
+        );
+    }
+
+    /// A layer whose text is already embedded in the accumulated message is
+    /// not appended again (some errors include their source in `Display`).
+    #[test]
+    fn format_error_chain_skips_duplicated_layers() {
+        let io = std::io::Error::other("disk full");
+        let wrapped = std::io::Error::other(io);
+        assert_eq!(format_error_chain(&wrapped), "disk full");
+    }
+
+    /// End-to-end against a real reqwest transport failure: a request to a
+    /// closed local port must surface the OS-level cause (e.g. "Connection
+    /// refused"), not just reqwest's top-level "error sending request" text.
+    #[tokio::test]
+    async fn format_error_chain_surfaces_os_cause_for_connect_refused() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let err = reqwest::Client::new()
+            .get(format!("http://{addr}/"))
+            .send()
+            .await
+            .expect_err("request to a closed port must fail");
+        assert!(err.is_connect());
+
+        let chain = format_error_chain(&err);
+        assert!(
+            chain.starts_with(&err.to_string()),
+            "chain must begin with the top-level message, got {chain:?}"
+        );
+        assert!(
+            chain.len() > err.to_string().len(),
+            "chain must include more than the top-level message, got {chain:?}"
+        );
+        assert!(
+            chain.to_lowercase().contains("refused"),
+            "chain must name the OS-level cause, got {chain:?}"
+        );
     }
 
     #[test]

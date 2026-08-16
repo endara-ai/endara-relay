@@ -1,11 +1,15 @@
 use super::server_name::{sanitize_server_name, ServerNameError};
 use super::server_type_resolution::{effective_server_type, strip_mcp_server_suffix};
 use super::stdio::{iso8601_now, RingBuffer};
-use super::{AdapterError, HealthStatus, McpAdapter, ToolInfo, DISCOVER_PROBE_TIMEOUT};
+use super::{
+    connect_error_message, format_error_chain, AdapterError, HealthStatus, McpAdapter, ToolInfo,
+    DISCOVER_PROBE_TIMEOUT,
+};
 use crate::events::{
     annotations_from_value, current_request_context, ToolCallEvent, ToolCallEventBus,
 };
 use crate::jsonrpc::{self, JsonRpcResponse};
+use crate::local_network::with_local_network_hint;
 use crate::protocol::{self, detect_upstream_dialect, ProtocolVersion};
 use async_trait::async_trait;
 use reqwest::Client;
@@ -353,7 +357,7 @@ impl SseAdapter {
         let sse_client = Client::builder()
             .default_headers(sse_headers)
             .build()
-            .map_err(|e| AdapterError::ConnectionFailed(e.to_string()))?;
+            .map_err(|e| AdapterError::ConnectionFailed(format_error_chain(&e)))?;
 
         let resp = sse_client
             .get(&self.config.url)
@@ -362,11 +366,14 @@ impl SseAdapter {
             .await
             .map_err(|e| {
                 if e.is_connect() {
-                    AdapterError::ConnectionFailed(format!("{}: {}", self.config.url, e))
+                    AdapterError::ConnectionFailed(with_local_network_hint(
+                        &self.config.url,
+                        connect_error_message(&self.config.url, &e),
+                    ))
                 } else {
                     AdapterError::HttpError {
                         status: 0,
-                        body: e.to_string(),
+                        body: format_error_chain(&e),
                     }
                 }
             })?;
@@ -581,11 +588,14 @@ impl SseAdapter {
                 if e.is_timeout() {
                     AdapterError::Timeout(self.config.timeout_secs)
                 } else if e.is_connect() {
-                    AdapterError::ConnectionFailed(format!("{}: {}", endpoint, e))
+                    AdapterError::ConnectionFailed(with_local_network_hint(
+                        &endpoint,
+                        connect_error_message(&endpoint, &e),
+                    ))
                 } else {
                     AdapterError::HttpError {
                         status: 0,
-                        body: e.to_string(),
+                        body: format_error_chain(&e),
                     }
                 }
             })?;
@@ -643,11 +653,14 @@ impl SseAdapter {
                 if e.is_timeout() {
                     AdapterError::Timeout(self.config.timeout_secs)
                 } else if e.is_connect() {
-                    AdapterError::ConnectionFailed(format!("{}: {}", endpoint, e))
+                    AdapterError::ConnectionFailed(with_local_network_hint(
+                        &endpoint,
+                        connect_error_message(&endpoint, &e),
+                    ))
                 } else {
                     AdapterError::HttpError {
                         status: 0,
-                        body: e.to_string(),
+                        body: format_error_chain(&e),
                     }
                 }
             })?;
