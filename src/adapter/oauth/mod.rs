@@ -287,8 +287,11 @@ pub struct OAuthAdapterInner {
     /// (e.g. an OAuth callback re-login under a different account/scope, see
     /// PR #140 review) without spamming clients with `list_changed` on
     /// routine token refreshes. `None` until a probe succeeds; cleared when
-    /// the inner adapter is torn down.
-    last_tools_fingerprint: RwLock<Option<u64>>,
+    /// the inner adapter is torn down AND whenever the forwarder relays an
+    /// inner `tools_changed` tick (the upstream drifted from the probed
+    /// baseline, so the next Some→Some swap must tick to be safe — see
+    /// `swap_tools_forwarder`). `Arc` so the forwarder task can share it.
+    last_tools_fingerprint: Arc<RwLock<Option<u64>>>,
 }
 
 impl OAuthAdapterInner {
@@ -1297,6 +1300,13 @@ impl OAuthAdapterInner {
     /// `Some`, spawn a fresh forwarder that pumps each inner tick into
     /// `outer_tools_changed_tx`. `Lagged` is forwarded as a tick (matching the
     /// registry listener); `Closed` ends the task.
+    ///
+    /// Each relayed tick also clears `last_tools_fingerprint`: an inner
+    /// `tools_changed` notification means the upstream tool set drifted from
+    /// the baseline probed at `apply_tokens` time, so a later Some→Some swap
+    /// that happens to reproduce the original set must still tick (the
+    /// registry's caches followed the drift). An unknown baseline makes the
+    /// next swap tick unconditionally — safe, at worst one extra tick.
     async fn swap_tools_forwarder(&self, rx: Option<broadcast::Receiver<()>>) {
         let mut handle_guard = self.inner_forwarder_handle.lock().await;
         if let Some(h) = handle_guard.take() {
@@ -1304,13 +1314,16 @@ impl OAuthAdapterInner {
         }
         let Some(mut rx) = rx else { return };
         let outer_tx = self.outer_tools_changed_tx.clone();
+        let fingerprint = self.last_tools_fingerprint.clone();
         let join = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(()) => {
+                        *fingerprint.write().await = None;
                         let _ = outer_tx.send(());
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
+                        *fingerprint.write().await = None;
                         let _ = outer_tx.send(());
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -1426,7 +1439,7 @@ impl OAuthAdapter {
                 ema_sso,
                 pending_authorize_url: RwLock::new(None),
                 server_type_recorded: AtomicBool::new(false),
-                last_tools_fingerprint: RwLock::new(None),
+                last_tools_fingerprint: Arc::new(RwLock::new(None)),
             }),
         }
     }
@@ -3746,6 +3759,60 @@ mod tests {
         assert!(
             recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
             "Some→Some swap with a changed tool set must emit a tick"
+        );
+        server.abort();
+    }
+
+    /// PR #140 review follow-up (round 2): a forwarded inner `tools_changed`
+    /// tick must invalidate the stored fingerprint. Sequence pinned here:
+    /// tool set A is probed (baseline = A), the inner notifies a change (the
+    /// registry's caches follow the drift, baseline must be cleared), then a
+    /// re-login reproduces A — without invalidation the A==A comparison
+    /// would suppress the tick and leave the registry's caches stale.
+    #[tokio::test]
+    async fn inner_tick_invalidates_fingerprint_so_relogin_to_same_tools_ticks() {
+        let tool_name = Arc::new(std::sync::RwLock::new("alpha".to_string()));
+        let (url, server) = spawn_mcp_server_with_mutable_tools(tool_name.clone()).await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+
+        // Baseline: apply with tool set A → fingerprint stored.
+        adapter.inner.apply_tokens(make_token_set("first")).await;
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "None→Some must tick"
+        );
+        assert!(
+            adapter.inner.last_tools_fingerprint.read().await.is_some(),
+            "baseline fingerprint must be stored after a successful probe"
+        );
+
+        // Simulate the inner adapter notifying a tool change (upstream
+        // drifted to B): bind the forwarder to a manual channel and tick it.
+        let (inner_tx, inner_rx) = broadcast::channel::<()>(16);
+        adapter.inner.swap_tools_forwarder(Some(inner_rx)).await;
+        inner_tx.send(()).expect("inner send");
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "forwarded inner tick must reach the outer broadcast"
+        );
+        assert!(
+            adapter.inner.last_tools_fingerprint.read().await.is_none(),
+            "forwarded inner tick must clear the fingerprint baseline"
+        );
+        drain(&mut outer_rx).await;
+
+        // Re-login reproducing the ORIGINAL tool set A: the baseline is
+        // unknown, so the Some→Some swap must tick even though the probed
+        // set equals the pre-drift baseline.
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "re-login after an inner tool change must tick even if the \
+             probed set matches the stale baseline"
         );
         server.abort();
     }
