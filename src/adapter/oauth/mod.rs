@@ -292,6 +292,13 @@ pub struct OAuthAdapterInner {
     /// baseline, so the next Some→Some swap must tick to be safe — see
     /// `swap_tools_forwarder`). `Arc` so the forwarder task can share it.
     last_tools_fingerprint: Arc<RwLock<Option<u64>>>,
+    /// Serializes [`Self::apply_tokens`] end-to-end. The OAuth callback,
+    /// proactive refresh, and reactive (401) refresh can all apply tokens
+    /// concurrently; without serialization, interleaved applies could
+    /// publish adapter B while a resumed apply A overwrites the fingerprint
+    /// baseline with A's — a later catalog equal to A would then be treated
+    /// as unchanged and the invalidation tick suppressed (PR #140 review).
+    apply_lock: Mutex<()>,
 }
 
 impl OAuthAdapterInner {
@@ -1047,6 +1054,12 @@ impl OAuthAdapterInner {
     }
 
     async fn apply_tokens_inner(self: &Arc<Self>, token_set: TokenSet) {
+        // Serialize the whole apply: callback, proactive refresh, and
+        // reactive refresh may overlap, and interleaved applies could pair
+        // the published adapter with another apply's fingerprint baseline
+        // (see `apply_lock`). Applies are rare (login/refresh), so a full
+        // mutex is the simple correct choice over rebuild versioning.
+        let _apply_guard = self.apply_lock.lock().await;
         let endpoint = &self.config.endpoint_name;
 
         // 1. Persist to disk
@@ -1440,6 +1453,7 @@ impl OAuthAdapter {
                 pending_authorize_url: RwLock::new(None),
                 server_type_recorded: AtomicBool::new(false),
                 last_tools_fingerprint: Arc::new(RwLock::new(None)),
+                apply_lock: Mutex::new(()),
             }),
         }
     }
