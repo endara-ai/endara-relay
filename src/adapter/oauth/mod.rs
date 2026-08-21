@@ -1130,14 +1130,18 @@ impl OAuthAdapterInner {
                 if new_fingerprint.is_some() {
                     *self.last_tools_fingerprint.write().await = new_fingerprint;
                 }
-                if should_tick {
-                    let _ = self.outer_tools_changed_tx.send(());
-                }
                 self.transition_to(
                     OAuthState::Authenticated,
                     "tokens applied, inner adapter ready",
                 )
                 .await;
+                // Tick only after the Authenticated transition so a racing
+                // registry rebuild can't read pre-transition health (e.g.
+                // Refreshing→Starting) and cache the new tools with a stale
+                // UNAVAILABLE label; inner+health are already published.
+                if should_tick {
+                    let _ = self.outer_tools_changed_tx.send(());
+                }
             }
             Err(e) => {
                 // Capture inner adapter's health before clearing it
