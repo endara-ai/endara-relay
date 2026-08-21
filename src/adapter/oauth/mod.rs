@@ -281,6 +281,24 @@ pub struct OAuthAdapterInner {
     /// time a non-empty `server_type` is written so subsequent applies skip
     /// the record call.
     server_type_recorded: AtomicBool,
+    /// Fingerprint (hash of the sorted, serialized tool list) probed from the
+    /// inner adapter after each successful [`Self::apply_tokens`] rebuild.
+    /// Compared across Some→Some swaps to detect an actual tool-set change
+    /// (e.g. an OAuth callback re-login under a different account/scope, see
+    /// PR #140 review) without spamming clients with `list_changed` on
+    /// routine token refreshes. `None` until a probe succeeds; cleared when
+    /// the inner adapter is torn down AND whenever the forwarder relays an
+    /// inner `tools_changed` tick (the upstream drifted from the probed
+    /// baseline, so the next Some→Some swap must tick to be safe — see
+    /// `swap_tools_forwarder`). `Arc` so the forwarder task can share it.
+    last_tools_fingerprint: Arc<RwLock<Option<u64>>>,
+    /// Serializes [`Self::apply_tokens`] end-to-end. The OAuth callback,
+    /// proactive refresh, and reactive (401) refresh can all apply tokens
+    /// concurrently; without serialization, interleaved applies could
+    /// publish adapter B while a resumed apply A overwrites the fingerprint
+    /// baseline with A's — a later catalog equal to A would then be treated
+    /// as unchanged and the invalidation tick suppressed (PR #140 review).
+    apply_lock: Mutex<()>,
 }
 
 impl OAuthAdapterInner {
@@ -314,6 +332,19 @@ impl OAuthAdapterInner {
         http_config.server_type_override = server_type_override;
         http_config.endpoint_name = endpoint_name;
         HttpAdapter::new_with_client_inner(http_config, client)
+    }
+
+    /// Hash the adapter's tool list into an order-insensitive fingerprint.
+    /// Returns `None` when `tools/list` fails — callers treat an unknown
+    /// probe conservatively (see `apply_tokens_inner`).
+    async fn probe_tools_fingerprint(adapter: &HttpAdapter) -> Option<u64> {
+        use std::hash::{Hash, Hasher};
+        let mut tools = adapter.list_tools().await.ok()?;
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        let serialized = serde_json::to_string(&tools).ok()?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        serialized.hash(&mut hasher);
+        Some(hasher.finish())
     }
 
     /// Transition to a new `OAuthState`.
@@ -1023,6 +1054,12 @@ impl OAuthAdapterInner {
     }
 
     async fn apply_tokens_inner(self: &Arc<Self>, token_set: TokenSet) {
+        // Serialize the whole apply: callback, proactive refresh, and
+        // reactive refresh may overlap, and interleaved applies could pair
+        // the published adapter with another apply's fingerprint baseline
+        // (see `apply_lock`). Applies are rare (login/refresh), so a full
+        // mutex is the simple correct choice over rebuild versioning.
+        let _apply_guard = self.apply_lock.lock().await;
         let endpoint = &self.config.endpoint_name;
 
         // 1. Persist to disk
@@ -1068,23 +1105,71 @@ impl OAuthAdapterInner {
                 // `health() == Healthy` is guaranteed to also see
                 // `inner_adapter == Some(_)`.
                 // Bind a forwarder against the new inner's tools-changed
-                // receiver (if any) before publishing it. No synthetic tick
-                // is emitted on swap — real ticks come from inner reconnects.
+                // receiver (if any) before publishing it. A synthetic tick is
+                // emitted on the outer broadcast when the inner's readiness
+                // changed (None→Some here; Some→None on the failure branch
+                // below) and when a Some→Some swap actually changed the tool
+                // set — an OAuth callback re-login under a different
+                // account/scope rebuilds the inner adapter too, and its
+                // different catalog must reach the registry's caches.
+                // Change detection probes the new inner's tool list once and
+                // compares its fingerprint against the previous successful
+                // probe, so routine Some→Some token refreshes with an
+                // unchanged tool set stay silent and clients aren't spammed
+                // with `list_changed` on every refresh.
                 let rx = adapter.subscribe_tools_changed();
-                *self.inner_adapter.write().await = Some(adapter);
+                let new_fingerprint = Self::probe_tools_fingerprint(&adapter).await;
+                let was_listable = {
+                    let mut guard = self.inner_adapter.write().await;
+                    let was = guard.is_some();
+                    *guard = Some(adapter);
+                    was
+                };
                 *self.inner_health.write().await = HealthStatus::Healthy;
                 self.swap_tools_forwarder(rx).await;
+                let should_tick = if !was_listable {
+                    true
+                } else {
+                    let old_fingerprint = *self.last_tools_fingerprint.read().await;
+                    match (old_fingerprint, new_fingerprint) {
+                        // Both probes succeeded: tick only on an actual change.
+                        (Some(old), Some(new)) => old != new,
+                        // Baseline unknown (previous probe failed): cached
+                        // tools may be stale — tick to be safe.
+                        (None, Some(_)) => true,
+                        // New probe failed: a change is undetectable, and the
+                        // registry's own refetch would fail too — stay silent
+                        // and keep the previous baseline.
+                        (_, None) => false,
+                    }
+                };
+                if new_fingerprint.is_some() {
+                    *self.last_tools_fingerprint.write().await = new_fingerprint;
+                }
                 self.transition_to(
                     OAuthState::Authenticated,
                     "tokens applied, inner adapter ready",
                 )
                 .await;
+                // Tick only after the Authenticated transition so a racing
+                // registry rebuild can't read pre-transition health (e.g.
+                // Refreshing→Starting) and cache the new tools with a stale
+                // UNAVAILABLE label; inner+health are already published.
+                if should_tick {
+                    let _ = self.outer_tools_changed_tx.send(());
+                }
             }
             Err(e) => {
                 // Capture inner adapter's health before clearing it
                 *self.inner_health.write().await = adapter.health();
-                *self.inner_adapter.write().await = None;
+                let was_listable = self.inner_adapter.write().await.take().is_some();
+                *self.last_tools_fingerprint.write().await = None;
                 self.swap_tools_forwarder(None).await;
+                // Some→None: the endpoint just lost its tools — tick so the
+                // registry drops them from the merged catalog.
+                if was_listable {
+                    let _ = self.outer_tools_changed_tx.send(());
+                }
                 self.transition_to(
                     OAuthState::ConnectionFailed,
                     &format!("inner adapter init failed: {}", e),
@@ -1228,6 +1313,13 @@ impl OAuthAdapterInner {
     /// `Some`, spawn a fresh forwarder that pumps each inner tick into
     /// `outer_tools_changed_tx`. `Lagged` is forwarded as a tick (matching the
     /// registry listener); `Closed` ends the task.
+    ///
+    /// Each relayed tick also clears `last_tools_fingerprint`: an inner
+    /// `tools_changed` notification means the upstream tool set drifted from
+    /// the baseline probed at `apply_tokens` time, so a later Some→Some swap
+    /// that happens to reproduce the original set must still tick (the
+    /// registry's caches followed the drift). An unknown baseline makes the
+    /// next swap tick unconditionally — safe, at worst one extra tick.
     async fn swap_tools_forwarder(&self, rx: Option<broadcast::Receiver<()>>) {
         let mut handle_guard = self.inner_forwarder_handle.lock().await;
         if let Some(h) = handle_guard.take() {
@@ -1235,13 +1327,16 @@ impl OAuthAdapterInner {
         }
         let Some(mut rx) = rx else { return };
         let outer_tx = self.outer_tools_changed_tx.clone();
+        let fingerprint = self.last_tools_fingerprint.clone();
         let join = tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(()) => {
+                        *fingerprint.write().await = None;
                         let _ = outer_tx.send(());
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
+                        *fingerprint.write().await = None;
                         let _ = outer_tx.send(());
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
@@ -1357,6 +1452,8 @@ impl OAuthAdapter {
                 ema_sso,
                 pending_authorize_url: RwLock::new(None),
                 server_type_recorded: AtomicBool::new(false),
+                last_tools_fingerprint: Arc::new(RwLock::new(None)),
+                apply_lock: Mutex::new(()),
             }),
         }
     }
@@ -3513,6 +3610,433 @@ mod tests {
             !recv_tick(&mut outer_rx, Duration::from_millis(150)).await,
             "no tick should reach outer subscriber after forwarder disabled"
         );
+    }
+
+    // --- apply_tokens readiness-change synthetic tick ---
+
+    fn make_token_set(access: &str) -> TokenSet {
+        TokenSet {
+            access_token: access.to_string(),
+            refresh_token: None,
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        }
+    }
+
+    /// Regression: when `apply_tokens` transitions the inner adapter from
+    /// `None` to `Some` (endpoint just became listable, e.g. after the OAuth
+    /// callback), a synthetic tick must reach the outer tools-changed
+    /// broadcast so the registry invalidates its stale merged catalog.
+    #[tokio::test]
+    async fn apply_tokens_none_to_some_emits_outer_tick() {
+        let (url, server) = spawn_minimal_mcp_server().await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+
+        adapter
+            .inner
+            .apply_tokens(make_token_set("test-access"))
+            .await;
+
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "None→Some inner readiness transition must emit a synthetic outer tick"
+        );
+        server.abort();
+    }
+
+    /// A routine Some→Some token refresh (inner adapter rebuilt, endpoint
+    /// stays listable) must NOT emit a synthetic tick — that would spam
+    /// clients with `notifications/tools/list_changed` on every refresh.
+    /// This variant pins the probe-failure path: the minimal server answers
+    /// `tools/list` without a `tools` field, so both fingerprint probes fail
+    /// and the swap must stay silent (a change is undetectable and the
+    /// registry's own refetch would fail too). The unchanged-tools no-tick
+    /// path is pinned by `apply_tokens_some_to_some_tool_change_emits_tick`.
+    #[tokio::test]
+    async fn apply_tokens_some_to_some_refresh_emits_no_tick() {
+        let (url, server) = spawn_minimal_mcp_server().await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+
+        // First apply: None→Some (tick expected, not asserted here).
+        adapter.inner.apply_tokens(make_token_set("first")).await;
+
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+        drain(&mut outer_rx).await;
+
+        // Second apply: Some→Some routine refresh.
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+
+        assert!(
+            !recv_tick(&mut outer_rx, Duration::from_millis(200)).await,
+            "routine Some→Some token refresh must not emit a synthetic tick"
+        );
+        server.abort();
+    }
+
+    /// Spawn an in-process MCP server whose `tools/list` response reflects
+    /// the current value of the shared `tool_name` — lets a test change the
+    /// upstream tool set between `apply_tokens` calls.
+    async fn spawn_mcp_server_with_mutable_tools(
+        tool_name: Arc<std::sync::RwLock<String>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::extract::State;
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handle(
+            State(tool_name): State<Arc<std::sync::RwLock<String>>>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            match method {
+                "initialize" => Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "serverInfo": {"name": "test-server", "version": "0.0.1"},
+                    },
+                })),
+                "tools/list" => {
+                    let name = tool_name.read().unwrap().clone();
+                    Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "tools": [{
+                                "name": name,
+                                "description": "a tool",
+                                "inputSchema": {"type": "object"},
+                            }],
+                        },
+                    }))
+                }
+                _ => Json(json!({"jsonrpc": "2.0", "id": id, "result": {}})),
+            }
+        }
+
+        let router = Router::new()
+            .route("/mcp", post(handle))
+            .with_state(tool_name);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}/mcp", addr.port()), handle)
+    }
+
+    /// PR #140 review follow-up: a Some→Some swap that actually changes the
+    /// tool set (e.g. an OAuth callback re-login under a different
+    /// account/scope) must emit a tick so the registry's caches don't go
+    /// stale, while an unchanged Some→Some swap stays silent.
+    #[tokio::test]
+    async fn apply_tokens_some_to_some_tool_change_emits_tick() {
+        let tool_name = Arc::new(std::sync::RwLock::new("alpha".to_string()));
+        let (url, server) = spawn_mcp_server_with_mutable_tools(tool_name.clone()).await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+
+        // None→Some: tick, and the fingerprint baseline is stored.
+        adapter.inner.apply_tokens(make_token_set("first")).await;
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "None→Some must tick"
+        );
+        drain(&mut outer_rx).await;
+
+        // Some→Some with an unchanged tool set: silent.
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        assert!(
+            !recv_tick(&mut outer_rx, Duration::from_millis(200)).await,
+            "unchanged Some→Some swap must not emit a tick"
+        );
+
+        // Some→Some with a changed tool set: tick.
+        *tool_name.write().unwrap() = "beta".to_string();
+        adapter.inner.apply_tokens(make_token_set("third")).await;
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "Some→Some swap with a changed tool set must emit a tick"
+        );
+        server.abort();
+    }
+
+    /// PR #140 review follow-up (round 2): a forwarded inner `tools_changed`
+    /// tick must invalidate the stored fingerprint. Sequence pinned here:
+    /// tool set A is probed (baseline = A), the inner notifies a change (the
+    /// registry's caches follow the drift, baseline must be cleared), then a
+    /// re-login reproduces A — without invalidation the A==A comparison
+    /// would suppress the tick and leave the registry's caches stale.
+    #[tokio::test]
+    async fn inner_tick_invalidates_fingerprint_so_relogin_to_same_tools_ticks() {
+        let tool_name = Arc::new(std::sync::RwLock::new("alpha".to_string()));
+        let (url, server) = spawn_mcp_server_with_mutable_tools(tool_name.clone()).await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+
+        // Baseline: apply with tool set A → fingerprint stored.
+        adapter.inner.apply_tokens(make_token_set("first")).await;
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "None→Some must tick"
+        );
+        assert!(
+            adapter.inner.last_tools_fingerprint.read().await.is_some(),
+            "baseline fingerprint must be stored after a successful probe"
+        );
+
+        // Simulate the inner adapter notifying a tool change (upstream
+        // drifted to B): bind the forwarder to a manual channel and tick it.
+        let (inner_tx, inner_rx) = broadcast::channel::<()>(16);
+        adapter.inner.swap_tools_forwarder(Some(inner_rx)).await;
+        inner_tx.send(()).expect("inner send");
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "forwarded inner tick must reach the outer broadcast"
+        );
+        assert!(
+            adapter.inner.last_tools_fingerprint.read().await.is_none(),
+            "forwarded inner tick must clear the fingerprint baseline"
+        );
+        drain(&mut outer_rx).await;
+
+        // Re-login reproducing the ORIGINAL tool set A: the baseline is
+        // unknown, so the Some→Some swap must tick even though the probed
+        // set equals the pre-drift baseline.
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "re-login after an inner tool change must tick even if the \
+             probed set matches the stale baseline"
+        );
+        server.abort();
+    }
+
+    /// When `apply_tokens` fails inner init while a previous inner adapter
+    /// existed (Some→None: endpoint just lost its tools), a synthetic tick
+    /// must fire so the registry drops the stale tools from the catalog.
+    #[tokio::test]
+    async fn apply_tokens_some_to_none_failure_emits_outer_tick() {
+        let (url, server) = spawn_minimal_mcp_server().await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+
+        // First apply succeeds: inner becomes Some.
+        adapter.inner.apply_tokens(make_token_set("first")).await;
+        assert!(adapter.inner.inner_adapter.read().await.is_some());
+
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+        drain(&mut outer_rx).await;
+
+        // Kill the upstream so the next inner init fails: Some→None.
+        server.abort();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        assert!(adapter.inner.inner_adapter.read().await.is_none());
+
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "Some→None inner readiness transition must emit a synthetic outer tick"
+        );
+    }
+
+    /// Spawn an in-process MCP server that also answers `tools/list` with a
+    /// single tool, so a registry-level test can observe the merged catalog
+    /// rebuild after `apply_tokens`.
+    async fn spawn_mcp_server_with_tools() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handle(Json(body): Json<Value>) -> Json<Value> {
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            match method {
+                "initialize" => Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "serverInfo": {"name": "test-server", "version": "0.0.1"},
+                    },
+                })),
+                "tools/list" => Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "tools": [{
+                            "name": "oauth_tool",
+                            "description": "a tool",
+                            "inputSchema": {"type": "object"},
+                        }],
+                    },
+                })),
+                _ => Json(json!({"jsonrpc": "2.0", "id": id, "result": {}})),
+            }
+        }
+
+        let router = Router::new().route("/mcp", post(handle));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}/mcp", addr.port()), handle)
+    }
+
+    /// Registry-level regression: after `apply_tokens` makes an OAuth
+    /// endpoint listable (None→Some), the registry's tools-changed listener
+    /// must bump `catalog_generation` and the merged catalog must rebuild
+    /// with the endpoint's tools — no restart required.
+    #[tokio::test]
+    async fn registry_rebuilds_merged_catalog_after_apply_tokens() {
+        use crate::registry::AdapterRegistry;
+
+        let (url, server) = spawn_mcp_server_with_tools().await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+        let inner = adapter.shared_inner();
+
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "test".into(),
+                Box::new(adapter),
+                "oauth".into(),
+                None,
+                Some("test".into()),
+            )
+            .await;
+
+        // Before tokens the inner adapter is None → empty merged catalog.
+        let catalog = registry.merged_catalog().await;
+        assert!(
+            catalog.is_empty(),
+            "expected empty catalog before apply_tokens, got {:?}",
+            catalog.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+
+        let gen_before = registry.catalog_generation();
+        inner.apply_tokens(make_token_set("test-access")).await;
+
+        // The synthetic tick reaches the registry listener asynchronously.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while registry.catalog_generation() <= gen_before && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            registry.catalog_generation() > gen_before,
+            "catalog generation must bump after apply_tokens readiness change"
+        );
+
+        // Merged catalog rebuild now sees the endpoint's tools (single
+        // active adapter → no prefix).
+        let catalog = registry.merged_catalog().await;
+        assert_eq!(
+            catalog.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["oauth_tool"],
+            "merged catalog must contain the endpoint's tools after apply_tokens"
+        );
+
+        server.abort();
+    }
+
+    /// Registry-level regression for the PR #140 review: a Some→Some
+    /// `apply_tokens` swap that changes the tool set (OAuth callback
+    /// re-login under a different account/scope) must reach the registry —
+    /// generation bump + merged catalog rebuilt with the new tools.
+    #[tokio::test]
+    async fn registry_rebuilds_merged_catalog_after_some_to_some_tool_change() {
+        use crate::registry::AdapterRegistry;
+
+        let tool_name = Arc::new(std::sync::RwLock::new("alpha".to_string()));
+        let (url, server) = spawn_mcp_server_with_mutable_tools(tool_name.clone()).await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+        let inner = adapter.shared_inner();
+
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "test".into(),
+                Box::new(adapter),
+                "oauth".into(),
+                None,
+                Some("test".into()),
+            )
+            .await;
+
+        // First apply: None→Some, catalog picks up "alpha".
+        let gen_before = inner_apply_and_wait(&registry, &inner, "first").await;
+        let catalog = registry.merged_catalog().await;
+        assert_eq!(
+            catalog.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["alpha"],
+            "merged catalog must contain the initial tool set"
+        );
+
+        // Re-login changes the upstream tool set; the Some→Some swap must
+        // tick so the registry rebuilds with "beta".
+        *tool_name.write().unwrap() = "beta".to_string();
+        inner.apply_tokens(make_token_set("second")).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while registry.catalog_generation() <= gen_before && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            registry.catalog_generation() > gen_before,
+            "catalog generation must bump after a Some→Some tool change"
+        );
+        let catalog = registry.merged_catalog().await;
+        assert_eq!(
+            catalog.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["beta"],
+            "merged catalog must reflect the changed tool set"
+        );
+
+        server.abort();
+    }
+
+    /// Apply tokens and wait for the registry's generation to settle past
+    /// the tick triggered by the apply; returns the settled generation.
+    async fn inner_apply_and_wait(
+        registry: &crate::registry::AdapterRegistry,
+        inner: &Arc<OAuthAdapterInner>,
+        token: &str,
+    ) -> u64 {
+        let gen_before = registry.catalog_generation();
+        inner.apply_tokens(make_token_set(token)).await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while registry.catalog_generation() <= gen_before && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        registry.catalog_generation()
     }
 
     // --- Refresh-time token endpoint discovery fallback tests ---

@@ -5469,6 +5469,7 @@ async fn list_idp_providers() -> impl IntoResponse {
 /// organization. Returns the discovered metadata (used to compose the SSO URL)
 /// or a ready-to-return `400` response. The SSRF guard inside discovery rejects
 /// internal/loopback hosts unless `allow_insecure` is set.
+#[allow(clippy::result_large_err)] // Err is a ready-to-return axum Response
 async fn validate_org_issuer(
     issuer: &str,
     allow_insecure: bool,
@@ -5490,6 +5491,7 @@ async fn validate_org_issuer(
 /// DCR when a registration endpoint exists), returning the resolved id and which
 /// path produced it. A `422 client_id_required` response is returned when the
 /// IdP supports neither CIMD nor DCR and no explicit `client_id` was supplied.
+#[allow(clippy::result_large_err)] // Err is a ready-to-return axum Response
 async fn resolve_org_client(
     org_client_id: Option<&str>,
     disc: &crate::oauth::discovery::DiscoveryResult,
