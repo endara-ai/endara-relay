@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use endara_relay::adapter::oauth::{OAuthAdapter, OAuthAdapterConfig};
 use endara_relay::adapter::stdio::{StdioAdapter, StdioConfig};
 use endara_relay::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use endara_relay::config::ProfileConfig;
@@ -8,6 +9,7 @@ use endara_relay::registry::AdapterRegistry;
 use endara_relay::server::{
     build_router, start_server, AppState, MetaToolSchemas, SessionIdentityStore,
 };
+use endara_relay::token_manager::{TokenManager, TokenSet};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -471,5 +473,213 @@ async fn profile_tools_list_excludes_out_of_profile_tools() {
         names.len(),
         3,
         "expected exactly gmail__send_email + 2 meta-tools, got: {names:?}"
+    );
+}
+
+/// Spawn an in-process HTTP MCP upstream that answers `initialize` and serves
+/// one tool (`craft_tool`) on `tools/list`. Stands in for the OAuth-protected
+/// server that only becomes reachable once tokens are applied.
+async fn spawn_oauth_upstream() -> (String, tokio::task::JoinHandle<()>) {
+    use axum::{routing::post, Json, Router};
+
+    async fn handle(Json(body): Json<Value>) -> Json<Value> {
+        let id = body.get("id").cloned().unwrap_or(Value::Null);
+        let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        match method {
+            "initialize" => Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {},
+                    "serverInfo": {"name": "oauth-upstream", "version": "0.0.1"},
+                },
+            })),
+            "tools/list" => Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "tools": [{
+                        "name": "craft_tool",
+                        "description": "a tool behind OAuth",
+                        "inputSchema": {"type": "object"},
+                    }],
+                },
+            })),
+            _ => Json(json!({"jsonrpc": "2.0", "id": id, "result": {}})),
+        }
+    }
+
+    let router = Router::new().route("/mcp", post(handle));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, router).await.ok();
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    (format!("http://127.0.0.1:{}/mcp", addr.port()), handle)
+}
+
+/// POST `tools/list` to the relay's native MCP route and return the tool names.
+async fn fetch_tool_names(client: &reqwest::Client, addr: SocketAddr) -> Vec<String> {
+    let resp = client
+        .post(format!("http://{}/mcp/tools/list", addr))
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "method": "tools/list",
+            "id": 1
+        }))
+        .send()
+        .await
+        .expect("tools/list request failed");
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+    body["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// End-to-end regression for the reported symptom: an OAuth endpoint whose
+/// inner adapter is not ready (`list_tools` → `Ok(vec![])`) leaves its tools
+/// out of the merged catalog, and the catalog is then cached by the first
+/// `tools/list`. Completing the login (`apply_tokens`) must emit a
+/// tools-changed tick so the registry invalidates the stale cache and fans a
+/// relay-wide `tools_changed` tick out for the endpoint (the client
+/// `list_changed` path) — the next `tools/list` must include the endpoint's
+/// tools without a relay restart.
+///
+/// Fails when the readiness-change tick in `apply_tokens_inner` is reverted:
+/// the relay-wide broadcast never fires and the cached catalog stays empty
+/// for the endpoint.
+#[tokio::test]
+async fn oauth_login_heals_stale_empty_tools_list() {
+    let (upstream_url, _upstream) = spawn_oauth_upstream().await;
+
+    // OAuth adapter with no persisted tokens: initialize() leaves it in
+    // NeedsLogin with no inner transport, so list_tools returns Ok(vec![]).
+    let token_dir = tempfile::tempdir().expect("tempdir");
+    let token_manager = Arc::new(TokenManager::new(token_dir.path().to_path_buf()));
+    let mut oauth = OAuthAdapter::new(
+        OAuthAdapterConfig {
+            endpoint_name: "craft".to_string(),
+            url: upstream_url,
+            token_endpoint_url: "http://127.0.0.1:1/token".to_string(),
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            heartbeat_interval_secs: 30,
+            probe_timeout_secs: 10,
+            probe_failure_threshold: 3,
+            server_type_override: None,
+            allow_insecure_oauth: false,
+            ema: None,
+        },
+        token_manager,
+    );
+    oauth.initialize().await.expect("oauth initialize failed");
+    let oauth_inner = oauth.shared_inner();
+
+    let registry = AdapterRegistry::new();
+    registry
+        .register(
+            "craft".into(),
+            Box::new(oauth),
+            "oauth".into(),
+            None,
+            Some("craft".into()),
+        )
+        .await;
+    registry
+        .register(
+            "other".into(),
+            Box::new(NamedToolAdapter { tool: "probe" }),
+            "stdio".into(),
+            None,
+            Some("other".into()),
+        )
+        .await;
+
+    let registry_arc = Arc::new(registry.clone());
+    let state = AppState {
+        registry: registry.clone(),
+        js_execution_mode: Arc::new(AtomicBool::new(false)),
+        meta_tool_handler: Arc::new(MetaToolHandler::new(registry_arc, Duration::from_secs(30))),
+        profile_registry: Arc::new(ProfileRegistry::new(registry.clone())),
+        oauth_flow_manager: None,
+        token_manager: None,
+        oauth_adapter_inners: None,
+        setup_manager: None,
+        started_at: std::time::Instant::now(),
+        toon_enabled: false,
+        session_identities: Arc::new(std::sync::Mutex::new(SessionIdentityStore::default())),
+        meta_tool_schemas: MetaToolSchemas::new(),
+    };
+    let router = build_router(state);
+    let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
+    let (addr, _handle) = start_server(router, addr)
+        .await
+        .expect("server start failed");
+    let client = reqwest::Client::new();
+
+    // Step 1: tools/list before login — the other endpoint's tool is served,
+    // the OAuth endpoint contributes nothing, and the merged catalog is now
+    // cached in this stale-empty state.
+    let names = fetch_tool_names(&client, addr).await;
+    assert!(
+        names.iter().any(|n| n == "other__probe"),
+        "other endpoint's tool missing before login: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.starts_with("craft__")),
+        "OAuth endpoint must contribute no tools before login: {names:?}"
+    );
+
+    // Step 2: subscribe to the relay-wide tools-changed broadcast BEFORE the
+    // login completes so the tick cannot be missed.
+    let mut tools_changed_rx = registry.subscribe_tools_changed();
+
+    // Step 3: OAuth login completes — tokens applied, inner adapter built
+    // against the upstream (None→Some readiness transition).
+    oauth_inner
+        .apply_tokens(TokenSet {
+            access_token: "test-access".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        })
+        .await;
+
+    // Step 4: the relay-wide broadcast must fire for the endpoint — this is
+    // what drives `notifications/tools/list_changed` to connected clients.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(remaining, tools_changed_rx.recv()).await {
+            Ok(Ok(endpoint)) if endpoint == "craft" => break,
+            Ok(Ok(_)) => continue,
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
+            Ok(Err(e)) => panic!("tools_changed broadcast closed unexpectedly: {e}"),
+            Err(_) => panic!(
+                "relay-wide tools_changed broadcast never fired for the OAuth \
+                 endpoint after apply_tokens (stale-empty catalog would never heal)"
+            ),
+        }
+    }
+
+    // Step 5: the registry invalidates its caches before fanning the tick
+    // out, so the next tools/list must rebuild the catalog and include the
+    // OAuth endpoint's tools.
+    let names = fetch_tool_names(&client, addr).await;
+    assert!(
+        names.iter().any(|n| n == "craft__craft_tool"),
+        "OAuth endpoint's tool missing after login healed the catalog: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "other__probe"),
+        "other endpoint's tool disappeared after login: {names:?}"
     );
 }

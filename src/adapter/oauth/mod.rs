@@ -1068,12 +1068,25 @@ impl OAuthAdapterInner {
                 // `health() == Healthy` is guaranteed to also see
                 // `inner_adapter == Some(_)`.
                 // Bind a forwarder against the new inner's tools-changed
-                // receiver (if any) before publishing it. No synthetic tick
-                // is emitted on swap — real ticks come from inner reconnects.
+                // receiver (if any) before publishing it. A synthetic tick is
+                // emitted on the outer broadcast only when the inner's
+                // readiness changed (None→Some here; Some→None on the failure
+                // branch below) so the registry invalidates its stale merged
+                // catalog the moment the endpoint becomes listable — routine
+                // Some→Some token refreshes stay silent to avoid spamming
+                // clients with `list_changed` on every refresh.
                 let rx = adapter.subscribe_tools_changed();
-                *self.inner_adapter.write().await = Some(adapter);
+                let was_listable = {
+                    let mut guard = self.inner_adapter.write().await;
+                    let was = guard.is_some();
+                    *guard = Some(adapter);
+                    was
+                };
                 *self.inner_health.write().await = HealthStatus::Healthy;
                 self.swap_tools_forwarder(rx).await;
+                if !was_listable {
+                    let _ = self.outer_tools_changed_tx.send(());
+                }
                 self.transition_to(
                     OAuthState::Authenticated,
                     "tokens applied, inner adapter ready",
@@ -1083,8 +1096,13 @@ impl OAuthAdapterInner {
             Err(e) => {
                 // Capture inner adapter's health before clearing it
                 *self.inner_health.write().await = adapter.health();
-                *self.inner_adapter.write().await = None;
+                let was_listable = self.inner_adapter.write().await.take().is_some();
                 self.swap_tools_forwarder(None).await;
+                // Some→None: the endpoint just lost its tools — tick so the
+                // registry drops them from the merged catalog.
+                if was_listable {
+                    let _ = self.outer_tools_changed_tx.send(());
+                }
                 self.transition_to(
                     OAuthState::ConnectionFailed,
                     &format!("inner adapter init failed: {}", e),
@@ -3513,6 +3531,204 @@ mod tests {
             !recv_tick(&mut outer_rx, Duration::from_millis(150)).await,
             "no tick should reach outer subscriber after forwarder disabled"
         );
+    }
+
+    // --- apply_tokens readiness-change synthetic tick ---
+
+    fn make_token_set(access: &str) -> TokenSet {
+        TokenSet {
+            access_token: access.to_string(),
+            refresh_token: None,
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        }
+    }
+
+    /// Regression: when `apply_tokens` transitions the inner adapter from
+    /// `None` to `Some` (endpoint just became listable, e.g. after the OAuth
+    /// callback), a synthetic tick must reach the outer tools-changed
+    /// broadcast so the registry invalidates its stale merged catalog.
+    #[tokio::test]
+    async fn apply_tokens_none_to_some_emits_outer_tick() {
+        let (url, server) = spawn_minimal_mcp_server().await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+
+        adapter.inner.apply_tokens(make_token_set("test-access")).await;
+
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "None→Some inner readiness transition must emit a synthetic outer tick"
+        );
+        server.abort();
+    }
+
+    /// A routine Some→Some token refresh (inner adapter rebuilt, endpoint
+    /// stays listable) must NOT emit a synthetic tick — that would spam
+    /// clients with `notifications/tools/list_changed` on every refresh.
+    #[tokio::test]
+    async fn apply_tokens_some_to_some_refresh_emits_no_tick() {
+        let (url, server) = spawn_minimal_mcp_server().await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+
+        // First apply: None→Some (tick expected, not asserted here).
+        adapter.inner.apply_tokens(make_token_set("first")).await;
+
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+        drain(&mut outer_rx).await;
+
+        // Second apply: Some→Some routine refresh.
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+
+        assert!(
+            !recv_tick(&mut outer_rx, Duration::from_millis(200)).await,
+            "routine Some→Some token refresh must not emit a synthetic tick"
+        );
+        server.abort();
+    }
+
+    /// When `apply_tokens` fails inner init while a previous inner adapter
+    /// existed (Some→None: endpoint just lost its tools), a synthetic tick
+    /// must fire so the registry drops the stale tools from the catalog.
+    #[tokio::test]
+    async fn apply_tokens_some_to_none_failure_emits_outer_tick() {
+        let (url, server) = spawn_minimal_mcp_server().await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+
+        // First apply succeeds: inner becomes Some.
+        adapter.inner.apply_tokens(make_token_set("first")).await;
+        assert!(adapter.inner.inner_adapter.read().await.is_some());
+
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+        drain(&mut outer_rx).await;
+
+        // Kill the upstream so the next inner init fails: Some→None.
+        server.abort();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        assert!(adapter.inner.inner_adapter.read().await.is_none());
+
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "Some→None inner readiness transition must emit a synthetic outer tick"
+        );
+    }
+
+    /// Spawn an in-process MCP server that also answers `tools/list` with a
+    /// single tool, so a registry-level test can observe the merged catalog
+    /// rebuild after `apply_tokens`.
+    async fn spawn_mcp_server_with_tools() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handle(Json(body): Json<Value>) -> Json<Value> {
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            match method {
+                "initialize" => Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "serverInfo": {"name": "test-server", "version": "0.0.1"},
+                    },
+                })),
+                "tools/list" => Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "tools": [{
+                            "name": "oauth_tool",
+                            "description": "a tool",
+                            "inputSchema": {"type": "object"},
+                        }],
+                    },
+                })),
+                _ => Json(json!({"jsonrpc": "2.0", "id": id, "result": {}})),
+            }
+        }
+
+        let router = Router::new().route("/mcp", post(handle));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}/mcp", addr.port()), handle)
+    }
+
+    /// Registry-level regression: after `apply_tokens` makes an OAuth
+    /// endpoint listable (None→Some), the registry's tools-changed listener
+    /// must bump `catalog_generation` and the merged catalog must rebuild
+    /// with the endpoint's tools — no restart required.
+    #[tokio::test]
+    async fn registry_rebuilds_merged_catalog_after_apply_tokens() {
+        use crate::registry::AdapterRegistry;
+
+        let (url, server) = spawn_mcp_server_with_tools().await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+        let inner = adapter.shared_inner();
+
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "test".into(),
+                Box::new(adapter),
+                "oauth".into(),
+                None,
+                Some("test".into()),
+            )
+            .await;
+
+        // Before tokens the inner adapter is None → empty merged catalog.
+        let catalog = registry.merged_catalog().await;
+        assert!(
+            catalog.is_empty(),
+            "expected empty catalog before apply_tokens, got {:?}",
+            catalog.iter().map(|t| &t.name).collect::<Vec<_>>()
+        );
+
+        let gen_before = registry.catalog_generation();
+        inner.apply_tokens(make_token_set("test-access")).await;
+
+        // The synthetic tick reaches the registry listener asynchronously.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while registry.catalog_generation() <= gen_before
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            registry.catalog_generation() > gen_before,
+            "catalog generation must bump after apply_tokens readiness change"
+        );
+
+        // Merged catalog rebuild now sees the endpoint's tools (single
+        // active adapter → no prefix).
+        let catalog = registry.merged_catalog().await;
+        assert_eq!(
+            catalog.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            vec!["oauth_tool"],
+            "merged catalog must contain the endpoint's tools after apply_tokens"
+        );
+
+        server.abort();
     }
 
     // --- Refresh-time token endpoint discovery fallback tests ---
