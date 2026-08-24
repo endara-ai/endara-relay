@@ -1289,6 +1289,15 @@ async fn oauth_start_inner(
 
     let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", state.relay_port);
 
+    // Sample the endpoint's reset generation BEFORE the network-bound
+    // discovery/DCR work below. A "Reset authorization" that lands while
+    // this start is mid-discovery cannot invalidate it (no pending flow
+    // exists yet), so the flow registration at Step 3 re-checks this value
+    // and refuses the insert if a reset bumped it — otherwise this start
+    // would hand out a post-reset-valid authorize URL WITHOUT the reset's
+    // `prompt=consent`, silently reusing the old provider grant.
+    let start_generation = flow_mgr.generation(&name).await;
+
     // ── Step 1: Resolve OAuth server metadata ──────────────────────────
     let (
         authorization_endpoint,
@@ -1761,8 +1770,9 @@ async fn oauth_start_inner(
     let pkce = PkceChallenge::generate();
     let code_challenge = pkce.code_challenge.clone();
 
-    let state_param = flow_mgr
-        .start_flow(
+    let Some(state_param) = flow_mgr
+        .start_flow_if_current(
+            start_generation,
             &name,
             &token_endpoint,
             &client_id,
@@ -1772,7 +1782,19 @@ async fn oauth_start_inner(
             issuer.as_deref(),
             iss_supported,
         )
-        .await;
+        .await
+    else {
+        // A reset landed while this start was mid-discovery: this start
+        // predates the reset, so its URL must not be handed out (it lacks
+        // the reset's forced consent). The reset's own follow-up start is
+        // the authoritative one.
+        return error_response(
+            StatusCode::CONFLICT,
+            "superseded_by_reset",
+            Some("Authorization was reset while this start was in progress; use the reset's authorize URL or retry"),
+        )
+        .into_response();
+    };
 
     // ── Step 4: Build authorization URL ────────────────────────────────
     let mut authorize_url = format!(
@@ -11407,6 +11429,68 @@ command = "echo"
             !authorize_url.contains("prompt=consent"),
             "regular start must not force consent, got: {}",
             authorize_url
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_start_superseded_by_reset_during_discovery() {
+        // The discovery-phase race Copilot flagged: a /oauth/start that began
+        // BEFORE a reset is not pending yet while it does discovery, so
+        // invalidate_endpoint cannot remove it. It must not later register a
+        // flow under the bumped generation and hand out an authorize URL
+        // without the reset's prompt=consent. The start must fail with 409
+        // superseded_by_reset and leave no pending flow behind.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let gate_srv = gate.clone();
+        let well_known = move |headers: axum::http::HeaderMap| {
+            let gate = gate_srv.clone();
+            async move {
+                // Block discovery until the test has performed the reset.
+                gate.notified().await;
+                let base = mock_issuer(&headers);
+                Json(serde_json::json!({
+                    "issuer": base,
+                    "authorization_endpoint": format!("{}/authorize", base),
+                    "token_endpoint": format!("{}/token", base),
+                    "code_challenge_methods_supported": ["S256"],
+                }))
+            }
+        };
+        let router =
+            Router::new().route("/.well-known/oauth-authorization-server", get(well_known));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let (state, flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        let app = management_routes(state);
+
+        // Start the pre-reset /oauth/start; it samples generation 0 at entry
+        // and then parks inside discovery on the gate.
+        let start_task = tokio::spawn(async move {
+            app.oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // The reset lands mid-discovery: bump the generation (there is no
+        // pending flow yet, so nothing is removed), then release discovery.
+        assert_eq!(flow_mgr.invalidate_endpoint("ep1").await, 0);
+        gate.notify_waiters();
+
+        let resp = start_task.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "superseded_by_reset");
+
+        // No flow was registered for the superseded start.
+        assert_eq!(
+            flow_mgr.invalidate_endpoint("ep1").await,
+            0,
+            "superseded start must not leave a pending flow"
         );
     }
 

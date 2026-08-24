@@ -137,8 +137,11 @@ pub struct OAuthFlowManager {
     /// Per-endpoint commit locks serializing a callback's token commit
     /// (post-exchange generation check + token save + adapter apply)
     /// against a "Reset authorization" (generation bump + disconnect).
-    /// See [`commit_lock`](Self::commit_lock).
-    commit_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Values are `Weak` so an entry lives only while a caller still holds
+    /// the `Arc` — dead entries are pruned on each acquisition, keeping the
+    /// map bounded even though setup callbacks use unique `setup:{uuid}`
+    /// keys. See [`commit_lock`](Self::commit_lock).
+    commit_locks: tokio::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl OAuthFlowManager {
@@ -190,6 +193,58 @@ impl OAuthFlowManager {
         self.pending.write().await.insert(state.clone(), flow);
         drop(generations);
         state
+    }
+
+    /// Like [`start_flow`](Self::start_flow), but refuses the insert when the
+    /// endpoint's reset generation no longer equals `expected_generation`
+    /// (sampled by the caller via [`generation`](Self::generation) at
+    /// auth-start entry, BEFORE any network-bound discovery/DCR work).
+    ///
+    /// This closes the discovery-phase race: a `/oauth/start` that began
+    /// before a reset has no pending flow yet, so `invalidate_endpoint`
+    /// cannot remove it — without this check it would later insert a flow
+    /// stamped with the already-bumped generation and hand out an authorize
+    /// URL lacking the reset's `prompt=consent`, silently reusing the old
+    /// provider grant. Returns `None` when superseded; the caller must fail
+    /// the start rather than hand out a pre-reset URL.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_flow_if_current(
+        &self,
+        expected_generation: u64,
+        endpoint_name: &str,
+        token_endpoint: &str,
+        client_id: &str,
+        client_secret: Option<&str>,
+        pkce: PkceChallenge,
+        redirect_uri: &str,
+        issuer: Option<&str>,
+        iss_parameter_supported: bool,
+    ) -> Option<String> {
+        let state = generate_state();
+        // Same lock discipline as `start_flow`: hold the generations read
+        // lock through the pending insert so the check and the insert are
+        // atomic with respect to `invalidate_endpoint`.
+        let generations = self.generations.read().await;
+        if *generations.get(endpoint_name).unwrap_or(&0) != expected_generation {
+            return None;
+        }
+        let flow = PendingFlow {
+            endpoint_name: endpoint_name.to_string(),
+            code_verifier: pkce.code_verifier,
+            token_endpoint: token_endpoint.to_string(),
+            client_id: client_id.to_string(),
+            client_secret: client_secret.map(|s| s.to_string()),
+            redirect_uri: redirect_uri.to_string(),
+            issuer: issuer.map(|s| s.to_string()),
+            iss_parameter_supported,
+            idp_issuer: None,
+            idp_credential_key: None,
+            created_at: Instant::now(),
+            generation: expected_generation,
+        };
+        self.pending.write().await.insert(state.clone(), flow);
+        drop(generations);
+        Some(state)
     }
 
     /// Register a pending **EMA IdP SSO** flow (END-18 Step 1). Behaves exactly
@@ -255,6 +310,13 @@ impl OAuthFlowManager {
     }
 
     /// The endpoint's current reset generation (0 until first invalidation).
+    /// Sample this at auth-start entry (before discovery/DCR network work)
+    /// and pass it to [`start_flow_if_current`](Self::start_flow_if_current)
+    /// so a reset landing mid-discovery supersedes the start.
+    pub async fn generation(&self, endpoint_name: &str) -> u64 {
+        self.current_generation(endpoint_name).await
+    }
+
     async fn current_generation(&self, endpoint_name: &str) -> u64 {
         *self
             .generations
@@ -299,13 +361,30 @@ impl OAuthFlowManager {
     /// commit finishes — with the lock, either the commit completes first
     /// (and the reset then wipes the freshly saved tokens) or the reset
     /// completes first (and the callback's check sees the stale generation).
+    ///
+    /// The map stores `Weak` references and prunes dead entries on every
+    /// acquisition, so keys whose lock is no longer held anywhere (e.g. the
+    /// unique `setup:{uuid}` names from completed setup callbacks) do not
+    /// accumulate for the process lifetime. Concurrent callers for the same
+    /// key always get the same mutex: the upgrade-or-replace happens under
+    /// the outer map lock.
     pub async fn commit_lock(&self, endpoint_name: &str) -> Arc<tokio::sync::Mutex<()>> {
-        self.commit_locks
-            .lock()
-            .await
-            .entry(endpoint_name.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        let mut locks = self.commit_locks.lock().await;
+        locks.retain(|_, weak| weak.strong_count() > 0);
+        match locks.get(endpoint_name).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(endpoint_name.to_string(), Arc::downgrade(&lock));
+                lock
+            }
+        }
+    }
+
+    /// Test-only: number of live entries in the commit-lock map.
+    #[cfg(test)]
+    pub(crate) async fn commit_lock_count(&self) -> usize {
+        self.commit_locks.lock().await.len()
     }
 
     /// Test-only: re-insert a flow under a chosen state key, preserving its
@@ -844,6 +923,72 @@ mod tests {
         let state2 = start_test_flow(&mgr, "ep").await;
         let flow2 = mgr.consume_flow(&state2).await.unwrap();
         assert!(mgr.is_current(&flow2).await);
+    }
+
+    #[tokio::test]
+    async fn start_flow_if_current_rejects_when_generation_bumped() {
+        // The discovery-phase race: an auth-start samples the generation at
+        // entry, a reset lands mid-discovery, and the deferred flow insert
+        // must be refused — otherwise the start would register a flow under
+        // the NEW generation whose authorize URL lacks prompt=consent.
+        let mgr = OAuthFlowManager::new();
+        let g = mgr.generation("ep").await;
+        mgr.invalidate_endpoint("ep").await;
+
+        let pkce = PkceChallenge::generate();
+        let refused = mgr
+            .start_flow_if_current(
+                g,
+                "ep",
+                "https://auth.example.com/token",
+                "cid",
+                None,
+                pkce,
+                "http://localhost/cb",
+                None,
+                false,
+            )
+            .await;
+        assert!(refused.is_none(), "pre-reset start must be superseded");
+
+        // Sampling after the bump succeeds and the flow is current.
+        let g2 = mgr.generation("ep").await;
+        let pkce = PkceChallenge::generate();
+        let state = mgr
+            .start_flow_if_current(
+                g2,
+                "ep",
+                "https://auth.example.com/token",
+                "cid",
+                None,
+                pkce,
+                "http://localhost/cb",
+                None,
+                false,
+            )
+            .await
+            .expect("start sampled after the reset must succeed");
+        let flow = mgr.consume_flow(&state).await.unwrap();
+        assert!(mgr.is_current(&flow).await);
+    }
+
+    #[tokio::test]
+    async fn commit_lock_map_prunes_released_entries() {
+        // Unique setup:{uuid} keys must not accumulate forever: once no
+        // caller holds a lock's Arc, the entry is pruned on the next
+        // acquisition.
+        let mgr = OAuthFlowManager::new();
+        for i in 0..100 {
+            let lock = mgr.commit_lock(&format!("setup:{i}")).await;
+            let _guard = lock.lock().await;
+        }
+        // All 100 Arcs were dropped; acquiring a new key prunes them.
+        let _keep = mgr.commit_lock("ep").await;
+        assert_eq!(mgr.commit_lock_count().await, 1);
+
+        // Same key while held returns the SAME mutex (not a replacement).
+        let again = mgr.commit_lock("ep").await;
+        assert!(Arc::ptr_eq(&_keep, &again));
     }
 
     #[test]
