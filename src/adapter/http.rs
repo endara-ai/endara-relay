@@ -2414,8 +2414,12 @@ mod tests {
         );
         assert!(text.to_lowercase().contains("sign-in"));
         // The raw upstream 401 / WWW-Authenticate challenge is never leaked.
-        assert!(!text.contains("401"));
-        assert!(!text.contains("WWW-Authenticate"));
+        // Check only the prose before the URL: the authorize URL itself
+        // legitimately contains arbitrary digits (ephemeral fixture port,
+        // state, code_challenge) that can spuriously contain "401".
+        let prose = text.split("\n\n").next().expect("prose before the URL");
+        assert!(!prose.contains("401"));
+        assert!(!prose.contains("WWW-Authenticate"));
 
         // State machine advanced and the URL is also stored on the interceptor.
         assert_eq!(
