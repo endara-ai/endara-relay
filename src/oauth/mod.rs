@@ -255,6 +255,7 @@ pub enum SetupSessionStatus {
 
 /// A transient OAuth setup session that does NOT write to config.toml until
 /// explicitly committed. Created by `POST /api/oauth/setup`.
+#[derive(Clone)]
 pub struct OAuthSetupSession {
     /// Display name for the endpoint.
     pub name: String,
@@ -313,7 +314,14 @@ impl OAuthSetupManager {
         }
     }
 
-    /// Create a new setup session. Returns the session ID.
+    /// Create a new setup session. Returns the session ID, or `None` when
+    /// another live session already holds `name`.
+    ///
+    /// The name reservation is checked and taken atomically under the
+    /// sessions write lock, so two concurrent same-name setup requests can
+    /// never both proceed — without it, the loser's setup-time DCR save
+    /// could overwrite the winner's validated credentials between commit's
+    /// store check and its config write.
     pub async fn create_session(
         &self,
         name: String,
@@ -321,7 +329,12 @@ impl OAuthSetupManager {
         scopes: Option<String>,
         tool_prefix: Option<String>,
         server_type_override: Option<String>,
-    ) -> Uuid {
+    ) -> Option<Uuid> {
+        let mut sessions = self.sessions.write().await;
+        sessions.retain(|_, s| s.created_at.elapsed() < SETUP_SESSION_MAX_AGE);
+        if sessions.values().any(|s| s.name == name) {
+            return None;
+        }
         let id = Uuid::new_v4();
         let session = OAuthSetupSession {
             name,
@@ -341,8 +354,8 @@ impl OAuthSetupManager {
             status: SetupSessionStatus::AwaitingCredentials,
             created_at: Instant::now(),
         };
-        self.sessions.write().await.insert(id, session);
-        id
+        sessions.insert(id, session);
+        Some(id)
     }
 
     /// Get mutable access to a session by ID.
@@ -593,7 +606,7 @@ mod tests {
                 Some("test".into()),
                 None,
             )
-            .await;
+            .await.unwrap();
 
         let data = mgr
             .get_session(&id, |s| {
@@ -624,11 +637,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setup_manager_rejects_duplicate_live_name() {
+        let mgr = OAuthSetupManager::new();
+        let first = mgr
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
+            .await;
+        assert!(first.is_some());
+
+        // Same name while the first session is live → reservation rejects.
+        let second = mgr
+            .create_session("ep".into(), "https://y.com".into(), None, None, None)
+            .await;
+        assert!(second.is_none());
+
+        // A different name is unaffected.
+        assert!(mgr
+            .create_session("other".into(), "https://y.com".into(), None, None, None)
+            .await
+            .is_some());
+
+        // Removing the first session frees the name.
+        mgr.remove_session(&first.unwrap()).await;
+        assert!(mgr
+            .create_session("ep".into(), "https://y.com".into(), None, None, None)
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn setup_manager_expired_session_does_not_hold_name() {
+        let mgr = OAuthSetupManager::new();
+        let id = mgr
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
+            .await
+            .unwrap();
+
+        // Manually expire the session
+        {
+            let mut sessions = mgr.sessions.write().await;
+            if let Some(s) = sessions.get_mut(&id) {
+                s.created_at = Instant::now() - Duration::from_secs(700);
+            }
+        }
+
+        // The expired session no longer reserves the name.
+        assert!(mgr
+            .create_session("ep".into(), "https://y.com".into(), None, None, None)
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn setup_manager_remove_session() {
         let mgr = OAuthSetupManager::new();
         let id = mgr
             .create_session("ep".into(), "https://x.com".into(), None, None, None)
-            .await;
+            .await.unwrap();
 
         let removed = mgr.remove_session(&id).await;
         assert!(removed.is_some());
@@ -643,7 +707,7 @@ mod tests {
         let mgr = OAuthSetupManager::new();
         let id = mgr
             .create_session("ep".into(), "https://x.com".into(), None, None, None)
-            .await;
+            .await.unwrap();
 
         let tokens = crate::token_manager::TokenSet {
             access_token: "access-tok".into(),
@@ -683,7 +747,7 @@ mod tests {
         let mgr = OAuthSetupManager::new();
         let id = mgr
             .create_session("ep".into(), "https://x.com".into(), None, None, None)
-            .await;
+            .await.unwrap();
 
         // Manually expire the session
         {
@@ -705,10 +769,10 @@ mod tests {
         let mgr = OAuthSetupManager::new();
         let fresh_id = mgr
             .create_session("fresh".into(), "https://a.com".into(), None, None, None)
-            .await;
+            .await.unwrap();
         let stale_id = mgr
             .create_session("stale".into(), "https://b.com".into(), None, None, None)
-            .await;
+            .await.unwrap();
 
         // Make one session stale
         {
@@ -731,7 +795,7 @@ mod tests {
         let mgr = OAuthSetupManager::new();
         let id = mgr
             .create_session("ep".into(), "https://x.com".into(), None, None, None)
-            .await;
+            .await.unwrap();
 
         mgr.get_session_mut(&id, |s| {
             s.client_id = Some("my-client".into());

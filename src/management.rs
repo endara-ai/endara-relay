@@ -2912,7 +2912,7 @@ async fn oauth_setup(
     };
 
     let scopes_str = body.scopes.as_ref().map(|s| s.join(" "));
-    let session_id = setup_mgr
+    let Some(session_id) = setup_mgr
         .create_session(
             body.name.clone(),
             body.url.clone(),
@@ -2920,7 +2920,24 @@ async fn oauth_setup(
             body.tool_prefix.clone(),
             body.server_type_override.clone(),
         )
-        .await;
+        .await
+    else {
+        // The name is reserved by another live setup session. Rejecting here
+        // (atomically, under the session-map lock) prevents two same-name
+        // setups from racing: the loser's setup-time DCR save could otherwise
+        // overwrite the winner's validated record between the commit-time
+        // store check and the config write.
+        return error_response(
+            StatusCode::CONFLICT,
+            "setup_in_progress",
+            Some(&format!(
+                "Another setup session for '{}' is already in progress. \
+                 Commit or cancel it first, or wait for it to expire.",
+                body.name
+            )),
+        )
+        .into_response();
+    };
 
     let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", state.relay_port);
 
@@ -3367,15 +3384,17 @@ async fn oauth_setup_commit(
         .into_response();
     };
 
-    // Take the session out — it's consumed on commit
-    let Some(session) = setup_mgr.remove_session(&session_id).await else {
+    // Snapshot the session but leave it in the manager until the commit
+    // succeeds: while it lives there its name reservation (enforced by
+    // `create_session`) keeps a concurrent same-name setup from starting and
+    // overwriting the DCR record validated below before our config write
+    // lands. Failed commits leave the session intact for a retry or cancel.
+    let Some(session) = setup_mgr.get_session(&session_id, |s| s.clone()).await else {
         return error_response(StatusCode::NOT_FOUND, "session not found or expired", None)
             .into_response();
     };
 
     if session.status != crate::oauth::SetupSessionStatus::Authorized {
-        // Put it back
-        setup_mgr.get_session_mut(&session_id, |_| {}).await;
         return error_response(
             StatusCode::CONFLICT,
             "session_not_authorized",
@@ -3585,6 +3604,10 @@ async fn oauth_setup_commit(
         )
         .into_response();
     }
+
+    // Commit succeeded — consume the session (releasing its name
+    // reservation; the committed config entry now owns the name).
+    setup_mgr.remove_session(&session_id).await;
 
     // Persist the token via TokenManager so it survives restarts
     if let (Some(ref tm), Some(tokens)) = (&state.token_manager, session.tokens) {
@@ -8860,7 +8883,7 @@ command = "echo"
         let setup_mgr = state.setup_manager.as_ref().unwrap();
         let session_id = setup_mgr
             .create_session("ep".into(), "https://x.com".into(), None, None, None)
-            .await;
+            .await.unwrap();
 
         let app = management_routes(state);
         let resp = app
@@ -8882,7 +8905,7 @@ command = "echo"
         let setup_mgr = state.setup_manager.as_ref().unwrap();
         let session_id = setup_mgr
             .create_session("ep".into(), "https://x.com".into(), None, None, None)
-            .await;
+            .await.unwrap();
 
         // First cancel
         setup_mgr.remove_session(&session_id).await;
@@ -8928,7 +8951,7 @@ command = "echo"
         let setup_mgr = state.setup_manager.as_ref().unwrap();
         let session_id = setup_mgr
             .create_session("ep".into(), "https://x.com".into(), None, None, None)
-            .await;
+            .await.unwrap();
 
         // Session is in AwaitingCredentials status (not Authorized)
         let app = management_routes(state);
@@ -8951,7 +8974,7 @@ command = "echo"
         let setup_mgr = state.setup_manager.as_ref().unwrap();
         let session_id = setup_mgr
             .create_session("ep".into(), "https://x.com".into(), None, None, None)
-            .await;
+            .await.unwrap();
 
         // Cancel the session
         setup_mgr.remove_session(&session_id).await;
@@ -8981,7 +9004,7 @@ command = "echo"
                 None,
                 None,
             )
-            .await;
+            .await.unwrap();
 
         let app = management_routes(state);
         let resp = app
@@ -9029,7 +9052,7 @@ command = "echo"
         let setup_mgr = state.setup_manager.as_ref().unwrap();
         let session_id = setup_mgr
             .create_session("ep".into(), "https://x.com".into(), None, None, None)
-            .await;
+            .await.unwrap();
         // Set auth/token endpoints so credential submission can proceed
         setup_mgr
             .get_session_mut(&session_id, |s| {
@@ -9079,7 +9102,7 @@ command = "echo"
                 Some("newep".into()),
                 None,
             )
-            .await;
+            .await.unwrap();
 
         // Set up the session as Authorized with endpoints and tokens
         setup_mgr
@@ -9130,6 +9153,102 @@ command = "echo"
         assert!(!contents.contains("secret-456"));
     }
 
+    /// A successful commit consumes the session (releasing its name
+    /// reservation): a second commit of the same session returns 404, and a
+    /// new setup session can reuse the name.
+    #[tokio::test]
+    async fn oauth_setup_commit_consumes_session_and_releases_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let mut state = test_state_with_setup().await;
+        state.config_path = Some(config_path);
+
+        let setup_mgr = state.setup_manager.as_ref().unwrap().clone();
+        let session_id = setup_mgr
+            .create_session("ep".into(), "https://mcp.example.com".into(), None, None, None)
+            .await
+            .unwrap();
+        setup_mgr
+            .get_session_mut(&session_id, |s| {
+                s.client_id = Some("cid".into());
+                s.status = crate::oauth::SetupSessionStatus::Authorized;
+            })
+            .await;
+
+        let app = management_routes(state);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Session consumed: re-commit is a 404.
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // Name reservation released (config-level duplicate detection is a
+        // separate concern checked by the setup-start handler).
+        assert!(setup_mgr
+            .create_session("ep".into(), "https://mcp.example.com".into(), None, None, None)
+            .await
+            .is_some());
+    }
+
+    /// A failed commit (session not authorized) keeps the session — and its
+    /// name reservation — in place for a retry or cancel.
+    #[tokio::test]
+    async fn oauth_setup_commit_failure_keeps_session_and_reservation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let mut state = test_state_with_setup().await;
+        state.config_path = Some(config_path);
+
+        let setup_mgr = state.setup_manager.as_ref().unwrap().clone();
+        let session_id = setup_mgr
+            .create_session("ep".into(), "https://mcp.example.com".into(), None, None, None)
+            .await
+            .unwrap();
+        // Not authorized → commit must fail with 409.
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // The session survives the failed commit…
+        assert!(setup_mgr
+            .get_session(&session_id, |_| ())
+            .await
+            .is_some());
+        // …and keeps holding the name reservation.
+        assert!(setup_mgr
+            .create_session("ep".into(), "https://other.example.com".into(), None, None, None)
+            .await
+            .is_none());
+    }
+
     /// Regression: an authorized session carrying a `client_secret` commits
     /// with `client_id` (but no `client_secret` key) in the written TOML
     /// entry, and the secret lands in the DCR store via the defensive save
@@ -9157,7 +9276,7 @@ command = "echo"
                 None,
                 None,
             )
-            .await;
+            .await.unwrap();
 
         setup_mgr
             .get_session_mut(&session_id, |s| {
@@ -9254,7 +9373,7 @@ command = "echo"
         let setup_mgr = state.setup_manager.as_ref().unwrap();
         let session_id = setup_mgr
             .create_session(name.into(), "https://mcp.example.com".into(), None, None, None)
-            .await;
+            .await.unwrap();
         setup_mgr
             .get_session_mut(&session_id, |s| {
                 s.authorization_endpoint = Some("https://auth.example.com/authorize".into());
@@ -9432,7 +9551,7 @@ command = "echo"
                 None,
                 Some("google-drive".into()),
             )
-            .await;
+            .await.unwrap();
 
         setup_mgr
             .get_session_mut(&session_id, |s| {
@@ -9506,7 +9625,7 @@ command = "echo"
                 None,
                 None,
             )
-            .await;
+            .await.unwrap();
 
         setup_mgr
             .get_session_mut(&session_id, |s| {
@@ -9583,7 +9702,7 @@ command = "echo"
         let setup_mgr = state.setup_manager.as_ref().unwrap();
         let session_id = setup_mgr
             .create_session("ep".into(), "https://x.com".into(), None, None, None)
-            .await;
+            .await.unwrap();
 
         // Mark as authorized
         setup_mgr
