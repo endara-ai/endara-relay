@@ -322,11 +322,17 @@ pub struct OAuthAdapterInner {
 
 impl OAuthAdapterInner {
     /// Build an inner HttpAdapter with a Bearer token in the default headers.
+    /// `span` is the OAuth adapter's persistent `endpoint` span: the inner
+    /// adapter instruments its async bodies with it so its tracing lines
+    /// (tool-call completed/failed, handshake logging) carry the
+    /// `endpoint`/`transport="oauth"` fields and reach the per-server Logs
+    /// tab. Every rebuild (token swap) shares the same span.
     fn build_inner_adapter(
         url: &str,
         access_token: &str,
         server_type_override: Option<String>,
         endpoint_name: String,
+        span: tracing::Span,
     ) -> HttpAdapter {
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
@@ -350,7 +356,7 @@ impl OAuthAdapterInner {
         let mut http_config = HttpConfig::new(url);
         http_config.server_type_override = server_type_override;
         http_config.endpoint_name = endpoint_name;
-        HttpAdapter::new_with_client_inner(http_config, client)
+        HttpAdapter::new_with_client_inner(http_config, client, span)
     }
 
     /// Hash the adapter's tool list into an order-insensitive fingerprint.
@@ -1167,6 +1173,7 @@ impl OAuthAdapterInner {
             &access_token,
             self.config.server_type_override.clone(),
             self.config.endpoint_name.clone(),
+            self.span.clone(),
         );
         // Share the OAuth adapter's event-bus OnceLock with the new inner so
         // overlay events fire from the inner's `call_tool` once the bus is
@@ -1807,9 +1814,13 @@ impl McpAdapter for OAuthAdapter {
         // OAuth's `inner.span` is the persistent endpoint span built at init
         // time with no parent linkage to per-request spans, so wrapping the
         // inner call here would zero out those fields on the `Started` event for
-        // every OAuth-routed tool call. The OAuth endpoint span is still applied
-        // around the refresh / state-transition branches below where it actually
-        // adds useful context.
+        // every OAuth-routed tool call. The inner adapter was built with this
+        // same endpoint span (see `build_inner_adapter`) and enters it via its
+        // own `.instrument(self.span)` AFTER the capture, so its tool-call
+        // tracing lines still carry `endpoint`/`transport="oauth"` for the
+        // Logs tab. The OAuth endpoint span is still applied around the
+        // refresh / state-transition branches below where it actually adds
+        // useful context.
         let guard = self.inner.inner_adapter.read().await;
         let adapter = match guard.as_ref() {
             Some(a) => a,
@@ -5085,6 +5096,233 @@ mod tests {
                 server.abort();
             });
         });
+    }
+
+    /// Regression: the inner `HttpAdapter`'s tool-call tracing lines must be
+    /// emitted inside the OAuth adapter's persistent `endpoint` span so the
+    /// desktop Logs tab (which attributes lines via the `endpoint` span field)
+    /// shows them. Before the fix, `build_inner_adapter` constructed the inner
+    /// adapter with `tracing::Span::none()`, so its
+    /// `.instrument(self.span.clone())` was a no-op and the "Tool call failed"
+    /// WARN for an `isError` envelope carried no `endpoint` scope — the Logs
+    /// tab dropped it.
+    ///
+    /// Asserts the WARN's span scope contains EXACTLY ONE `endpoint` span
+    /// (endpoint name + `transport="oauth"`), guarding both the missing-span
+    /// regression and the duplicated-`endpoint`-field concern.
+    ///
+    /// `#[test]` (not `#[tokio::test]`) because we install the capture layer
+    /// via `with_default(...)` and drive an inner current-thread runtime so
+    /// the dispatcher stays attached across `tokio::spawn`'d tasks.
+    #[test]
+    #[serial_test::serial(tracing)]
+    fn call_tool_iserror_warn_carries_oauth_endpoint_span() {
+        crate::test_tracing::init_permissive_tracing();
+        use std::sync::Mutex as StdMutex;
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::Context;
+        use tracing_subscriber::prelude::*;
+        use tracing_subscriber::registry::LookupSpan;
+        use tracing_subscriber::Layer;
+
+        #[derive(Default, Clone, Debug)]
+        struct EndpointSpanFields {
+            endpoint: Option<String>,
+            transport: Option<String>,
+        }
+
+        /// WARN message → the `endpoint` spans (with fields) in its scope.
+        type CapturedWarns = Arc<StdMutex<Vec<(String, Vec<EndpointSpanFields>)>>>;
+
+        struct SpanFieldVisitor<'a>(&'a mut EndpointSpanFields);
+        impl Visit for SpanFieldVisitor<'_> {
+            fn record_str(&mut self, field: &Field, value: &str) {
+                match field.name() {
+                    "endpoint" => self.0.endpoint = Some(value.to_string()),
+                    "transport" => self.0.transport = Some(value.to_string()),
+                    _ => {}
+                }
+            }
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                let rendered = format!("{value:?}").trim_matches('"').to_string();
+                match field.name() {
+                    "endpoint" => self.0.endpoint = Some(rendered),
+                    "transport" => self.0.transport = Some(rendered),
+                    _ => {}
+                }
+            }
+        }
+
+        struct MessageVisitor(String);
+        impl Visit for MessageVisitor {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+
+        /// Captures every WARN event's message plus the `endpoint` spans
+        /// (with their recorded fields) found in its span scope.
+        struct WarnScopeCaptureLayer {
+            warns: CapturedWarns,
+        }
+
+        impl<S> Layer<S> for WarnScopeCaptureLayer
+        where
+            S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                id: &tracing::span::Id,
+                ctx: Context<'_, S>,
+            ) {
+                if attrs.metadata().name() != "endpoint" {
+                    return;
+                }
+                let mut fields = EndpointSpanFields::default();
+                attrs.record(&mut SpanFieldVisitor(&mut fields));
+                if let Some(span) = ctx.span(id) {
+                    span.extensions_mut().insert(fields);
+                }
+            }
+
+            fn on_event(&self, event: &tracing::Event<'_>, ctx: Context<'_, S>) {
+                if *event.metadata().level() != tracing::Level::WARN {
+                    return;
+                }
+                let mut msg = MessageVisitor(String::new());
+                event.record(&mut msg);
+                let mut endpoint_spans = Vec::new();
+                if let Some(scope) = ctx.event_scope(event) {
+                    for span in scope {
+                        if span.name() == "endpoint" {
+                            let fields = span
+                                .extensions()
+                                .get::<EndpointSpanFields>()
+                                .cloned()
+                                .unwrap_or_default();
+                            endpoint_spans.push(fields);
+                        }
+                    }
+                }
+                self.warns.lock().unwrap().push((msg.0, endpoint_spans));
+            }
+        }
+
+        let warns: CapturedWarns = Arc::new(StdMutex::new(Vec::new()));
+        let layer = WarnScopeCaptureLayer {
+            warns: warns.clone(),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        tracing::subscriber::with_default(subscriber, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let (url, server) = spawn_iserror_mcp_server().await;
+                let mut config = make_config();
+                config.url = url;
+                let adapter = make_adapter(config);
+
+                adapter
+                    .inner
+                    .apply_tokens(TokenSet {
+                        access_token: "test-access".to_string(),
+                        refresh_token: None,
+                        expires_at: None,
+                        token_type: "Bearer".to_string(),
+                        scope: None,
+                        issued_at: None,
+                    })
+                    .await;
+
+                // Once-guard interplay: the OAuth layer recorded the inner
+                // handshake's `server_type` on the shared span; the inner
+                // adapter's own guard is pre-flipped so token-swap rebuilds
+                // never re-append the field.
+                assert!(adapter.inner.server_type_recorded_flag());
+                {
+                    let guard = adapter.inner.inner_adapter.read().await;
+                    let inner = guard.as_ref().expect("inner adapter after apply_tokens");
+                    assert!(
+                        inner.server_type_recorded_flag(),
+                        "inner adapter's server_type guard must be pre-flipped"
+                    );
+                }
+
+                // The isError envelope is forwarded unchanged (transport Ok).
+                let result = adapter.call_tool("boom", serde_json::json!({})).await;
+                assert!(result.is_ok(), "envelope must be forwarded, got {result:?}");
+
+                server.abort();
+            });
+        });
+
+        let warns = warns.lock().unwrap();
+        let failed: Vec<_> = warns
+            .iter()
+            .filter(|(msg, _)| msg == "Tool call failed")
+            .collect();
+        assert_eq!(
+            failed.len(),
+            1,
+            "expected exactly one 'Tool call failed' WARN, got {warns:?}"
+        );
+        let (_, endpoint_spans) = failed[0];
+        assert_eq!(
+            endpoint_spans.len(),
+            1,
+            "WARN must be scoped to exactly one `endpoint` span (no duplicates), got {endpoint_spans:?}"
+        );
+        assert_eq!(endpoint_spans[0].endpoint.as_deref(), Some("test"));
+        assert_eq!(endpoint_spans[0].transport.as_deref(), Some("oauth"));
+    }
+
+    /// Like [`spawn_minimal_mcp_server`], but `tools/call` returns a
+    /// tool-level error envelope (`isError: true`) so the adapter's WARN
+    /// "Tool call failed" tracing path fires on a transport-level `Ok`.
+    async fn spawn_iserror_mcp_server() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handle(Json(body): Json<Value>) -> Json<Value> {
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            if method == "initialize" {
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "serverInfo": {"name": "test-server", "version": "0.0.1"},
+                    },
+                }))
+            } else if method == "tools/call" {
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "content": [{"type": "text", "text": "invalid_grant"}],
+                        "isError": true,
+                    },
+                }))
+            } else {
+                Json(json!({"jsonrpc": "2.0", "id": id, "result": {}}))
+            }
+        }
+
+        let router = Router::new().route("/mcp", post(handle));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}/mcp", addr.port()), handle)
     }
 
     /// Repeated `apply_tokens` calls (token refresh, reconnect) must NOT
