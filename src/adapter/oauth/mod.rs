@@ -3743,7 +3743,11 @@ mod tests {
             axum::serve(listener, router).await.ok();
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
-        (format!("http://127.0.0.1:{}/mcp", addr.port()), gate, handle)
+        (
+            format!("http://127.0.0.1:{}/mcp", addr.port()),
+            gate,
+            handle,
+        )
     }
 
     /// An apply entered from an error state (here AuthRequired) must report
@@ -3820,7 +3824,10 @@ mod tests {
             .transition_to(OAuthState::ConnectionFailed, "test: pin error state")
             .await;
 
-        adapter.inner.apply_tokens(make_token_set("will-fail")).await;
+        adapter
+            .inner
+            .apply_tokens(make_token_set("will-fail"))
+            .await;
 
         assert_eq!(
             adapter.inner.state.read().await.clone(),
@@ -3829,9 +3836,11 @@ mod tests {
         );
         let history = adapter.inner.transition_history.read().await;
         assert!(
-            history.iter().any(|r| r.from == OAuthState::ConnectionFailed
-                && r.to == OAuthState::Refreshing
-                && r.reason == "applying new tokens"),
+            history
+                .iter()
+                .any(|r| r.from == OAuthState::ConnectionFailed
+                    && r.to == OAuthState::Refreshing
+                    && r.reason == "applying new tokens"),
             "expected ConnectionFailed → Refreshing 'applying new tokens'; got: {:?}",
             history
                 .iter()
@@ -3855,7 +3864,10 @@ mod tests {
             .transition_to(OAuthState::Refreshing, "test: refresh in progress")
             .await;
 
-        adapter.inner.apply_tokens(make_token_set("refreshed")).await;
+        adapter
+            .inner
+            .apply_tokens(make_token_set("refreshed"))
+            .await;
 
         assert_eq!(
             adapter.inner.state.read().await.clone(),
