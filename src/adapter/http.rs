@@ -1431,14 +1431,22 @@ impl McpAdapter for HttpAdapter {
                     .await
                     .get(name)
                     .and_then(|v| v.as_ref().and_then(annotations_from_value));
+                // The overlay displays the event's `server_name`, so prefer
+                // the effective (override-aware) name over the raw
+                // upstream-derived one, matching the observability capture.
+                let server_type = self.server_type.read().await.clone();
+                let server_name = match server_type.clone() {
+                    Some(name) => Some(name),
+                    None => self.upstream_server_name.read().await.clone(),
+                };
                 bus.send(ToolCallEvent::Started {
                     request_id: request_id.clone(),
                     request_uid: span_ctx.request_uid.clone(),
                     ts: iso8601_now(),
                     endpoint: self.config.endpoint_name.clone(),
                     transport: "http".into(),
-                    server_type: self.server_type.read().await.clone(),
-                    server_name: self.upstream_server_name.read().await.clone(),
+                    server_type,
+                    server_name,
                     profile: span_ctx.profile.clone(),
                     tool: name.to_string(),
                     annotations,

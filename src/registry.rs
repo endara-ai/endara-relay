@@ -976,7 +976,13 @@ impl AdapterRegistry {
         let request_value = arguments.clone();
         let request_bytes = request_value.to_string().len() as i64;
         let server_type = entry.adapter.server_type();
-        let server_name = entry.adapter.upstream_server_name();
+        // Record the effective (override-aware) name so the Observability
+        // list/detail/filter honor a configured `server_type_override`,
+        // falling back to the raw upstream-derived name when the effective
+        // name is not yet known.
+        let server_name = server_type
+            .clone()
+            .or_else(|| entry.adapter.upstream_server_name());
         let transport = entry.transport.clone();
         let endpoint_name = endpoint.clone();
         let tool_name = tool.clone();
@@ -1596,6 +1602,10 @@ impl AdapterRegistry {
         if let Some(bus) = &self.event_bus {
             let span_ctx = current_request_context();
             let request_id = uuid::Uuid::new_v4().to_string();
+            // The overlay displays the event's `server_name`, so prefer the
+            // effective (override-aware) name over the raw upstream-derived
+            // one, matching the observability capture.
+            let server_name = server_type.clone().or(server_name);
             // Emit `Started` first so the overlay can spawn an in-flight
             // card before it sees `Failed`, matching the
             // adapter-side ordering.
@@ -1642,6 +1652,10 @@ impl AdapterRegistry {
         if let Some(bus) = &self.event_bus {
             let span_ctx = current_request_context();
             let request_id = uuid::Uuid::new_v4().to_string();
+            // The overlay displays the event's `server_name`, so prefer the
+            // effective (override-aware) name over the raw upstream-derived
+            // one, matching the observability capture.
+            let server_name = server_type.clone().or(server_name);
             // Emit `Started` first so the overlay spawns an in-flight card
             // before it sees `Failed`, matching the adapter-side ordering.
             bus.send(ToolCallEvent::Started {
@@ -2464,11 +2478,97 @@ mod tests {
         );
     }
 
+    /// Route one call through a registry wired with an in-memory
+    /// observability store and return the single captured row. Capture is
+    /// gated on an inbound `request` span carrying a `request_uid`, so the
+    /// call is instrumented the same way the inbound dispatch would.
+    async fn capture_one_call(adapter: MockAdapter) -> crate::observability::store::CallRecord {
+        use crate::config::ObservabilityConfig;
+        use crate::events::SpanFieldCaptureLayer;
+        use crate::observability::payloads::PayloadStore;
+        use crate::observability::store::{QueryFilter, Store};
+        use tracing::Instrument;
+        use tracing_subscriber::prelude::*;
+
+        let subscriber = tracing_subscriber::registry().with(SpanFieldCaptureLayer);
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let payloads = Arc::new(PayloadStore::new(10, 128, 256 * 1024));
+        let config = ObservabilityConfig {
+            enabled: true,
+            ..ObservabilityConfig::default()
+        };
+        let obs = Observability::new(&config, Arc::clone(&store), Arc::clone(&payloads));
+        let registry = AdapterRegistry::new().with_observability(obs);
+        registry
+            .register(
+                "ep".into(),
+                Box::new(adapter),
+                "stdio".into(),
+                None,
+                Some("ep".into()),
+            )
+            .await;
+        registry
+            .route_tool_call("echo", json!({}))
+            .instrument(tracing::info_span!(
+                "request",
+                method = "tools/call",
+                request_uid = "test-uid",
+            ))
+            .await
+            .unwrap();
+
+        // Drain: poll until the row lands via the background consumer.
+        let mut rows = Vec::new();
+        for _ in 0..50 {
+            rows = store.query(&QueryFilter::default(), 10, None).unwrap();
+            if !rows.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(rows.len(), 1, "call captured");
+        rows.remove(0)
+    }
+
+    /// Bug 2 regression: the captured `server_name` prefers the effective
+    /// (override-aware) `server_type()` over the raw upstream-derived name so
+    /// the Observability list/detail/filter honor `server_type_override`.
+    #[tokio::test]
+    #[serial_test::serial(tracing)]
+    async fn captured_server_name_prefers_effective_name() {
+        crate::test_tracing::init_permissive_tracing();
+        let adapter = MockAdapter::healthy_with_names(
+            vec![make_tool("echo")],
+            Some("gmail"),
+            Some("statelessserver"),
+        );
+        let row = capture_one_call(adapter).await;
+        assert_eq!(row.server_name.as_deref(), Some("gmail"));
+        assert_eq!(row.server_type.as_deref(), Some("gmail"));
+    }
+
+    /// Without an effective name the capture falls back to the raw
+    /// upstream-derived name (unchanged pre-fix behavior).
+    #[tokio::test]
+    #[serial_test::serial(tracing)]
+    async fn captured_server_name_falls_back_to_upstream_name() {
+        crate::test_tracing::init_permissive_tracing();
+        let adapter =
+            MockAdapter::healthy_with_names(vec![make_tool("echo")], None, Some("statelessserver"));
+        let row = capture_one_call(adapter).await;
+        assert_eq!(row.server_name.as_deref(), Some("statelessserver"));
+        assert_eq!(row.server_type, None);
+    }
+
     /// A mock adapter for testing.
     struct MockAdapter {
         health: HealthStatus,
         tools: Vec<ToolInfo>,
         server_type_val: Option<String>,
+        upstream_name_val: Option<String>,
     }
 
     impl MockAdapter {
@@ -2477,6 +2577,7 @@ mod tests {
                 health: HealthStatus::Healthy,
                 tools,
                 server_type_val: None,
+                upstream_name_val: None,
             }
         }
 
@@ -2486,6 +2587,23 @@ mod tests {
                 health: HealthStatus::Healthy,
                 tools,
                 server_type_val: Some(st.to_string()),
+                upstream_name_val: None,
+            }
+        }
+
+        /// Healthy mock with independent effective (`server_type`) and raw
+        /// upstream (`upstream_server_name`) names, for the effective-name
+        /// preference tests.
+        fn healthy_with_names(
+            tools: Vec<ToolInfo>,
+            server_type: Option<&str>,
+            upstream_name: Option<&str>,
+        ) -> Self {
+            Self {
+                health: HealthStatus::Healthy,
+                tools,
+                server_type_val: server_type.map(str::to_string),
+                upstream_name_val: upstream_name.map(str::to_string),
             }
         }
 
@@ -2494,6 +2612,7 @@ mod tests {
                 health: HealthStatus::Unhealthy("test".into()),
                 tools: vec![],
                 server_type_val: None,
+                upstream_name_val: None,
             }
         }
 
@@ -2502,6 +2621,7 @@ mod tests {
                 health: HealthStatus::Unhealthy("test".into()),
                 tools,
                 server_type_val: None,
+                upstream_name_val: None,
             }
         }
     }
@@ -2526,6 +2646,9 @@ mod tests {
         }
         fn server_type(&self) -> Option<String> {
             self.server_type_val.clone()
+        }
+        fn upstream_server_name(&self) -> Option<String> {
+            self.upstream_name_val.clone()
         }
         async fn shutdown(&mut self) -> Result<(), AdapterError> {
             Ok(())
