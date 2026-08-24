@@ -286,13 +286,31 @@ async fn apply_probe_action(
             );
         }
         ProbeAction::AuthFailed => {
+            // The probe ran without holding the state lock, so an apply /
+            // refresh may have taken over mid-probe (state moved off
+            // `Authenticated`, e.g. to `Refreshing`). Re-check under the
+            // write lock and only apply the stale 401 if the state that
+            // dispatched this probe still holds; otherwise the in-flight
+            // lifecycle operation's own outcome decides the final state,
+            // and stomping it here would resurrect the error banner
+            // mid-apply.
+            let mut state = adapter.state.write().await;
+            if *state != OAuthState::Authenticated {
+                debug!(
+                    oauth_state = ?*state,
+                    result = "stale",
+                    "heartbeat probe got 401 but state moved off \
+                     Authenticated mid-probe; dropping stale result"
+                );
+                return;
+            }
             adapter.metrics.inc_heartbeat_unhealthy();
             warn!(
                 oauth_state = ?oauth_state,
                 result = "unhealthy",
                 "heartbeat probe got 401, transitioning to AuthRequired"
             );
-            *adapter.state.write().await = OAuthState::AuthRequired;
+            *state = OAuthState::AuthRequired;
         }
     }
 }
@@ -738,6 +756,46 @@ mod tests {
                 i
             );
         }
+    }
+
+    /// Regression: a probe is dispatched while `Authenticated`, but an
+    /// apply/refresh moves the state to `Refreshing` before the probe's 401
+    /// result is applied. The stale `AuthFailed` must be DROPPED — not
+    /// stomp the in-flight apply with `AuthRequired` (which would resurrect
+    /// the error banner mid-apply).
+    #[tokio::test]
+    async fn heartbeat_stale_auth_failed_mid_apply_is_dropped() {
+        let threshold = 3;
+        let inner = make_test_inner(threshold);
+        arm_healthy(&inner).await;
+
+        // Snapshot the state the loop read when it dispatched the probe.
+        let dispatched_state = inner.state.read().await.clone();
+        assert_eq!(dispatched_state, OAuthState::Authenticated);
+
+        // An apply takes over mid-probe.
+        *inner.state.write().await = OAuthState::Refreshing;
+
+        // The probe's 401 result lands afterwards: it must be dropped.
+        let mut failures = 0u32;
+        let action = classify_probe_result(auth(), &mut failures, threshold);
+        assert_eq!(action, ProbeAction::AuthFailed);
+        apply_probe_action(&inner, action, threshold, &dispatched_state).await;
+
+        assert_eq!(
+            *inner.state.read().await,
+            OAuthState::Refreshing,
+            "stale probe 401 must not overwrite an in-flight apply"
+        );
+        // No unhealthy metric increment for a dropped stale result.
+        let snap = inner.metrics.snapshot();
+        assert_eq!(snap.oauth_heartbeat_probe_total_unhealthy, 0);
+
+        // Control: with the state still Authenticated the 401 applies.
+        *inner.state.write().await = OAuthState::Authenticated;
+        let action = classify_probe_result(auth(), &mut failures, threshold);
+        apply_probe_action(&inner, action, threshold, &dispatched_state).await;
+        assert_eq!(*inner.state.read().await, OAuthState::AuthRequired);
     }
 
     // -- Recovery-from-ConnectionFailed harness -----------------------------
