@@ -152,9 +152,12 @@ pub struct OAuthAdapterConfig {
     pub heartbeat_interval_secs: u64,
     /// Per-probe timeout in seconds (default: 10).
     pub probe_timeout_secs: u64,
-    /// Number of consecutive probe network failures required before flipping
-    /// `inner_health` to `Unhealthy("upstream unreachable")` (default: 3).
-    /// Hysteresis to avoid flapping on a single transient timeout.
+    /// Number of consecutive probe failures required before flipping
+    /// `inner_health` to `Unhealthy` (default: 3). Counts both transport-dead
+    /// failures (connect failure/timeout, reported as "upstream unreachable")
+    /// and alive-but-erroring upstream failures (HTTP status > 0, JSON-RPC or
+    /// protocol errors, reported with the actual error text). Hysteresis to
+    /// avoid flapping on a single transient failure.
     pub probe_failure_threshold: u32,
     /// Optional override for the advertised `server_type` name. Forwarded to
     /// the inner [`HttpAdapter`] when it is constructed.
