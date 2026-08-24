@@ -606,7 +606,8 @@ mod tests {
                 Some("test".into()),
                 None,
             )
-            .await.unwrap();
+            .await
+            .unwrap();
 
         let data = mgr
             .get_session(&id, |s| {
@@ -692,7 +693,8 @@ mod tests {
         let mgr = OAuthSetupManager::new();
         let id = mgr
             .create_session("ep".into(), "https://x.com".into(), None, None, None)
-            .await.unwrap();
+            .await
+            .unwrap();
 
         let removed = mgr.remove_session(&id).await;
         assert!(removed.is_some());
@@ -707,7 +709,8 @@ mod tests {
         let mgr = OAuthSetupManager::new();
         let id = mgr
             .create_session("ep".into(), "https://x.com".into(), None, None, None)
-            .await.unwrap();
+            .await
+            .unwrap();
 
         let tokens = crate::token_manager::TokenSet {
             access_token: "access-tok".into(),
@@ -747,7 +750,8 @@ mod tests {
         let mgr = OAuthSetupManager::new();
         let id = mgr
             .create_session("ep".into(), "https://x.com".into(), None, None, None)
-            .await.unwrap();
+            .await
+            .unwrap();
 
         // Manually expire the session
         {
@@ -769,10 +773,12 @@ mod tests {
         let mgr = OAuthSetupManager::new();
         let fresh_id = mgr
             .create_session("fresh".into(), "https://a.com".into(), None, None, None)
-            .await.unwrap();
+            .await
+            .unwrap();
         let stale_id = mgr
             .create_session("stale".into(), "https://b.com".into(), None, None, None)
-            .await.unwrap();
+            .await
+            .unwrap();
 
         // Make one session stale
         {
@@ -795,7 +801,8 @@ mod tests {
         let mgr = OAuthSetupManager::new();
         let id = mgr
             .create_session("ep".into(), "https://x.com".into(), None, None, None)
-            .await.unwrap();
+            .await
+            .unwrap();
 
         mgr.get_session_mut(&id, |s| {
             s.client_id = Some("my-client".into());
