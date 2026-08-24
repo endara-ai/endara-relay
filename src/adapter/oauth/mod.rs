@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -286,6 +286,13 @@ pub struct OAuthAdapterInner {
     /// time a non-empty `server_type` is written so subsequent applies skip
     /// the record call.
     server_type_recorded: AtomicBool,
+    /// Lifecycle generation counter, bumped at the start of every token
+    /// apply (`apply_tokens_inner`, under `apply_lock`). Lets the heartbeat
+    /// detect that an apply ran between a probe's dispatch and its result
+    /// landing — even when the state has already returned to
+    /// `Authenticated` (ABA) — so a stale probe 401 can be dropped instead
+    /// of stomping the freshly rebuilt adapter with `AuthRequired`.
+    pub lifecycle_generation: AtomicU64,
     /// Fingerprint (hash of the sorted, serialized tool list) probed from the
     /// inner adapter after each successful [`Self::apply_tokens`] rebuild.
     /// Compared across Some→Some swaps to detect an actual tool-set change
@@ -1065,6 +1072,12 @@ impl OAuthAdapterInner {
         // (see `apply_lock`). Applies are rare (login/refresh), so a full
         // mutex is the simple correct choice over rebuild versioning.
         let _apply_guard = self.apply_lock.lock().await;
+        // Bump the lifecycle generation FIRST (still under `apply_lock`,
+        // before any state change) so a heartbeat probe dispatched before
+        // this apply can recognize its result as stale even if the state
+        // has already returned to `Authenticated` by the time the result
+        // lands (ABA; see `apply_probe_action`'s AuthFailed arm).
+        self.lifecycle_generation.fetch_add(1, Ordering::Relaxed);
         let endpoint = &self.config.endpoint_name;
 
         // Surface the apply as a transitional state right away: the inner
@@ -1489,6 +1502,7 @@ impl OAuthAdapter {
                 ema_sso,
                 pending_authorize_url: RwLock::new(None),
                 server_type_recorded: AtomicBool::new(false),
+                lifecycle_generation: AtomicU64::new(0),
                 last_tools_fingerprint: Arc::new(RwLock::new(None)),
                 apply_lock: Mutex::new(()),
             }),

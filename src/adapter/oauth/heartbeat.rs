@@ -219,9 +219,12 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
         match classify_tick_action(&oauth_state) {
             TickAction::Skip => continue,
             TickAction::Probe => {
+                let generation = adapter
+                    .lifecycle_generation
+                    .load(std::sync::atomic::Ordering::Relaxed);
                 let result = probe_inner(&adapter).await;
                 let action = classify_probe_result(result, &mut consecutive_failures, threshold);
-                apply_probe_action(&adapter, action, threshold, &oauth_state).await;
+                apply_probe_action(&adapter, action, threshold, &oauth_state, generation).await;
             }
             TickAction::Recover => {
                 attempt_recovery(&adapter).await;
@@ -241,6 +244,7 @@ async fn apply_probe_action(
     action: ProbeAction,
     threshold: u32,
     oauth_state: &OAuthState,
+    dispatched_generation: u64,
 ) {
     match action {
         ProbeAction::MarkHealthy => {
@@ -293,14 +297,25 @@ async fn apply_probe_action(
             // dispatched this probe still holds; otherwise the in-flight
             // lifecycle operation's own outcome decides the final state,
             // and stomping it here would resurrect the error banner
-            // mid-apply.
+            // mid-apply. The state check alone has an ABA hole: an entire
+            // apply (Authenticated → Refreshing → Authenticated, publishing
+            // a NEW inner adapter) can complete mid-probe, so the enum
+            // matches again while the 401 belongs to the replaced adapter.
+            // The lifecycle generation (bumped at the start of every apply)
+            // catches exactly that.
             let mut state = adapter.state.write().await;
-            if *state != OAuthState::Authenticated {
+            let current_generation = adapter
+                .lifecycle_generation
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if *state != OAuthState::Authenticated || current_generation != dispatched_generation {
                 debug!(
                     oauth_state = ?*state,
+                    dispatched_generation = dispatched_generation,
+                    current_generation = current_generation,
                     result = "stale",
-                    "heartbeat probe got 401 but state moved off \
-                     Authenticated mid-probe; dropping stale result"
+                    "heartbeat probe got 401 but the lifecycle moved on \
+                     mid-probe (state changed or an apply ran); dropping \
+                     stale result"
                 );
                 return;
             }
@@ -594,8 +609,11 @@ mod tests {
         threshold: u32,
     ) {
         let oauth_state = adapter.state.read().await.clone();
+        let generation = adapter
+            .lifecycle_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
         let action = classify_probe_result(result, failures, threshold);
-        apply_probe_action(adapter, action, threshold, &oauth_state).await;
+        apply_probe_action(adapter, action, threshold, &oauth_state, generation).await;
     }
 
     /// Set the adapter into the `Authenticated` / `Healthy` baseline that
@@ -769,8 +787,11 @@ mod tests {
         let inner = make_test_inner(threshold);
         arm_healthy(&inner).await;
 
-        // Snapshot the state the loop read when it dispatched the probe.
+        // Snapshot what the loop read when it dispatched the probe.
         let dispatched_state = inner.state.read().await.clone();
+        let dispatched_gen = inner
+            .lifecycle_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
         assert_eq!(dispatched_state, OAuthState::Authenticated);
 
         // An apply takes over mid-probe.
@@ -780,7 +801,7 @@ mod tests {
         let mut failures = 0u32;
         let action = classify_probe_result(auth(), &mut failures, threshold);
         assert_eq!(action, ProbeAction::AuthFailed);
-        apply_probe_action(&inner, action, threshold, &dispatched_state).await;
+        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
 
         assert_eq!(
             *inner.state.read().await,
@@ -791,11 +812,55 @@ mod tests {
         let snap = inner.metrics.snapshot();
         assert_eq!(snap.oauth_heartbeat_probe_total_unhealthy, 0);
 
-        // Control: with the state still Authenticated the 401 applies.
+        // Control: with the state still Authenticated and the generation
+        // unchanged, the 401 applies.
         *inner.state.write().await = OAuthState::Authenticated;
         let action = classify_probe_result(auth(), &mut failures, threshold);
-        apply_probe_action(&inner, action, threshold, &dispatched_state).await;
+        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
         assert_eq!(*inner.state.read().await, OAuthState::AuthRequired);
+    }
+
+    /// Regression (ABA): an ENTIRE apply completes mid-probe — the state
+    /// goes Authenticated → Refreshing → Authenticated and a NEW inner
+    /// adapter is published. The state enum matches `Authenticated` again
+    /// when the old probe's 401 lands, but the result belongs to the
+    /// replaced adapter: the lifecycle generation (bumped at the start of
+    /// every apply) must cause the stale 401 to be dropped.
+    #[tokio::test]
+    async fn heartbeat_stale_auth_failed_after_full_apply_aba_is_dropped() {
+        let threshold = 3;
+        let inner = make_test_inner(threshold);
+        arm_healthy(&inner).await;
+
+        // Probe dispatched: snapshot state + generation.
+        let dispatched_state = inner.state.read().await.clone();
+        let dispatched_gen = inner
+            .lifecycle_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(dispatched_state, OAuthState::Authenticated);
+
+        // A full apply completes mid-probe: generation bumps and the state
+        // returns to Authenticated (mirrors apply_tokens_inner's sequence).
+        inner
+            .lifecycle_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *inner.state.write().await = OAuthState::Refreshing;
+        *inner.state.write().await = OAuthState::Authenticated;
+
+        // The old probe's 401 lands: state matches but generation differs —
+        // the stale result must be dropped.
+        let mut failures = 0u32;
+        let action = classify_probe_result(auth(), &mut failures, threshold);
+        assert_eq!(action, ProbeAction::AuthFailed);
+        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
+
+        assert_eq!(
+            *inner.state.read().await,
+            OAuthState::Authenticated,
+            "stale probe 401 must not stomp the freshly applied adapter (ABA)"
+        );
+        let snap = inner.metrics.snapshot();
+        assert_eq!(snap.oauth_heartbeat_probe_total_unhealthy, 0);
     }
 
     // -- Recovery-from-ConnectionFailed harness -----------------------------
