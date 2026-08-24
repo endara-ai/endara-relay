@@ -448,10 +448,19 @@ impl OAuthSetupManager {
     /// The check-and-remove runs atomically under the sessions write lock,
     /// so a DELETE racing a commit can never yank the session out from
     /// under the commit's DCR/config writes after the claim succeeded.
+    ///
+    /// Expiry is checked first: an expired session — including an abandoned
+    /// `Committing` claim whose lease has lapsed — is removed and reported
+    /// `NotFound` ("no live session"), so a dead claim cannot answer DELETE
+    /// with `CommitInProgress` forever while nothing else sweeps it.
     pub async fn cancel_session(&self, id: &Uuid) -> CancelOutcome {
         let mut sessions = self.sessions.write().await;
         match sessions.get(id) {
             None => CancelOutcome::NotFound,
+            Some(s) if s.created_at.elapsed() > SETUP_SESSION_MAX_AGE => {
+                sessions.remove(id);
+                CancelOutcome::NotFound
+            }
             Some(s) if s.status == SetupSessionStatus::Committing => {
                 CancelOutcome::CommitInProgress
             }
@@ -1121,6 +1130,45 @@ mod tests {
         };
         mgr.sessions.write().await.get_mut(&id).unwrap().created_at = expired;
         mgr.cleanup_stale().await;
+        assert!(mgr.sessions.read().await.get(&id).is_none());
+    }
+
+    /// Cancelling an expired `Committing` session (an abandoned claim whose
+    /// lease has lapsed) removes it and reports `NotFound` — DELETE must not
+    /// keep answering `CommitInProgress` forever when nothing else sweeps
+    /// the dead claim.
+    #[tokio::test]
+    async fn setup_manager_cancel_expired_claim_returns_not_found() {
+        let mgr = OAuthSetupManager::new();
+        let id = mgr
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
+            .await
+            .unwrap();
+        mgr.get_session_mut(&id, |s| s.status = SetupSessionStatus::Authorized)
+            .await;
+        assert!(matches!(
+            mgr.claim_for_commit(&id).await,
+            CommitClaim::Claimed(_)
+        ));
+
+        // A live claim still refuses cancellation.
+        assert!(matches!(
+            mgr.cancel_session(&id).await,
+            CancelOutcome::CommitInProgress
+        ));
+
+        // Lapse the claim's lease: cancel now removes the session and
+        // reports NotFound instead of an endless 409.
+        let Some(expired) =
+            Instant::now().checked_sub(SETUP_SESSION_MAX_AGE + Duration::from_secs(1))
+        else {
+            return;
+        };
+        mgr.sessions.write().await.get_mut(&id).unwrap().created_at = expired;
+        assert!(matches!(
+            mgr.cancel_session(&id).await,
+            CancelOutcome::NotFound
+        ));
         assert!(mgr.sessions.read().await.get(&id).is_none());
     }
 
