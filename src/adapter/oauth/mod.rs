@@ -581,13 +581,29 @@ impl OAuthAdapterInner {
     /// adapter transitions to `AuthRequired` (matching the pre-existing
     /// non-2xx behavior).
     pub async fn do_token_refresh(self: &Arc<Self>) -> Result<TokenSet, OAuthError> {
-        // Capture the grant epoch this refresh runs against. Every state
+        // Convenience entry for callers that do not commit the result via
+        // `apply_refreshed_tokens` (EMA startup acquisition, tests). Callers
+        // that DO commit must snapshot the epoch themselves and pass the
+        // same value to both `do_token_refresh_with_epoch` and
+        // `apply_refreshed_tokens`, so the refresh's transitions and its
+        // commit identify the same grant.
+        let refresh_epoch = self.current_grant_epoch();
+        self.do_token_refresh_with_epoch(refresh_epoch).await
+    }
+
+    pub async fn do_token_refresh_with_epoch(
+        self: &Arc<Self>,
+        refresh_epoch: u64,
+    ) -> Result<TokenSet, OAuthError> {
+        // `refresh_epoch` is the grant epoch this refresh runs against,
+        // snapshotted by the caller BEFORE the refresh began. Every state
         // transition below goes through `transition_if_current` with this
         // epoch, so a refresh that outlives its grant (reset/disconnect,
         // possibly followed by a replacement login) cannot perturb the
         // successor grant's state (PR #145 review). The result commit is
-        // epoch-guarded separately in `apply_refreshed_tokens`.
-        let refresh_epoch = self.current_grant_epoch();
+        // epoch-guarded separately in `apply_refreshed_tokens` — with the
+        // SAME epoch value, so the two guards cannot disagree about which
+        // grant the refresh belongs to.
 
         // EMA (END-18) endpoints mint/refresh their access token through the
         // ID-JAG chain (Steps 2+3, with a stored ID Token) instead of the
@@ -1460,7 +1476,7 @@ impl OAuthAdapterInner {
                     let _ = inner.refresh_task_handle.lock().await.take();
                 }
                 let refresh_epoch = inner.current_grant_epoch();
-                match inner.do_token_refresh().await {
+                match inner.do_token_refresh_with_epoch(refresh_epoch).await {
                     Ok(new_tokens) => {
                         // Recursively apply — this will schedule the next refresh
                         inner
@@ -1493,7 +1509,7 @@ impl OAuthAdapterInner {
                             let _ = inner.refresh_task_handle.lock().await.take();
                         }
                         let retry_epoch = inner.current_grant_epoch();
-                        match inner.do_token_refresh().await {
+                        match inner.do_token_refresh_with_epoch(retry_epoch).await {
                             Ok(new_tokens) => {
                                 inner.apply_refreshed_tokens(new_tokens, retry_epoch).await;
                                 let state = inner.state.read().await.clone();
@@ -1771,7 +1787,7 @@ impl McpAdapter for OAuthAdapter {
                     // Store expired tokens so refresh can use the refresh_token
                     *self.inner.tokens.write().await = Some(token_set);
                     let refresh_epoch = self.inner.current_grant_epoch();
-                    match self.inner.do_token_refresh().await {
+                    match self.inner.do_token_refresh_with_epoch(refresh_epoch).await {
                         Ok(new_tokens) => {
                             self.inner
                                 .apply_refreshed_tokens(new_tokens, refresh_epoch)
@@ -1837,7 +1853,7 @@ impl McpAdapter for OAuthAdapter {
                             info!("Got 401 on list_tools, attempting token refresh");
 
                             let refresh_epoch = self.inner.current_grant_epoch();
-                            match self.inner.do_token_refresh().await {
+                            match self.inner.do_token_refresh_with_epoch(refresh_epoch).await {
                                 Ok(new_tokens) => {
                                     self.inner
                                         .apply_refreshed_tokens(new_tokens, refresh_epoch)
@@ -1995,7 +2011,7 @@ impl McpAdapter for OAuthAdapter {
                 let refresh_epoch = self.inner.current_grant_epoch();
                 let refresh_result = async {
                     info!("Got 401, attempting token refresh");
-                    self.inner.do_token_refresh().await
+                    self.inner.do_token_refresh_with_epoch(refresh_epoch).await
                 }
                 .instrument(self.inner.span.clone())
                 .await;

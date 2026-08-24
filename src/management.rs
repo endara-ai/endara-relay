@@ -2536,7 +2536,7 @@ async fn oauth_refresh(
 
     // Attempt refresh
     let refresh_epoch = inner.current_grant_epoch();
-    match inner.do_token_refresh().await {
+    match inner.do_token_refresh_with_epoch(refresh_epoch).await {
         Ok(new_tokens) => {
             let expires_at = new_tokens.expires_at;
             let refreshed_at = new_tokens.issued_at;
