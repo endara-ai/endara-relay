@@ -1067,6 +1067,18 @@ impl OAuthAdapterInner {
         let _apply_guard = self.apply_lock.lock().await;
         let endpoint = &self.config.endpoint_name;
 
+        // Surface the apply as a transitional state right away: the inner
+        // adapter rebuild below (init handshake + tools fingerprint probe)
+        // takes seconds of network time, and leaving a prior error state
+        // (AuthRequired/ConnectionFailed) in place keeps `derive_health`
+        // reporting the stale error as if it were a fresh failure. Refresh
+        // paths already enter the apply in `Refreshing` — skip the no-op
+        // self-transition to keep the ring buffer free of noise.
+        if *self.state.read().await != OAuthState::Refreshing {
+            self.transition_to(OAuthState::Refreshing, "applying new tokens")
+                .await;
+        }
+
         // 1. Persist to disk
         if let Err(e) = self.token_manager.save(endpoint, &token_set).await {
             error!(error = %e, "Failed to persist tokens");
@@ -3683,6 +3695,180 @@ mod tests {
         assert!(
             !recv_tick(&mut outer_rx, Duration::from_millis(200)).await,
             "routine Some→Some token refresh must not emit a synthetic tick"
+        );
+        server.abort();
+    }
+
+    /// Spawn an in-process MCP server whose `initialize` response blocks
+    /// until the returned `Notify` is notified — lets a test observe the
+    /// adapter's state/health while `apply_tokens` is mid-rebuild.
+    async fn spawn_blocking_init_mcp_server() -> (
+        String,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::extract::State;
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handle(
+            State(gate): State<Arc<tokio::sync::Notify>>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            if method == "initialize" {
+                gate.notified().await;
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "serverInfo": {"name": "test-server", "version": "0.0.1"},
+                    },
+                }))
+            } else {
+                Json(json!({"jsonrpc": "2.0", "id": id, "result": {}}))
+            }
+        }
+
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let router = Router::new()
+            .route("/mcp", post(handle))
+            .with_state(gate.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}/mcp", addr.port()), gate, handle)
+    }
+
+    /// An apply entered from an error state (here AuthRequired) must report
+    /// `Starting` while the inner adapter rebuild is in flight — not the
+    /// stale error — and still end `Authenticated`/`Healthy` on success.
+    #[tokio::test]
+    async fn apply_tokens_from_error_state_reports_starting_mid_apply() {
+        let (url, gate, server) = spawn_blocking_init_mcp_server().await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+
+        // Pin the adapter in an error state, as after a failed refresh.
+        adapter
+            .inner
+            .transition_to(OAuthState::AuthRequired, "test: pin error state")
+            .await;
+        assert!(
+            matches!(adapter.health(), HealthStatus::Unhealthy(_)),
+            "precondition: AuthRequired must report Unhealthy"
+        );
+
+        let inner = adapter.inner.clone();
+        let apply = tokio::spawn(async move {
+            inner.apply_tokens(make_token_set("mid-apply")).await;
+        });
+
+        // The inner init is blocked on the gate: wait for the apply to enter
+        // Refreshing and assert health reports Starting, not the stale error.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let state = adapter.inner.state.read().await.clone();
+            if state == OAuthState::Refreshing {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for Refreshing mid-apply; state {:?}",
+                state
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            adapter.health(),
+            HealthStatus::Starting,
+            "mid-apply health must be Starting, not the stale AuthRequired error"
+        );
+
+        // Release the inner init and let the apply finish.
+        gate.notify_one();
+        apply.await.unwrap();
+        assert_eq!(
+            adapter.inner.state.read().await.clone(),
+            OAuthState::Authenticated
+        );
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        server.abort();
+    }
+
+    /// A failing apply entered from an error state must transition through
+    /// Refreshing (recorded with the "applying new tokens" reason) and still
+    /// end ConnectionFailed with the inner init error preserved.
+    #[tokio::test]
+    async fn apply_tokens_failure_from_error_state_transitions_via_refreshing() {
+        let mut config = make_config();
+        // Port 1 is reserved and not bound: immediate connection refused.
+        config.url = "http://127.0.0.1:1/mcp".to_string();
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+
+        adapter
+            .inner
+            .transition_to(OAuthState::ConnectionFailed, "test: pin error state")
+            .await;
+
+        adapter.inner.apply_tokens(make_token_set("will-fail")).await;
+
+        assert_eq!(
+            adapter.inner.state.read().await.clone(),
+            OAuthState::ConnectionFailed,
+            "failed apply must still end ConnectionFailed"
+        );
+        let history = adapter.inner.transition_history.read().await;
+        assert!(
+            history.iter().any(|r| r.from == OAuthState::ConnectionFailed
+                && r.to == OAuthState::Refreshing
+                && r.reason == "applying new tokens"),
+            "expected ConnectionFailed → Refreshing 'applying new tokens'; got: {:?}",
+            history
+                .iter()
+                .map(|r| (r.from.clone(), r.to.clone(), r.reason.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Refresh paths (proactive/reactive) enter the apply already in
+    /// `Refreshing` — the apply must not record a no-op self-transition.
+    #[tokio::test]
+    async fn apply_tokens_already_refreshing_skips_transition() {
+        let (url, server) = spawn_minimal_mcp_server().await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+
+        adapter
+            .inner
+            .transition_to(OAuthState::Refreshing, "test: refresh in progress")
+            .await;
+
+        adapter.inner.apply_tokens(make_token_set("refreshed")).await;
+
+        assert_eq!(
+            adapter.inner.state.read().await.clone(),
+            OAuthState::Authenticated
+        );
+        let history = adapter.inner.transition_history.read().await;
+        assert!(
+            !history.iter().any(|r| r.reason == "applying new tokens"),
+            "apply entered in Refreshing must not record a self-transition; got: {:?}",
+            history
+                .iter()
+                .map(|r| (r.from.clone(), r.to.clone(), r.reason.clone()))
+                .collect::<Vec<_>>()
         );
         server.abort();
     }
