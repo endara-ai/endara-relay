@@ -1470,11 +1470,12 @@ async fn oauth_start(
     // A DCR-provenanced record (`registered_via_dcr == true`) with a live
     // `registration_endpoint` always takes the interactive re-registration
     // heal path — including when `config.toml` still carries a stale DCR
-    // `client_id` from the initial setup commit (setup persists the DCR
-    // pair to TOML alongside the `.dcr.json` file, so `config_client_id`
-    // is `Some` for every setup-created endpoint and would otherwise skip
-    // this branch, breaking the RFC 7591 re-registration promise for the
-    // most common shape of DCR endpoint). The DCR file is the authoritative
+    // `client_id` from the initial setup commit (setup stamps the non-secret
+    // `client_id` into TOML — the secret lives only in the `.dcr.json` store,
+    // though legacy configs may still carry the full pair — so
+    // `config_client_id` is `Some` for every setup-created endpoint and would
+    // otherwise skip this branch, breaking the RFC 7591 re-registration
+    // promise for the most common shape of DCR endpoint). The DCR file is the authoritative
     // source for DCR-provenanced credentials — `watcher::resolve_oauth_client_creds`
     // already prefers it at startup — so we do not need to rewrite `config.toml`
     // here for the running adapter (Finding 2's `set_client_credentials`
@@ -3492,7 +3493,17 @@ async fn oauth_setup_commit(
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_secs(),
-                    issuer: session.issuer.clone(),
+                    // Issuer binding follows provenance, matching the setup
+                    // paths: DCR-minted credentials are bound to the issuer
+                    // they were registered against (issuer-mismatch
+                    // invalidation applies), while manually supplied ones
+                    // are stored issuer-unbound (`None`), same as the
+                    // /credentials path.
+                    issuer: if session.registered_via_dcr {
+                        session.issuer.clone()
+                    } else {
+                        None
+                    },
                     // Provenance tracked on the session: true only when the
                     // credentials were minted via RFC 7591 DCR during setup,
                     // so recovered records keep self-heal eligibility.
@@ -9208,7 +9219,9 @@ command = "echo"
             .expect("commit must defensively persist credentials to the DCR store");
         assert_eq!(creds.client_id, "client-123");
         assert_eq!(creds.client_secret.as_deref(), Some("super-secret"));
-        assert_eq!(creds.issuer.as_deref(), Some("https://auth.example.com"));
+        // Non-DCR-provenanced credentials are stored issuer-unbound, matching
+        // the manual /credentials path convention.
+        assert_eq!(creds.issuer, None);
         assert!(!creds.registered_via_dcr);
     }
 
