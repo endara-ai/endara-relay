@@ -2346,10 +2346,14 @@ async fn oauth_revoke(
 /// POST /api/endpoints/:name/oauth/reset
 ///
 /// "Reset authorization": discard the old grant and force a fresh consent
-/// screen. Sequencing: disconnect the OAuth adapter first (best-effort
-/// upstream revocation + local token/DCR deletion — the same path as
-/// `/oauth/revoke`), then start a new authorization flow with
-/// `force_consent`, returning the composed `authorize_url`.
+/// screen. Sequencing: disconnect the OAuth adapter first (local token
+/// deletion via the same `disconnect()` path as `/oauth/revoke` — upstream
+/// RFC 7009 revocation rides along once `disconnect()` gains it), then start
+/// a new authorization flow with `force_consent`, returning the composed
+/// `authorize_url`. Unlike `/oauth/revoke`, the client registration (DCR
+/// record) is preserved across the reset: only the grant is discarded, so
+/// the follow-up start flow can reuse the registered client instead of
+/// losing a secret that exists nowhere else.
 async fn oauth_reset(
     State(state): State<ManagementState>,
     Path(name): Path<String>,
@@ -2386,10 +2390,27 @@ async fn oauth_reset(
         }
     };
 
-    // Discard the old grant (upstream revoke is best-effort inside
-    // disconnect) BEFORE composing the new authorize URL, so the start flow
-    // sees a clean slate.
+    // Snapshot the client registration before disconnect: `disconnect()`
+    // deletes the DCR record along with the tokens, but reset must only
+    // discard the grant. Desktop-created DCR endpoints keep the
+    // client_secret solely in that record, and manually supplied
+    // credentials live only there — losing it would break the one-step
+    // reset (no secret / `dcr_unsupported` on providers without DCR).
+    let preserved_dcr = match state.token_manager {
+        Some(ref tm) => tm.load_dcr(&name).await.ok().flatten(),
+        None => None,
+    };
+
+    // Discard the old grant BEFORE composing the new authorize URL, so the
+    // start flow sees a clean slate.
     inner.disconnect().await;
+
+    // Restore the client registration so the start flow reuses it.
+    if let (Some(tm), Some(ref creds)) = (state.token_manager.as_ref(), preserved_dcr.as_ref()) {
+        if let Err(e) = tm.save_dcr(&name, creds).await {
+            warn!(endpoint = %name, error = %e, "Reset: failed to restore client registration after disconnect");
+        }
+    }
 
     oauth_start_inner(state, name, true).await
 }
@@ -8944,7 +8965,11 @@ command = "echo"
         let (base_url, _server) = spawn_mock_as(router).await;
 
         // Config half: endpoint "oauth-ep" with oauth_server_url → mock AS.
+        // Clear the config client_id: the credentials live ONLY in the DCR
+        // record (the manually-supplied-credentials shape), so a reset that
+        // dropped the record would come back `dcr_unsupported`.
         let (start_state, _flow_mgr) = test_state_oauth_start("oauth-ep", &base_url, None);
+        start_state.config.write().await.endpoints[0].client_id = None;
 
         // Adapter half: a live OAuth inner with persisted tokens.
         let tmp = tempfile::tempdir().unwrap();
@@ -8958,6 +8983,18 @@ command = "echo"
             issued_at: None,
         };
         token_manager.save("oauth-ep", &token_set).await.unwrap();
+        // Manually supplied client credentials, stored only in the DCR
+        // record: reset must preserve them (only the grant is discarded).
+        let manual_creds = DcrCredentials {
+            client_id: "manual-client".to_string(),
+            client_secret: Some("manual-secret".to_string()),
+            registered_via_dcr: false,
+            ..Default::default()
+        };
+        token_manager
+            .save_dcr("oauth-ep", &manual_creds)
+            .await
+            .unwrap();
         let adapter = OAuthAdapter::new(make_oauth_config("oauth-ep"), token_manager.clone());
         let shared_inner = adapter.shared_inner();
         *shared_inner.state.write().await = OAuthState::Authenticated;
@@ -9007,6 +9044,21 @@ command = "echo"
         // the adapter is Disconnected.
         assert_eq!(*shared_inner.state.read().await, OAuthState::Disconnected);
         assert!(token_manager.load("oauth-ep").await.unwrap().is_none());
+
+        // ...but the client registration survives the reset, and the new
+        // authorize URL was built with the preserved client_id.
+        let creds = token_manager
+            .load_dcr("oauth-ep")
+            .await
+            .unwrap()
+            .expect("client registration must be preserved across reset");
+        assert_eq!(creds.client_id, "manual-client");
+        assert_eq!(creds.client_secret.as_deref(), Some("manual-secret"));
+        assert!(
+            authorize_url.contains("client_id=manual-client"),
+            "start flow must reuse the preserved client registration, got: {}",
+            authorize_url
+        );
     }
 
     #[tokio::test]
