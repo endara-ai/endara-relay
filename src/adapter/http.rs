@@ -2413,20 +2413,25 @@ mod tests {
             text
         );
         assert!(text.to_lowercase().contains("sign-in"));
-        // The raw upstream 401 / WWW-Authenticate challenge is never leaked.
-        // Check only the prose before the URL: the authorize URL itself
-        // legitimately contains arbitrary digits (ephemeral fixture port,
-        // state, code_challenge) that can spuriously contain "401".
-        let prose = text.split("\n\n").next().expect("prose before the URL");
-        assert!(!prose.contains("401"));
-        assert!(!prose.contains("WWW-Authenticate"));
 
         // State machine advanced and the URL is also stored on the interceptor.
         assert_eq!(
             interceptor.state().await,
             crate::adapter::oauth::OAuthState::NeedsLogin
         );
-        assert!(interceptor.pending_authorize_url().await.is_some());
+        let authorize_url = interceptor
+            .pending_authorize_url()
+            .await
+            .expect("pending authorize URL stored on the interceptor");
+
+        // The raw upstream 401 / WWW-Authenticate challenge is never leaked.
+        // Remove only the exact stored authorize URL first: its arbitrary
+        // digits (ephemeral fixture port, state, code_challenge) can
+        // spuriously contain "401", but everything else in the surfaced text
+        // must stay free of the upstream challenge.
+        let without_url = text.replace(&authorize_url, "");
+        assert!(!without_url.contains("401"));
+        assert!(!without_url.contains("WWW-Authenticate"));
 
         server.abort();
     }
