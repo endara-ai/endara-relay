@@ -286,12 +286,19 @@ pub struct OAuthAdapterInner {
     /// time a non-empty `server_type` is written so subsequent applies skip
     /// the record call.
     server_type_recorded: AtomicBool,
-    /// Lifecycle generation counter, bumped at the start of every token
-    /// apply (`apply_tokens_inner`, under `apply_lock`). Lets the heartbeat
-    /// detect that an apply ran between a probe's dispatch and its result
-    /// landing — even when the state has already returned to
-    /// `Authenticated` (ABA) — so a stale probe 401 can be dropped instead
-    /// of stomping the freshly rebuilt adapter with `AuthRequired`.
+    /// Lifecycle generation counter, bumped on EVERY `OAuthState` write,
+    /// inside the same `state` write-lock critical section as the write
+    /// itself (see `transition_to`, the inline `Refreshing` entry in
+    /// `apply_tokens_inner`, and the heartbeat's `AuthFailed` arm). The
+    /// heartbeat snapshots state + generation under one `state` read lock
+    /// when it dispatches a probe; if the generation still matches under
+    /// the write lock when the result lands, no state transition — and
+    /// therefore no apply/publish (every apply passes through
+    /// `Refreshing`) — happened mid-probe, so the result belongs to the
+    /// currently published inner adapter. This closes the ABA hole where
+    /// an entire apply (Authenticated → Refreshing → Authenticated)
+    /// completes mid-probe and a stale 401 would stomp the rebuilt
+    /// adapter with `AuthRequired`.
     pub lifecycle_generation: AtomicU64,
     /// Fingerprint (hash of the sorted, serialized tool list) probed from the
     /// inner adapter after each successful [`Self::apply_tokens`] rebuild.
@@ -369,6 +376,10 @@ impl OAuthAdapterInner {
         let mut state = self.state.write().await;
         let mut history = self.transition_history.write().await;
         let old = do_transition(&mut state, new_state.clone(), reason, &mut history);
+        // Bumped inside the write critical section so "generation
+        // unchanged" observed under either state lock proves no
+        // transition interleaved (see `lifecycle_generation`).
+        self.lifecycle_generation.fetch_add(1, Ordering::Relaxed);
         self.metrics.inc_state_transition();
         info!(
             from = ?old,
@@ -1072,12 +1083,6 @@ impl OAuthAdapterInner {
         // (see `apply_lock`). Applies are rare (login/refresh), so a full
         // mutex is the simple correct choice over rebuild versioning.
         let _apply_guard = self.apply_lock.lock().await;
-        // Bump the lifecycle generation FIRST (still under `apply_lock`,
-        // before any state change) so a heartbeat probe dispatched before
-        // this apply can recognize its result as stale even if the state
-        // has already returned to `Authenticated` by the time the result
-        // lands (ABA; see `apply_probe_action`'s AuthFailed arm).
-        self.lifecycle_generation.fetch_add(1, Ordering::Relaxed);
         let endpoint = &self.config.endpoint_name;
 
         // Surface the apply as a transitional state right away: the inner
@@ -1101,6 +1106,7 @@ impl OAuthAdapterInner {
                     "applying new tokens",
                     &mut history,
                 );
+                self.lifecycle_generation.fetch_add(1, Ordering::Relaxed);
                 self.metrics.inc_state_transition();
                 info!(
                     from = ?old,
