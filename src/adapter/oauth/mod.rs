@@ -417,19 +417,26 @@ impl OAuthAdapterInner {
     }
 
     /// Like [`Self::transition_to`], but only if `epoch` is still the
-    /// current grant epoch — checked under the state write lock, so a
-    /// stale refresh's failure-path transition cannot interleave with the
-    /// replacement grant's transitions. Returns whether the transition was
-    /// performed. Used by refresh error paths: a refresh that began against
-    /// a grant since discarded (reset/disconnect) or replaced (new callback
-    /// login) must not move the adapter to AuthRequired/ConnectionFailed
-    /// based on the OLD grant's outcome (PR #145 review).
+    /// current grant epoch. Returns whether the transition was performed.
+    /// Used by refresh error paths: a refresh that began against a grant
+    /// since discarded (reset/disconnect) or replaced (new callback login)
+    /// must not move the adapter to AuthRequired/ConnectionFailed based on
+    /// the OLD grant's outcome (PR #145 review).
+    ///
+    /// The epoch check and the transition are made atomic with grant
+    /// replacement by taking the `apply_lock` FIRST (the existing
+    /// apply→state lock order): both epoch writers — `disconnect()` and a
+    /// NEW-grant `apply_tokens_inner` — bump under that lock, so a bump
+    /// cannot land between the check below and `do_transition`. Callers
+    /// hold at most the `refresh_mutex`, which no `apply_lock` holder
+    /// acquires, so the ordering is deadlock-free.
     pub async fn transition_if_current(
         &self,
         epoch: u64,
         new_state: OAuthState,
         reason: &str,
     ) -> bool {
+        let _apply_guard = self.apply_lock.lock().await;
         let mut state = self.state.write().await;
         if self.grant_epoch.load(Ordering::Acquire) != epoch {
             info!(
@@ -441,6 +448,10 @@ impl OAuthAdapterInner {
         }
         let mut history = self.transition_history.write().await;
         let old = do_transition(&mut state, new_state.clone(), reason, &mut history);
+        // Bumped inside the write critical section like every other state
+        // writer, preserving the heartbeat's stale-probe ABA invariant
+        // (see `lifecycle_generation`).
+        self.lifecycle_generation.fetch_add(1, Ordering::Relaxed);
         self.metrics.inc_state_transition();
         info!(
             from = ?old,
