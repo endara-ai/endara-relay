@@ -2420,7 +2420,7 @@ async fn oauth_reset(
     inner.disconnect().await;
 
     // Restore the client registration so the start flow reuses it.
-    if let (Some(tm), Some(ref creds)) = (state.token_manager.as_ref(), preserved_dcr.as_ref()) {
+    if let (Some(tm), Some(creds)) = (state.token_manager.as_ref(), preserved_dcr.as_ref()) {
         if let Err(e) = tm.save_dcr(&name, creds).await {
             warn!(endpoint = %name, error = %e, "Reset: failed to restore client registration after disconnect");
         }
@@ -3251,6 +3251,14 @@ async fn oauth_setup(
                 urlencoding(&code_challenge),
             );
 
+            // Google only issues a refresh token when `access_type=offline`
+            // is requested (see `oauth_start_inner`); setup-created Google
+            // endpoints need it too or their very first grant is
+            // access-token-only.
+            if is_google_authorization_endpoint(&auth_endpoint) {
+                authorize_url.push_str("&access_type=offline");
+            }
+
             // Scope accumulation: union any previously-granted scopes (from a
             // persisted TokenSet for this name) with the requested scopes.
             let requested_scope = scopes_str.clone().unwrap_or_default();
@@ -3426,6 +3434,13 @@ async fn oauth_setup_credentials(
         urlencoding(&state_param),
         urlencoding(&code_challenge),
     );
+
+    // Google only issues a refresh token when `access_type=offline` is
+    // requested (see `oauth_start_inner`); the manual-credentials setup path
+    // needs it too or the very first grant is access-token-only.
+    if is_google_authorization_endpoint(&auth_endpoint) {
+        authorize_url.push_str("&access_type=offline");
+    }
 
     // Scope accumulation: union previously-granted scopes (from a persisted
     // TokenSet for this endpoint) with the requested scopes for step-up.
@@ -8988,12 +9003,15 @@ command = "echo"
         // Adapter half: a live OAuth inner with persisted tokens.
         let tmp = tempfile::tempdir().unwrap();
         let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        // The old grant carries a scope: if the start half ran BEFORE the
+        // disconnect, scope accumulation would merge it into the new
+        // authorize URL — its absence below proves the ordering.
         let token_set = crate::token_manager::TokenSet {
             access_token: "old-access".to_string(),
             refresh_token: Some("old-refresh".to_string()),
             expires_at: None,
             token_type: "Bearer".to_string(),
-            scope: None,
+            scope: Some("pre-reset-scope".to_string()),
             issued_at: None,
         };
         token_manager.save("oauth-ep", &token_set).await.unwrap();
@@ -9058,6 +9076,15 @@ command = "echo"
         // the adapter is Disconnected.
         assert_eq!(*shared_inner.state.read().await, OAuthState::Disconnected);
         assert!(token_manager.load("oauth-ep").await.unwrap().is_none());
+
+        // Ordering proof: had the start half run before the disconnect,
+        // scope accumulation would have merged the old grant's scope into
+        // the new authorize URL.
+        assert!(
+            !authorize_url.contains("pre-reset-scope"),
+            "old grant's scope leaked into the reset URL — start ran before disconnect: {}",
+            authorize_url
+        );
 
         // ...but the client registration survives the reset, and the new
         // authorize URL was built with the preserved client_id.
