@@ -904,6 +904,17 @@ impl OAuthAdapterInner {
             ema.client_secret.as_deref(),
             ema.resource_client_id.as_deref(),
             ema.resource_client_secret.as_deref(),
+            // Epoch-guard the chain's endpoint-token persistence: the save at
+            // the end of `ensure_access_token` happens under this same
+            // `apply_lock`/epoch pair that guards non-EMA refresh commits, so
+            // a disconnect or replacement grant landing mid-chain drops the
+            // minted token BEFORE it reaches disk (PR #149 review) — not just
+            // at the later `apply_refreshed_tokens`.
+            Some(ema::GrantGuard {
+                apply_lock: &self.apply_lock,
+                grant_epoch: &self.grant_epoch,
+                expected_epoch: refresh_epoch,
+            }),
         )
         .await
         {
@@ -915,6 +926,17 @@ impl OAuthAdapterInner {
                 *self.pending_authorize_url.write().await = None;
                 info!("EMA token exchange successful");
                 Ok(token_set)
+            }
+            Err(EmaError::StaleGrant) => {
+                // The grant this refresh ran against is gone (reset/disconnect
+                // or replacement login). Nothing was persisted; no state
+                // transition either — `transition_if_current` would be a no-op
+                // with the stale epoch, and the successor grant's state must
+                // not be perturbed. Mirrors the non-EMA abandon path.
+                info!("Abandoning EMA refresh: grant was discarded or replaced while the chain was in flight");
+                Err(OAuthError::StaleGrant {
+                    endpoint: self.config.endpoint_name.clone(),
+                })
             }
             Err(e) => {
                 self.metrics.inc_refresh_failure();
