@@ -23,7 +23,9 @@ use crate::adapter::{FailedAdapter, HealthStatus, McpAdapter, StartingAdapter};
 use crate::config::{Config, ObservabilityConfig};
 use crate::events::ToolCallEventBus;
 use crate::oauth::client::{self, ClientRegistration};
-use crate::oauth::{OAuthFlowManager, OAuthSetupManager, PkceChallenge};
+use crate::oauth::{
+    append_google_authorize_params, OAuthFlowManager, OAuthSetupManager, PkceChallenge,
+};
 use crate::observability::payloads::StoredPayloads;
 use crate::observability::store::{AggregateBucket, CallRecord, QueryFilter};
 use crate::profile_registry::ProfileRegistry;
@@ -1219,10 +1221,31 @@ struct OAuthRefreshResponse {
     refreshed_at: Option<u64>,
 }
 
+/// Optional query parameters for POST /api/endpoints/:name/oauth/start.
+#[derive(Deserialize, Default)]
+struct OAuthStartQuery {
+    /// When `true`, append `prompt=consent` to the authorize URL so the
+    /// provider re-shows its consent screen instead of silently reusing the
+    /// prior grant. Non-OIDC providers ignore unknown parameters, so this is
+    /// safe to send everywhere.
+    #[serde(default)]
+    force_consent: bool,
+}
+
 /// POST /api/endpoints/:name/oauth/start
 ///
 /// Generates a PKCE challenge, registers a pending flow, and returns the
 /// authorization URL that the user should open in a browser.
+async fn oauth_start(
+    State(state): State<ManagementState>,
+    Path(name): Path<String>,
+    Query(query): Query<OAuthStartQuery>,
+) -> impl IntoResponse {
+    oauth_start_inner(state, name, query.force_consent).await
+}
+
+/// Shared implementation of the auth-start flow, used by `oauth_start` and by
+/// `oauth_reset` (which forces consent).
 ///
 /// Resolution order:
 /// 1. If `oauth_server_url` is in config, derive endpoints from convention.
@@ -1231,10 +1254,13 @@ struct OAuthRefreshResponse {
 ///    credentials → if missing/expired + registration_endpoint available,
 ///    attempt dynamic client registration → if DCR fails/unavailable, return
 ///    `dcr_unsupported` so the UI can prompt for manual credentials.
-async fn oauth_start(
-    State(state): State<ManagementState>,
-    Path(name): Path<String>,
-) -> impl IntoResponse {
+///
+/// `force_consent` appends `prompt=consent` to the composed authorize URL.
+async fn oauth_start_inner(
+    state: ManagementState,
+    name: String,
+    force_consent: bool,
+) -> axum::response::Response {
     use crate::oauth::dcr;
     use crate::oauth::discovery;
 
@@ -1264,6 +1290,15 @@ async fn oauth_start(
     };
 
     let redirect_uri = format!("http://127.0.0.1:{}/oauth/callback", state.relay_port);
+
+    // Sample the endpoint's reset generation BEFORE the network-bound
+    // discovery/DCR work below. A "Reset authorization" that lands while
+    // this start is mid-discovery cannot invalidate it (no pending flow
+    // exists yet), so the flow registration at Step 3 re-checks this value
+    // and refuses the insert if a reset bumped it — otherwise this start
+    // would hand out a post-reset-valid authorize URL WITHOUT the reset's
+    // `prompt=consent`, silently reusing the old provider grant.
+    let start_generation = flow_mgr.generation(&name).await;
 
     // ── Step 1: Resolve OAuth server metadata ──────────────────────────
     let (
@@ -1737,8 +1772,9 @@ async fn oauth_start(
     let pkce = PkceChallenge::generate();
     let code_challenge = pkce.code_challenge.clone();
 
-    let state_param = flow_mgr
-        .start_flow(
+    let Some(state_param) = flow_mgr
+        .start_flow_if_current(
+            start_generation,
             &name,
             &token_endpoint,
             &client_id,
@@ -1748,7 +1784,19 @@ async fn oauth_start(
             issuer.as_deref(),
             iss_supported,
         )
-        .await;
+        .await
+    else {
+        // A reset landed while this start was mid-discovery: this start
+        // predates the reset, so its URL must not be handed out (it lacks
+        // the reset's forced consent). The reset's own follow-up start is
+        // the authoritative one.
+        return error_response(
+            StatusCode::CONFLICT,
+            "superseded_by_reset",
+            Some("Authorization was reset while this start was in progress; use the reset's authorize URL or retry"),
+        )
+        .into_response();
+    };
 
     // ── Step 4: Build authorization URL ────────────────────────────────
     let mut authorize_url = format!(
@@ -1759,6 +1807,18 @@ async fn oauth_start(
         urlencoding(&state_param),
         urlencoding(&code_challenge),
     );
+
+    // Forced consent ("Reset authorization"): `prompt=consent` makes OIDC
+    // providers re-show the consent screen instead of silently reusing the
+    // prior grant. Non-OIDC providers ignore unknown parameters, so this is
+    // safe to append unconditionally when requested.
+    if force_consent {
+        authorize_url.push_str("&prompt=consent");
+    }
+
+    // Google needs `access_type=offline` for a refresh token to be issued
+    // (shared helper — see `crate::oauth::append_google_authorize_params`).
+    append_google_authorize_params(&mut authorize_url, &authorization_endpoint);
 
     // Scope accumulation for step-up authorization: union the scopes we'd
     // request today (config scopes) with any previously-granted scopes from a
@@ -2279,13 +2339,143 @@ async fn oauth_revoke(
     drop(inners_guard);
 
     // Call disconnect (aborts refresh task, clears tokens, deletes from disk)
-    inner.disconnect().await;
+    if let Err(e) = inner.disconnect().await {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to delete tokens from disk",
+            Some(&format!(
+                "The grant would survive a relay restart; retry the revoke. ({})",
+                e
+            )),
+        )
+        .into_response();
+    }
 
     Json(OAuthRevokeResponse {
         status: "disconnected".to_string(),
         endpoint: name,
     })
     .into_response()
+}
+
+/// POST /api/endpoints/:name/oauth/reset
+///
+/// "Reset authorization": discard the old grant and force a fresh consent
+/// screen. Sequencing: disconnect the OAuth adapter first (local token
+/// deletion via the same `disconnect()` path as `/oauth/revoke` — upstream
+/// RFC 7009 revocation rides along once `disconnect()` gains it), then start
+/// a new authorization flow with `force_consent`, returning the composed
+/// `authorize_url`. Unlike `/oauth/revoke`, the client registration (DCR
+/// record) is preserved across the reset: only the grant is discarded, so
+/// the follow-up start flow can reuse the registered client instead of
+/// losing a secret that exists nowhere else.
+async fn oauth_reset(
+    State(state): State<ManagementState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    // Verify endpoint exists in registry
+    {
+        let entries = state.registry.entries().read().await;
+        if !entries.contains_key(&name) {
+            return endpoint_not_found(&name).into_response();
+        }
+    }
+
+    let Some(ref inners) = state.oauth_adapter_inners else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "endpoint is not configured for OAuth",
+            Some("No OAuth adapter inners available"),
+        )
+        .into_response();
+    };
+
+    let inner = {
+        let inners_guard = inners.read().await;
+        match inners_guard.get(&name) {
+            Some(inner) => inner.clone(),
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "endpoint is not configured for OAuth",
+                    Some(&format!("Endpoint '{}' is not an OAuth endpoint", name)),
+                )
+                .into_response();
+            }
+        }
+    };
+
+    // Serialize the whole discard (generation bump + disconnect + DCR
+    // restore) against the callback's commit phase: the callback holds this
+    // same per-endpoint lock from its post-exchange generation check through
+    // its token save / adapter apply, so a callback mid-commit either
+    // finishes before we bump (and its tokens are wiped by the disconnect
+    // below) or checks the generation after our bump and refuses to commit.
+    // Without it a callback that passed its check could persist the
+    // pre-reset grant AFTER our disconnect, undoing the reset.
+    let commit_guard = match state.oauth_flow_manager {
+        Some(ref flow_mgr) => Some(flow_mgr.commit_lock(&name).await),
+        None => None,
+    };
+    let _commit_guard = match commit_guard {
+        Some(ref lock) => Some(lock.lock().await),
+        None => None,
+    };
+
+    // Invalidate pending flows for this endpoint and bump its reset
+    // generation BEFORE disconnecting: an authorize URL handed out by a
+    // pre-reset `/oauth/start` stays valid for up to FLOW_MAX_AGE, and its
+    // late callback would otherwise complete after the disconnect and
+    // clobber the reset with the pre-reset grant. The generation bump also
+    // covers callbacks already consumed and mid token exchange — the
+    // callback handler refuses to commit a flow from a stale generation.
+    if let Some(ref flow_mgr) = state.oauth_flow_manager {
+        let removed = flow_mgr.invalidate_endpoint(&name).await;
+        if removed > 0 {
+            info!(endpoint = %name, removed, "Reset: invalidated pending OAuth flows");
+        }
+    }
+
+    // Snapshot the client registration before disconnect: `disconnect()`
+    // deletes the DCR record along with the tokens, but reset must only
+    // discard the grant. Desktop-created DCR endpoints keep the
+    // client_secret solely in that record, and manually supplied
+    // credentials live only there — losing it would break the one-step
+    // reset (no secret / `dcr_unsupported` on providers without DCR).
+    let preserved_dcr = match state.token_manager {
+        Some(ref tm) => tm.load_dcr(&name).await.ok().flatten(),
+        None => None,
+    };
+
+    // Discard the old grant BEFORE composing the new authorize URL, so the
+    // start flow sees a clean slate. A failed local deletion fails the
+    // whole reset: reporting success while the old token file survives on
+    // disk would silently restore the discarded grant on the next restart.
+    if let Err(e) = inner.disconnect().await {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to delete tokens from disk",
+            Some(&format!(
+                "Reset aborted: the old grant would survive a relay restart; retry the reset. ({})",
+                e
+            )),
+        )
+        .into_response();
+    }
+
+    // Restore the client registration so the start flow reuses it.
+    if let (Some(tm), Some(creds)) = (state.token_manager.as_ref(), preserved_dcr.as_ref()) {
+        if let Err(e) = tm.save_dcr(&name, creds).await {
+            warn!(endpoint = %name, error = %e, "Reset: failed to restore client registration after disconnect");
+        }
+    }
+
+    // Release before starting the replacement flow: `oauth_start_inner`
+    // performs discovery (network) and must not hold the commit lock.
+    drop(_commit_guard);
+    drop(commit_guard);
+
+    oauth_start_inner(state, name, true).await
 }
 
 /// POST /api/endpoints/:name/oauth/refresh
@@ -2349,7 +2539,7 @@ async fn oauth_refresh(
         Ok(new_tokens) => {
             let expires_at = new_tokens.expires_at;
             let refreshed_at = new_tokens.issued_at;
-            inner.apply_tokens(new_tokens).await;
+            inner.apply_refreshed_tokens(new_tokens).await;
 
             let status = {
                 let s = inner.state.read().await;
@@ -3110,6 +3300,11 @@ async fn oauth_setup(
                 urlencoding(&code_challenge),
             );
 
+            // Google needs `access_type=offline` for a refresh token
+            // (shared helper); setup-created Google endpoints need it too or
+            // their very first grant is access-token-only.
+            append_google_authorize_params(&mut authorize_url, &auth_endpoint);
+
             // Scope accumulation: union any previously-granted scopes (from a
             // persisted TokenSet for this name) with the requested scopes.
             let requested_scope = scopes_str.clone().unwrap_or_default();
@@ -3285,6 +3480,11 @@ async fn oauth_setup_credentials(
         urlencoding(&state_param),
         urlencoding(&code_challenge),
     );
+
+    // Google needs `access_type=offline` for a refresh token (shared
+    // helper); the manual-credentials setup path needs it too or the very
+    // first grant is access-token-only.
+    append_google_authorize_params(&mut authorize_url, &auth_endpoint);
 
     // Scope accumulation: union previously-granted scopes (from a persisted
     // TokenSet for this endpoint) with the requested scopes for step-up.
@@ -5532,6 +5732,7 @@ pub fn management_routes(state: ManagementState) -> Router {
         )
         .route("/api/endpoints/{name}/oauth/status", get(oauth_status))
         .route("/api/endpoints/{name}/oauth/revoke", post(oauth_revoke))
+        .route("/api/endpoints/{name}/oauth/reset", post(oauth_reset))
         .route("/api/endpoints/{name}/oauth/refresh", post(oauth_refresh))
         .route("/api/endpoints/{name}/oauth/metrics", get(oauth_metrics))
         // OAuth capability probe (add-time)
@@ -5819,7 +6020,7 @@ async fn compose_org_sso_url(
     } else {
         '?'
     };
-    format!(
+    let mut authorize_url = format!(
         "{}{}response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256&scope={}",
         disc.authorization_endpoint,
         sep,
@@ -5828,7 +6029,11 @@ async fn compose_org_sso_url(
         urlencoding(&state_param),
         urlencoding(&code_challenge),
         urlencoding("openid offline_access"),
-    )
+    );
+    // Google needs `access_type=offline` for a refresh token (shared helper);
+    // a Google-fronted org SSO grant is access-token-only without it.
+    append_google_authorize_params(&mut authorize_url, &disc.authorization_endpoint);
+    authorize_url
 }
 
 /// Persist the updated organization list back to `config.toml`, preserving the
@@ -8817,6 +9022,168 @@ command = "echo"
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// Reset sequencing: disconnect (tokens deleted, state → Disconnected)
+    /// happens first, then a fresh start flow with forced consent returns an
+    /// authorize URL containing prompt=consent.
+    #[tokio::test]
+    async fn oauth_reset_disconnects_then_returns_consent_url() {
+        // Mock AS for the post-disconnect start flow.
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let base = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{}/authorize", base),
+                "token_endpoint": format!("{}/token", base),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        let router =
+            Router::new().route("/.well-known/oauth-authorization-server", get(well_known));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        // Config half: endpoint "oauth-ep" with oauth_server_url → mock AS.
+        // Clear the config client_id: the credentials live ONLY in the DCR
+        // record (the manually-supplied-credentials shape), so a reset that
+        // dropped the record would come back `dcr_unsupported`.
+        let (start_state, _flow_mgr) = test_state_oauth_start("oauth-ep", &base_url, None);
+        start_state.config.write().await.endpoints[0].client_id = None;
+
+        // Adapter half: a live OAuth inner with persisted tokens.
+        let tmp = tempfile::tempdir().unwrap();
+        let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        // The old grant carries a scope: if the start half ran BEFORE the
+        // disconnect, scope accumulation would merge it into the new
+        // authorize URL — its absence below proves the ordering.
+        let token_set = crate::token_manager::TokenSet {
+            access_token: "old-access".to_string(),
+            refresh_token: Some("old-refresh".to_string()),
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: Some("pre-reset-scope".to_string()),
+            issued_at: None,
+        };
+        token_manager.save("oauth-ep", &token_set).await.unwrap();
+        // Manually supplied client credentials, stored only in the DCR
+        // record: reset must preserve them (only the grant is discarded).
+        let manual_creds = DcrCredentials {
+            client_id: "manual-client".to_string(),
+            client_secret: Some("manual-secret".to_string()),
+            registered_via_dcr: false,
+            ..Default::default()
+        };
+        token_manager
+            .save_dcr("oauth-ep", &manual_creds)
+            .await
+            .unwrap();
+        let adapter = OAuthAdapter::new(make_oauth_config("oauth-ep"), token_manager.clone());
+        let shared_inner = adapter.shared_inner();
+        *shared_inner.state.write().await = OAuthState::Authenticated;
+        let oauth_inners: OAuthAdapterInners =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        oauth_inners
+            .write()
+            .await
+            .insert("oauth-ep".to_string(), shared_inner.clone());
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "oauth-ep".to_string(),
+                Box::new(adapter),
+                "oauth".to_string(),
+                None,
+                None,
+            )
+            .await;
+
+        let state = ManagementState {
+            registry: Arc::new(registry),
+            oauth_adapter_inners: Some(oauth_inners),
+            token_manager: Some(token_manager.clone()),
+            ..start_state
+        };
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/oauth-ep/oauth/reset")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        assert!(
+            authorize_url.contains("&prompt=consent"),
+            "reset must force consent, got: {}",
+            authorize_url
+        );
+
+        // Disconnect ran before the start flow: local tokens are gone and
+        // the adapter is Disconnected.
+        assert_eq!(*shared_inner.state.read().await, OAuthState::Disconnected);
+        assert!(token_manager.load("oauth-ep").await.unwrap().is_none());
+
+        // Ordering proof: had the start half run before the disconnect,
+        // scope accumulation would have merged the old grant's scope into
+        // the new authorize URL.
+        assert!(
+            !authorize_url.contains("pre-reset-scope"),
+            "old grant's scope leaked into the reset URL — start ran before disconnect: {}",
+            authorize_url
+        );
+
+        // ...but the client registration survives the reset, and the new
+        // authorize URL was built with the preserved client_id.
+        let creds = token_manager
+            .load_dcr("oauth-ep")
+            .await
+            .unwrap()
+            .expect("client registration must be preserved across reset");
+        assert_eq!(creds.client_id, "manual-client");
+        assert_eq!(creds.client_secret.as_deref(), Some("manual-secret"));
+        assert!(
+            authorize_url.contains("client_id=manual-client"),
+            "start flow must reuse the preserved client registration, got: {}",
+            authorize_url
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_reset_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (state, _inner) = test_state_with_oauth("oauth-ep", tmp.path()).await;
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/nonexistent/oauth/reset")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn oauth_reset_not_oauth_endpoint() {
+        // Non-OAuth endpoint with no adapter inners
+        let state = test_state(vec![("echo", MockAdapter::healthy_with_tools(vec![]))]).await;
+        let app = management_routes(state);
+
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/echo/oauth/reset")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
     #[tokio::test]
     async fn oauth_refresh_needs_login_rejected() {
         let tmp = tempfile::tempdir().unwrap();
@@ -10979,6 +11346,230 @@ command = "echo"
         );
         // No discovery metadata on the fallback path.
         assert!(body.get("discovery").is_none() || body["discovery"].is_null());
+    }
+
+    #[test]
+    fn google_authorization_endpoint_detection() {
+        use crate::oauth::is_google_authorization_endpoint;
+        assert!(is_google_authorization_endpoint(
+            "https://accounts.google.com/o/oauth2/v2/auth"
+        ));
+        assert!(is_google_authorization_endpoint(
+            "https://ACCOUNTS.GOOGLE.COM/o/oauth2/v2/auth"
+        ));
+        // Lookalike hosts must not match.
+        assert!(!is_google_authorization_endpoint(
+            "https://accounts.google.com.evil.test/auth"
+        ));
+        assert!(!is_google_authorization_endpoint(
+            "https://auth.example.com/authorize"
+        ));
+        assert!(!is_google_authorization_endpoint("not a url"));
+    }
+
+    /// Mock AS whose metadata is served locally; the discovered
+    /// authorization_endpoint is NOT Google, so no access_type=offline.
+    async fn spawn_plain_as() -> (String, tokio::task::JoinHandle<()>) {
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let base = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": base,
+                "authorization_endpoint": format!("{}/authorize", base),
+                "token_endpoint": format!("{}/token", base),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        let router =
+            Router::new().route("/.well-known/oauth-authorization-server", get(well_known));
+        spawn_mock_as(router).await
+    }
+
+    #[tokio::test]
+    async fn oauth_start_force_consent_appends_prompt_consent() {
+        let (base_url, _server) = spawn_plain_as().await;
+        let (state, _flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start?force_consent=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        assert!(
+            authorize_url.contains("&prompt=consent"),
+            "force_consent=true must append prompt=consent, got: {}",
+            authorize_url
+        );
+        // Non-Google AS: no access_type=offline.
+        assert!(
+            !authorize_url.contains("access_type=offline"),
+            "non-Google AS must not get access_type=offline, got: {}",
+            authorize_url
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_start_regular_has_no_prompt_consent() {
+        // Regular Authorize / Re-authorize is unchanged: no forced consent.
+        let (base_url, _server) = spawn_plain_as().await;
+        let (state, _flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        assert!(
+            !authorize_url.contains("prompt=consent"),
+            "regular start must not force consent, got: {}",
+            authorize_url
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_start_superseded_by_reset_during_discovery() {
+        // The discovery-phase race Copilot flagged: a /oauth/start that began
+        // BEFORE a reset is not pending yet while it does discovery, so
+        // invalidate_endpoint cannot remove it. It must not later register a
+        // flow under the bumped generation and hand out an authorize URL
+        // without the reset's prompt=consent. The start must fail with 409
+        // superseded_by_reset and leave no pending flow behind.
+        // Two-step handshake, immune to lost wakeups on slow CI runners:
+        // `entered_tx` tells the test the discovery request ARRIVED (the
+        // start already sampled generation 0 — sampling precedes discovery),
+        // and `gate.notify_one()` stores a permit, so the release completes
+        // the handler's `notified().await` even if it parks afterwards.
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let gate_srv = gate.clone();
+        let well_known = move |headers: axum::http::HeaderMap| {
+            let gate = gate_srv.clone();
+            let entered_tx = entered_tx.clone();
+            async move {
+                // Signal arrival, then block discovery until the test has
+                // performed the reset.
+                let _ = entered_tx.send(());
+                gate.notified().await;
+                let base = mock_issuer(&headers);
+                Json(serde_json::json!({
+                    "issuer": base,
+                    "authorization_endpoint": format!("{}/authorize", base),
+                    "token_endpoint": format!("{}/token", base),
+                    "code_challenge_methods_supported": ["S256"],
+                }))
+            }
+        };
+        let router =
+            Router::new().route("/.well-known/oauth-authorization-server", get(well_known));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let (state, flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        let app = management_routes(state);
+
+        // Start the pre-reset /oauth/start; it samples generation 0 at entry
+        // and then parks inside discovery on the gate.
+        let start_task = tokio::spawn(async move {
+            app.oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        });
+        // Wait until discovery is in flight (generation already sampled).
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx.recv())
+            .await
+            .expect("discovery request never arrived")
+            .expect("entered_tx dropped");
+
+        // The reset lands mid-discovery: bump the generation (there is no
+        // pending flow yet, so nothing is removed), then release discovery.
+        assert_eq!(flow_mgr.invalidate_endpoint("ep1").await, 0);
+        gate.notify_one();
+
+        let resp = start_task.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "superseded_by_reset");
+
+        // No flow was registered for the superseded start.
+        assert_eq!(
+            flow_mgr.invalidate_endpoint("ep1").await,
+            0,
+            "superseded start must not leave a pending flow"
+        );
+    }
+
+    #[tokio::test]
+    async fn oauth_start_google_as_appends_access_type_offline() {
+        // Mock AS metadata pointing the authorization_endpoint at Google's
+        // AS: access_type=offline must be appended even WITHOUT
+        // force_consent, so Google issues a refresh token.
+        async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
+            let base = mock_issuer(&headers);
+            Json(serde_json::json!({
+                "issuer": base,
+                "authorization_endpoint": "https://accounts.google.com/o/oauth2/v2/auth",
+                "token_endpoint": format!("{}/token", base),
+                "code_challenge_methods_supported": ["S256"],
+            }))
+        }
+        let router =
+            Router::new().route("/.well-known/oauth-authorization-server", get(well_known));
+        let (base_url, _server) = spawn_mock_as(router).await;
+
+        let (state, _flow_mgr) = test_state_oauth_start("ep1", &base_url, None);
+        let app = management_routes(state);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        assert!(
+            authorize_url.starts_with("https://accounts.google.com/o/oauth2/v2/auth?"),
+            "expected Google authorization endpoint, got: {}",
+            authorize_url
+        );
+        assert!(
+            authorize_url.contains("&access_type=offline"),
+            "Google AS must get access_type=offline, got: {}",
+            authorize_url
+        );
+        assert!(!authorize_url.contains("prompt=consent"));
+
+        // With force_consent both parameters are present.
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints/ep1/oauth/start?force_consent=true")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        let authorize_url = body["authorize_url"].as_str().unwrap();
+        assert!(authorize_url.contains("&prompt=consent"));
+        assert!(authorize_url.contains("&access_type=offline"));
     }
 
     #[tokio::test]

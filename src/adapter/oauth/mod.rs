@@ -14,7 +14,7 @@ use crate::oauth::client::ENDARA_CLIENT_METADATA_URL;
 use crate::oauth::discovery::{discover_oauth_server, DiscoveryResult};
 use crate::oauth::ema::{self, EmaError};
 use crate::oauth::{OAuthError, OAuthFlowManager, PkceChallenge};
-use crate::token_manager::{TokenManager, TokenSet};
+use crate::token_manager::{TokenError, TokenManager, TokenSet};
 use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::Value;
@@ -841,7 +841,7 @@ impl OAuthAdapterInner {
             '?'
         };
         let scope = ema::compose_idp_scope(ema.resource_scope.as_deref(), true);
-        let authorize_url = format!(
+        let mut authorize_url = format!(
             "{}{}response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256&scope={}",
             ema.idp_authorization_endpoint,
             sep,
@@ -850,6 +850,12 @@ impl OAuthAdapterInner {
             form_urlencode(&state_param),
             form_urlencode(&code_challenge),
             form_urlencode(&scope),
+        );
+        // Google needs `access_type=offline` for a refresh token (shared
+        // helper); a Google-fronted IdP grant is access-token-only without it.
+        crate::oauth::append_google_authorize_params(
+            &mut authorize_url,
+            &ema.idp_authorization_endpoint,
         );
         info!(
             endpoint = %self.config.endpoint_name,
@@ -1073,16 +1079,39 @@ impl OAuthAdapterInner {
         self: &Arc<Self>,
         token_set: TokenSet,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-        Box::pin(self.apply_tokens_inner(token_set))
+        Box::pin(self.apply_tokens_inner(token_set, false))
     }
 
-    async fn apply_tokens_inner(self: &Arc<Self>, token_set: TokenSet) {
+    /// Apply a token set produced by REFRESHING the current grant (proactive
+    /// timer, reactive 401, heartbeat recovery, manual `/oauth/refresh`).
+    /// Unlike [`Self::apply_tokens`], this refuses to commit when the grant
+    /// was discarded (disconnect / reset) after the refresh's network
+    /// exchange started: `disconnect()` clears the in-memory tokens under
+    /// the same `apply_lock`, so a refresh commit that acquires the lock
+    /// after a disconnect observes `tokens == None` and drops its result
+    /// instead of resurrecting the discarded grant on disk. Callback logins
+    /// (a NEW grant) must keep using `apply_tokens` — they legitimately
+    /// apply while no tokens exist.
+    pub fn apply_refreshed_tokens(
+        self: &Arc<Self>,
+        token_set: TokenSet,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+        Box::pin(self.apply_tokens_inner(token_set, true))
+    }
+
+    async fn apply_tokens_inner(self: &Arc<Self>, token_set: TokenSet, refresh_of_current: bool) {
         // Serialize the whole apply: callback, proactive refresh, and
         // reactive refresh may overlap, and interleaved applies could pair
         // the published adapter with another apply's fingerprint baseline
         // (see `apply_lock`). Applies are rare (login/refresh), so a full
         // mutex is the simple correct choice over rebuild versioning.
         let _apply_guard = self.apply_lock.lock().await;
+        if refresh_of_current && self.tokens.read().await.is_none() {
+            warn!(
+                "Dropping refreshed tokens: grant was discarded (disconnect/reset) while the refresh was in flight"
+            );
+            return;
+        }
         let endpoint = &self.config.endpoint_name;
 
         // Surface the apply as a transitional state right away: the inner
@@ -1298,7 +1327,7 @@ impl OAuthAdapterInner {
                 match inner.do_token_refresh().await {
                     Ok(new_tokens) => {
                         // Recursively apply — this will schedule the next refresh
-                        inner.apply_tokens(new_tokens).await;
+                        inner.apply_refreshed_tokens(new_tokens).await;
                         // Defensive: if the recursive apply_tokens ever
                         // returns while still in `Refreshing`, surface a
                         // loud warn-log so a future regression is not
@@ -1327,7 +1356,7 @@ impl OAuthAdapterInner {
                         }
                         match inner.do_token_refresh().await {
                             Ok(new_tokens) => {
-                                inner.apply_tokens(new_tokens).await;
+                                inner.apply_refreshed_tokens(new_tokens).await;
                                 let state = inner.state.read().await.clone();
                                 if matches!(state, OAuthState::Refreshing) {
                                     warn!(
@@ -1402,8 +1431,21 @@ impl OAuthAdapterInner {
         *handle_guard = Some(join.abort_handle());
     }
 
-    /// Disconnect: abort refresh task, clear tokens, delete from disk, set Disconnected.
-    pub async fn disconnect(self: &Arc<Self>) {
+    /// Disconnect: abort refresh task, clear tokens, delete from disk, set
+    /// Disconnected. Returns `Err` when the persisted tokens could not be
+    /// deleted from disk — the grant then survives a restart, so callers
+    /// (revoke / reset) must surface the failure instead of reporting a
+    /// clean disconnect. DCR-record deletion failures are logged but do not
+    /// fail the disconnect: the record holds client credentials, not the
+    /// grant.
+    pub async fn disconnect(self: &Arc<Self>) -> Result<(), TokenError> {
+        // Serialize against a token apply: a refresh whose network exchange
+        // already succeeded commits (persist + rebuild) under this same
+        // lock, so acquiring it here means no refresh is mid-commit while
+        // we tear down — and a refresh commit that acquires it after us
+        // observes the cleared in-memory tokens and drops its result (see
+        // `apply_tokens_inner`) instead of resurrecting the grant.
+        let _apply_guard = self.apply_lock.lock().await;
         let endpoint = &self.config.endpoint_name;
 
         // Abort refresh task
@@ -1429,8 +1471,9 @@ impl OAuthAdapterInner {
         // Clear in-memory tokens
         *self.tokens.write().await = None;
 
-        // Delete tokens from disk
-        if let Err(e) = self.token_manager.delete(endpoint).await {
+        // Delete tokens from disk (propagated to the caller on failure)
+        let delete_result = self.token_manager.delete(endpoint).await;
+        if let Err(ref e) = delete_result {
             error!(error = %e, "Failed to delete tokens from disk");
         }
 
@@ -1442,6 +1485,8 @@ impl OAuthAdapterInner {
         // Set state
         self.transition_to(OAuthState::Disconnected, "user disconnected")
             .await;
+
+        delete_result
     }
 }
 
@@ -1579,7 +1624,7 @@ impl McpAdapter for OAuthAdapter {
                     *self.inner.tokens.write().await = Some(token_set);
                     match self.inner.do_token_refresh().await {
                         Ok(new_tokens) => {
-                            self.inner.apply_tokens(new_tokens).await;
+                            self.inner.apply_refreshed_tokens(new_tokens).await;
                         }
                         Err(e) => {
                             warn!(
@@ -1638,7 +1683,7 @@ impl McpAdapter for OAuthAdapter {
 
                             match self.inner.do_token_refresh().await {
                                 Ok(new_tokens) => {
-                                    self.inner.apply_tokens(new_tokens).await;
+                                    self.inner.apply_refreshed_tokens(new_tokens).await;
                                     // Retry with new token
                                     let guard = self.inner.inner_adapter.read().await;
                                     match guard.as_ref() {
@@ -1793,7 +1838,7 @@ impl McpAdapter for OAuthAdapter {
 
                 match refresh_result {
                     Ok(new_tokens) => {
-                        self.inner.apply_tokens(new_tokens).await;
+                        self.inner.apply_refreshed_tokens(new_tokens).await;
                         // Retry with new token — again in caller's span so
                         // the inner adapter sees the per-request scope.
                         let guard = self.inner.inner_adapter.read().await;
@@ -2390,7 +2435,7 @@ mod tests {
         assert_eq!(loaded.unwrap().access_token, "test-access");
 
         // Disconnect
-        adapter.inner.disconnect().await;
+        adapter.inner.disconnect().await.unwrap();
         assert_eq!(adapter.health(), HealthStatus::Stopped);
 
         // Verify tokens are deleted from disk
@@ -2400,6 +2445,74 @@ mod tests {
         // Verify in-memory tokens cleared
         let tokens = adapter.inner.tokens.read().await;
         assert!(tokens.is_none());
+    }
+
+    /// Reset-vs-refresh race (PR #145 review): a refresh whose network
+    /// exchange finished BEFORE the reset's disconnect must not commit its
+    /// tokens afterwards — `apply_refreshed_tokens` observes the cleared
+    /// in-memory tokens under the `apply_lock` and drops the result instead
+    /// of resurrecting the discarded grant on disk.
+    #[tokio::test]
+    async fn refreshed_tokens_dropped_after_disconnect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let config = make_config();
+        let mut adapter = OAuthAdapter::new(config, tm.clone());
+        adapter.initialize().await.unwrap();
+
+        let token_set = TokenSet {
+            access_token: "old-access".to_string(),
+            refresh_token: Some("old-refresh".to_string()),
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        };
+        adapter.inner.apply_tokens(token_set).await;
+        assert!(tm.load("test").await.unwrap().is_some());
+
+        // The reset's disconnect lands first.
+        adapter.inner.disconnect().await.unwrap();
+        assert!(tm.load("test").await.unwrap().is_none());
+
+        // A refresh that raced the disconnect now tries to commit its
+        // result: it must be dropped, not persisted.
+        let refreshed = TokenSet {
+            access_token: "refreshed-access".to_string(),
+            refresh_token: Some("refreshed-refresh".to_string()),
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        };
+        adapter.inner.apply_refreshed_tokens(refreshed).await;
+
+        assert!(
+            tm.load("test").await.unwrap().is_none(),
+            "post-disconnect refresh commit must not resurrect the grant on disk"
+        );
+        assert!(adapter.inner.tokens.read().await.is_none());
+
+        // A NEW grant (callback login after the replacement start flow, which
+        // moves the endpoint back out of Disconnected) still applies from the
+        // clean slate.
+        adapter
+            .inner
+            .transition_to(OAuthState::NeedsLogin, "test: replacement start flow")
+            .await;
+        let new_grant = TokenSet {
+            access_token: "new-access".to_string(),
+            refresh_token: None,
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        };
+        adapter.inner.apply_tokens(new_grant).await;
+        assert_eq!(
+            tm.load("test").await.unwrap().unwrap().access_token,
+            "new-access"
+        );
     }
 
     #[test]

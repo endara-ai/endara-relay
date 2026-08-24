@@ -1990,6 +1990,24 @@ async fn oauth_callback(
         }
     };
 
+    // Reset-generation guard: a "Reset authorization" invalidates the
+    // endpoint's pending flows and bumps its generation in the flow manager.
+    // `consume_flow` already misses flows removed by the invalidation; this
+    // check additionally covers a callback whose flow was consumed and mid
+    // token exchange when the reset landed (its recorded `generation` is now
+    // stale), so it cannot clobber the reset with the pre-reset grant.
+    if !flow_mgr.is_current(&flow).await {
+        warn!(
+            endpoint = %flow.endpoint_name,
+            flow_generation = flow.generation,
+            "Refusing OAuth callback from a flow superseded by a reset"
+        );
+        return oauth_html_response(
+            "<html><body><h1>OAuth Error</h1><p>This login session was superseded by a reset. Please click Authorize again.</p><p>You can close this window.</p></body></html>"
+                .to_string(),
+        );
+    }
+
     // RFC 9207 issuer (`iss`) validation: when we discovered the authorization
     // server's issuer, the callback MUST carry a matching `iss` (mix-up
     // defense). When no issuer was recorded (legacy convention-based config),
@@ -2196,6 +2214,31 @@ async fn oauth_callback(
         scope: token_json["scope"].as_str().map(|s| s.to_string()),
         issued_at: Some(now_secs),
     };
+
+    // Commit phase: serialize against "Reset authorization" for this
+    // endpoint. The lock is held from the generation re-check below through
+    // every side effect (IdP credential save, token save, adapter apply), so
+    // a reset cannot land between the check and the commit and be undone by
+    // this callback persisting the pre-reset grant. The reset holds the same
+    // lock across its generation bump + disconnect.
+    let commit_lock = flow_mgr.commit_lock(&flow.endpoint_name).await;
+    let _commit_guard = commit_lock.lock().await;
+
+    // Reset-generation re-check: the token exchange above is a network round
+    // trip, so a reset can land while this callback is in flight (after the
+    // pre-exchange check). Refuse to commit under a stale generation so the
+    // pre-reset grant cannot clobber the reset's clean slate.
+    if !flow_mgr.is_current(&flow).await {
+        warn!(
+            endpoint = %flow.endpoint_name,
+            flow_generation = flow.generation,
+            "Refusing to commit OAuth callback: flow superseded by a reset during token exchange"
+        );
+        return oauth_html_response(
+            "<html><body><h1>OAuth Error</h1><p>This login session was superseded by a reset. Please click Authorize again.</p><p>You can close this window.</p></body></html>"
+                .to_string(),
+        );
+    }
 
     // EMA Step 1 (END-18): when this authorization-code flow was an IdP SSO for
     // an EMA endpoint, capture the ID Token (plus the IdP refresh token and
@@ -6295,6 +6338,235 @@ mod tests {
         let loaded = tm.load_dcr(endpoint_name).await.unwrap().unwrap();
         assert_eq!(loaded.client_id, "operator-manual-client");
         assert!(!loaded.registered_via_dcr);
+    }
+
+    /// Reset-generation guard: a callback whose pending flow predates a
+    /// "Reset authorization" (`invalidate_endpoint`) must be rejected before
+    /// the token exchange, and must not save tokens — the reset's clean
+    /// slate wins over the pre-reset grant.
+    #[tokio::test]
+    async fn oauth_callback_rejects_flow_superseded_by_reset() {
+        use axum::body::to_bytes;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Token endpoint counts POSTs so we can assert it was never hit.
+        let token_hits = Arc::new(AtomicUsize::new(0));
+        let hits = token_hits.clone();
+        let router = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    "{\"access_token\":\"stale\",\"token_type\":\"Bearer\",\"expires_in\":3600}"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let token_endpoint = format!("http://127.0.0.1:{}/token", addr.port());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let endpoint_name = "reset-race-ep";
+
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let pkce = crate::oauth::PkceChallenge::generate();
+        let state_param = flow_mgr
+            .start_flow(
+                endpoint_name,
+                &token_endpoint,
+                "pre-reset-client",
+                None,
+                pkce,
+                "http://127.0.0.1:9400/oauth/callback",
+                None,
+                false,
+            )
+            .await;
+
+        // Simulate the pre-consume shape of the race: a reset lands after
+        // the authorize URL was handed out but before the callback arrives.
+        flow_mgr.invalidate_endpoint(endpoint_name).await;
+
+        let mut app_state = test_app_state();
+        app_state.oauth_flow_manager = Some(flow_mgr.clone());
+        app_state.token_manager = Some(tm.clone());
+
+        let params = OAuthCallbackParams {
+            code: Some("authcode".to_string()),
+            state: Some(state_param),
+            error: None,
+            iss: None,
+        };
+        let resp = oauth_callback(State(app_state.clone()), Query(params)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The pending flow was removed by the invalidation, so this rejects
+        // as an invalid/expired session without hitting the token endpoint.
+        assert_eq!(token_hits.load(Ordering::SeqCst), 0);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body_str.contains("Invalid or expired"),
+            "pre-consume reset must invalidate the pending flow: {body_str}"
+        );
+        assert!(tm.load(endpoint_name).await.unwrap().is_none());
+
+        // Mid-exchange shape: the flow was consumed BEFORE the reset landed.
+        // Re-arm a pending flow, consume it manually (as the callback does),
+        // then reset — the generation guard must reject the commit.
+        let pkce = crate::oauth::PkceChallenge::generate();
+        let state_param2 = flow_mgr
+            .start_flow(
+                endpoint_name,
+                &token_endpoint,
+                "pre-reset-client",
+                None,
+                pkce,
+                "http://127.0.0.1:9400/oauth/callback",
+                None,
+                false,
+            )
+            .await;
+        let consumed = flow_mgr.consume_flow(&state_param2).await.unwrap();
+        flow_mgr.invalidate_endpoint(endpoint_name).await;
+        assert!(
+            !flow_mgr.is_current(&consumed).await,
+            "consumed flow must be stale after a reset"
+        );
+
+        // End-to-end: a state param whose flow is stamped with the old
+        // generation (re-inserted post-consume, pre-reset shape) is refused
+        // by the callback's generation guard before the token exchange.
+        let stale_state = "stale-generation-state".to_string();
+        flow_mgr
+            .reinsert_flow_for_test(&stale_state, consumed)
+            .await;
+        let params = OAuthCallbackParams {
+            code: Some("authcode".to_string()),
+            state: Some(stale_state),
+            error: None,
+            iss: None,
+        };
+        let resp = oauth_callback(State(app_state), Query(params)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            token_hits.load(Ordering::SeqCst),
+            0,
+            "generation guard must reject before POSTing to the token endpoint"
+        );
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body_str.contains("superseded by a reset"),
+            "error page must explain the flow was superseded by a reset: {body_str}"
+        );
+        assert!(tm.load(endpoint_name).await.unwrap().is_none());
+    }
+
+    /// Commit-lock serialization (post-check race): a reset that lands
+    /// AFTER the callback finished the token exchange but BEFORE its commit
+    /// must still win. The test holds the per-endpoint commit lock (as
+    /// `oauth_reset` does), lets the callback complete the exchange and
+    /// block on the lock, bumps the generation under the lock, then
+    /// releases it — the callback's post-exchange re-check must refuse the
+    /// commit even though its pre-exchange check passed.
+    #[tokio::test]
+    async fn oauth_callback_commit_blocked_by_reset_holding_commit_lock() {
+        use axum::body::to_bytes;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let token_hits = Arc::new(AtomicUsize::new(0));
+        let hits = token_hits.clone();
+        let router = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    "{\"access_token\":\"pre-reset\",\"token_type\":\"Bearer\",\"expires_in\":3600}"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let token_endpoint = format!("http://127.0.0.1:{}/token", addr.port());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let endpoint_name = "commit-lock-ep";
+
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let pkce = crate::oauth::PkceChallenge::generate();
+        let state_param = flow_mgr
+            .start_flow(
+                endpoint_name,
+                &token_endpoint,
+                "pre-reset-client",
+                None,
+                pkce,
+                "http://127.0.0.1:9400/oauth/callback",
+                None,
+                false,
+            )
+            .await;
+
+        let mut app_state = test_app_state();
+        app_state.oauth_flow_manager = Some(flow_mgr.clone());
+        app_state.token_manager = Some(tm.clone());
+
+        // Simulate a concurrent reset: grab the commit lock BEFORE the
+        // callback runs, so the callback exchanges tokens and then blocks
+        // at its commit phase.
+        let lock = flow_mgr.commit_lock(endpoint_name).await;
+        let guard = lock.lock().await;
+
+        let params = OAuthCallbackParams {
+            code: Some("authcode".to_string()),
+            state: Some(state_param),
+            error: None,
+            iss: None,
+        };
+        let callback = tokio::spawn(oauth_callback(State(app_state), Query(params)));
+
+        // Wait for the token exchange to complete (pre-exchange generation
+        // check passed, callback is now blocked on the commit lock).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while token_hits.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "token exchange never happened");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !callback.is_finished(),
+            "callback must block on the commit lock"
+        );
+
+        // The reset half, still under the lock: bump the generation.
+        flow_mgr.invalidate_endpoint(endpoint_name).await;
+        drop(guard);
+
+        // The callback resumes, re-checks the generation, and must refuse.
+        let resp = callback.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body_str.contains("superseded by a reset"),
+            "post-exchange commit must be refused under a stale generation: {body_str}"
+        );
+        assert!(
+            tm.load(endpoint_name).await.unwrap().is_none(),
+            "pre-reset grant must not be persisted after the reset"
+        );
     }
 
     /// After a successful interactive re-authorization the callback must

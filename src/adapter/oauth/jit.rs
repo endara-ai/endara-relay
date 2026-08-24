@@ -291,6 +291,13 @@ impl JitInterceptor {
             urlencoding(&state_param),
             urlencoding(&code_challenge),
         );
+        // Google needs `access_type=offline` for a refresh token (shared
+        // helper); a JIT-initiated Google grant is access-token-only
+        // without it.
+        crate::oauth::append_google_authorize_params(
+            &mut authorize_url,
+            &disc.authorization_endpoint,
+        );
         // Scope accumulation for step-up authorization: when this endpoint
         // already has a persisted token with a granted scope, request the
         // UNION of previously-granted scopes and the scopes we'd request today

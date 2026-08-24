@@ -12,6 +12,7 @@ pub mod url_guard;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -81,6 +82,34 @@ pub fn generate_state() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// True when an authorize URL targets Google's authorization server
+/// (`accounts.google.com`), which requires `access_type=offline` for a
+/// refresh token to be issued. Host comparison only — a lookalike host like
+/// `accounts.google.com.evil.test` does not match.
+pub fn is_google_authorization_endpoint(authorization_endpoint: &str) -> bool {
+    url::Url::parse(authorization_endpoint)
+        .ok()
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| h.eq_ignore_ascii_case("accounts.google.com"))
+        })
+        .unwrap_or(false)
+}
+
+/// Append Google-specific authorization parameters to a composed authorize
+/// URL. Google's authorization server only issues a refresh token when
+/// `access_type=offline` is requested — without it every grant is
+/// access-token-only and proactive refresh is impossible. Other providers
+/// ignore the unknown parameter, but it is scoped to Google to avoid noise.
+/// Shared by every authorize-URL builder (management start/setup, JIT, EMA
+/// IdP SSO, org SSO) so no path hands out a Google grant without it. The URL
+/// must already carry at least one query parameter (`&` separator).
+pub fn append_google_authorize_params(authorize_url: &mut String, authorization_endpoint: &str) {
+    if is_google_authorization_endpoint(authorization_endpoint) {
+        authorize_url.push_str("&access_type=offline");
+    }
+}
+
 /// Maximum age for a pending OAuth flow before it's considered stale.
 const FLOW_MAX_AGE: Duration = Duration::from_secs(600); // 10 minutes
 
@@ -117,18 +146,38 @@ pub struct PendingFlow {
     /// falls back to `idp_issuer` as the key.
     pub idp_credential_key: Option<String>,
     pub created_at: Instant,
+    /// Per-endpoint reset generation this flow was started under. A
+    /// "Reset authorization" bumps the endpoint's generation (see
+    /// [`OAuthFlowManager::invalidate_endpoint`]); the `/oauth/callback`
+    /// commit path refuses flows from an older generation so a pre-reset
+    /// callback — even one already past `consume_flow` and mid token
+    /// exchange — cannot clobber the reset.
+    pub generation: u64,
 }
 
 /// In-memory map holding pending OAuth flows. One entry per in-progress login.
 /// Entries are created by `/oauth/start` and consumed by `/oauth/callback`.
 pub struct OAuthFlowManager {
     pending: RwLock<HashMap<String, PendingFlow>>,
+    /// Per-endpoint reset generation counters (absent entry == generation 0).
+    /// Bumped by [`invalidate_endpoint`](Self::invalidate_endpoint).
+    generations: RwLock<HashMap<String, u64>>,
+    /// Per-endpoint commit locks serializing a callback's token commit
+    /// (post-exchange generation check + token save + adapter apply)
+    /// against a "Reset authorization" (generation bump + disconnect).
+    /// Values are `Weak` so an entry lives only while a caller still holds
+    /// the `Arc` — dead entries are pruned on each acquisition, keeping the
+    /// map bounded even though setup callbacks use unique `setup:{uuid}`
+    /// keys. See [`commit_lock`](Self::commit_lock).
+    commit_locks: tokio::sync::Mutex<HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
 
 impl OAuthFlowManager {
     pub fn new() -> Self {
         Self {
             pending: RwLock::new(HashMap::new()),
+            generations: RwLock::new(HashMap::new()),
+            commit_locks: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -149,6 +198,12 @@ impl OAuthFlowManager {
         iss_parameter_supported: bool,
     ) -> String {
         let state = generate_state();
+        // Hold the generations read lock through the pending insert so
+        // `invalidate_endpoint` (generations write → pending write) cannot
+        // bump the generation between sampling and insertion — that would
+        // hand the caller an authorize URL whose callback is guaranteed to
+        // be rejected as stale. Same lock order as `invalidate_endpoint`.
+        let generations = self.generations.read().await;
         let flow = PendingFlow {
             endpoint_name: endpoint_name.to_string(),
             code_verifier: pkce.code_verifier,
@@ -161,9 +216,63 @@ impl OAuthFlowManager {
             idp_issuer: None,
             idp_credential_key: None,
             created_at: Instant::now(),
+            generation: *generations.get(endpoint_name).unwrap_or(&0),
         };
         self.pending.write().await.insert(state.clone(), flow);
+        drop(generations);
         state
+    }
+
+    /// Like [`start_flow`](Self::start_flow), but refuses the insert when the
+    /// endpoint's reset generation no longer equals `expected_generation`
+    /// (sampled by the caller via [`generation`](Self::generation) at
+    /// auth-start entry, BEFORE any network-bound discovery/DCR work).
+    ///
+    /// This closes the discovery-phase race: a `/oauth/start` that began
+    /// before a reset has no pending flow yet, so `invalidate_endpoint`
+    /// cannot remove it — without this check it would later insert a flow
+    /// stamped with the already-bumped generation and hand out an authorize
+    /// URL lacking the reset's `prompt=consent`, silently reusing the old
+    /// provider grant. Returns `None` when superseded; the caller must fail
+    /// the start rather than hand out a pre-reset URL.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_flow_if_current(
+        &self,
+        expected_generation: u64,
+        endpoint_name: &str,
+        token_endpoint: &str,
+        client_id: &str,
+        client_secret: Option<&str>,
+        pkce: PkceChallenge,
+        redirect_uri: &str,
+        issuer: Option<&str>,
+        iss_parameter_supported: bool,
+    ) -> Option<String> {
+        let state = generate_state();
+        // Same lock discipline as `start_flow`: hold the generations read
+        // lock through the pending insert so the check and the insert are
+        // atomic with respect to `invalidate_endpoint`.
+        let generations = self.generations.read().await;
+        if *generations.get(endpoint_name).unwrap_or(&0) != expected_generation {
+            return None;
+        }
+        let flow = PendingFlow {
+            endpoint_name: endpoint_name.to_string(),
+            code_verifier: pkce.code_verifier,
+            token_endpoint: token_endpoint.to_string(),
+            client_id: client_id.to_string(),
+            client_secret: client_secret.map(|s| s.to_string()),
+            redirect_uri: redirect_uri.to_string(),
+            issuer: issuer.map(|s| s.to_string()),
+            iss_parameter_supported,
+            idp_issuer: None,
+            idp_credential_key: None,
+            created_at: Instant::now(),
+            generation: expected_generation,
+        };
+        self.pending.write().await.insert(state.clone(), flow);
+        drop(generations);
+        Some(state)
     }
 
     /// Register a pending **EMA IdP SSO** flow (END-18 Step 1). Behaves exactly
@@ -196,6 +305,8 @@ impl OAuthFlowManager {
         idp_credential_key: &str,
     ) -> String {
         let state = generate_state();
+        // Generations read lock held through the insert — see `start_flow`.
+        let generations = self.generations.read().await;
         let flow = PendingFlow {
             endpoint_name: endpoint_name.to_string(),
             code_verifier: pkce.code_verifier,
@@ -208,8 +319,10 @@ impl OAuthFlowManager {
             idp_issuer: Some(idp_issuer.to_string()),
             idp_credential_key: Some(idp_credential_key.to_string()),
             created_at: Instant::now(),
+            generation: *generations.get(endpoint_name).unwrap_or(&0),
         };
         self.pending.write().await.insert(state.clone(), flow);
+        drop(generations);
         state
     }
 
@@ -222,6 +335,91 @@ impl OAuthFlowManager {
             return None;
         }
         Some(flow)
+    }
+
+    /// The endpoint's current reset generation (0 until first invalidation).
+    /// Sample this at auth-start entry (before discovery/DCR network work)
+    /// and pass it to [`start_flow_if_current`](Self::start_flow_if_current)
+    /// so a reset landing mid-discovery supersedes the start.
+    pub async fn generation(&self, endpoint_name: &str) -> u64 {
+        self.current_generation(endpoint_name).await
+    }
+
+    async fn current_generation(&self, endpoint_name: &str) -> u64 {
+        *self
+            .generations
+            .read()
+            .await
+            .get(endpoint_name)
+            .unwrap_or(&0)
+    }
+
+    /// Invalidate every pending flow for `endpoint_name` and bump its reset
+    /// generation, so flows started before this call can neither be consumed
+    /// (removed here) nor committed if already consumed and mid token
+    /// exchange (their `generation` is now stale — see [`is_current`]).
+    /// Called by "Reset authorization" before it starts the replacement flow.
+    /// Returns the number of pending flows removed.
+    ///
+    /// [`is_current`]: Self::is_current
+    pub async fn invalidate_endpoint(&self, endpoint_name: &str) -> usize {
+        // Hold both locks across the bump+removal so a concurrent
+        // `start_flow` cannot interleave a flow stamped with the old
+        // generation after removal.
+        let mut generations = self.generations.write().await;
+        let mut pending = self.pending.write().await;
+        *generations.entry(endpoint_name.to_string()).or_insert(0) += 1;
+        let before = pending.len();
+        pending.retain(|_, f| f.endpoint_name != endpoint_name);
+        before - pending.len()
+    }
+
+    /// Whether `flow` was started under the endpoint's current reset
+    /// generation. `/oauth/callback` checks this before committing tokens so
+    /// a callback from a pre-reset flow cannot clobber the reset.
+    pub async fn is_current(&self, flow: &PendingFlow) -> bool {
+        flow.generation == self.current_generation(&flow.endpoint_name).await
+    }
+
+    /// The endpoint's commit lock. `/oauth/callback` holds it across its
+    /// post-exchange generation check AND the token save / adapter apply;
+    /// "Reset authorization" holds it across the generation bump +
+    /// disconnect. This closes the time-of-check/time-of-use window where a
+    /// reset lands after the callback's generation check but before its
+    /// commit finishes — with the lock, either the commit completes first
+    /// (and the reset then wipes the freshly saved tokens) or the reset
+    /// completes first (and the callback's check sees the stale generation).
+    ///
+    /// The map stores `Weak` references and prunes dead entries on every
+    /// acquisition, so keys whose lock is no longer held anywhere (e.g. the
+    /// unique `setup:{uuid}` names from completed setup callbacks) do not
+    /// accumulate for the process lifetime. Concurrent callers for the same
+    /// key always get the same mutex: the upgrade-or-replace happens under
+    /// the outer map lock.
+    pub async fn commit_lock(&self, endpoint_name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.commit_locks.lock().await;
+        locks.retain(|_, weak| weak.strong_count() > 0);
+        match locks.get(endpoint_name).and_then(std::sync::Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(endpoint_name.to_string(), Arc::downgrade(&lock));
+                lock
+            }
+        }
+    }
+
+    /// Test-only: number of live entries in the commit-lock map.
+    #[cfg(test)]
+    pub(crate) async fn commit_lock_count(&self) -> usize {
+        self.commit_locks.lock().await.len()
+    }
+
+    /// Test-only: re-insert a flow under a chosen state key, preserving its
+    /// recorded `generation` (used to exercise the stale-generation guard).
+    #[cfg(test)]
+    pub(crate) async fn reinsert_flow_for_test(&self, state: &str, flow: PendingFlow) {
+        self.pending.write().await.insert(state.to_string(), flow);
     }
 
     /// Periodic cleanup of stale flows (call from a background task or on each access).
@@ -573,6 +771,34 @@ mod tests {
     }
 
     #[test]
+    fn append_google_authorize_params_scoped_to_google_host() {
+        // Google host: access_type=offline appended (case-insensitive host).
+        let mut url = "https://accounts.google.com/o/oauth2/v2/auth?response_type=code".to_string();
+        append_google_authorize_params(&mut url, "https://accounts.google.com/o/oauth2/v2/auth");
+        assert!(url.ends_with("&access_type=offline"));
+
+        let mut url = "https://ACCOUNTS.GOOGLE.COM/auth?response_type=code".to_string();
+        append_google_authorize_params(&mut url, "https://ACCOUNTS.GOOGLE.COM/auth");
+        assert!(url.ends_with("&access_type=offline"));
+
+        // Non-Google and lookalike hosts: untouched.
+        for endpoint in [
+            "https://auth.example.com/authorize",
+            "https://accounts.google.com.evil.test/auth",
+            "not a url",
+        ] {
+            let mut url = format!("{}?response_type=code", endpoint);
+            let before = url.clone();
+            append_google_authorize_params(&mut url, endpoint);
+            assert_eq!(
+                url, before,
+                "non-Google endpoint must be untouched: {}",
+                endpoint
+            );
+        }
+    }
+
+    #[test]
     fn pkce_generates_unique_pairs() {
         let a = PkceChallenge::generate();
         let b = PkceChallenge::generate();
@@ -703,6 +929,122 @@ mod tests {
         mgr.cleanup_stale().await;
         let pending = mgr.pending.read().await;
         assert!(pending.is_empty());
+    }
+
+    async fn start_test_flow(mgr: &OAuthFlowManager, endpoint: &str) -> String {
+        mgr.start_flow(
+            endpoint,
+            "https://auth.example.com/token",
+            "cid",
+            None,
+            PkceChallenge::generate(),
+            "http://localhost/cb",
+            None,
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn invalidate_endpoint_removes_only_that_endpoints_flows() {
+        let mgr = OAuthFlowManager::new();
+        let state_a = start_test_flow(&mgr, "ep-a").await;
+        let state_a2 = start_test_flow(&mgr, "ep-a").await;
+        let state_b = start_test_flow(&mgr, "ep-b").await;
+
+        let removed = mgr.invalidate_endpoint("ep-a").await;
+        assert_eq!(removed, 2);
+
+        // ep-a flows are gone; ep-b's flow is untouched and still current.
+        assert!(mgr.consume_flow(&state_a).await.is_none());
+        assert!(mgr.consume_flow(&state_a2).await.is_none());
+        let flow_b = mgr.consume_flow(&state_b).await.unwrap();
+        assert!(mgr.is_current(&flow_b).await);
+    }
+
+    #[tokio::test]
+    async fn invalidate_endpoint_marks_consumed_flow_stale() {
+        // A callback consumed BEFORE the reset (mid token exchange) must be
+        // detectable as stale afterwards: is_current flips to false once the
+        // endpoint's generation is bumped.
+        let mgr = OAuthFlowManager::new();
+        let state = start_test_flow(&mgr, "ep").await;
+        let flow = mgr.consume_flow(&state).await.unwrap();
+        assert!(mgr.is_current(&flow).await);
+
+        mgr.invalidate_endpoint("ep").await;
+        assert!(!mgr.is_current(&flow).await);
+
+        // A flow started AFTER the reset carries the new generation.
+        let state2 = start_test_flow(&mgr, "ep").await;
+        let flow2 = mgr.consume_flow(&state2).await.unwrap();
+        assert!(mgr.is_current(&flow2).await);
+    }
+
+    #[tokio::test]
+    async fn start_flow_if_current_rejects_when_generation_bumped() {
+        // The discovery-phase race: an auth-start samples the generation at
+        // entry, a reset lands mid-discovery, and the deferred flow insert
+        // must be refused — otherwise the start would register a flow under
+        // the NEW generation whose authorize URL lacks prompt=consent.
+        let mgr = OAuthFlowManager::new();
+        let g = mgr.generation("ep").await;
+        mgr.invalidate_endpoint("ep").await;
+
+        let pkce = PkceChallenge::generate();
+        let refused = mgr
+            .start_flow_if_current(
+                g,
+                "ep",
+                "https://auth.example.com/token",
+                "cid",
+                None,
+                pkce,
+                "http://localhost/cb",
+                None,
+                false,
+            )
+            .await;
+        assert!(refused.is_none(), "pre-reset start must be superseded");
+
+        // Sampling after the bump succeeds and the flow is current.
+        let g2 = mgr.generation("ep").await;
+        let pkce = PkceChallenge::generate();
+        let state = mgr
+            .start_flow_if_current(
+                g2,
+                "ep",
+                "https://auth.example.com/token",
+                "cid",
+                None,
+                pkce,
+                "http://localhost/cb",
+                None,
+                false,
+            )
+            .await
+            .expect("start sampled after the reset must succeed");
+        let flow = mgr.consume_flow(&state).await.unwrap();
+        assert!(mgr.is_current(&flow).await);
+    }
+
+    #[tokio::test]
+    async fn commit_lock_map_prunes_released_entries() {
+        // Unique setup:{uuid} keys must not accumulate forever: once no
+        // caller holds a lock's Arc, the entry is pruned on the next
+        // acquisition.
+        let mgr = OAuthFlowManager::new();
+        for i in 0..100 {
+            let lock = mgr.commit_lock(&format!("setup:{i}")).await;
+            let _guard = lock.lock().await;
+        }
+        // All 100 Arcs were dropped; acquiring a new key prunes them.
+        let _keep = mgr.commit_lock("ep").await;
+        assert_eq!(mgr.commit_lock_count().await, 1);
+
+        // Same key while held returns the SAME mutex (not a replacement).
+        let again = mgr.commit_lock("ep").await;
+        assert!(Arc::ptr_eq(&_keep, &again));
     }
 
     #[test]
