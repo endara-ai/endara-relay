@@ -13,6 +13,7 @@
 //! arrives over TLS from the IdP and the downstream AS verifies the signature
 //! in Step 3. This is a documented hardening follow-up.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
@@ -108,6 +109,35 @@ pub enum EmaError {
     /// persisting the resulting access token.
     #[error("token storage error: {0}")]
     Storage(String),
+
+    /// The grant this refresh ran against was discarded or replaced
+    /// (disconnect/reset or a new login) while the chain was in flight; the
+    /// minted token was NOT persisted (see [`GrantGuard`]).
+    #[error("grant discarded or replaced while EMA refresh was in flight")]
+    StaleGrant,
+}
+
+/// Epoch guard for the endpoint-token persistence at the end of
+/// [`ensure_access_token`].
+///
+/// The OAuth adapter's grant epoch is bumped (under its `apply_lock`) by both
+/// `disconnect()` (reset/revoke) and a NEW-grant token install, so a refresh
+/// that outlives its grant must not write its result to disk — that would
+/// resurrect a revoked grant after restart or overwrite the replacement
+/// grant's persisted tokens. When a guard is supplied, the save runs under
+/// `apply_lock` and only if `grant_epoch` still equals `expected_epoch`;
+/// otherwise the chain abandons with [`EmaError::StaleGrant`]. Epoch bumps
+/// happen under this same lock, so a bump ordered after the guarded save also
+/// cleans up or overwrites what it wrote — the disk can never end up holding
+/// a stale grant's token.
+pub struct GrantGuard<'a> {
+    /// The adapter's `apply_lock`: serializes token installs, disconnects,
+    /// and epoch bumps.
+    pub apply_lock: &'a Mutex<()>,
+    /// The adapter's grant epoch counter.
+    pub grant_epoch: &'a AtomicU64,
+    /// The caller's epoch snapshot, taken BEFORE the refresh began.
+    pub expected_epoch: u64,
 }
 
 /// Build the RFC 8693 token-exchange form body for the ID Token → ID-JAG leg
@@ -612,10 +642,16 @@ async fn refresh_and_persist_idp_token(
 ///    a single refresh-and-retry. A failed refresh ⇒ [`EmaError::ReauthRequired`]
 ///    (no silent loop); an [`EmaError::AuthorizationDenied`] propagates as-is (M5).
 /// 5. [`validate_id_jag`] (M6) then Step 3 (`redeem_id_jag`), persisting the
-///    resulting `TokenSet` via [`TokenManager::save`] (M8).
+///    resulting `TokenSet` via [`TokenManager::save`] (M8). With a
+///    [`GrantGuard`] the save runs under the adapter's `apply_lock` and only
+///    while the grant epoch still matches the caller's snapshot; a stale
+///    chain abandons with [`EmaError::StaleGrant`] instead of writing a
+///    discarded grant's token to disk.
 ///
 /// `refresh_mutex` is supplied by the caller (the OAuth adapter owns one per
 /// endpoint), mirroring the adapter's existing refresh-coalescing guard.
+/// `grant_guard` is `None` only for callers with no adapter grant lifecycle
+/// (unit tests); the adapter always passes `Some`.
 ///
 /// **Credential routing (R1).** `client_id`/`client_secret` are the *requesting*
 /// client credentials and are used only on the IdP-facing legs (Step 2 exchange
@@ -648,6 +684,7 @@ pub async fn ensure_access_token(
     client_secret: Option<&str>,
     resource_client_id: Option<&str>,
     resource_client_secret: Option<&str>,
+    grant_guard: Option<GrantGuard<'_>>,
 ) -> Result<TokenSet, EmaError> {
     // Fast path: a still-valid persisted token needs neither lock nor network.
     if let Some(ts) = load_token(token_manager, endpoint).await? {
@@ -750,10 +787,32 @@ pub async fn ensure_access_token(
         resource_client_secret,
     )
     .await?;
-    token_manager
-        .save(endpoint, &token_set)
-        .await
-        .map_err(|e| EmaError::Storage(e.to_string()))?;
+    // Persist the minted token — epoch-guarded when the caller has a grant
+    // lifecycle. The guard's `apply_lock` is the same lock under which the
+    // adapter bumps the epoch (disconnect / new-grant install), so a chain
+    // that outlived its grant is detected HERE, before its token reaches
+    // disk, instead of resurrecting a revoked grant after restart or
+    // overwriting a replacement grant's persisted tokens. Lock order:
+    // `refresh_mutex` → `apply_lock`, same as the non-EMA refresh path (no
+    // `apply_lock` holder acquires the `refresh_mutex`).
+    match grant_guard {
+        Some(guard) => {
+            let _apply = guard.apply_lock.lock().await;
+            if guard.expected_epoch != guard.grant_epoch.load(Ordering::Acquire) {
+                return Err(EmaError::StaleGrant);
+            }
+            token_manager
+                .save(endpoint, &token_set)
+                .await
+                .map_err(|e| EmaError::Storage(e.to_string()))?;
+        }
+        None => {
+            token_manager
+                .save(endpoint, &token_set)
+                .await
+                .map_err(|e| EmaError::Storage(e.to_string()))?;
+        }
+    }
     Ok(token_set)
 }
 
@@ -1404,6 +1463,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .expect("valid cached token must be returned");
@@ -1429,7 +1489,7 @@ mod tests {
 
         let ts = ensure_access_token(
             &mgr, &lock, "ep", IDP_ISS, &idp_ep, AS_ISS, &as_ep, RESOURCE, None, true, None, None,
-            None, None,
+            None, None, None,
         )
         .await
         .expect("chain must succeed");
@@ -1469,7 +1529,7 @@ mod tests {
 
         let ts = ensure_access_token(
             &mgr, &lock, "ep", IDP_ISS, &idp_ep, AS_ISS, &as_ep, RESOURCE, None, true, None, None,
-            None, None,
+            None, None, None,
         )
         .await
         .expect("refresh then chain must succeed");
@@ -1515,7 +1575,7 @@ mod tests {
 
         let ts = ensure_access_token(
             &mgr, &lock, "ep", IDP_ISS, &idp_ep, AS_ISS, &as_ep, RESOURCE, None, true, None, None,
-            None, None,
+            None, None, None,
         )
         .await
         .expect("reactive refresh then retry must succeed");
@@ -1549,7 +1609,7 @@ mod tests {
 
         let err = ensure_access_token(
             &mgr, &lock, "ep", IDP_ISS, &idp_ep, AS_ISS, &as_ep, RESOURCE, None, true, None, None,
-            None, None,
+            None, None, None,
         )
         .await
         .unwrap_err();
@@ -1586,6 +1646,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -1613,6 +1674,7 @@ mod tests {
             RESOURCE,
             None,
             true,
+            None,
             None,
             None,
             None,
@@ -1651,7 +1713,7 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 ensure_access_token(
                     &mgr, &lock, "ep", IDP_ISS, &idp_ep, AS_ISS, &as_ep, RESOURCE, None, true,
-                    None, None, None, None,
+                    None, None, None, None, None,
                 )
                 .await
             }));
@@ -1668,6 +1730,119 @@ mod tests {
         );
         assert_eq!(c.redeem, 1, "coalesced: exactly one Step 3");
         drop(c);
+        server.abort();
+    }
+
+    /// A stale [`GrantGuard`] (epoch bumped mid-chain, e.g. disconnect or a
+    /// replacement login) abandons the chain with `StaleGrant` and leaves NO
+    /// endpoint token on disk — the minted token must not resurrect a revoked
+    /// grant or overwrite a replacement grant's persisted tokens.
+    #[tokio::test]
+    async fn stale_grant_guard_abandons_without_persisting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        mgr.save_idp(
+            IDP_ISS,
+            &idp_creds("good-id-token", Some(now_unix() + 3600), None),
+        )
+        .await
+        .unwrap();
+        let (idp_ep, as_ep, counts, server) =
+            spawn_token_fixture(RefreshOutcome::Fail, "good-id-token", 0).await;
+        let lock = Mutex::new(());
+        let apply_lock = Mutex::new(());
+        let epoch = AtomicU64::new(0);
+
+        // Simulate a disconnect/replacement landing while the chain is in
+        // flight: the guard's snapshot (0) no longer matches the counter.
+        epoch.store(1, Ordering::Release);
+
+        let err = ensure_access_token(
+            &mgr,
+            &lock,
+            "ep",
+            IDP_ISS,
+            &idp_ep,
+            AS_ISS,
+            &as_ep,
+            RESOURCE,
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some(GrantGuard {
+                apply_lock: &apply_lock,
+                grant_epoch: &epoch,
+                expected_epoch: 0,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(matches!(err, EmaError::StaleGrant), "got {err:?}");
+        // The chain ran (the guard fires only at persistence)…
+        {
+            let c = counts.lock().unwrap();
+            assert_eq!(c.exchange, 1, "Step 2 ran before the guard fired");
+            assert_eq!(c.redeem, 1, "Step 3 ran before the guard fired");
+        }
+        // …but nothing reached disk.
+        assert!(
+            mgr.load("ep").await.unwrap().is_none(),
+            "stale chain must not persist an endpoint token"
+        );
+        server.abort();
+    }
+
+    /// A current [`GrantGuard`] (epoch unchanged) persists and returns the
+    /// minted token exactly like the guard-less path.
+    #[tokio::test]
+    async fn current_grant_guard_persists_normally() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        mgr.save_idp(
+            IDP_ISS,
+            &idp_creds("good-id-token", Some(now_unix() + 3600), None),
+        )
+        .await
+        .unwrap();
+        let (idp_ep, as_ep, _counts, server) =
+            spawn_token_fixture(RefreshOutcome::Fail, "good-id-token", 0).await;
+        let lock = Mutex::new(());
+        let apply_lock = Mutex::new(());
+        let epoch = AtomicU64::new(7);
+
+        let ts = ensure_access_token(
+            &mgr,
+            &lock,
+            "ep",
+            IDP_ISS,
+            &idp_ep,
+            AS_ISS,
+            &as_ep,
+            RESOURCE,
+            None,
+            true,
+            None,
+            None,
+            None,
+            None,
+            Some(GrantGuard {
+                apply_lock: &apply_lock,
+                grant_epoch: &epoch,
+                expected_epoch: 7,
+            }),
+        )
+        .await
+        .expect("current-epoch chain must succeed");
+
+        assert_eq!(ts.access_token, "final-access-token");
+        assert!(
+            mgr.load("ep").await.unwrap().unwrap().is_valid(),
+            "current chain persists the minted token"
+        );
         server.abort();
     }
 
@@ -1782,6 +1957,7 @@ mod tests {
             Some("req-secret"),
             Some("res-client"),
             Some("res-secret"),
+            None,
         )
         .await
         .expect("chain must succeed");
@@ -1843,6 +2019,7 @@ mod tests {
             true,
             Some("req-client"),
             Some("req-secret"),
+            None,
             None,
             None,
         )

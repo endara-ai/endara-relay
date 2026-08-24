@@ -179,6 +179,18 @@ pub struct OAuthAdapterConfig {
     pub ema: Option<EmaConfig>,
 }
 
+/// Outcome of an epoch-guarded refresh commit
+/// ([`OAuthAdapterInner::apply_refreshed_tokens`]): either the token set was
+/// installed, or it was dropped because the grant the refresh began against
+/// was discarded or replaced (disconnect/reset/re-login) while the refresh
+/// was in flight. Callers that report success to a user must check for the
+/// dropped case instead of assuming a returned token set was committed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefreshCommitOutcome {
+    Committed,
+    DroppedStaleGrant,
+}
+
 /// Outcome of a single POST to the OAuth token endpoint. Returned by
 /// `OAuthAdapterInner::execute_token_post` so the caller can special-case
 /// HTTP 404 (which triggers the discovery fallback) without prematurely
@@ -581,13 +593,29 @@ impl OAuthAdapterInner {
     /// adapter transitions to `AuthRequired` (matching the pre-existing
     /// non-2xx behavior).
     pub async fn do_token_refresh(self: &Arc<Self>) -> Result<TokenSet, OAuthError> {
-        // Capture the grant epoch this refresh runs against. Every state
+        // Convenience entry for callers that do not commit the result via
+        // `apply_refreshed_tokens` (EMA startup acquisition, tests). Callers
+        // that DO commit must snapshot the epoch themselves and pass the
+        // same value to both `do_token_refresh_with_epoch` and
+        // `apply_refreshed_tokens`, so the refresh's transitions and its
+        // commit identify the same grant.
+        let refresh_epoch = self.current_grant_epoch();
+        self.do_token_refresh_with_epoch(refresh_epoch).await
+    }
+
+    pub async fn do_token_refresh_with_epoch(
+        self: &Arc<Self>,
+        refresh_epoch: u64,
+    ) -> Result<TokenSet, OAuthError> {
+        // `refresh_epoch` is the grant epoch this refresh runs against,
+        // snapshotted by the caller BEFORE the refresh began. Every state
         // transition below goes through `transition_if_current` with this
         // epoch, so a refresh that outlives its grant (reset/disconnect,
         // possibly followed by a replacement login) cannot perturb the
         // successor grant's state (PR #145 review). The result commit is
-        // epoch-guarded separately in `apply_refreshed_tokens`.
-        let refresh_epoch = self.current_grant_epoch();
+        // epoch-guarded separately in `apply_refreshed_tokens` — with the
+        // SAME epoch value, so the two guards cannot disagree about which
+        // grant the refresh belongs to.
 
         // EMA (END-18) endpoints mint/refresh their access token through the
         // ID-JAG chain (Steps 2+3, with a stored ID Token) instead of the
@@ -622,26 +650,48 @@ impl OAuthAdapterInner {
         }
 
         let correlation_id = generate_correlation_id();
+        // Pair the epoch check with the refresh-token read under the
+        // `apply_lock`: epoch bumps and token installs happen under this
+        // same lock, so a replacement grant installed after the caller's
+        // snapshot but before this read is detected HERE — the stale
+        // attempt abandons instead of POSTing the NEW grant's refresh
+        // token, which a rotating provider would invalidate even though
+        // the epoch-guarded commit would drop the result. Lock order:
+        // `refresh_mutex` → `apply_lock` is safe because no `apply_lock`
+        // holder acquires the `refresh_mutex`. The guard is dropped before
+        // `transition_if_current` below (which re-acquires the
+        // `apply_lock` itself).
         let refresh_token = {
+            let _epoch_guard = self.apply_lock.lock().await;
+            if refresh_epoch != self.grant_epoch.load(Ordering::Acquire) {
+                info!(
+                    correlation_id = %correlation_id,
+                    "Abandoning refresh: grant was discarded or replaced before refresh inputs were read"
+                );
+                return Err(OAuthError::StaleGrant {
+                    endpoint: self.config.endpoint_name.clone(),
+                });
+            }
             let tokens = self.tokens.read().await;
-            match tokens.as_ref().and_then(|t| t.refresh_token.clone()) {
-                Some(rt) => rt,
-                None => {
-                    warn!(
-                        correlation_id = %correlation_id,
-                        "No refresh token available"
-                    );
-                    self.transition_if_current(
-                        refresh_epoch,
-                        OAuthState::AuthRequired,
-                        "no refresh token",
-                    )
-                    .await;
-                    self.metrics.inc_refresh_failure();
-                    return Err(OAuthError::NoRefreshToken {
-                        endpoint: self.config.endpoint_name.clone(),
-                    });
-                }
+            tokens.as_ref().and_then(|t| t.refresh_token.clone())
+        };
+        let refresh_token = match refresh_token {
+            Some(rt) => rt,
+            None => {
+                warn!(
+                    correlation_id = %correlation_id,
+                    "No refresh token available"
+                );
+                self.transition_if_current(
+                    refresh_epoch,
+                    OAuthState::AuthRequired,
+                    "no refresh token",
+                )
+                .await;
+                self.metrics.inc_refresh_failure();
+                return Err(OAuthError::NoRefreshToken {
+                    endpoint: self.config.endpoint_name.clone(),
+                });
             }
         };
 
@@ -854,6 +904,17 @@ impl OAuthAdapterInner {
             ema.client_secret.as_deref(),
             ema.resource_client_id.as_deref(),
             ema.resource_client_secret.as_deref(),
+            // Epoch-guard the chain's endpoint-token persistence: the save at
+            // the end of `ensure_access_token` happens under this same
+            // `apply_lock`/epoch pair that guards non-EMA refresh commits, so
+            // a disconnect or replacement grant landing mid-chain drops the
+            // minted token BEFORE it reaches disk (PR #149 review) — not just
+            // at the later `apply_refreshed_tokens`.
+            Some(ema::GrantGuard {
+                apply_lock: &self.apply_lock,
+                grant_epoch: &self.grant_epoch,
+                expected_epoch: refresh_epoch,
+            }),
         )
         .await
         {
@@ -865,6 +926,17 @@ impl OAuthAdapterInner {
                 *self.pending_authorize_url.write().await = None;
                 info!("EMA token exchange successful");
                 Ok(token_set)
+            }
+            Err(EmaError::StaleGrant) => {
+                // The grant this refresh ran against is gone (reset/disconnect
+                // or replacement login). Nothing was persisted; no state
+                // transition either — `transition_if_current` would be a no-op
+                // with the stale epoch, and the successor grant's state must
+                // not be perturbed. Mirrors the non-EMA abandon path.
+                info!("Abandoning EMA refresh: grant was discarded or replaced while the chain was in flight");
+                Err(OAuthError::StaleGrant {
+                    endpoint: self.config.endpoint_name.clone(),
+                })
             }
             Err(e) => {
                 self.metrics.inc_refresh_failure();
@@ -1199,7 +1271,11 @@ impl OAuthAdapterInner {
         self: &Arc<Self>,
         token_set: TokenSet,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
-        Box::pin(self.apply_tokens_inner(token_set, None))
+        Box::pin(async move {
+            // NEW grants always commit; the outcome only matters for
+            // epoch-guarded refresh commits.
+            let _ = self.apply_tokens_inner(token_set, None).await;
+        })
     }
 
     /// Apply a token set produced by REFRESHING the current grant (proactive
@@ -1215,15 +1291,25 @@ impl OAuthAdapterInner {
     /// replacement grant installed by a post-reset login (a presence check
     /// on `tokens` alone would miss the latter). Callback logins (a NEW
     /// grant) must keep using `apply_tokens`.
+    ///
+    /// Returns whether the tokens were committed or dropped as stale, so
+    /// callers that report success to a user (manual `POST /oauth/refresh`)
+    /// can surface the drop instead of describing a token set that was
+    /// never installed.
     pub fn apply_refreshed_tokens(
         self: &Arc<Self>,
         token_set: TokenSet,
         refresh_epoch: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = RefreshCommitOutcome> + Send + '_>>
+    {
         Box::pin(self.apply_tokens_inner(token_set, Some(refresh_epoch)))
     }
 
-    async fn apply_tokens_inner(self: &Arc<Self>, token_set: TokenSet, refresh_epoch: Option<u64>) {
+    async fn apply_tokens_inner(
+        self: &Arc<Self>,
+        token_set: TokenSet,
+        refresh_epoch: Option<u64>,
+    ) -> RefreshCommitOutcome {
         // Serialize the whole apply: callback, proactive refresh, and
         // reactive refresh may overlap, and interleaved applies could pair
         // the published adapter with another apply's fingerprint baseline
@@ -1235,7 +1321,7 @@ impl OAuthAdapterInner {
                 warn!(
                     "Dropping refreshed tokens: grant was discarded or replaced (disconnect/reset/re-login) while the refresh was in flight"
                 );
-                return;
+                return RefreshCommitOutcome::DroppedStaleGrant;
             }
             Some(_) => {}
             None => {
@@ -1460,7 +1546,7 @@ impl OAuthAdapterInner {
                     let _ = inner.refresh_task_handle.lock().await.take();
                 }
                 let refresh_epoch = inner.current_grant_epoch();
-                match inner.do_token_refresh().await {
+                match inner.do_token_refresh_with_epoch(refresh_epoch).await {
                     Ok(new_tokens) => {
                         // Recursively apply — this will schedule the next refresh
                         inner
@@ -1493,7 +1579,7 @@ impl OAuthAdapterInner {
                             let _ = inner.refresh_task_handle.lock().await.take();
                         }
                         let retry_epoch = inner.current_grant_epoch();
-                        match inner.do_token_refresh().await {
+                        match inner.do_token_refresh_with_epoch(retry_epoch).await {
                             Ok(new_tokens) => {
                                 inner.apply_refreshed_tokens(new_tokens, retry_epoch).await;
                                 let state = inner.state.read().await.clone();
@@ -1535,6 +1621,8 @@ impl OAuthAdapterInner {
             let handle = tokio::spawn(fut.instrument(refresh_span));
             self.refresh_task_handle.lock().await.replace(handle);
         }
+
+        RefreshCommitOutcome::Committed
     }
 
     /// Abort any existing inner→outer tools-changed forwarder and, if `rx` is
@@ -1771,7 +1859,7 @@ impl McpAdapter for OAuthAdapter {
                     // Store expired tokens so refresh can use the refresh_token
                     *self.inner.tokens.write().await = Some(token_set);
                     let refresh_epoch = self.inner.current_grant_epoch();
-                    match self.inner.do_token_refresh().await {
+                    match self.inner.do_token_refresh_with_epoch(refresh_epoch).await {
                         Ok(new_tokens) => {
                             self.inner
                                 .apply_refreshed_tokens(new_tokens, refresh_epoch)
@@ -1837,7 +1925,7 @@ impl McpAdapter for OAuthAdapter {
                             info!("Got 401 on list_tools, attempting token refresh");
 
                             let refresh_epoch = self.inner.current_grant_epoch();
-                            match self.inner.do_token_refresh().await {
+                            match self.inner.do_token_refresh_with_epoch(refresh_epoch).await {
                                 Ok(new_tokens) => {
                                     self.inner
                                         .apply_refreshed_tokens(new_tokens, refresh_epoch)
@@ -1995,7 +2083,7 @@ impl McpAdapter for OAuthAdapter {
                 let refresh_epoch = self.inner.current_grant_epoch();
                 let refresh_result = async {
                     info!("Got 401, attempting token refresh");
-                    self.inner.do_token_refresh().await
+                    self.inner.do_token_refresh_with_epoch(refresh_epoch).await
                 }
                 .instrument(self.inner.span.clone())
                 .await;
@@ -2656,10 +2744,11 @@ mod tests {
             scope: None,
             issued_at: None,
         };
-        adapter
+        let outcome = adapter
             .inner
             .apply_refreshed_tokens(refreshed, refresh_epoch)
             .await;
+        assert_eq!(outcome, RefreshCommitOutcome::DroppedStaleGrant);
 
         assert!(
             tm.load("test").await.unwrap().is_none(),
@@ -2744,10 +2833,11 @@ mod tests {
             scope: None,
             issued_at: None,
         };
-        adapter
+        let outcome = adapter
             .inner
             .apply_refreshed_tokens(stale_result, stale_epoch)
             .await;
+        assert_eq!(outcome, RefreshCommitOutcome::DroppedStaleGrant);
         assert_eq!(
             tm.load("test").await.unwrap().unwrap().access_token,
             "new-access",
@@ -2789,14 +2879,105 @@ mod tests {
             scope: None,
             issued_at: None,
         };
-        adapter
+        let outcome = adapter
             .inner
             .apply_refreshed_tokens(fresh, current_epoch)
             .await;
+        assert_eq!(outcome, RefreshCommitOutcome::Committed);
         assert_eq!(
             tm.load("test").await.unwrap().unwrap().access_token,
             "new-access-2"
         );
+    }
+
+    /// PR #149 review: the epoch guard on the COMMIT is not enough when the
+    /// replacement grant lands between the caller's epoch snapshot and the
+    /// refresh's read of its inputs. Without a start-time check the stale
+    /// attempt would read grant B's refresh token from `self.tokens` and
+    /// POST it — a rotating provider then invalidates B's refresh token
+    /// even though the commit is dropped. The refresh must abandon with
+    /// `StaleGrant` BEFORE the network call: B's refresh token is neither
+    /// used nor invalidated, and B's state and tokens are untouched.
+    #[tokio::test]
+    async fn stale_refresh_abandons_before_using_replacement_grant_inputs() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let token_posts = Arc::new(AtomicUsize::new(0));
+        let (token_url, token_server) = spawn_token_server_always_500(token_posts.clone()).await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let mut config = make_config();
+        config.token_endpoint_url = token_url;
+        let mut adapter = OAuthAdapter::new(config, tm.clone());
+        adapter.initialize().await.unwrap();
+
+        let grant_a = TokenSet {
+            access_token: "a-access".to_string(),
+            refresh_token: Some("a-refresh".to_string()),
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        };
+        adapter.inner.apply_tokens(grant_a).await;
+
+        // A refresh driver snapshots epoch A...
+        let stale_epoch = adapter.inner.current_grant_epoch();
+
+        // ...but before it reads its inputs, a replacement login installs
+        // grant B (epoch bump under the apply_lock).
+        let grant_b = TokenSet {
+            access_token: "b-access".to_string(),
+            refresh_token: Some("b-refresh".to_string()),
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        };
+        adapter.inner.apply_tokens(grant_b).await;
+        let state_before = adapter.inner.state.read().await.clone();
+
+        // The stale attempt now proceeds: it must abandon without touching
+        // grant B's refresh token.
+        let err = adapter
+            .inner
+            .do_token_refresh_with_epoch(stale_epoch)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OAuthError::StaleGrant { .. }),
+            "expected StaleGrant, got {err:?}"
+        );
+        assert_eq!(
+            token_posts.load(AtomicOrdering::SeqCst),
+            0,
+            "stale refresh must not POST the replacement grant's refresh token"
+        );
+
+        // Grant B is untouched: tokens (in memory and on disk) and state.
+        let tokens = adapter.inner.tokens.read().await.clone().unwrap();
+        assert_eq!(tokens.access_token, "b-access");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("b-refresh"));
+        assert_eq!(
+            tm.load("test").await.unwrap().unwrap().access_token,
+            "b-access"
+        );
+        assert_eq!(*adapter.inner.state.read().await, state_before);
+
+        // Grant B's own refresh (current epoch) still reaches the network.
+        let current_epoch = adapter.inner.current_grant_epoch();
+        let _ = adapter
+            .inner
+            .do_token_refresh_with_epoch(current_epoch)
+            .await;
+        assert_eq!(
+            token_posts.load(AtomicOrdering::SeqCst),
+            1,
+            "current-epoch refresh must proceed to the token endpoint"
+        );
+
+        token_server.abort();
     }
 
     #[test]

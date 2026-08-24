@@ -160,7 +160,7 @@ fn classify_tick_action(state: &OAuthState) -> TickAction {
 /// the heartbeat interval, so there is no tight retry loop here.
 async fn attempt_recovery(adapter: &Arc<OAuthAdapterInner>) {
     let refresh_epoch = adapter.current_grant_epoch();
-    match adapter.do_token_refresh().await {
+    match adapter.do_token_refresh_with_epoch(refresh_epoch).await {
         Ok(tokens) => {
             adapter.apply_refreshed_tokens(tokens, refresh_epoch).await;
         }

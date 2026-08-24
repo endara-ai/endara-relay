@@ -48,6 +48,9 @@ pub enum OAuthError {
 
     #[error("EMA token exchange failed: {0}")]
     Ema(String),
+
+    #[error("Refresh abandoned for endpoint '{endpoint}': the grant it was started for was discarded or replaced")]
+    StaleGrant { endpoint: String },
 }
 
 /// PKCE (Proof Key for Code Exchange) challenge pair for OAuth 2.0 S256.

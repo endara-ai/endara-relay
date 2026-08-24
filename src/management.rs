@@ -16,7 +16,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use crate::adapter::http::{HttpAdapter, HttpConfig};
-use crate::adapter::oauth::OAuthState;
+use crate::adapter::oauth::{OAuthState, RefreshCommitOutcome};
 use crate::adapter::sse::{SseAdapter, SseConfig};
 use crate::adapter::stdio::{StdioAdapter, StdioConfig};
 use crate::adapter::{FailedAdapter, HealthStatus, McpAdapter, StartingAdapter};
@@ -2536,13 +2536,27 @@ async fn oauth_refresh(
 
     // Attempt refresh
     let refresh_epoch = inner.current_grant_epoch();
-    match inner.do_token_refresh().await {
+    match inner.do_token_refresh_with_epoch(refresh_epoch).await {
         Ok(new_tokens) => {
             let expires_at = new_tokens.expires_at;
             let refreshed_at = new_tokens.issued_at;
-            inner
+            let outcome = inner
                 .apply_refreshed_tokens(new_tokens, refresh_epoch)
                 .await;
+
+            // A successful token-endpoint response is not a committed
+            // refresh: the commit is dropped when the grant was discarded
+            // or replaced (disconnect/reset/re-login) while the refresh was
+            // in flight. Reporting 200 with the discarded set's metadata
+            // would falsely describe tokens that were never installed.
+            if outcome == RefreshCommitOutcome::DroppedStaleGrant {
+                return error_response(
+                    StatusCode::CONFLICT,
+                    "token refresh not committed",
+                    Some("the grant was discarded or replaced (disconnect/reset/re-login) while the refresh was in flight"),
+                )
+                .into_response();
+            }
 
             let status = {
                 let s = inner.state.read().await;
@@ -2556,6 +2570,14 @@ async fn oauth_refresh(
             })
             .into_response()
         }
+        // Same concurrent disconnect/replacement, caught before the token
+        // POST: not an upstream failure, so 409 rather than 502.
+        Err(e @ crate::oauth::OAuthError::StaleGrant { .. }) => error_response(
+            StatusCode::CONFLICT,
+            "token refresh not committed",
+            Some(&e.to_string()),
+        )
+        .into_response(),
         Err(e) => error_response(
             StatusCode::BAD_GATEWAY,
             "token refresh failed",
