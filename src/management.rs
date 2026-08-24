@@ -3333,6 +3333,12 @@ async fn oauth_setup_status(
 ///
 /// Write the fully-configured endpoint to config.toml and register the adapter.
 /// Only succeeds if the session has status `Authorized`.
+///
+/// The `client_secret` is never written to config.toml — client credentials
+/// live in the DCR store (`{name}.dcr.json` via `TokenManager`). Only the
+/// non-secret `client_id` is stamped into the `[[endpoints]]` entry. If no
+/// DCR record was persisted during setup, the session's credentials are
+/// defensively saved to the store here before the config is written.
 async fn oauth_setup_commit(
     State(state): State<ManagementState>,
     Path(id): Path<String>,
@@ -3428,9 +3434,8 @@ async fn oauth_setup_commit(
     if let Some(ref cid) = session.client_id {
         ep_table.insert("client_id".into(), toml::Value::String(cid.clone()));
     }
-    if let Some(ref cs) = session.client_secret {
-        ep_table.insert("client_secret".into(), toml::Value::String(cs.clone()));
-    }
+    // `client_secret` is deliberately NOT written to config.toml; it lives in
+    // the DCR store only (defensively persisted below if missing).
     if let Some(ref scopes_str) = session.scopes {
         let scopes_vec: Vec<toml::Value> = scopes_str
             .split_whitespace()
@@ -3448,6 +3453,46 @@ async fn oauth_setup_commit(
             "server_type_override".into(),
             toml::Value::String(sto.clone()),
         );
+    }
+
+    // Defensive persistence: if the setup flow did not write a DCR record
+    // (e.g. an older/partial flow), save the session's client credentials to
+    // the store now so they survive without a TOML `client_secret`. Never
+    // overwrites an existing record.
+    if let (Some(ref tm), Some(ref cid)) = (&state.token_manager, &session.client_id) {
+        match tm.load_dcr(&session.name).await {
+            Ok(None) => {
+                let creds = DcrCredentials {
+                    client_id: cid.clone(),
+                    client_secret: session.client_secret.clone(),
+                    client_secret_expires_at: 0,
+                    registered_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs(),
+                    issuer: session.issuer.clone(),
+                    // The session does not record registration provenance, so
+                    // never claim DCR provenance for this defensive save.
+                    registered_via_dcr: false,
+                    ..Default::default()
+                };
+                if let Err(e) = tm.save_dcr(&session.name, &creds).await {
+                    warn!(
+                        endpoint = %session.name,
+                        error = %e,
+                        "Failed to persist client credentials at commit"
+                    );
+                }
+            }
+            Ok(Some(_)) => {}
+            Err(e) => {
+                warn!(
+                    endpoint = %session.name,
+                    error = %e,
+                    "Failed to read DCR credentials at commit; skipping defensive save"
+                );
+            }
+        }
     }
 
     // Append to the [[endpoints]] array
@@ -9013,6 +9058,107 @@ command = "echo"
         assert!(contents.contains("new-ep"));
         assert!(contents.contains("https://mcp.example.com"));
         assert!(contents.contains("oauth"));
+        assert!(contents.contains("client-123"));
+        // The secret must never be stamped into config.toml.
+        assert!(
+            !contents.contains("client_secret"),
+            "client_secret must not be written to config.toml; got:\n{}",
+            contents
+        );
+        assert!(!contents.contains("secret-456"));
+    }
+
+    /// Regression: an authorized session carrying a `client_secret` commits
+    /// with `client_id` (but no `client_secret` key) in the written TOML
+    /// entry, and the secret lands in the DCR store via the defensive save
+    /// (no record was written during setup).
+    #[tokio::test]
+    async fn oauth_setup_commit_persists_secret_to_dcr_store_not_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let token_dir = tmp.path().join("tokens");
+        std::fs::create_dir_all(&token_dir).unwrap();
+        let token_manager = Arc::new(TokenManager::new(token_dir));
+
+        let mut state = test_state_with_setup().await;
+        state.config_path = Some(config_path.clone());
+        state.token_manager = Some(token_manager.clone());
+
+        let setup_mgr = state.setup_manager.as_ref().unwrap();
+        let session_id = setup_mgr
+            .create_session(
+                "secret-ep".into(),
+                "https://mcp.example.com".into(),
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        setup_mgr
+            .get_session_mut(&session_id, |s| {
+                s.authorization_endpoint = Some("https://auth.example.com/authorize".into());
+                s.token_endpoint = Some("https://auth.example.com/token".into());
+                s.issuer = Some("https://auth.example.com".into());
+                s.client_id = Some("client-123".into());
+                s.client_secret = Some("super-secret".into());
+                s.status = crate::oauth::SetupSessionStatus::Authorized;
+                s.tokens = Some(crate::token_manager::TokenSet {
+                    access_token: "tok".into(),
+                    refresh_token: None,
+                    expires_at: None,
+                    token_type: "Bearer".into(),
+                    scope: None,
+                    issued_at: None,
+                });
+            })
+            .await;
+
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // TOML entry: `client_id` present, `client_secret` key absent.
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        let parsed: toml::Table = contents.parse().unwrap();
+        let endpoints = parsed
+            .get("endpoints")
+            .and_then(|v| v.as_array())
+            .expect("endpoints array missing from written config");
+        let ep = endpoints
+            .iter()
+            .find(|v| v.get("name").and_then(|n| n.as_str()) == Some("secret-ep"))
+            .expect("committed endpoint missing from config");
+        assert_eq!(
+            ep.get("client_id").and_then(|v| v.as_str()),
+            Some("client-123")
+        );
+        assert!(
+            ep.get("client_secret").is_none(),
+            "client_secret must not be written to config.toml; got:\n{}",
+            contents
+        );
+        assert!(!contents.contains("super-secret"));
+
+        // The defensive save persisted the credentials to the DCR store.
+        let creds = token_manager
+            .load_dcr("secret-ep")
+            .await
+            .unwrap()
+            .expect("commit must defensively persist credentials to the DCR store");
+        assert_eq!(creds.client_id, "client-123");
+        assert_eq!(creds.client_secret.as_deref(), Some("super-secret"));
+        assert_eq!(creds.issuer.as_deref(), Some("https://auth.example.com"));
+        assert!(!creds.registered_via_dcr);
     }
 
     /// Round-trip: a commit driven by a session created with
@@ -10749,14 +10895,14 @@ command = "echo"
         assert!(!persisted.registered_via_dcr);
     }
 
-    /// Regression for PR #130 Finding 1: setup-created endpoints persist
-    /// the DCR `client_id`/`client_secret` into `config.toml` alongside
-    /// the `.dcr.json` file, so `config_client_id.is_some()` is true for
-    /// every setup-created endpoint. If the config-branch is checked
-    /// first, the DCR-provenanced re-registration heal path is
-    /// unreachable and stale server-side registrations loop forever. The
-    /// resolution must check DCR-provenanced re-registration BEFORE the
-    /// config branch and mint a fresh client_id.
+    /// Regression for PR #130 Finding 1: setup commits used to persist the
+    /// DCR `client_id`/`client_secret` into `config.toml` alongside the
+    /// `.dcr.json` file (commit still stamps `client_id`, and legacy configs
+    /// carry both), so `config_client_id.is_some()` is true for such
+    /// endpoints. If the config-branch is checked first, the DCR-provenanced
+    /// re-registration heal path is unreachable and stale server-side
+    /// registrations loop forever. The resolution must check DCR-provenanced
+    /// re-registration BEFORE the config branch and mint a fresh client_id.
     #[tokio::test]
     async fn oauth_start_reregisters_dcr_record_even_when_config_carries_stale_client_id() {
         async fn well_known(headers: axum::http::HeaderMap) -> Json<Value> {
@@ -10784,9 +10930,9 @@ command = "echo"
         let token_manager = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
 
         // The DCR record and `config.toml` BOTH carry the same stale
-        // `client_id` — this is exactly what setup writes on commit
-        // (see `oauth_setup_commit` in this module: DCR pair persisted
-        // to disk AND stamped into `config.toml`). The record is
+        // `client_id` — commit stamps `client_id` into `config.toml`
+        // (secrets stay in the DCR store only), and legacy configs from
+        // older commits carry the full pair. The record is
         // DCR-provenanced so the RFC 7591 heal path applies.
         let stored = DcrCredentials {
             client_id: "stale-dcr-client".to_string(),
