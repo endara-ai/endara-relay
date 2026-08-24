@@ -16,8 +16,38 @@ use tracing::{debug, trace, warn};
 /// Error type for heartbeat probes.
 #[derive(Debug)]
 enum ProbeError {
+    /// Transport-dead: the upstream did not answer at the transport level
+    /// (connect failure, timeout, or a send error with no HTTP status).
     Network(String),
+    /// Alive-but-erroring: the upstream answered, but with an error (HTTP
+    /// status > 0 other than 401, JSON-RPC error, protocol error).
+    Upstream(String),
+    /// 401 from the upstream — credentials are no longer accepted.
     Auth,
+}
+
+/// Classify an [`AdapterError`] as a transport-dead ("upstream is gone")
+/// signal versus an alive-but-erroring one. Mirrors
+/// `HttpAdapter::is_transport_dead` (http.rs): dead is only `ConnectionFailed`,
+/// `Timeout`, or `HttpError { status: 0 }` — a server answering with a
+/// non-zero HTTP status, JSON-RPC error, or protocol error is alive.
+fn is_transport_dead(err: &AdapterError) -> bool {
+    matches!(
+        err,
+        AdapterError::ConnectionFailed(_)
+            | AdapterError::Timeout(_)
+            | AdapterError::HttpError { status: 0, .. }
+    )
+}
+
+/// Map a probe's `AdapterError` to a `ProbeError`: 401 → `Auth`,
+/// transport-dead → `Network`, everything else → `Upstream`.
+fn classify_adapter_error(e: AdapterError) -> ProbeError {
+    match e {
+        AdapterError::HttpError { status: 401, .. } => ProbeError::Auth,
+        e if is_transport_dead(&e) => ProbeError::Network(e.to_string()),
+        e => ProbeError::Upstream(e.to_string()),
+    }
 }
 
 /// Action the heartbeat loop should take in response to a probe result.
@@ -28,19 +58,26 @@ enum ProbeError {
 enum ProbeAction {
     /// Reset failure counter and mark inner_health as Healthy.
     MarkHealthy,
-    /// Network failure but below the threshold — leave inner_health alone,
+    /// Probe failure but below the threshold — leave inner_health alone,
     /// just log at debug. `failures` is the new (post-increment) count.
     BelowThreshold { failures: u32, reason: String },
-    /// Network failure reached the threshold — mark Unhealthy.
-    MarkUnhealthy { reason: String },
+    /// Probe failure reached the threshold — mark Unhealthy.
+    /// `transport_dead` records whether the threshold-crossing failure was a
+    /// transport-dead one (`Network`) or an alive-but-erroring upstream
+    /// (`Upstream`); it selects the health message written by
+    /// `apply_probe_action`.
+    MarkUnhealthy {
+        reason: String,
+        transport_dead: bool,
+    },
     /// Auth failure — reset counter and transition to AuthRequired.
     AuthFailed,
 }
 
 /// Apply hysteresis to a probe result.
 ///
-/// Mutates `failures` in place: increments on `Network`, resets on `Ok` or
-/// `Auth`. Returns the action the loop should perform.
+/// Mutates `failures` in place: increments on `Network`/`Upstream`, resets on
+/// `Ok` or `Auth`. Returns the action the loop should perform.
 fn classify_probe_result(
     result: Result<(), ProbeError>,
     failures: &mut u32,
@@ -55,16 +92,31 @@ fn classify_probe_result(
             *failures = 0;
             ProbeAction::AuthFailed
         }
-        Err(ProbeError::Network(reason)) => {
-            *failures = failures.saturating_add(1);
-            if *failures >= threshold {
-                ProbeAction::MarkUnhealthy { reason }
-            } else {
-                ProbeAction::BelowThreshold {
-                    failures: *failures,
-                    reason,
-                }
-            }
+        Err(ProbeError::Network(reason)) => record_probe_failure(reason, true, failures, threshold),
+        Err(ProbeError::Upstream(reason)) => {
+            record_probe_failure(reason, false, failures, threshold)
+        }
+    }
+}
+
+/// Shared hysteresis increment for both failure kinds (`Network` /
+/// `Upstream`); `transport_dead` is carried through to `MarkUnhealthy`.
+fn record_probe_failure(
+    reason: String,
+    transport_dead: bool,
+    failures: &mut u32,
+    threshold: u32,
+) -> ProbeAction {
+    *failures = failures.saturating_add(1);
+    if *failures >= threshold {
+        ProbeAction::MarkUnhealthy {
+            reason,
+            transport_dead,
+        }
+    } else {
+        ProbeAction::BelowThreshold {
+            failures: *failures,
+            reason,
         }
     }
 }
@@ -132,8 +184,7 @@ async fn probe_inner(inner: &OAuthAdapterInner) -> Result<(), ProbeError> {
     let timeout_secs = inner.config.probe_timeout_secs;
     match tokio::time::timeout(Duration::from_secs(timeout_secs), adapter.list_tools()).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(AdapterError::HttpError { status: 401, .. })) => Err(ProbeError::Auth),
-        Ok(Err(e)) => Err(ProbeError::Network(e.to_string())),
+        Ok(Err(e)) => Err(classify_adapter_error(e)),
         Err(_) => Err(ProbeError::Network(format!(
             "probe timed out after {}s",
             timeout_secs
@@ -164,13 +215,25 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
             return;
         };
 
-        let oauth_state = adapter.state.read().await.clone();
+        // Snapshot state AND generation inside one read-lock critical
+        // section: generation bumps only happen inside state write-lock
+        // sections, so holding the read lock guarantees the pair is
+        // coherent — a bump cannot interleave between the two reads and
+        // hand the probe a post-apply generation while it still probes
+        // the pre-apply adapter.
+        let (oauth_state, generation) = {
+            let state = adapter.state.read().await;
+            let generation = adapter
+                .lifecycle_generation
+                .load(std::sync::atomic::Ordering::Relaxed);
+            (state.clone(), generation)
+        };
         match classify_tick_action(&oauth_state) {
             TickAction::Skip => continue,
             TickAction::Probe => {
                 let result = probe_inner(&adapter).await;
                 let action = classify_probe_result(result, &mut consecutive_failures, threshold);
-                apply_probe_action(&adapter, action, threshold, &oauth_state).await;
+                apply_probe_action(&adapter, action, threshold, &oauth_state, generation).await;
             }
             TickAction::Recover => {
                 attempt_recovery(&adapter).await;
@@ -190,6 +253,7 @@ async fn apply_probe_action(
     action: ProbeAction,
     threshold: u32,
     oauth_state: &OAuthState,
+    dispatched_generation: u64,
 ) {
     match action {
         ProbeAction::MarkHealthy => {
@@ -211,26 +275,76 @@ async fn apply_probe_action(
                 "heartbeat probe failed below threshold; not flipping inner_health"
             );
         }
-        ProbeAction::MarkUnhealthy { reason } => {
-            *adapter.inner_health.write().await =
-                HealthStatus::Unhealthy("upstream unreachable".into());
+        ProbeAction::MarkUnhealthy {
+            reason,
+            transport_dead,
+        } => {
+            // "upstream unreachable" only when the upstream is genuinely
+            // dead at the transport level; an alive-but-erroring upstream
+            // (403/5xx/JSON-RPC/protocol) surfaces its actual error text.
+            let message = if transport_dead {
+                "upstream unreachable".to_string()
+            } else {
+                reason.clone()
+            };
+            *adapter.inner_health.write().await = HealthStatus::Unhealthy(message);
             adapter.metrics.inc_heartbeat_unhealthy();
             warn!(
                 oauth_state = ?oauth_state,
                 result = "unhealthy",
                 threshold = threshold,
+                transport_dead = transport_dead,
                 reason = %reason,
                 "heartbeat probe failed at threshold"
             );
         }
         ProbeAction::AuthFailed => {
+            // The probe ran without holding the state lock, so an apply /
+            // refresh may have taken over mid-probe (state moved off
+            // `Authenticated`, e.g. to `Refreshing`). Re-check under the
+            // write lock and only apply the stale 401 if the state that
+            // dispatched this probe still holds; otherwise the in-flight
+            // lifecycle operation's own outcome decides the final state,
+            // and stomping it here would resurrect the error banner
+            // mid-apply. The state check alone has an ABA hole: an entire
+            // apply (Authenticated → Refreshing → Authenticated, publishing
+            // a NEW inner adapter) can complete mid-probe, so the enum
+            // matches again while the 401 belongs to the replaced adapter.
+            // The lifecycle generation catches exactly that: it is bumped
+            // inside every state write-lock section and snapshotted with
+            // the state under one read lock at dispatch, so "generation
+            // unchanged" here proves no transition — hence no apply —
+            // interleaved, and the probed adapter is still the published
+            // one.
+            let mut state = adapter.state.write().await;
+            let current_generation = adapter
+                .lifecycle_generation
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if *state != OAuthState::Authenticated || current_generation != dispatched_generation {
+                debug!(
+                    oauth_state = ?*state,
+                    dispatched_generation = dispatched_generation,
+                    current_generation = current_generation,
+                    result = "stale",
+                    "heartbeat probe got 401 but the lifecycle moved on \
+                     mid-probe (state changed or an apply ran); dropping \
+                     stale result"
+                );
+                return;
+            }
             adapter.metrics.inc_heartbeat_unhealthy();
             warn!(
                 oauth_state = ?oauth_state,
                 result = "unhealthy",
                 "heartbeat probe got 401, transitioning to AuthRequired"
             );
-            *adapter.state.write().await = OAuthState::AuthRequired;
+            *state = OAuthState::AuthRequired;
+            // Keep the invariant "every state write bumps the generation
+            // inside the write critical section" (see
+            // `lifecycle_generation`).
+            adapter
+                .lifecycle_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -241,6 +355,10 @@ mod tests {
 
     fn net(reason: &str) -> Result<(), ProbeError> {
         Err(ProbeError::Network(reason.to_string()))
+    }
+
+    fn upstream(reason: &str) -> Result<(), ProbeError> {
+        Err(ProbeError::Upstream(reason.to_string()))
     }
 
     fn ok() -> Result<(), ProbeError> {
@@ -284,9 +402,106 @@ mod tests {
 
         assert_eq!(failures, 3);
         match a3 {
-            ProbeAction::MarkUnhealthy { reason } => assert_eq!(reason, "dns"),
+            ProbeAction::MarkUnhealthy {
+                reason,
+                transport_dead,
+            } => {
+                assert_eq!(reason, "dns");
+                assert!(transport_dead, "Network failures are transport-dead");
+            }
             other => panic!("expected MarkUnhealthy, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn three_consecutive_upstream_failures_flip_to_unhealthy_not_transport_dead() {
+        let mut failures: u32 = 0;
+        let threshold = 3;
+
+        let _ = classify_probe_result(
+            upstream("HTTP error 403: forbidden"),
+            &mut failures,
+            threshold,
+        );
+        let _ = classify_probe_result(
+            upstream("HTTP error 403: forbidden"),
+            &mut failures,
+            threshold,
+        );
+        let a3 = classify_probe_result(
+            upstream("HTTP error 403: forbidden"),
+            &mut failures,
+            threshold,
+        );
+
+        assert_eq!(failures, 3);
+        match a3 {
+            ProbeAction::MarkUnhealthy {
+                reason,
+                transport_dead,
+            } => {
+                assert_eq!(reason, "HTTP error 403: forbidden");
+                assert!(!transport_dead, "Upstream failures are alive-but-erroring");
+            }
+            other => panic!("expected MarkUnhealthy, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_adapter_error_maps_transport_dead_vs_upstream() {
+        // 401 → Auth.
+        assert!(matches!(
+            classify_adapter_error(AdapterError::HttpError {
+                status: 401,
+                body: "unauthorized".into(),
+            }),
+            ProbeError::Auth
+        ));
+
+        // Transport-dead (mirrors HttpAdapter::is_transport_dead) → Network.
+        assert!(matches!(
+            classify_adapter_error(AdapterError::ConnectionFailed("refused".into())),
+            ProbeError::Network(_)
+        ));
+        assert!(matches!(
+            classify_adapter_error(AdapterError::Timeout(30)),
+            ProbeError::Network(_)
+        ));
+        assert!(matches!(
+            classify_adapter_error(AdapterError::HttpError {
+                status: 0,
+                body: "send error".into(),
+            }),
+            ProbeError::Network(_)
+        ));
+
+        // Alive-but-erroring → Upstream, carrying the real error text.
+        match classify_adapter_error(AdapterError::HttpError {
+            status: 403,
+            body: "forbidden".into(),
+        }) {
+            ProbeError::Upstream(reason) => assert_eq!(reason, "HTTP error 403: forbidden"),
+            other => panic!("expected Upstream, got {:?}", other),
+        }
+        assert!(matches!(
+            classify_adapter_error(AdapterError::HttpError {
+                status: 500,
+                body: "boom".into(),
+            }),
+            ProbeError::Upstream(_)
+        ));
+        assert!(matches!(
+            classify_adapter_error(AdapterError::JsonRpcError {
+                code: -32000,
+                message: "nope".into(),
+                data: None,
+            }),
+            ProbeError::Upstream(_)
+        ));
+        assert!(matches!(
+            classify_adapter_error(AdapterError::ProtocolError("bad".into())),
+            ProbeError::Upstream(_)
+        ));
     }
 
     #[test]
@@ -333,7 +548,7 @@ mod tests {
         let action = classify_probe_result(net("boom"), &mut failures, 1);
         assert_eq!(failures, 1);
         match action {
-            ProbeAction::MarkUnhealthy { reason } => assert_eq!(reason, "boom"),
+            ProbeAction::MarkUnhealthy { reason, .. } => assert_eq!(reason, "boom"),
             other => panic!("expected MarkUnhealthy, got {:?}", other),
         }
     }
@@ -413,8 +628,11 @@ mod tests {
         threshold: u32,
     ) {
         let oauth_state = adapter.state.read().await.clone();
+        let generation = adapter
+            .lifecycle_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
         let action = classify_probe_result(result, failures, threshold);
-        apply_probe_action(adapter, action, threshold, &oauth_state).await;
+        apply_probe_action(adapter, action, threshold, &oauth_state, generation).await;
     }
 
     /// Set the adapter into the `Authenticated` / `Healthy` baseline that
@@ -474,6 +692,64 @@ mod tests {
         assert_eq!(snap.oauth_heartbeat_probe_total_healthy, 0);
     }
 
+    /// Regression: an alive-but-erroring upstream (e.g. Gmail MCP answering
+    /// 403) must surface its actual error text at the threshold, not the
+    /// transport-dead "upstream unreachable".
+    #[tokio::test]
+    async fn heartbeat_upstream_errors_surface_real_reason_not_unreachable() {
+        let threshold = 3;
+        let inner = make_test_inner(threshold);
+        arm_healthy(&inner).await;
+
+        let mut failures = 0u32;
+        for _ in 0..threshold {
+            let err = AdapterError::HttpError {
+                status: 403,
+                body: "forbidden".into(),
+            };
+            step_once(
+                &inner,
+                Err(classify_adapter_error(err)),
+                &mut failures,
+                threshold,
+            )
+            .await;
+        }
+        assert_eq!(failures, threshold);
+        match &*inner.inner_health.read().await {
+            HealthStatus::Unhealthy(reason) => {
+                assert!(
+                    reason.contains("HTTP error 403"),
+                    "message must carry the 403 error text, got {:?}",
+                    reason
+                );
+                assert_ne!(reason, "upstream unreachable");
+            }
+            other => panic!("expected Unhealthy, got {:?}", other),
+        };
+    }
+
+    /// The 3-tick hysteresis applies to alive-but-erroring failures too: two
+    /// upstream errors must not flip inner_health.
+    #[tokio::test]
+    async fn heartbeat_upstream_errors_below_threshold_do_not_flip() {
+        let threshold = 3;
+        let inner = make_test_inner(threshold);
+        arm_healthy(&inner).await;
+
+        let mut failures = 0u32;
+        for _ in 0..(threshold - 1) {
+            step_once(
+                &inner,
+                upstream("HTTP error 500: boom"),
+                &mut failures,
+                threshold,
+            )
+            .await;
+            assert_eq!(*inner.inner_health.read().await, HealthStatus::Healthy);
+        }
+    }
+
     #[tokio::test]
     async fn heartbeat_single_ok_after_failures_recovers_to_healthy() {
         let threshold = 3;
@@ -517,6 +793,134 @@ mod tests {
                 i
             );
         }
+    }
+
+    /// Regression: a probe is dispatched while `Authenticated`, but an
+    /// apply/refresh moves the state to `Refreshing` before the probe's 401
+    /// result is applied. The stale `AuthFailed` must be DROPPED — not
+    /// stomp the in-flight apply with `AuthRequired` (which would resurrect
+    /// the error banner mid-apply).
+    #[tokio::test]
+    async fn heartbeat_stale_auth_failed_mid_apply_is_dropped() {
+        let threshold = 3;
+        let inner = make_test_inner(threshold);
+        arm_healthy(&inner).await;
+
+        // Snapshot what the loop read when it dispatched the probe.
+        let dispatched_state = inner.state.read().await.clone();
+        let dispatched_gen = inner
+            .lifecycle_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(dispatched_state, OAuthState::Authenticated);
+
+        // An apply takes over mid-probe.
+        *inner.state.write().await = OAuthState::Refreshing;
+
+        // The probe's 401 result lands afterwards: it must be dropped.
+        let mut failures = 0u32;
+        let action = classify_probe_result(auth(), &mut failures, threshold);
+        assert_eq!(action, ProbeAction::AuthFailed);
+        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
+
+        assert_eq!(
+            *inner.state.read().await,
+            OAuthState::Refreshing,
+            "stale probe 401 must not overwrite an in-flight apply"
+        );
+        // No unhealthy metric increment for a dropped stale result.
+        let snap = inner.metrics.snapshot();
+        assert_eq!(snap.oauth_heartbeat_probe_total_unhealthy, 0);
+
+        // Control: with the state still Authenticated and the generation
+        // unchanged, the 401 applies.
+        *inner.state.write().await = OAuthState::Authenticated;
+        let action = classify_probe_result(auth(), &mut failures, threshold);
+        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
+        assert_eq!(*inner.state.read().await, OAuthState::AuthRequired);
+    }
+
+    /// Regression (ABA): an ENTIRE apply completes mid-probe — the state
+    /// goes Authenticated → Refreshing → Authenticated and a NEW inner
+    /// adapter is published. The state enum matches `Authenticated` again
+    /// when the old probe's 401 lands, but the result belongs to the
+    /// replaced adapter: the lifecycle generation (bumped inside every
+    /// state write-lock section) must cause the stale 401 to be dropped.
+    #[tokio::test]
+    async fn heartbeat_stale_auth_failed_after_full_apply_aba_is_dropped() {
+        let threshold = 3;
+        let inner = make_test_inner(threshold);
+        arm_healthy(&inner).await;
+
+        // Probe dispatched: snapshot state + generation (the loop reads
+        // both under one state read lock).
+        let dispatched_state = inner.state.read().await.clone();
+        let dispatched_gen = inner
+            .lifecycle_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(dispatched_state, OAuthState::Authenticated);
+
+        // A full apply completes mid-probe via the real transition path,
+        // which bumps the generation inside each state write: the state
+        // returns to Authenticated (mirrors apply_tokens_inner's sequence).
+        inner
+            .transition_to(OAuthState::Refreshing, "test: apply takes over")
+            .await;
+        inner
+            .transition_to(OAuthState::Authenticated, "test: apply finished")
+            .await;
+
+        // The old probe's 401 lands: state matches but generation differs —
+        // the stale result must be dropped.
+        let mut failures = 0u32;
+        let action = classify_probe_result(auth(), &mut failures, threshold);
+        assert_eq!(action, ProbeAction::AuthFailed);
+        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
+
+        assert_eq!(
+            *inner.state.read().await,
+            OAuthState::Authenticated,
+            "stale probe 401 must not stomp the freshly applied adapter (ABA)"
+        );
+        let snap = inner.metrics.snapshot();
+        assert_eq!(snap.oauth_heartbeat_probe_total_unhealthy, 0);
+    }
+
+    /// Pins the invariant the stale-probe drop check relies on: every state
+    /// write bumps `lifecycle_generation` inside the same write-lock
+    /// critical section — both `transition_to` and the heartbeat's own
+    /// AuthFailed arm — so "generation unchanged" proves no transition
+    /// (hence no apply/publish) interleaved with a probe.
+    #[tokio::test]
+    async fn every_state_write_bumps_lifecycle_generation() {
+        let threshold = 3;
+        let inner = make_test_inner(threshold);
+        arm_healthy(&inner).await;
+        let load = |inner: &OAuthAdapterInner| {
+            inner
+                .lifecycle_generation
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+
+        let g0 = load(&inner);
+        inner
+            .transition_to(OAuthState::Refreshing, "test: bump check")
+            .await;
+        assert_eq!(load(&inner), g0 + 1, "transition_to must bump");
+        inner
+            .transition_to(OAuthState::Authenticated, "test: bump check")
+            .await;
+        assert_eq!(load(&inner), g0 + 2, "transition_to must bump");
+
+        // The heartbeat's AuthFailed arm writes AuthRequired directly under
+        // the write lock; it must bump too.
+        let dispatched_state = inner.state.read().await.clone();
+        let dispatched_gen = load(&inner);
+        let mut failures = 0u32;
+        let action = classify_probe_result(auth(), &mut failures, threshold);
+        assert_eq!(action, ProbeAction::AuthFailed);
+        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
+        assert_eq!(*inner.state.read().await, OAuthState::AuthRequired);
+        assert_eq!(load(&inner), g0 + 3, "AuthFailed arm must bump");
     }
 
     // -- Recovery-from-ConnectionFailed harness -----------------------------

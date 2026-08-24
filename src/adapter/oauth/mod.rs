@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, RwLock};
@@ -152,9 +152,14 @@ pub struct OAuthAdapterConfig {
     pub heartbeat_interval_secs: u64,
     /// Per-probe timeout in seconds (default: 10).
     pub probe_timeout_secs: u64,
-    /// Number of consecutive probe network failures required before flipping
-    /// `inner_health` to `Unhealthy("upstream unreachable")` (default: 3).
-    /// Hysteresis to avoid flapping on a single transient timeout.
+    /// Number of consecutive probe failures required before flipping
+    /// `inner_health` to `Unhealthy` (default: 3). Counts both transport-dead
+    /// failures (connect failure/timeout, reported as "upstream unreachable")
+    /// and alive-but-erroring upstream failures (HTTP status > 0 other than
+    /// 401, JSON-RPC or protocol errors, reported with the actual error
+    /// text). HTTP 401 is excluded: it bypasses the hysteresis and
+    /// immediately transitions to `AuthRequired`. Hysteresis to avoid
+    /// flapping on a single transient failure.
     pub probe_failure_threshold: u32,
     /// Optional override for the advertised `server_type` name. Forwarded to
     /// the inner [`HttpAdapter`] when it is constructed.
@@ -281,6 +286,20 @@ pub struct OAuthAdapterInner {
     /// time a non-empty `server_type` is written so subsequent applies skip
     /// the record call.
     server_type_recorded: AtomicBool,
+    /// Lifecycle generation counter, bumped on EVERY `OAuthState` write,
+    /// inside the same `state` write-lock critical section as the write
+    /// itself (see `transition_to`, the inline `Refreshing` entry in
+    /// `apply_tokens_inner`, and the heartbeat's `AuthFailed` arm). The
+    /// heartbeat snapshots state + generation under one `state` read lock
+    /// when it dispatches a probe; if the generation still matches under
+    /// the write lock when the result lands, no state transition — and
+    /// therefore no apply/publish (every apply passes through
+    /// `Refreshing`) — happened mid-probe, so the result belongs to the
+    /// currently published inner adapter. This closes the ABA hole where
+    /// an entire apply (Authenticated → Refreshing → Authenticated)
+    /// completes mid-probe and a stale 401 would stomp the rebuilt
+    /// adapter with `AuthRequired`.
+    pub lifecycle_generation: AtomicU64,
     /// Fingerprint (hash of the sorted, serialized tool list) probed from the
     /// inner adapter after each successful [`Self::apply_tokens`] rebuild.
     /// Compared across Some→Some swaps to detect an actual tool-set change
@@ -357,6 +376,10 @@ impl OAuthAdapterInner {
         let mut state = self.state.write().await;
         let mut history = self.transition_history.write().await;
         let old = do_transition(&mut state, new_state.clone(), reason, &mut history);
+        // Bumped inside the write critical section so "generation
+        // unchanged" observed under either state lock proves no
+        // transition interleaved (see `lifecycle_generation`).
+        self.lifecycle_generation.fetch_add(1, Ordering::Relaxed);
         self.metrics.inc_state_transition();
         info!(
             from = ?old,
@@ -1062,6 +1085,39 @@ impl OAuthAdapterInner {
         let _apply_guard = self.apply_lock.lock().await;
         let endpoint = &self.config.endpoint_name;
 
+        // Surface the apply as a transitional state right away: the inner
+        // adapter rebuild below (init handshake + tools fingerprint probe)
+        // takes seconds of network time, and leaving a prior error state
+        // (AuthRequired/ConnectionFailed) in place keeps `derive_health`
+        // reporting the stale error as if it were a fresh failure. Refresh
+        // paths already enter the apply in `Refreshing` — skip the no-op
+        // self-transition to keep the ring buffer free of noise. The check
+        // and transition happen under one state write lock so a concurrent
+        // `do_token_refresh` (guarded by `refresh_mutex`, not `apply_lock`)
+        // cannot interleave between them and produce a noisy
+        // Refreshing→Refreshing self-record.
+        {
+            let mut state = self.state.write().await;
+            if *state != OAuthState::Refreshing {
+                let mut history = self.transition_history.write().await;
+                let old = do_transition(
+                    &mut state,
+                    OAuthState::Refreshing,
+                    "applying new tokens",
+                    &mut history,
+                );
+                self.lifecycle_generation.fetch_add(1, Ordering::Relaxed);
+                self.metrics.inc_state_transition();
+                info!(
+                    from = ?old,
+                    to = ?OAuthState::Refreshing,
+                    oauth_state = ?OAuthState::Refreshing,
+                    reason = "applying new tokens",
+                    "OAuth state transition"
+                );
+            }
+        }
+
         // 1. Persist to disk
         if let Err(e) = self.token_manager.save(endpoint, &token_set).await {
             error!(error = %e, "Failed to persist tokens");
@@ -1452,6 +1508,7 @@ impl OAuthAdapter {
                 ema_sso,
                 pending_authorize_url: RwLock::new(None),
                 server_type_recorded: AtomicBool::new(false),
+                lifecycle_generation: AtomicU64::new(0),
                 last_tools_fingerprint: Arc::new(RwLock::new(None)),
                 apply_lock: Mutex::new(()),
             }),
@@ -3678,6 +3735,219 @@ mod tests {
         assert!(
             !recv_tick(&mut outer_rx, Duration::from_millis(200)).await,
             "routine Some→Some token refresh must not emit a synthetic tick"
+        );
+        server.abort();
+    }
+
+    /// Spawn an in-process MCP server whose `initialize` response blocks
+    /// until the returned `Notify` is notified — lets a test observe the
+    /// adapter's state/health while `apply_tokens` is mid-rebuild.
+    async fn spawn_blocking_init_mcp_server() -> (
+        String,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::extract::State;
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handle(
+            State(gate): State<Arc<tokio::sync::Notify>>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            if method == "initialize" {
+                gate.notified().await;
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "serverInfo": {"name": "test-server", "version": "0.0.1"},
+                    },
+                }))
+            } else {
+                Json(json!({"jsonrpc": "2.0", "id": id, "result": {}}))
+            }
+        }
+
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let router = Router::new()
+            .route("/mcp", post(handle))
+            .with_state(gate.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (
+            format!("http://127.0.0.1:{}/mcp", addr.port()),
+            gate,
+            handle,
+        )
+    }
+
+    /// An apply entered from an error state (here AuthRequired) must report
+    /// `Starting` while the inner adapter rebuild is in flight — not the
+    /// stale error — and still end `Authenticated`/`Healthy` on success.
+    #[tokio::test]
+    async fn apply_tokens_from_error_state_reports_starting_mid_apply() {
+        let (url, gate, server) = spawn_blocking_init_mcp_server().await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+
+        // Pin the adapter in an error state, as after a failed refresh.
+        adapter
+            .inner
+            .transition_to(OAuthState::AuthRequired, "test: pin error state")
+            .await;
+        assert!(
+            matches!(adapter.health(), HealthStatus::Unhealthy(_)),
+            "precondition: AuthRequired must report Unhealthy"
+        );
+
+        let inner = adapter.inner.clone();
+        let apply = tokio::spawn(async move {
+            inner.apply_tokens(make_token_set("mid-apply")).await;
+        });
+
+        // The inner init is blocked on the gate: wait for the apply to enter
+        // Refreshing and assert health reports Starting, not the stale error.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let state = adapter.inner.state.read().await.clone();
+            if state == OAuthState::Refreshing {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for Refreshing mid-apply; state {:?}",
+                state
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            adapter.health(),
+            HealthStatus::Starting,
+            "mid-apply health must be Starting, not the stale AuthRequired error"
+        );
+
+        // Release the inner init and let the apply finish.
+        gate.notify_one();
+        apply.await.unwrap();
+        assert_eq!(
+            adapter.inner.state.read().await.clone(),
+            OAuthState::Authenticated
+        );
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        server.abort();
+    }
+
+    /// Spawn an in-process MCP server whose `initialize` deterministically
+    /// fails with a JSON-RPC error — pins the apply's failure branch without
+    /// depending on a fixed port being unbound on the host.
+    async fn spawn_failing_init_mcp_server() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handle(Json(body): Json<Value>) -> Json<Value> {
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32603, "message": "init rejected"},
+            }))
+        }
+
+        let router = Router::new().route("/mcp", post(handle));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}/mcp", addr.port()), handle)
+    }
+
+    /// A failing apply entered from an error state must transition through
+    /// Refreshing (recorded with the "applying new tokens" reason) and still
+    /// end ConnectionFailed with the inner init error preserved.
+    #[tokio::test]
+    async fn apply_tokens_failure_from_error_state_transitions_via_refreshing() {
+        let (url, server) = spawn_failing_init_mcp_server().await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+
+        adapter
+            .inner
+            .transition_to(OAuthState::ConnectionFailed, "test: pin error state")
+            .await;
+
+        adapter
+            .inner
+            .apply_tokens(make_token_set("will-fail"))
+            .await;
+
+        assert_eq!(
+            adapter.inner.state.read().await.clone(),
+            OAuthState::ConnectionFailed,
+            "failed apply must still end ConnectionFailed"
+        );
+        let history = adapter.inner.transition_history.read().await;
+        assert!(
+            history
+                .iter()
+                .any(|r| r.from == OAuthState::ConnectionFailed
+                    && r.to == OAuthState::Refreshing
+                    && r.reason == "applying new tokens"),
+            "expected ConnectionFailed → Refreshing 'applying new tokens'; got: {:?}",
+            history
+                .iter()
+                .map(|r| (r.from.clone(), r.to.clone(), r.reason.clone()))
+                .collect::<Vec<_>>()
+        );
+        server.abort();
+    }
+
+    /// Refresh paths (proactive/reactive) enter the apply already in
+    /// `Refreshing` — the apply must not record a no-op self-transition.
+    #[tokio::test]
+    async fn apply_tokens_already_refreshing_skips_transition() {
+        let (url, server) = spawn_minimal_mcp_server().await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+
+        adapter
+            .inner
+            .transition_to(OAuthState::Refreshing, "test: refresh in progress")
+            .await;
+
+        adapter
+            .inner
+            .apply_tokens(make_token_set("refreshed"))
+            .await;
+
+        assert_eq!(
+            adapter.inner.state.read().await.clone(),
+            OAuthState::Authenticated
+        );
+        let history = adapter.inner.transition_history.read().await;
+        assert!(
+            !history.iter().any(|r| r.reason == "applying new tokens"),
+            "apply entered in Refreshing must not record a self-transition; got: {:?}",
+            history
+                .iter()
+                .map(|r| (r.from.clone(), r.to.clone(), r.reason.clone()))
+                .collect::<Vec<_>>()
         );
         server.abort();
     }
