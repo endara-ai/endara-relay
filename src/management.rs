@@ -23,7 +23,9 @@ use crate::adapter::{FailedAdapter, HealthStatus, McpAdapter, StartingAdapter};
 use crate::config::{Config, ObservabilityConfig};
 use crate::events::ToolCallEventBus;
 use crate::oauth::client::{self, ClientRegistration};
-use crate::oauth::{OAuthFlowManager, OAuthSetupManager, PkceChallenge};
+use crate::oauth::{
+    append_google_authorize_params, OAuthFlowManager, OAuthSetupManager, PkceChallenge,
+};
 use crate::observability::payloads::StoredPayloads;
 use crate::observability::store::{AggregateBucket, CallRecord, QueryFilter};
 use crate::profile_registry::ProfileRegistry;
@@ -1814,13 +1816,9 @@ async fn oauth_start_inner(
         authorize_url.push_str("&prompt=consent");
     }
 
-    // Google's authorization server only issues a refresh token when
-    // `access_type=offline` is requested — without it every grant is
-    // access-token-only and proactive refresh is impossible. Other providers
-    // ignore the unknown parameter, but scope it to Google to avoid noise.
-    if is_google_authorization_endpoint(&authorization_endpoint) {
-        authorize_url.push_str("&access_type=offline");
-    }
+    // Google needs `access_type=offline` for a refresh token to be issued
+    // (shared helper — see `crate::oauth::append_google_authorize_params`).
+    append_google_authorize_params(&mut authorize_url, &authorization_endpoint);
 
     // Scope accumulation for step-up authorization: union the scopes we'd
     // request today (config scopes) with any previously-granted scopes from a
@@ -2197,21 +2195,6 @@ fn urlencoding(s: &str) -> String {
     url::form_urlencoded::byte_serialize(s.as_bytes()).collect()
 }
 
-/// True when an authorize URL targets Google's authorization server
-/// (`accounts.google.com`), which requires `access_type=offline` for a
-/// refresh token to be issued (see `oauth_start_inner`). Host comparison
-/// only — a lookalike host like `accounts.google.com.evil.test` does not
-/// match.
-fn is_google_authorization_endpoint(authorization_endpoint: &str) -> bool {
-    url::Url::parse(authorization_endpoint)
-        .ok()
-        .and_then(|u| {
-            u.host_str()
-                .map(|h| h.eq_ignore_ascii_case("accounts.google.com"))
-        })
-        .unwrap_or(false)
-}
-
 /// GET /api/endpoints/:name/oauth/status
 ///
 /// Returns detailed OAuth status for the endpoint including token info.
@@ -2356,7 +2339,17 @@ async fn oauth_revoke(
     drop(inners_guard);
 
     // Call disconnect (aborts refresh task, clears tokens, deletes from disk)
-    inner.disconnect().await;
+    if let Err(e) = inner.disconnect().await {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to delete tokens from disk",
+            Some(&format!(
+                "The grant would survive a relay restart; retry the revoke. ({})",
+                e
+            )),
+        )
+        .into_response();
+    }
 
     Json(OAuthRevokeResponse {
         status: "disconnected".to_string(),
@@ -2455,8 +2448,20 @@ async fn oauth_reset(
     };
 
     // Discard the old grant BEFORE composing the new authorize URL, so the
-    // start flow sees a clean slate.
-    inner.disconnect().await;
+    // start flow sees a clean slate. A failed local deletion fails the
+    // whole reset: reporting success while the old token file survives on
+    // disk would silently restore the discarded grant on the next restart.
+    if let Err(e) = inner.disconnect().await {
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to delete tokens from disk",
+            Some(&format!(
+                "Reset aborted: the old grant would survive a relay restart; retry the reset. ({})",
+                e
+            )),
+        )
+        .into_response();
+    }
 
     // Restore the client registration so the start flow reuses it.
     if let (Some(tm), Some(creds)) = (state.token_manager.as_ref(), preserved_dcr.as_ref()) {
@@ -2534,7 +2539,7 @@ async fn oauth_refresh(
         Ok(new_tokens) => {
             let expires_at = new_tokens.expires_at;
             let refreshed_at = new_tokens.issued_at;
-            inner.apply_tokens(new_tokens).await;
+            inner.apply_refreshed_tokens(new_tokens).await;
 
             let status = {
                 let s = inner.state.read().await;
@@ -3295,13 +3300,10 @@ async fn oauth_setup(
                 urlencoding(&code_challenge),
             );
 
-            // Google only issues a refresh token when `access_type=offline`
-            // is requested (see `oauth_start_inner`); setup-created Google
-            // endpoints need it too or their very first grant is
-            // access-token-only.
-            if is_google_authorization_endpoint(&auth_endpoint) {
-                authorize_url.push_str("&access_type=offline");
-            }
+            // Google needs `access_type=offline` for a refresh token
+            // (shared helper); setup-created Google endpoints need it too or
+            // their very first grant is access-token-only.
+            append_google_authorize_params(&mut authorize_url, &auth_endpoint);
 
             // Scope accumulation: union any previously-granted scopes (from a
             // persisted TokenSet for this name) with the requested scopes.
@@ -3479,12 +3481,10 @@ async fn oauth_setup_credentials(
         urlencoding(&code_challenge),
     );
 
-    // Google only issues a refresh token when `access_type=offline` is
-    // requested (see `oauth_start_inner`); the manual-credentials setup path
-    // needs it too or the very first grant is access-token-only.
-    if is_google_authorization_endpoint(&auth_endpoint) {
-        authorize_url.push_str("&access_type=offline");
-    }
+    // Google needs `access_type=offline` for a refresh token (shared
+    // helper); the manual-credentials setup path needs it too or the very
+    // first grant is access-token-only.
+    append_google_authorize_params(&mut authorize_url, &auth_endpoint);
 
     // Scope accumulation: union previously-granted scopes (from a persisted
     // TokenSet for this endpoint) with the requested scopes for step-up.
@@ -6020,7 +6020,7 @@ async fn compose_org_sso_url(
     } else {
         '?'
     };
-    format!(
+    let mut authorize_url = format!(
         "{}{}response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256&scope={}",
         disc.authorization_endpoint,
         sep,
@@ -6029,7 +6029,11 @@ async fn compose_org_sso_url(
         urlencoding(&state_param),
         urlencoding(&code_challenge),
         urlencoding("openid offline_access"),
-    )
+    );
+    // Google needs `access_type=offline` for a refresh token (shared helper);
+    // a Google-fronted org SSO grant is access-token-only without it.
+    append_google_authorize_params(&mut authorize_url, &disc.authorization_endpoint);
+    authorize_url
 }
 
 /// Persist the updated organization list back to `config.toml`, preserving the
@@ -11346,6 +11350,7 @@ command = "echo"
 
     #[test]
     fn google_authorization_endpoint_detection() {
+        use crate::oauth::is_google_authorization_endpoint;
         assert!(is_google_authorization_endpoint(
             "https://accounts.google.com/o/oauth2/v2/auth"
         ));
@@ -11440,12 +11445,21 @@ command = "echo"
         // flow under the bumped generation and hand out an authorize URL
         // without the reset's prompt=consent. The start must fail with 409
         // superseded_by_reset and leave no pending flow behind.
+        // Two-step handshake, immune to lost wakeups on slow CI runners:
+        // `entered_tx` tells the test the discovery request ARRIVED (the
+        // start already sampled generation 0 — sampling precedes discovery),
+        // and `gate.notify_one()` stores a permit, so the release completes
+        // the handler's `notified().await` even if it parks afterwards.
         let gate = Arc::new(tokio::sync::Notify::new());
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
         let gate_srv = gate.clone();
         let well_known = move |headers: axum::http::HeaderMap| {
             let gate = gate_srv.clone();
+            let entered_tx = entered_tx.clone();
             async move {
-                // Block discovery until the test has performed the reset.
+                // Signal arrival, then block discovery until the test has
+                // performed the reset.
+                let _ = entered_tx.send(());
                 gate.notified().await;
                 let base = mock_issuer(&headers);
                 Json(serde_json::json!({
@@ -11474,12 +11488,16 @@ command = "echo"
             .await
             .unwrap()
         });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Wait until discovery is in flight (generation already sampled).
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx.recv())
+            .await
+            .expect("discovery request never arrived")
+            .expect("entered_tx dropped");
 
         // The reset lands mid-discovery: bump the generation (there is no
         // pending flow yet, so nothing is removed), then release discovery.
         assert_eq!(flow_mgr.invalidate_endpoint("ep1").await, 0);
-        gate.notify_waiters();
+        gate.notify_one();
 
         let resp = start_task.await.unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);

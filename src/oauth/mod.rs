@@ -82,6 +82,34 @@ pub fn generate_state() -> String {
     URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// True when an authorize URL targets Google's authorization server
+/// (`accounts.google.com`), which requires `access_type=offline` for a
+/// refresh token to be issued. Host comparison only — a lookalike host like
+/// `accounts.google.com.evil.test` does not match.
+pub fn is_google_authorization_endpoint(authorization_endpoint: &str) -> bool {
+    url::Url::parse(authorization_endpoint)
+        .ok()
+        .and_then(|u| {
+            u.host_str()
+                .map(|h| h.eq_ignore_ascii_case("accounts.google.com"))
+        })
+        .unwrap_or(false)
+}
+
+/// Append Google-specific authorization parameters to a composed authorize
+/// URL. Google's authorization server only issues a refresh token when
+/// `access_type=offline` is requested — without it every grant is
+/// access-token-only and proactive refresh is impossible. Other providers
+/// ignore the unknown parameter, but it is scoped to Google to avoid noise.
+/// Shared by every authorize-URL builder (management start/setup, JIT, EMA
+/// IdP SSO, org SSO) so no path hands out a Google grant without it. The URL
+/// must already carry at least one query parameter (`&` separator).
+pub fn append_google_authorize_params(authorize_url: &mut String, authorization_endpoint: &str) {
+    if is_google_authorization_endpoint(authorization_endpoint) {
+        authorize_url.push_str("&access_type=offline");
+    }
+}
+
 /// Maximum age for a pending OAuth flow before it's considered stale.
 const FLOW_MAX_AGE: Duration = Duration::from_secs(600); // 10 minutes
 
@@ -740,6 +768,34 @@ mod tests {
         hasher.update(pkce.code_verifier.as_bytes());
         let expected = URL_SAFE_NO_PAD.encode(hasher.finalize());
         assert_eq!(pkce.code_challenge, expected);
+    }
+
+    #[test]
+    fn append_google_authorize_params_scoped_to_google_host() {
+        // Google host: access_type=offline appended (case-insensitive host).
+        let mut url = "https://accounts.google.com/o/oauth2/v2/auth?response_type=code".to_string();
+        append_google_authorize_params(&mut url, "https://accounts.google.com/o/oauth2/v2/auth");
+        assert!(url.ends_with("&access_type=offline"));
+
+        let mut url = "https://ACCOUNTS.GOOGLE.COM/auth?response_type=code".to_string();
+        append_google_authorize_params(&mut url, "https://ACCOUNTS.GOOGLE.COM/auth");
+        assert!(url.ends_with("&access_type=offline"));
+
+        // Non-Google and lookalike hosts: untouched.
+        for endpoint in [
+            "https://auth.example.com/authorize",
+            "https://accounts.google.com.evil.test/auth",
+            "not a url",
+        ] {
+            let mut url = format!("{}?response_type=code", endpoint);
+            let before = url.clone();
+            append_google_authorize_params(&mut url, endpoint);
+            assert_eq!(
+                url, before,
+                "non-Google endpoint must be untouched: {}",
+                endpoint
+            );
+        }
     }
 
     #[test]

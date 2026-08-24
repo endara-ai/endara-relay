@@ -161,7 +161,7 @@ fn classify_tick_action(state: &OAuthState) -> TickAction {
 async fn attempt_recovery(adapter: &Arc<OAuthAdapterInner>) {
     match adapter.do_token_refresh().await {
         Ok(tokens) => {
-            adapter.apply_tokens(tokens).await;
+            adapter.apply_refreshed_tokens(tokens).await;
         }
         Err(e) => {
             debug!(
