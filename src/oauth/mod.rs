@@ -251,6 +251,34 @@ pub enum SetupSessionStatus {
     AwaitingAuth,
     /// Authorization complete — tokens obtained.
     Authorized,
+    /// Claimed by an in-flight `POST /commit`: the session can be neither
+    /// cancelled nor committed again until the commit finishes (a failed
+    /// commit reverts to [`Authorized`](Self::Authorized) via
+    /// [`OAuthSetupManager::release_commit_claim`]).
+    Committing,
+}
+
+/// Outcome of [`OAuthSetupManager::claim_for_commit`].
+pub enum CommitClaim {
+    /// The session was `Authorized`; it is now `Committing` and this claim
+    /// carries a snapshot of it.
+    Claimed(Box<OAuthSetupSession>),
+    /// Another commit request already claimed the session.
+    AlreadyCommitting,
+    /// The session exists but authorization has not completed.
+    NotAuthorized,
+    /// No live session with this ID.
+    NotFound,
+}
+
+/// Outcome of [`OAuthSetupManager::cancel_session`].
+pub enum CancelOutcome {
+    /// The session was removed.
+    Cancelled,
+    /// The session is claimed by an in-flight commit and was NOT removed.
+    CommitInProgress,
+    /// No live session with this ID.
+    NotFound,
 }
 
 /// A transient OAuth setup session that does NOT write to config.toml until
@@ -284,6 +312,11 @@ pub struct OAuthSetupSession {
     pub client_id: Option<String>,
     /// Client secret (optional).
     pub client_secret: Option<String>,
+    /// `client_secret_expires_at` from the registration response (RFC 7591;
+    /// 0 = never expires). Written by the commit-time defensive save so a
+    /// recovered record carries the provider's real expiry instead of
+    /// silently becoming non-expiring. 0 for manual credentials.
+    pub client_secret_expires_at: u64,
     /// Whether the session's client credentials were minted via true DCR
     /// (RFC 7591) during this setup. Persisted as the DCR record's
     /// `registered_via_dcr` when the commit has to defensively save the
@@ -349,6 +382,7 @@ impl OAuthSetupManager {
             issuer: None,
             client_id: None,
             client_secret: None,
+            client_secret_expires_at: 0,
             registered_via_dcr: false,
             tokens: None,
             status: SetupSessionStatus::AwaitingCredentials,
@@ -356,6 +390,68 @@ impl OAuthSetupManager {
         };
         sessions.insert(id, session);
         Some(id)
+    }
+
+    /// Atomically claim a session for an exclusive commit attempt. Under the
+    /// sessions write lock, an `Authorized` session transitions to
+    /// [`SetupSessionStatus::Committing`] and a snapshot is returned; any
+    /// other state is reported without mutating the session. While claimed,
+    /// [`cancel_session`](Self::cancel_session) refuses to remove the session
+    /// and a duplicate commit request gets
+    /// [`CommitClaim::AlreadyCommitting`], so exactly one commit can consume
+    /// the session. A failed commit must revert the claim via
+    /// [`release_commit_claim`](Self::release_commit_claim).
+    pub async fn claim_for_commit(&self, id: &Uuid) -> CommitClaim {
+        let mut sessions = self.sessions.write().await;
+        let Some(session) = sessions.get_mut(id) else {
+            return CommitClaim::NotFound;
+        };
+        if session.created_at.elapsed() > SETUP_SESSION_MAX_AGE {
+            sessions.remove(id);
+            return CommitClaim::NotFound;
+        }
+        match session.status {
+            SetupSessionStatus::Committing => CommitClaim::AlreadyCommitting,
+            SetupSessionStatus::Authorized => {
+                session.status = SetupSessionStatus::Committing;
+                let mut snapshot = session.clone();
+                // The snapshot reflects the pre-claim state so a caller
+                // persisting it never leaks the transient claim marker.
+                snapshot.status = SetupSessionStatus::Authorized;
+                CommitClaim::Claimed(Box::new(snapshot))
+            }
+            _ => CommitClaim::NotAuthorized,
+        }
+    }
+
+    /// Revert a commit claim after a failed commit: a `Committing` session
+    /// returns to `Authorized` so it can be retried or cancelled. No-op when
+    /// the session is gone or not claimed.
+    pub async fn release_commit_claim(&self, id: &Uuid) {
+        let mut sessions = self.sessions.write().await;
+        if let Some(session) = sessions.get_mut(id) {
+            if session.status == SetupSessionStatus::Committing {
+                session.status = SetupSessionStatus::Authorized;
+            }
+        }
+    }
+
+    /// Cancel (remove) a session unless an in-flight commit has claimed it.
+    /// The check-and-remove runs atomically under the sessions write lock,
+    /// so a DELETE racing a commit can never yank the session out from
+    /// under the commit's DCR/config writes after the claim succeeded.
+    pub async fn cancel_session(&self, id: &Uuid) -> CancelOutcome {
+        let mut sessions = self.sessions.write().await;
+        match sessions.get(id) {
+            None => CancelOutcome::NotFound,
+            Some(s) if s.status == SetupSessionStatus::Committing => {
+                CancelOutcome::CommitInProgress
+            }
+            Some(_) => {
+                sessions.remove(id);
+                CancelOutcome::Cancelled
+            }
+        }
     }
 
     /// Get mutable access to a session by ID.
@@ -385,7 +481,7 @@ impl OAuthSetupManager {
         Some(f(session))
     }
 
-    /// Remove a session (cancel or after commit).
+    /// Remove a session (after commit, or setup-flow cleanup).
     pub async fn remove_session(&self, id: &Uuid) -> Option<OAuthSetupSession> {
         self.sessions.write().await.remove(id)
     }
@@ -816,5 +912,74 @@ mod tests {
             .unwrap();
         assert_eq!(cid.as_deref(), Some("my-client"));
         assert_eq!(status, SetupSessionStatus::AwaitingAuth);
+    }
+
+    /// Exactly one commit can claim an `Authorized` session; while claimed,
+    /// a duplicate commit and a cancel are both refused, and releasing the
+    /// claim restores `Authorized` so retry/cancel work again.
+    #[tokio::test]
+    async fn setup_manager_commit_claim_locks_out_cancel_and_duplicate() {
+        let mgr = OAuthSetupManager::new();
+        let id = mgr
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
+            .await
+            .unwrap();
+
+        // Not yet authorized → claim refused.
+        assert!(matches!(
+            mgr.claim_for_commit(&id).await,
+            CommitClaim::NotAuthorized
+        ));
+
+        mgr.get_session_mut(&id, |s| s.status = SetupSessionStatus::Authorized)
+            .await;
+
+        // First claim wins and the snapshot carries the pre-claim status.
+        let CommitClaim::Claimed(snapshot) = mgr.claim_for_commit(&id).await else {
+            panic!("authorized session must be claimable");
+        };
+        assert_eq!(snapshot.status, SetupSessionStatus::Authorized);
+
+        // Duplicate commit and cancel are locked out while claimed.
+        assert!(matches!(
+            mgr.claim_for_commit(&id).await,
+            CommitClaim::AlreadyCommitting
+        ));
+        assert!(matches!(
+            mgr.cancel_session(&id).await,
+            CancelOutcome::CommitInProgress
+        ));
+        assert!(mgr.get_session(&id, |_| ()).await.is_some());
+
+        // Releasing the claim (failed commit) restores Authorized: the
+        // session can be re-claimed or cancelled.
+        mgr.release_commit_claim(&id).await;
+        let status = mgr.get_session(&id, |s| s.status.clone()).await.unwrap();
+        assert_eq!(status, SetupSessionStatus::Authorized);
+        assert!(matches!(
+            mgr.cancel_session(&id).await,
+            CancelOutcome::Cancelled
+        ));
+        assert!(matches!(
+            mgr.cancel_session(&id).await,
+            CancelOutcome::NotFound
+        ));
+    }
+
+    /// Unknown IDs report `NotFound` for both claim and cancel.
+    #[tokio::test]
+    async fn setup_manager_claim_and_cancel_nonexistent_return_not_found() {
+        let mgr = OAuthSetupManager::new();
+        let fake_id = Uuid::new_v4();
+        assert!(matches!(
+            mgr.claim_for_commit(&fake_id).await,
+            CommitClaim::NotFound
+        ));
+        assert!(matches!(
+            mgr.cancel_session(&fake_id).await,
+            CancelOutcome::NotFound
+        ));
+        // Releasing a claim on a missing session is a harmless no-op.
+        mgr.release_commit_claim(&fake_id).await;
     }
 }

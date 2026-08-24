@@ -3078,6 +3078,7 @@ async fn oauth_setup(
                 .get_session_mut(&session_id, |s| {
                     s.client_id = Some(client_id.clone());
                     s.client_secret = client_secret.clone();
+                    s.client_secret_expires_at = resolved.client_secret_expires_at;
                     s.registered_via_dcr = used_dcr;
                     s.status = crate::oauth::SetupSessionStatus::AwaitingAuth;
                 })
@@ -3215,6 +3216,8 @@ async fn oauth_setup_credentials(
         .get_session_mut(&session_id, |s| {
             s.client_id = Some(body.client_id.clone());
             s.client_secret = body.client_secret.clone();
+            // Manually-supplied credentials never expire on their own.
+            s.client_secret_expires_at = 0;
             // Manually-supplied credentials are never DCR-provenanced.
             s.registered_via_dcr = false;
             s.status = crate::oauth::SetupSessionStatus::AwaitingAuth;
@@ -3333,6 +3336,7 @@ async fn oauth_setup_status(
                 crate::oauth::SetupSessionStatus::AwaitingCredentials => "awaiting_credentials",
                 crate::oauth::SetupSessionStatus::AwaitingAuth => "awaiting_auth",
                 crate::oauth::SetupSessionStatus::Authorized => "authorized",
+                crate::oauth::SetupSessionStatus::Committing => "committing",
             };
             OAuthSetupStatusResponse {
                 session_id: session_id.to_string(),
@@ -3355,17 +3359,30 @@ async fn oauth_setup_status(
 /// Write the fully-configured endpoint to config.toml and register the adapter.
 /// Only succeeds if the session has status `Authorized`.
 ///
+/// The commit atomically claims the session
+/// ([`OAuthSetupManager::claim_for_commit`]): while claimed, a duplicate
+/// commit gets `409 commit_in_progress` and a concurrent cancel cannot
+/// remove the session, so exactly one request can consume it. A failed
+/// commit releases the claim, keeping the session for retry or cancel.
+///
 /// The `client_secret` is never written to config.toml — client credentials
 /// live in the DCR store (`{name}.dcr.json` via `TokenManager`). Only the
 /// non-secret `client_id` is stamped into the `[[endpoints]]` entry. If no
 /// DCR record was persisted during setup, the session's credentials are
 /// defensively saved to the store (atomic save-if-absent under the DCR
-/// write lock, carrying the session's registration provenance) before the
-/// config is written. A pre-existing record that does not match the
-/// session's credentials rejects the commit with `409 dcr_record_mismatch`;
-/// a store read/write failure rejects it with `500 dcr_persistence_failed`
-/// (a secretless TOML entry with no readable store record would be
-/// unusable after restart). Failed commits keep the session for retry.
+/// write lock, carrying the session's registration provenance and secret
+/// expiry) before the config is written. A pre-existing record that does
+/// not match the session's credentials rejects the commit with
+/// `409 dcr_record_mismatch`; a store read/write failure rejects it with
+/// `500 dcr_persistence_failed` (a secretless TOML entry with no readable
+/// store record would be unusable after restart).
+///
+/// The committed endpoint is applied through the same synchronous path as
+/// `POST /api/endpoints` ([`apply_endpoint_change`]): the TOML write, the
+/// adapter registration, and the `state.config` publish all complete
+/// before the session (and its name reservation) is released, so a new
+/// same-name setup attempt can never slip in between the config write and
+/// the watcher's debounced reload.
 async fn oauth_setup_commit(
     State(state): State<ManagementState>,
     Path(id): Path<String>,
@@ -3387,101 +3404,83 @@ async fn oauth_setup_commit(
         .into_response();
     };
 
-    // Snapshot the session but leave it in the manager until the commit
-    // succeeds: while it lives there its name reservation (enforced by
-    // `create_session`) keeps a concurrent same-name setup from starting and
-    // overwriting the DCR record validated below before our config write
-    // lands. Failed commits leave the session intact for a retry or cancel.
-    let Some(session) = setup_mgr.get_session(&session_id, |s| s.clone()).await else {
-        return error_response(StatusCode::NOT_FOUND, "session not found or expired", None)
-            .into_response();
-    };
-
-    if session.status != crate::oauth::SetupSessionStatus::Authorized {
-        return error_response(
-            StatusCode::CONFLICT,
-            "session_not_authorized",
-            Some("OAuth authorization has not been completed yet."),
-        )
-        .into_response();
-    }
-
-    // Build the endpoint config entry
-    let Some(ref config_path) = state.config_path else {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "config_path not configured",
-            None,
-        )
-        .into_response();
-    };
-
-    let resolved = crate::config::expand_tilde(config_path);
-
-    let contents = match std::fs::read_to_string(&resolved) {
-        Ok(c) => c,
-        Err(e) => {
+    // Atomically claim the session for this commit. The claim (a) keeps the
+    // session in the manager so its name reservation (enforced by
+    // `create_session`) blocks a concurrent same-name setup from starting
+    // and overwriting the DCR record validated below, and (b) locks out a
+    // concurrent cancel or duplicate commit for the whole commit window.
+    let session = match setup_mgr.claim_for_commit(&session_id).await {
+        crate::oauth::CommitClaim::Claimed(s) => *s,
+        crate::oauth::CommitClaim::AlreadyCommitting => {
             return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to read config file",
-                Some(&e.to_string()),
+                StatusCode::CONFLICT,
+                "commit_in_progress",
+                Some("Another commit request for this session is in flight."),
             )
             .into_response();
         }
-    };
-
-    let mut parsed: toml::Table = match contents.parse() {
-        Ok(t) => t,
-        Err(e) => {
+        crate::oauth::CommitClaim::NotAuthorized => {
             return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to parse config file",
-                Some(&e.to_string()),
+                StatusCode::CONFLICT,
+                "session_not_authorized",
+                Some("OAuth authorization has not been completed yet."),
             )
             .into_response();
         }
+        crate::oauth::CommitClaim::NotFound => {
+            return error_response(StatusCode::NOT_FOUND, "session not found or expired", None)
+                .into_response();
+        }
     };
 
-    // Build the new endpoint TOML entry
-    let mut ep_table = toml::Table::new();
-    ep_table.insert("name".into(), toml::Value::String(session.name.clone()));
-    ep_table.insert("transport".into(), toml::Value::String("oauth".to_string()));
-    ep_table.insert("url".into(), toml::Value::String(session.url.clone()));
-
-    if let Some(ref oauth_server) = session.oauth_server_url {
-        ep_table.insert(
-            "oauth_server_url".into(),
-            toml::Value::String(oauth_server.clone()),
-        );
-    }
-    if let Some(ref token_ep) = session.token_endpoint {
-        ep_table.insert(
-            "token_endpoint".into(),
-            toml::Value::String(token_ep.clone()),
-        );
-    }
-    if let Some(ref cid) = session.client_id {
-        ep_table.insert("client_id".into(), toml::Value::String(cid.clone()));
-    }
-    // `client_secret` is deliberately NOT written to config.toml; it lives in
-    // the DCR store only (defensively persisted below if missing).
-    if let Some(ref scopes_str) = session.scopes {
-        let scopes_vec: Vec<toml::Value> = scopes_str
-            .split_whitespace()
-            .map(|s| toml::Value::String(s.to_string()))
-            .collect();
-        if !scopes_vec.is_empty() {
-            ep_table.insert("scopes".into(), toml::Value::Array(scopes_vec));
+    match commit_claimed_session(&state, &session).await {
+        Ok(()) => {}
+        Err(resp) => {
+            // Failed commit: revert the claim so the session can be retried
+            // or cancelled.
+            setup_mgr.release_commit_claim(&session_id).await;
+            return *resp;
         }
     }
-    if let Some(ref tp) = session.tool_prefix {
-        ep_table.insert("tool_prefix".into(), toml::Value::String(tp.clone()));
+
+    // Commit succeeded — consume the session. Its name reservation is only
+    // released now, after `commit_claimed_session` has published the
+    // committed config to `state.config`, so the setup-start duplicate
+    // check can already see the new endpoint.
+    setup_mgr.remove_session(&session_id).await;
+
+    // Persist the token via TokenManager so it survives restarts
+    if let (Some(ref tm), Some(ref tokens)) = (&state.token_manager, &session.tokens) {
+        if let Err(e) = tm.save(&session.name, tokens).await {
+            warn!(endpoint = %session.name, error = %e, "Failed to persist tokens");
+        }
     }
-    if let Some(ref sto) = session.server_type_override {
-        ep_table.insert(
-            "server_type_override".into(),
-            toml::Value::String(sto.clone()),
-        );
+
+    Json(serde_json::json!({
+        "status": "committed",
+        "name": session.name
+    }))
+    .into_response()
+}
+
+/// Fallible body of [`oauth_setup_commit`], run while the session is claimed
+/// (`Committing`). Persists the session's client credentials to the DCR
+/// store (defensive save-if-absent), then writes and synchronously applies
+/// the committed endpoint. Any `Err` leaves the session claimed for the
+/// caller to release.
+async fn commit_claimed_session(
+    state: &ManagementState,
+    session: &crate::oauth::OAuthSetupSession,
+) -> Result<(), Box<axum::response::Response>> {
+    if state.config_path.is_none() {
+        return Err(Box::new(
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "config_path not configured",
+                None,
+            )
+            .into_response(),
+        ));
     }
 
     // Defensive persistence: if the setup flow did not write a DCR record
@@ -3510,7 +3509,11 @@ async fn oauth_setup_commit(
                 None => Ok(Some(DcrCredentials {
                     client_id: cid.clone(),
                     client_secret: session.client_secret.clone(),
-                    client_secret_expires_at: 0,
+                    // The expiry resolved during setup (DCR response's
+                    // `client_secret_expires_at`; 0 for manual creds), so a
+                    // recovered record keeps the same lifetime the normal
+                    // setup-time save would have written.
+                    client_secret_expires_at: session.client_secret_expires_at,
                     registered_at: std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
@@ -3537,7 +3540,9 @@ async fn oauth_setup_commit(
                     {
                         // Existing record matches this session — keep it
                         // (preserves registered_at/issuer/provenance and any
-                        // resource credentials).
+                        // resource credentials). `update_dcr` skips the save
+                        // when the returned record equals the loaded one, so
+                        // this does not rewrite the file.
                         Ok(Some(existing))
                     } else {
                         Err(DcrCommitError::Mismatch {
@@ -3556,17 +3561,19 @@ async fn oauth_setup_commit(
                     stored_client_id = %stored_client_id,
                     "Stored DCR record does not match the setup session's credentials; refusing to commit"
                 );
-                return error_response(
-                    StatusCode::CONFLICT,
-                    "dcr_record_mismatch",
-                    Some(
-                        "A stored credential record for this endpoint name does not \
-                         match this setup session's client credentials. Delete the \
-                         endpoint's stored credentials or re-run setup under a \
-                         different name.",
-                    ),
-                )
-                .into_response();
+                return Err(Box::new(
+                    error_response(
+                        StatusCode::CONFLICT,
+                        "dcr_record_mismatch",
+                        Some(
+                            "A stored credential record for this endpoint name does not \
+                             match this setup session's client credentials. Delete the \
+                             endpoint's stored credentials or re-run setup under a \
+                             different name.",
+                        ),
+                    )
+                    .into_response(),
+                ));
             }
             Err(DcrCommitError::Token(e)) => {
                 // A load failure (corrupt record) or save failure means we
@@ -3580,66 +3587,63 @@ async fn oauth_setup_commit(
                     error = %e,
                     "Failed to read/write DCR credentials at commit; refusing to commit"
                 );
-                return error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "dcr_persistence_failed",
-                    Some(&format!(
-                        "Could not persist client credentials to the credential \
-                         store: {e}. The setup session was kept; retry the commit \
-                         or cancel the session.",
-                    )),
-                )
-                .into_response();
+                return Err(Box::new(
+                    error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "dcr_persistence_failed",
+                        Some(&format!(
+                            "Could not persist client credentials to the credential \
+                             store: {e}. The setup session was kept; retry the commit \
+                             or cancel the session.",
+                        )),
+                    )
+                    .into_response(),
+                ));
             }
         }
     }
 
-    // Append to the [[endpoints]] array
-    let endpoints = parsed
-        .entry("endpoints")
-        .or_insert_with(|| toml::Value::Array(Vec::new()));
-    if let toml::Value::Array(ref mut arr) = endpoints {
-        arr.push(toml::Value::Table(ep_table));
-    }
-
-    let new_contents = match toml::to_string_pretty(&parsed) {
-        Ok(s) => s,
-        Err(e) => {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to serialize config",
-                Some(&e.to_string()),
-            )
-            .into_response();
-        }
+    // Build the committed endpoint and apply it through the same synchronous
+    // path as `POST /api/endpoints`: TOML write + adapter registration +
+    // `state.config` publish, all before this function returns. Publishing
+    // synchronously (instead of waiting for the watcher's debounced reload)
+    // closes the window in which a new same-name setup could pass the
+    // setup-start duplicate check against a stale `state.config` snapshot.
+    // `client_secret` is deliberately NOT part of the entry; it lives in the
+    // DCR store only (persisted above).
+    let new_ep = crate::config::EndpointConfig {
+        name: session.name.clone(),
+        description: None,
+        tool_prefix: session.tool_prefix.clone(),
+        transport: crate::config::Transport::Oauth,
+        command: None,
+        args: None,
+        url: Some(session.url.clone()),
+        env: None,
+        headers: None,
+        disabled: false,
+        disabled_tools: Vec::new(),
+        oauth_server_url: session.oauth_server_url.clone(),
+        client_id: session.client_id.clone(),
+        client_secret: None,
+        scopes: session
+            .scopes
+            .as_ref()
+            .map(|s| {
+                s.split_whitespace()
+                    .map(|scope| scope.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v| !v.is_empty()),
+        token_endpoint: session.token_endpoint.clone(),
+        server_type_override: session.server_type_override.clone(),
+        isolation: None,
+        container_image: None,
+        mounts: None,
+        auth: None,
     };
 
-    if let Err(e) = crate::config::write_config_file(&resolved, &new_contents) {
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to write config file",
-            Some(&e.to_string()),
-        )
-        .into_response();
-    }
-
-    // Commit succeeded — consume the session (releasing its name
-    // reservation; the committed config entry now owns the name).
-    setup_mgr.remove_session(&session_id).await;
-
-    // Persist the token via TokenManager so it survives restarts
-    if let (Some(ref tm), Some(tokens)) = (&state.token_manager, session.tokens) {
-        if let Err(e) = tm.save(&session.name, &tokens).await {
-            warn!(endpoint = %session.name, error = %e, "Failed to persist tokens");
-        }
-    }
-
-    // The config watcher will pick up the change and load the new adapter.
-    Json(serde_json::json!({
-        "status": "committed",
-        "name": session.name
-    }))
-    .into_response()
+    apply_endpoint_change(state, new_ep, None).await
 }
 
 /// DELETE /api/oauth/setup/:id
@@ -3666,11 +3670,20 @@ async fn oauth_setup_cancel(
         .into_response();
     };
 
-    let removed = setup_mgr.remove_session(&session_id).await;
-    if removed.is_some() {
-        Json(serde_json::json!({ "status": "cancelled" })).into_response()
-    } else {
-        error_response(StatusCode::NOT_FOUND, "session not found or expired", None).into_response()
+    match setup_mgr.cancel_session(&session_id).await {
+        crate::oauth::CancelOutcome::Cancelled => {
+            Json(serde_json::json!({ "status": "cancelled" })).into_response()
+        }
+        crate::oauth::CancelOutcome::CommitInProgress => error_response(
+            StatusCode::CONFLICT,
+            "commit_in_progress",
+            Some("A commit for this session is in flight; it cannot be cancelled."),
+        )
+        .into_response(),
+        crate::oauth::CancelOutcome::NotFound => {
+            error_response(StatusCode::NOT_FOUND, "session not found or expired", None)
+                .into_response()
+        }
     }
 }
 
@@ -9753,6 +9766,204 @@ command = "echo"
             "expected no server_type_override key when override is None, got:\n{}",
             contents
         );
+    }
+
+    /// The defensive save must carry the expiry resolved during setup
+    /// (tracked on the session), not a hardcoded "never expires": an
+    /// expiring DCR secret recovered at commit time keeps its lifetime.
+    #[tokio::test]
+    async fn oauth_setup_commit_defensive_save_preserves_secret_expiry() {
+        let (app, session_id, _config_path, token_manager, _tmp) = commit_fixture("exp-ep", |s| {
+            s.client_id = Some("dcr-minted".into());
+            s.client_secret = Some("dcr-secret".into());
+            s.client_secret_expires_at = 1_999_999_999;
+            s.registered_via_dcr = true;
+        })
+        .await;
+
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let creds = token_manager
+            .load_dcr("exp-ep")
+            .await
+            .unwrap()
+            .expect("defensive save must write a DCR record");
+        assert_eq!(
+            creds.client_secret_expires_at, 1_999_999_999,
+            "the session's resolved secret expiry must be persisted"
+        );
+    }
+
+    /// While a commit has claimed the session, a duplicate commit gets
+    /// `409 commit_in_progress` and a cancel gets `409` too — neither can
+    /// consume the in-flight session.
+    #[tokio::test]
+    async fn oauth_setup_commit_claim_blocks_duplicate_commit_and_cancel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+
+        let mut state = test_state_with_setup().await;
+        state.config_path = Some(config_path);
+
+        let setup_mgr = state.setup_manager.as_ref().unwrap().clone();
+        let session_id = setup_mgr
+            .create_session(
+                "busy-ep".into(),
+                "https://mcp.example.com".into(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        setup_mgr
+            .get_session_mut(&session_id, |s| {
+                s.status = crate::oauth::SetupSessionStatus::Authorized;
+            })
+            .await;
+
+        // Simulate an in-flight commit holding the claim.
+        assert!(matches!(
+            setup_mgr.claim_for_commit(&session_id).await,
+            crate::oauth::CommitClaim::Claimed(_)
+        ));
+
+        let app = management_routes(state);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "commit_in_progress");
+
+        let resp = app
+            .oneshot(
+                Request::delete(format!("/api/oauth/setup/{}", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // The session is still there for the in-flight commit.
+        assert!(setup_mgr.get_session(&session_id, |_| ()).await.is_some());
+    }
+
+    /// The committed endpoint must be visible through `state.config` the
+    /// moment the commit response lands — published synchronously, not via
+    /// the watcher's debounced reload — so a same-name setup started right
+    /// after the commit is rejected by the duplicate-name check instead of
+    /// slipping through and clobbering the endpoint's DCR record.
+    #[tokio::test]
+    async fn oauth_setup_commit_publishes_config_before_releasing_name() {
+        let (app, session_id, _config_path, _token_manager, _tmp) =
+            commit_fixture("sync-ep", |s| {
+                s.client_id = Some("client-123".into());
+                s.client_secret = Some("secret-456".into());
+            })
+            .await;
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // A new same-name setup right after the commit response must be
+        // rejected by the duplicate-name check against `state.config` —
+        // no watcher involved.
+        let resp = app
+            .oneshot(
+                Request::post("/api/oauth/setup")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "name": "sync-ep",
+                            "url": "https://other.example.com"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "endpoint_exists");
+    }
+
+    /// A failed commit releases the claim: the session returns to
+    /// `Authorized` so it can be retried or cancelled.
+    #[tokio::test]
+    async fn oauth_setup_commit_failure_releases_claim() {
+        // config_path is None → the claimed commit fails immediately.
+        let state = test_state_with_setup().await;
+        let setup_mgr = state.setup_manager.as_ref().unwrap().clone();
+        let session_id = setup_mgr
+            .create_session(
+                "rel-ep".into(),
+                "https://mcp.example.com".into(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        setup_mgr
+            .get_session_mut(&session_id, |s| {
+                s.status = crate::oauth::SetupSessionStatus::Authorized;
+            })
+            .await;
+
+        let app = management_routes(state);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Claim released: session is Authorized again and cancellable.
+        let status = setup_mgr
+            .get_session(&session_id, |s| s.status.clone())
+            .await
+            .unwrap();
+        assert_eq!(status, crate::oauth::SetupSessionStatus::Authorized);
+
+        let resp = app
+            .oneshot(
+                Request::delete(format!("/api/oauth/setup/{}", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     /// HTTP-layer round-trip: the request body's `server_type_override` field
