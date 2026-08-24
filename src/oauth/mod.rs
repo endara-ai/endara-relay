@@ -117,18 +117,29 @@ pub struct PendingFlow {
     /// falls back to `idp_issuer` as the key.
     pub idp_credential_key: Option<String>,
     pub created_at: Instant,
+    /// Per-endpoint reset generation this flow was started under. A
+    /// "Reset authorization" bumps the endpoint's generation (see
+    /// [`OAuthFlowManager::invalidate_endpoint`]); the `/oauth/callback`
+    /// commit path refuses flows from an older generation so a pre-reset
+    /// callback — even one already past `consume_flow` and mid token
+    /// exchange — cannot clobber the reset.
+    pub generation: u64,
 }
 
 /// In-memory map holding pending OAuth flows. One entry per in-progress login.
 /// Entries are created by `/oauth/start` and consumed by `/oauth/callback`.
 pub struct OAuthFlowManager {
     pending: RwLock<HashMap<String, PendingFlow>>,
+    /// Per-endpoint reset generation counters (absent entry == generation 0).
+    /// Bumped by [`invalidate_endpoint`](Self::invalidate_endpoint).
+    generations: RwLock<HashMap<String, u64>>,
 }
 
 impl OAuthFlowManager {
     pub fn new() -> Self {
         Self {
             pending: RwLock::new(HashMap::new()),
+            generations: RwLock::new(HashMap::new()),
         }
     }
 
@@ -161,6 +172,7 @@ impl OAuthFlowManager {
             idp_issuer: None,
             idp_credential_key: None,
             created_at: Instant::now(),
+            generation: self.current_generation(endpoint_name).await,
         };
         self.pending.write().await.insert(state.clone(), flow);
         state
@@ -208,6 +220,7 @@ impl OAuthFlowManager {
             idp_issuer: Some(idp_issuer.to_string()),
             idp_credential_key: Some(idp_credential_key.to_string()),
             created_at: Instant::now(),
+            generation: self.current_generation(endpoint_name).await,
         };
         self.pending.write().await.insert(state.clone(), flow);
         state
@@ -222,6 +235,50 @@ impl OAuthFlowManager {
             return None;
         }
         Some(flow)
+    }
+
+    /// The endpoint's current reset generation (0 until first invalidation).
+    async fn current_generation(&self, endpoint_name: &str) -> u64 {
+        *self
+            .generations
+            .read()
+            .await
+            .get(endpoint_name)
+            .unwrap_or(&0)
+    }
+
+    /// Invalidate every pending flow for `endpoint_name` and bump its reset
+    /// generation, so flows started before this call can neither be consumed
+    /// (removed here) nor committed if already consumed and mid token
+    /// exchange (their `generation` is now stale — see [`is_current`]).
+    /// Called by "Reset authorization" before it starts the replacement flow.
+    /// Returns the number of pending flows removed.
+    ///
+    /// [`is_current`]: Self::is_current
+    pub async fn invalidate_endpoint(&self, endpoint_name: &str) -> usize {
+        // Hold both locks across the bump+removal so a concurrent
+        // `start_flow` cannot interleave a flow stamped with the old
+        // generation after removal.
+        let mut generations = self.generations.write().await;
+        let mut pending = self.pending.write().await;
+        *generations.entry(endpoint_name.to_string()).or_insert(0) += 1;
+        let before = pending.len();
+        pending.retain(|_, f| f.endpoint_name != endpoint_name);
+        before - pending.len()
+    }
+
+    /// Whether `flow` was started under the endpoint's current reset
+    /// generation. `/oauth/callback` checks this before committing tokens so
+    /// a callback from a pre-reset flow cannot clobber the reset.
+    pub async fn is_current(&self, flow: &PendingFlow) -> bool {
+        flow.generation == self.current_generation(&flow.endpoint_name).await
+    }
+
+    /// Test-only: re-insert a flow under a chosen state key, preserving its
+    /// recorded `generation` (used to exercise the stale-generation guard).
+    #[cfg(test)]
+    pub(crate) async fn reinsert_flow_for_test(&self, state: &str, flow: PendingFlow) {
+        self.pending.write().await.insert(state.to_string(), flow);
     }
 
     /// Periodic cleanup of stale flows (call from a background task or on each access).
@@ -703,6 +760,56 @@ mod tests {
         mgr.cleanup_stale().await;
         let pending = mgr.pending.read().await;
         assert!(pending.is_empty());
+    }
+
+    async fn start_test_flow(mgr: &OAuthFlowManager, endpoint: &str) -> String {
+        mgr.start_flow(
+            endpoint,
+            "https://auth.example.com/token",
+            "cid",
+            None,
+            PkceChallenge::generate(),
+            "http://localhost/cb",
+            None,
+            false,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn invalidate_endpoint_removes_only_that_endpoints_flows() {
+        let mgr = OAuthFlowManager::new();
+        let state_a = start_test_flow(&mgr, "ep-a").await;
+        let state_a2 = start_test_flow(&mgr, "ep-a").await;
+        let state_b = start_test_flow(&mgr, "ep-b").await;
+
+        let removed = mgr.invalidate_endpoint("ep-a").await;
+        assert_eq!(removed, 2);
+
+        // ep-a flows are gone; ep-b's flow is untouched and still current.
+        assert!(mgr.consume_flow(&state_a).await.is_none());
+        assert!(mgr.consume_flow(&state_a2).await.is_none());
+        let flow_b = mgr.consume_flow(&state_b).await.unwrap();
+        assert!(mgr.is_current(&flow_b).await);
+    }
+
+    #[tokio::test]
+    async fn invalidate_endpoint_marks_consumed_flow_stale() {
+        // A callback consumed BEFORE the reset (mid token exchange) must be
+        // detectable as stale afterwards: is_current flips to false once the
+        // endpoint's generation is bumped.
+        let mgr = OAuthFlowManager::new();
+        let state = start_test_flow(&mgr, "ep").await;
+        let flow = mgr.consume_flow(&state).await.unwrap();
+        assert!(mgr.is_current(&flow).await);
+
+        mgr.invalidate_endpoint("ep").await;
+        assert!(!mgr.is_current(&flow).await);
+
+        // A flow started AFTER the reset carries the new generation.
+        let state2 = start_test_flow(&mgr, "ep").await;
+        let flow2 = mgr.consume_flow(&state2).await.unwrap();
+        assert!(mgr.is_current(&flow2).await);
     }
 
     #[test]

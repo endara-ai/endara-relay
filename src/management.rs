@@ -2390,6 +2390,20 @@ async fn oauth_reset(
         }
     };
 
+    // Invalidate pending flows for this endpoint and bump its reset
+    // generation BEFORE disconnecting: an authorize URL handed out by a
+    // pre-reset `/oauth/start` stays valid for up to FLOW_MAX_AGE, and its
+    // late callback would otherwise complete after the disconnect and
+    // clobber the reset with the pre-reset grant. The generation bump also
+    // covers callbacks already consumed and mid token exchange — the
+    // callback handler refuses to commit a flow from a stale generation.
+    if let Some(ref flow_mgr) = state.oauth_flow_manager {
+        let removed = flow_mgr.invalidate_endpoint(&name).await;
+        if removed > 0 {
+            info!(endpoint = %name, removed, "Reset: invalidated pending OAuth flows");
+        }
+    }
+
     // Snapshot the client registration before disconnect: `disconnect()`
     // deletes the DCR record along with the tokens, but reset must only
     // discard the grant. Desktop-created DCR endpoints keep the
