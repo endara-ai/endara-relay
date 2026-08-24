@@ -1073,10 +1073,30 @@ impl OAuthAdapterInner {
         // (AuthRequired/ConnectionFailed) in place keeps `derive_health`
         // reporting the stale error as if it were a fresh failure. Refresh
         // paths already enter the apply in `Refreshing` — skip the no-op
-        // self-transition to keep the ring buffer free of noise.
-        if *self.state.read().await != OAuthState::Refreshing {
-            self.transition_to(OAuthState::Refreshing, "applying new tokens")
-                .await;
+        // self-transition to keep the ring buffer free of noise. The check
+        // and transition happen under one state write lock so a concurrent
+        // `do_token_refresh` (guarded by `refresh_mutex`, not `apply_lock`)
+        // cannot interleave between them and produce a noisy
+        // Refreshing→Refreshing self-record.
+        {
+            let mut state = self.state.write().await;
+            if *state != OAuthState::Refreshing {
+                let mut history = self.transition_history.write().await;
+                let old = do_transition(
+                    &mut state,
+                    OAuthState::Refreshing,
+                    "applying new tokens",
+                    &mut history,
+                );
+                self.metrics.inc_state_transition();
+                info!(
+                    from = ?old,
+                    to = ?OAuthState::Refreshing,
+                    oauth_state = ?OAuthState::Refreshing,
+                    reason = "applying new tokens",
+                    "OAuth state transition"
+                );
+            }
         }
 
         // 1. Persist to disk
@@ -3808,14 +3828,40 @@ mod tests {
         server.abort();
     }
 
+    /// Spawn an in-process MCP server whose `initialize` deterministically
+    /// fails with a JSON-RPC error — pins the apply's failure branch without
+    /// depending on a fixed port being unbound on the host.
+    async fn spawn_failing_init_mcp_server() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::{routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handle(Json(body): Json<Value>) -> Json<Value> {
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            Json(json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {"code": -32603, "message": "init rejected"},
+            }))
+        }
+
+        let router = Router::new().route("/mcp", post(handle));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        (format!("http://127.0.0.1:{}/mcp", addr.port()), handle)
+    }
+
     /// A failing apply entered from an error state must transition through
     /// Refreshing (recorded with the "applying new tokens" reason) and still
     /// end ConnectionFailed with the inner init error preserved.
     #[tokio::test]
     async fn apply_tokens_failure_from_error_state_transitions_via_refreshing() {
+        let (url, server) = spawn_failing_init_mcp_server().await;
         let mut config = make_config();
-        // Port 1 is reserved and not bound: immediate connection refused.
-        config.url = "http://127.0.0.1:1/mcp".to_string();
+        config.url = url;
         let mut adapter = make_adapter(config);
         adapter.initialize().await.unwrap();
 
@@ -3847,6 +3893,7 @@ mod tests {
                 .map(|r| (r.from.clone(), r.to.clone(), r.reason.clone()))
                 .collect::<Vec<_>>()
         );
+        server.abort();
     }
 
     /// Refresh paths (proactive/reactive) enter the apply already in
