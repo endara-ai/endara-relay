@@ -3362,7 +3362,10 @@ async fn oauth_setup_status(
 /// defensively saved to the store (atomic save-if-absent under the DCR
 /// write lock, carrying the session's registration provenance) before the
 /// config is written. A pre-existing record that does not match the
-/// session's credentials rejects the commit with `409 dcr_record_mismatch`.
+/// session's credentials rejects the commit with `409 dcr_record_mismatch`;
+/// a store read/write failure rejects it with `500 dcr_persistence_failed`
+/// (a secretless TOML entry with no readable store record would be
+/// unusable after restart). Failed commits keep the session for retry.
 async fn oauth_setup_commit(
     State(state): State<ManagementState>,
     Path(id): Path<String>,
@@ -3567,11 +3570,27 @@ async fn oauth_setup_commit(
                 .into_response();
             }
             Err(DcrCommitError::Token(e)) => {
+                // A load failure (corrupt record) or save failure means we
+                // cannot prove the store holds this session's credentials.
+                // Committing anyway would write a secretless TOML entry that
+                // resolves to no usable credentials after restart, so fail
+                // the commit; the session (and its name reservation) survive
+                // for a retry or cancel.
                 warn!(
                     endpoint = %session.name,
                     error = %e,
-                    "Failed to read/write DCR credentials at commit; skipping defensive save"
+                    "Failed to read/write DCR credentials at commit; refusing to commit"
                 );
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "dcr_persistence_failed",
+                    Some(&format!(
+                        "Could not persist client credentials to the credential \
+                         store: {e}. The setup session was kept; retry the commit \
+                         or cancel the session.",
+                    )),
+                )
+                .into_response();
             }
         }
     }
@@ -9525,6 +9544,43 @@ command = "echo"
         // Stored record untouched.
         let loaded = token_manager.load_dcr("mm-ep").await.unwrap().unwrap();
         assert_eq!(loaded, stale);
+    }
+
+    /// A store read/write failure during the defensive save (e.g. a corrupt
+    /// `{name}.dcr.json`) must fail the commit: committing anyway would write
+    /// a secretless TOML entry whose credentials can't be resolved after a
+    /// restart. Nothing may be written to config.toml.
+    #[tokio::test]
+    async fn oauth_setup_commit_fails_when_dcr_store_unreadable() {
+        let (app, session_id, config_path, _token_manager, tmp) =
+            commit_fixture("bad-ep", |s| {
+                s.client_id = Some("client-x".into());
+                s.client_secret = Some("secret-x".into());
+            })
+            .await;
+
+        // Corrupt record: load_dcr will fail with a serde error.
+        std::fs::write(tmp.path().join("tokens/bad-ep.dcr.json"), "{not json").unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "dcr_persistence_failed");
+
+        // config.toml untouched — no endpoint entry was committed.
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !contents.contains("bad-ep"),
+            "commit must not write config.toml on store failure; got:\n{}",
+            contents
+        );
     }
 
     /// Round-trip: a commit driven by a session created with
