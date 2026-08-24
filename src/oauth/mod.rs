@@ -251,10 +251,39 @@ pub enum SetupSessionStatus {
     AwaitingAuth,
     /// Authorization complete — tokens obtained.
     Authorized,
+    /// Claimed by an in-flight `POST /commit`: the session can be neither
+    /// cancelled nor committed again until the commit finishes (a failed
+    /// commit reverts to [`Authorized`](Self::Authorized) via
+    /// [`OAuthSetupManager::release_commit_claim`]).
+    Committing,
+}
+
+/// Outcome of [`OAuthSetupManager::claim_for_commit`].
+pub enum CommitClaim {
+    /// The session was `Authorized`; it is now `Committing` and this claim
+    /// carries a snapshot of it.
+    Claimed(Box<OAuthSetupSession>),
+    /// Another commit request already claimed the session.
+    AlreadyCommitting,
+    /// The session exists but authorization has not completed.
+    NotAuthorized,
+    /// No live session with this ID.
+    NotFound,
+}
+
+/// Outcome of [`OAuthSetupManager::cancel_session`].
+pub enum CancelOutcome {
+    /// The session was removed.
+    Cancelled,
+    /// The session is claimed by an in-flight commit and was NOT removed.
+    CommitInProgress,
+    /// No live session with this ID.
+    NotFound,
 }
 
 /// A transient OAuth setup session that does NOT write to config.toml until
 /// explicitly committed. Created by `POST /api/oauth/setup`.
+#[derive(Clone)]
 pub struct OAuthSetupSession {
     /// Display name for the endpoint.
     pub name: String,
@@ -283,6 +312,17 @@ pub struct OAuthSetupSession {
     pub client_id: Option<String>,
     /// Client secret (optional).
     pub client_secret: Option<String>,
+    /// `client_secret_expires_at` from the registration response (RFC 7591;
+    /// 0 = never expires). Written by the commit-time defensive save so a
+    /// recovered record carries the provider's real expiry instead of
+    /// silently becoming non-expiring. 0 for manual credentials.
+    pub client_secret_expires_at: u64,
+    /// Whether the session's client credentials were minted via true DCR
+    /// (RFC 7591) during this setup. Persisted as the DCR record's
+    /// `registered_via_dcr` when the commit has to defensively save the
+    /// credentials, so recovered records keep their re-registration
+    /// self-heal eligibility. `false` for manual/CIMD credentials.
+    pub registered_via_dcr: bool,
     /// Obtained tokens (populated after callback).
     pub tokens: Option<TokenSet>,
     /// Current session status.
@@ -307,7 +347,14 @@ impl OAuthSetupManager {
         }
     }
 
-    /// Create a new setup session. Returns the session ID.
+    /// Create a new setup session. Returns the session ID, or `None` when
+    /// another live session already holds `name`.
+    ///
+    /// The name reservation is checked and taken atomically under the
+    /// sessions write lock, so two concurrent same-name setup requests can
+    /// never both proceed — without it, the loser's setup-time DCR save
+    /// could overwrite the winner's validated credentials between commit's
+    /// store check and its config write.
     pub async fn create_session(
         &self,
         name: String,
@@ -315,7 +362,12 @@ impl OAuthSetupManager {
         scopes: Option<String>,
         tool_prefix: Option<String>,
         server_type_override: Option<String>,
-    ) -> Uuid {
+    ) -> Option<Uuid> {
+        let mut sessions = self.sessions.write().await;
+        sessions.retain(|_, s| s.created_at.elapsed() < SETUP_SESSION_MAX_AGE);
+        if sessions.values().any(|s| s.name == name) {
+            return None;
+        }
         let id = Uuid::new_v4();
         let session = OAuthSetupSession {
             name,
@@ -330,15 +382,91 @@ impl OAuthSetupManager {
             issuer: None,
             client_id: None,
             client_secret: None,
+            client_secret_expires_at: 0,
+            registered_via_dcr: false,
             tokens: None,
             status: SetupSessionStatus::AwaitingCredentials,
             created_at: Instant::now(),
         };
-        self.sessions.write().await.insert(id, session);
-        id
+        sessions.insert(id, session);
+        Some(id)
     }
 
-    /// Get mutable access to a session by ID.
+    /// Atomically claim a session for an exclusive commit attempt. Under the
+    /// sessions write lock, an `Authorized` session transitions to
+    /// [`SetupSessionStatus::Committing`] and a snapshot is returned; any
+    /// other state is reported without mutating the session. While claimed,
+    /// [`cancel_session`](Self::cancel_session) refuses to remove the session
+    /// and a duplicate commit request gets
+    /// [`CommitClaim::AlreadyCommitting`], so exactly one commit can consume
+    /// the session. A failed commit must revert the claim via
+    /// [`release_commit_claim`](Self::release_commit_claim).
+    ///
+    /// Claiming refreshes the session's expiry lease (`created_at`), so the
+    /// age sweeps in [`create_session`](Self::create_session) /
+    /// [`cleanup_stale`](Self::cleanup_stale) cannot drop an actively
+    /// committing session — and release its name reservation — mid-write. An
+    /// abandoned claim (commit task died without releasing) still expires,
+    /// one full max-age after the claim instead of after creation.
+    pub async fn claim_for_commit(&self, id: &Uuid) -> CommitClaim {
+        let mut sessions = self.sessions.write().await;
+        let Some(session) = sessions.get_mut(id) else {
+            return CommitClaim::NotFound;
+        };
+        if session.created_at.elapsed() > SETUP_SESSION_MAX_AGE {
+            sessions.remove(id);
+            return CommitClaim::NotFound;
+        }
+        match session.status {
+            SetupSessionStatus::Committing => CommitClaim::AlreadyCommitting,
+            SetupSessionStatus::Authorized => {
+                session.status = SetupSessionStatus::Committing;
+                session.created_at = Instant::now();
+                let mut snapshot = session.clone();
+                // The snapshot reflects the pre-claim state so a caller
+                // persisting it never leaks the transient claim marker.
+                snapshot.status = SetupSessionStatus::Authorized;
+                CommitClaim::Claimed(Box::new(snapshot))
+            }
+            _ => CommitClaim::NotAuthorized,
+        }
+    }
+
+    /// Revert a commit claim after a failed commit: a `Committing` session
+    /// returns to `Authorized` so it can be retried or cancelled. No-op when
+    /// the session is gone or not claimed.
+    pub async fn release_commit_claim(&self, id: &Uuid) {
+        let mut sessions = self.sessions.write().await;
+        if let Some(session) = sessions.get_mut(id) {
+            if session.status == SetupSessionStatus::Committing {
+                session.status = SetupSessionStatus::Authorized;
+            }
+        }
+    }
+
+    /// Cancel (remove) a session unless an in-flight commit has claimed it.
+    /// The check-and-remove runs atomically under the sessions write lock,
+    /// so a DELETE racing a commit can never yank the session out from
+    /// under the commit's DCR/config writes after the claim succeeded.
+    pub async fn cancel_session(&self, id: &Uuid) -> CancelOutcome {
+        let mut sessions = self.sessions.write().await;
+        match sessions.get(id) {
+            None => CancelOutcome::NotFound,
+            Some(s) if s.status == SetupSessionStatus::Committing => {
+                CancelOutcome::CommitInProgress
+            }
+            Some(_) => {
+                sessions.remove(id);
+                CancelOutcome::Cancelled
+            }
+        }
+    }
+
+    /// Get mutable access to a session by ID. Returns `None` for a session
+    /// claimed by an in-flight commit ([`SetupSessionStatus::Committing`]):
+    /// a claimed session's state is frozen until the claim is released, so a
+    /// late credentials submission cannot flip it back to `AwaitingAuth` and
+    /// reopen the cancel/duplicate-commit races the claim closed.
     pub async fn get_session_mut<F, R>(&self, id: &Uuid, f: F) -> Option<R>
     where
         F: FnOnce(&mut OAuthSetupSession) -> R,
@@ -347,6 +475,9 @@ impl OAuthSetupManager {
         let session = sessions.get_mut(id)?;
         if session.created_at.elapsed() > SETUP_SESSION_MAX_AGE {
             sessions.remove(id);
+            return None;
+        }
+        if session.status == SetupSessionStatus::Committing {
             return None;
         }
         Some(f(session))
@@ -365,22 +496,39 @@ impl OAuthSetupManager {
         Some(f(session))
     }
 
-    /// Remove a session (cancel or after commit).
+    /// Remove a session (after commit, or setup-flow cleanup).
     pub async fn remove_session(&self, id: &Uuid) -> Option<OAuthSetupSession> {
         self.sessions.write().await.remove(id)
     }
 
     /// Mark a session as authorized with the obtained tokens.
-    /// Called from the OAuth callback handler.
+    /// Called from the OAuth callback handler. Returns `false` for a session
+    /// claimed by an in-flight commit: a late/duplicate callback must not
+    /// overwrite the tokens being committed or flip the status out of
+    /// `Committing` (which would let a cancel or second commit consume it).
     pub async fn mark_authorized(&self, id: &Uuid, tokens: TokenSet) -> bool {
         let mut sessions = self.sessions.write().await;
         if let Some(session) = sessions.get_mut(id) {
+            if session.status == SetupSessionStatus::Committing {
+                return false;
+            }
             session.tokens = Some(tokens);
             session.status = SetupSessionStatus::Authorized;
             true
         } else {
             false
         }
+    }
+
+    /// Whether a live (unexpired) setup session currently reserves `name`.
+    /// The endpoint create/rename APIs consult this so a name mid-setup
+    /// cannot be taken by a regular endpoint mutation and later collide
+    /// with the session's own commit.
+    pub async fn is_name_reserved(&self, name: &str) -> bool {
+        let sessions = self.sessions.read().await;
+        sessions
+            .values()
+            .any(|s| s.name == name && s.created_at.elapsed() < SETUP_SESSION_MAX_AGE)
     }
 
     /// Periodic cleanup of expired sessions.
@@ -586,7 +734,8 @@ mod tests {
                 Some("test".into()),
                 None,
             )
-            .await;
+            .await
+            .unwrap();
 
         let data = mgr
             .get_session(&id, |s| {
@@ -617,11 +766,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn setup_manager_rejects_duplicate_live_name() {
+        let mgr = OAuthSetupManager::new();
+        let first = mgr
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
+            .await;
+        assert!(first.is_some());
+
+        // Same name while the first session is live → reservation rejects.
+        let second = mgr
+            .create_session("ep".into(), "https://y.com".into(), None, None, None)
+            .await;
+        assert!(second.is_none());
+
+        // A different name is unaffected.
+        assert!(mgr
+            .create_session("other".into(), "https://y.com".into(), None, None, None)
+            .await
+            .is_some());
+
+        // Removing the first session frees the name.
+        mgr.remove_session(&first.unwrap()).await;
+        assert!(mgr
+            .create_session("ep".into(), "https://y.com".into(), None, None, None)
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn setup_manager_expired_session_does_not_hold_name() {
+        let mgr = OAuthSetupManager::new();
+        let id = mgr
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
+            .await
+            .unwrap();
+
+        // Manually expire the session
+        {
+            let mut sessions = mgr.sessions.write().await;
+            if let Some(s) = sessions.get_mut(&id) {
+                s.created_at = Instant::now() - Duration::from_secs(700);
+            }
+        }
+
+        // The expired session no longer reserves the name.
+        assert!(mgr
+            .create_session("ep".into(), "https://y.com".into(), None, None, None)
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
     async fn setup_manager_remove_session() {
         let mgr = OAuthSetupManager::new();
         let id = mgr
             .create_session("ep".into(), "https://x.com".into(), None, None, None)
-            .await;
+            .await
+            .unwrap();
 
         let removed = mgr.remove_session(&id).await;
         assert!(removed.is_some());
@@ -636,7 +837,8 @@ mod tests {
         let mgr = OAuthSetupManager::new();
         let id = mgr
             .create_session("ep".into(), "https://x.com".into(), None, None, None)
-            .await;
+            .await
+            .unwrap();
 
         let tokens = crate::token_manager::TokenSet {
             access_token: "access-tok".into(),
@@ -676,7 +878,8 @@ mod tests {
         let mgr = OAuthSetupManager::new();
         let id = mgr
             .create_session("ep".into(), "https://x.com".into(), None, None, None)
-            .await;
+            .await
+            .unwrap();
 
         // Manually expire the session
         {
@@ -698,10 +901,12 @@ mod tests {
         let mgr = OAuthSetupManager::new();
         let fresh_id = mgr
             .create_session("fresh".into(), "https://a.com".into(), None, None, None)
-            .await;
+            .await
+            .unwrap();
         let stale_id = mgr
             .create_session("stale".into(), "https://b.com".into(), None, None, None)
-            .await;
+            .await
+            .unwrap();
 
         // Make one session stale
         {
@@ -724,7 +929,8 @@ mod tests {
         let mgr = OAuthSetupManager::new();
         let id = mgr
             .create_session("ep".into(), "https://x.com".into(), None, None, None)
-            .await;
+            .await
+            .unwrap();
 
         mgr.get_session_mut(&id, |s| {
             s.client_id = Some("my-client".into());
@@ -738,5 +944,198 @@ mod tests {
             .unwrap();
         assert_eq!(cid.as_deref(), Some("my-client"));
         assert_eq!(status, SetupSessionStatus::AwaitingAuth);
+    }
+
+    /// Exactly one commit can claim an `Authorized` session; while claimed,
+    /// a duplicate commit and a cancel are both refused, and releasing the
+    /// claim restores `Authorized` so retry/cancel work again.
+    #[tokio::test]
+    async fn setup_manager_commit_claim_locks_out_cancel_and_duplicate() {
+        let mgr = OAuthSetupManager::new();
+        let id = mgr
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
+            .await
+            .unwrap();
+
+        // Not yet authorized → claim refused.
+        assert!(matches!(
+            mgr.claim_for_commit(&id).await,
+            CommitClaim::NotAuthorized
+        ));
+
+        mgr.get_session_mut(&id, |s| s.status = SetupSessionStatus::Authorized)
+            .await;
+
+        // First claim wins and the snapshot carries the pre-claim status.
+        let CommitClaim::Claimed(snapshot) = mgr.claim_for_commit(&id).await else {
+            panic!("authorized session must be claimable");
+        };
+        assert_eq!(snapshot.status, SetupSessionStatus::Authorized);
+
+        // Duplicate commit and cancel are locked out while claimed.
+        assert!(matches!(
+            mgr.claim_for_commit(&id).await,
+            CommitClaim::AlreadyCommitting
+        ));
+        assert!(matches!(
+            mgr.cancel_session(&id).await,
+            CancelOutcome::CommitInProgress
+        ));
+        assert!(mgr.get_session(&id, |_| ()).await.is_some());
+
+        // Releasing the claim (failed commit) restores Authorized: the
+        // session can be re-claimed or cancelled.
+        mgr.release_commit_claim(&id).await;
+        let status = mgr.get_session(&id, |s| s.status.clone()).await.unwrap();
+        assert_eq!(status, SetupSessionStatus::Authorized);
+        assert!(matches!(
+            mgr.cancel_session(&id).await,
+            CancelOutcome::Cancelled
+        ));
+        assert!(matches!(
+            mgr.cancel_session(&id).await,
+            CancelOutcome::NotFound
+        ));
+    }
+
+    /// Unknown IDs report `NotFound` for both claim and cancel.
+    #[tokio::test]
+    async fn setup_manager_claim_and_cancel_nonexistent_return_not_found() {
+        let mgr = OAuthSetupManager::new();
+        let fake_id = Uuid::new_v4();
+        assert!(matches!(
+            mgr.claim_for_commit(&fake_id).await,
+            CommitClaim::NotFound
+        ));
+        assert!(matches!(
+            mgr.cancel_session(&fake_id).await,
+            CancelOutcome::NotFound
+        ));
+        // Releasing a claim on a missing session is a harmless no-op.
+        mgr.release_commit_claim(&fake_id).await;
+    }
+
+    /// A claimed (`Committing`) session is frozen: `get_session_mut` and
+    /// `mark_authorized` are both refused, so a late credentials submission
+    /// or duplicate callback cannot flip the status and reopen the
+    /// cancel/duplicate-commit races the claim closed. Releasing the claim
+    /// unfreezes it.
+    #[tokio::test]
+    async fn setup_manager_claimed_session_rejects_mutation_and_callback() {
+        let mgr = OAuthSetupManager::new();
+        let id = mgr
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
+            .await
+            .unwrap();
+        mgr.get_session_mut(&id, |s| s.status = SetupSessionStatus::Authorized)
+            .await;
+        assert!(matches!(
+            mgr.claim_for_commit(&id).await,
+            CommitClaim::Claimed(_)
+        ));
+
+        let tokens = crate::token_manager::TokenSet {
+            access_token: "late".into(),
+            refresh_token: None,
+            expires_at: None,
+            token_type: "Bearer".into(),
+            scope: None,
+            issued_at: None,
+        };
+        assert!(
+            !mgr.mark_authorized(&id, tokens.clone()).await,
+            "a late callback must not touch a claimed session"
+        );
+        assert!(
+            mgr.get_session_mut(&id, |s| s.status = SetupSessionStatus::AwaitingAuth)
+                .await
+                .is_none(),
+            "mutation must be refused while claimed"
+        );
+        let status = mgr.get_session(&id, |s| s.status.clone()).await.unwrap();
+        assert_eq!(status, SetupSessionStatus::Committing);
+
+        // After release both work again.
+        mgr.release_commit_claim(&id).await;
+        assert!(mgr.mark_authorized(&id, tokens).await);
+        assert!(mgr
+            .get_session_mut(&id, |s| s.client_id = Some("cid".into()))
+            .await
+            .is_some());
+    }
+
+    /// Claiming refreshes the session's expiry lease so the age sweeps
+    /// cannot drop an actively committing session (releasing its name
+    /// reservation mid-write), while an abandoned claim still expires.
+    #[tokio::test]
+    async fn setup_manager_claim_refreshes_expiry_lease() {
+        let mgr = OAuthSetupManager::new();
+        let id = mgr
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
+            .await
+            .unwrap();
+        mgr.get_session_mut(&id, |s| s.status = SetupSessionStatus::Authorized)
+            .await;
+
+        // Age the session close to expiry, then claim: the claim must
+        // restart the age clock. (`checked_sub` guards hosts whose
+        // monotonic clock is younger than the backdate.)
+        let Some(aged) =
+            Instant::now().checked_sub(SETUP_SESSION_MAX_AGE - Duration::from_secs(10))
+        else {
+            return;
+        };
+        mgr.sessions.write().await.get_mut(&id).unwrap().created_at = aged;
+        assert!(matches!(
+            mgr.claim_for_commit(&id).await,
+            CommitClaim::Claimed(_)
+        ));
+        let lease_age = mgr
+            .sessions
+            .read()
+            .await
+            .get(&id)
+            .unwrap()
+            .created_at
+            .elapsed();
+        assert!(
+            lease_age < Duration::from_secs(60),
+            "claim must refresh the expiry lease, got age {lease_age:?}"
+        );
+
+        // The sweep keeps the freshly claimed session (and its name
+        // reservation): a same-name create_session is still refused.
+        mgr.cleanup_stale().await;
+        assert!(mgr.get_session(&id, |_| ()).await.is_some());
+        assert!(mgr
+            .create_session("ep".into(), "https://y.com".into(), None, None, None)
+            .await
+            .is_none());
+
+        // An abandoned claim (never released) still expires one max-age
+        // after the claim.
+        let Some(expired) =
+            Instant::now().checked_sub(SETUP_SESSION_MAX_AGE + Duration::from_secs(1))
+        else {
+            return;
+        };
+        mgr.sessions.write().await.get_mut(&id).unwrap().created_at = expired;
+        mgr.cleanup_stale().await;
+        assert!(mgr.sessions.read().await.get(&id).is_none());
+    }
+
+    /// `is_name_reserved` reflects live sessions only.
+    #[tokio::test]
+    async fn setup_manager_is_name_reserved() {
+        let mgr = OAuthSetupManager::new();
+        assert!(!mgr.is_name_reserved("ep").await);
+        let id = mgr
+            .create_session("ep".into(), "https://x.com".into(), None, None, None)
+            .await
+            .unwrap();
+        assert!(mgr.is_name_reserved("ep").await);
+        assert!(!mgr.is_name_reserved("other").await);
+        mgr.remove_session(&id).await;
+        assert!(!mgr.is_name_reserved("ep").await);
     }
 }

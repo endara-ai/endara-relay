@@ -291,6 +291,11 @@ impl TokenManager {
     /// write. This is the helper `set_endpoint_credentials` uses to fold
     /// caller-supplied fields into the existing record without racing a
     /// concurrent `invalid_client` self-heal.
+    ///
+    /// Returning the loaded record unchanged is a true no-op: the save is
+    /// skipped when the closure's `Some` output equals what was loaded, so
+    /// "keep the existing record" never rewrites the file (no mtime churn,
+    /// no redundant tmp-file rename).
     pub async fn update_dcr<F, E>(
         &self,
         endpoint_name: &str,
@@ -302,9 +307,11 @@ impl TokenManager {
     {
         let _guard = self.dcr_write_lock.lock().await;
         let existing = self.load_dcr(endpoint_name).await?;
-        match update(existing)? {
+        match update(existing.clone())? {
             Some(creds) => {
-                self.save_dcr_locked(endpoint_name, &creds).await?;
+                if existing.as_ref() != Some(&creds) {
+                    self.save_dcr_locked(endpoint_name, &creds).await?;
+                }
                 Ok(Some(creds))
             }
             None => {
@@ -891,6 +898,44 @@ mod tests {
             .unwrap();
         assert!(outcome.is_none());
         assert!(mgr.load_dcr("ep").await.unwrap().is_none());
+    }
+
+    /// Returning the loaded record unchanged from the closure is a true
+    /// no-op: the DCR file is not rewritten (mtime unchanged), while a
+    /// modified record still is.
+    #[tokio::test]
+    async fn update_dcr_skips_save_when_record_unchanged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        mgr.save_dcr("ep", &make_dcr_creds()).await.unwrap();
+
+        let path = tmp.path().join("ep.dcr.json");
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let outcome = mgr
+            .update_dcr("ep", |existing| -> Result<_, TokenError> { Ok(existing) })
+            .await
+            .unwrap();
+        assert_eq!(outcome, Some(make_dcr_creds()));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before,
+            "an unchanged record must not rewrite the DCR file"
+        );
+
+        // A genuinely modified record still lands on disk.
+        let updated = mgr
+            .update_dcr("ep", |existing| -> Result<_, TokenError> {
+                let mut c = existing.unwrap();
+                c.client_secret = Some("rotated".to_string());
+                Ok(Some(c))
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.client_secret.as_deref(), Some("rotated"));
+        let loaded = mgr.load_dcr("ep").await.unwrap().unwrap();
+        assert_eq!(loaded.client_secret.as_deref(), Some("rotated"));
     }
 
     /// `update_dcr` propagates closure errors without touching disk.
