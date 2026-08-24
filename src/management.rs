@@ -3446,15 +3446,10 @@ async fn oauth_setup_commit(
     // Commit succeeded — consume the session. Its name reservation is only
     // released now, after `commit_claimed_session` has published the
     // committed config to `state.config`, so the setup-start duplicate
-    // check can already see the new endpoint.
+    // check can already see the new endpoint. (The session's tokens were
+    // persisted inside `commit_claimed_session`, before the adapter was
+    // registered.)
     setup_mgr.remove_session(&session_id).await;
-
-    // Persist the token via TokenManager so it survives restarts
-    if let (Some(ref tm), Some(ref tokens)) = (&state.token_manager, &session.tokens) {
-        if let Err(e) = tm.save(&session.name, tokens).await {
-            warn!(endpoint = %session.name, error = %e, "Failed to persist tokens");
-        }
-    }
 
     Json(serde_json::json!({
         "status": "committed",
@@ -3465,9 +3460,9 @@ async fn oauth_setup_commit(
 
 /// Fallible body of [`oauth_setup_commit`], run while the session is claimed
 /// (`Committing`). Persists the session's client credentials to the DCR
-/// store (defensive save-if-absent), then writes and synchronously applies
-/// the committed endpoint. Any `Err` leaves the session claimed for the
-/// caller to release.
+/// store (defensive save-if-absent) and its tokens, then writes and
+/// synchronously applies the committed endpoint. Any `Err` leaves the
+/// session claimed for the caller to release.
 async fn commit_claimed_session(
     state: &ManagementState,
     session: &crate::oauth::OAuthSetupSession,
@@ -3600,6 +3595,19 @@ async fn commit_claimed_session(
                     .into_response(),
                 ));
             }
+        }
+    }
+
+    // Persist the session's tokens BEFORE the endpoint is applied below:
+    // `apply_endpoint_change` registers the new adapter, whose spawned
+    // initialization immediately loads the token from disk — saving only
+    // after the apply returns would race that load and could strand a
+    // freshly authorized adapter in NeedsLogin. A token saved ahead of a
+    // commit that then fails is harmless: a retry overwrites it, and a
+    // token file without a config entry grants nothing.
+    if let (Some(ref tm), Some(ref tokens)) = (&state.token_manager, &session.tokens) {
+        if let Err(e) = tm.save(&session.name, tokens).await {
+            warn!(endpoint = %session.name, error = %e, "Failed to persist tokens");
         }
     }
 
@@ -4545,6 +4553,12 @@ fn endpoint_to_toml_table(
 /// `disabled`, `disabled_tools`, and legacy `client_secret` keys are
 /// preserved — those are managed via dedicated routes / the credentials
 /// endpoint, not the create/update body.
+///
+/// Name uniqueness is revalidated here against the on-disk entries: the
+/// handlers' earlier checks ran against a possibly stale in-memory
+/// snapshot, so a create (or rename to a new name) that would collide
+/// with an existing entry fails with `409` instead of appending a
+/// duplicate `[[endpoints]]` entry.
 fn write_endpoint_to_disk(
     config_path: &std::path::Path,
     new_ep: &crate::config::EndpointConfig,
@@ -4578,8 +4592,23 @@ fn write_endpoint_to_disk(
 
     let mut new_table = endpoint_to_toml_table(new_ep);
 
+    let name_taken = |arr: &[toml::Value], name: &str| {
+        arr.iter()
+            .any(|v| v.get("name").and_then(|n| n.as_str()) == Some(name))
+    };
+    let duplicate_err = || {
+        (
+            StatusCode::CONFLICT,
+            "duplicate endpoint name",
+            format!("Endpoint name '{}' is already in use.", new_ep.name),
+        )
+    };
+
     match original_name {
         None => {
+            if name_taken(arr, &new_ep.name) {
+                return Err(duplicate_err());
+            }
             arr.push(toml::Value::Table(new_table));
         }
         Some(orig) => {
@@ -4593,6 +4622,9 @@ fn write_endpoint_to_disk(
                     format!("No endpoint named '{}'", orig),
                 ));
             };
+            if new_ep.name != orig && name_taken(arr, &new_ep.name) {
+                return Err(duplicate_err());
+            }
             if let Some(existing) = arr[idx].as_table() {
                 for key in ["disabled", "disabled_tools", "client_secret"] {
                     if let Some(v) = existing.get(key) {
@@ -4742,10 +4774,40 @@ async fn create_endpoint(
         Ok(ep) => ep,
         Err(resp) => return *resp,
     };
+    if let Some(resp) = name_reserved_by_setup(&state, &new_ep.name).await {
+        return *resp;
+    }
     if let Err(resp) = apply_endpoint_change(&state, new_ep.clone(), None).await {
         return *resp;
     }
     (StatusCode::CREATED, Json(endpoint_summary_from(&new_ep))).into_response()
+}
+
+/// `409` when `name` is currently reserved by a live OAuth setup session.
+/// The regular create/rename APIs consult this so they cannot take a name
+/// mid-setup and later collide with the session's own commit (whose claim
+/// keeps the reservation alive until the committed config is published).
+async fn name_reserved_by_setup(
+    state: &ManagementState,
+    name: &str,
+) -> Option<Box<axum::response::Response>> {
+    let setup_mgr = state.setup_manager.as_ref()?;
+    if setup_mgr.is_name_reserved(name).await {
+        return Some(Box::new(
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "duplicate endpoint name",
+                    "detail": format!(
+                        "Endpoint name '{}' is reserved by an OAuth setup session in progress.",
+                        name
+                    ),
+                })),
+            )
+                .into_response(),
+        ));
+    }
+    None
 }
 
 /// PUT /api/endpoints/{name} — update (and optionally rename) an endpoint.
@@ -4769,6 +4831,11 @@ async fn update_endpoint(
         Ok(ep) => ep,
         Err(resp) => return *resp,
     };
+    if new_ep.name != name {
+        if let Some(resp) = name_reserved_by_setup(&state, &new_ep.name).await {
+            return *resp;
+        }
+    }
     if let Err(resp) = apply_endpoint_change(&state, new_ep.clone(), Some(&name)).await {
         return *resp;
     }
@@ -13151,6 +13218,140 @@ client_id = "client123"
             before, after,
             "rejected create must not write to config.toml"
         );
+    }
+
+    /// A name reserved by a live OAuth setup session is refused by the
+    /// regular create and rename APIs with 409, so a mid-setup name cannot
+    /// be taken out from under the session's eventual commit.
+    #[tokio::test]
+    async fn endpoint_create_and_rename_reject_setup_reserved_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let mut state = endpoints_test_state(&config_file).await;
+        let setup_mgr = Arc::new(OAuthSetupManager::new());
+        let session_id = setup_mgr
+            .create_session(
+                "insetup".into(),
+                "https://mcp.example.com".into(),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        state.setup_manager = Some(setup_mgr.clone());
+        let before = std::fs::read_to_string(&config_file).unwrap();
+        let app = management_routes(state);
+
+        let body = serde_json::json!({
+            "name": "insetup",
+            "transport": "stdio",
+            "command": "echo",
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/endpoints")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // Renaming an existing endpoint onto the reserved name is refused
+        // too.
+        let body = serde_json::json!({
+            "name": "insetup",
+            "transport": "stdio",
+            "command": "echo",
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::put("/api/endpoints/existing")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let after = std::fs::read_to_string(&config_file).unwrap();
+        assert_eq!(before, after, "rejected mutations must not touch disk");
+
+        // Once the session is gone the name is usable again.
+        setup_mgr.remove_session(&session_id).await;
+        let body = serde_json::json!({
+            "name": "insetup",
+            "transport": "stdio",
+            "command": "echo",
+        });
+        let resp = app
+            .oneshot(
+                Request::post("/api/endpoints")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// `write_endpoint_to_disk` revalidates name uniqueness against the
+    /// on-disk entries, so a create racing a stale in-memory snapshot gets
+    /// 409 instead of appending a duplicate `[[endpoints]]` entry.
+    #[tokio::test]
+    async fn write_endpoint_to_disk_rejects_on_disk_duplicate() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_file = tmp.path().join("config.toml");
+        let _state = endpoints_test_state(&config_file).await;
+        let before = std::fs::read_to_string(&config_file).unwrap();
+
+        let dup = EndpointConfig {
+            name: "existing".to_string(),
+            description: None,
+            tool_prefix: None,
+            transport: Transport::Stdio,
+            command: Some("echo".into()),
+            args: None,
+            url: None,
+            env: None,
+            headers: None,
+            disabled: false,
+            disabled_tools: Vec::new(),
+            oauth_server_url: None,
+            client_id: None,
+            client_secret: None,
+            scopes: None,
+            token_endpoint: None,
+            server_type_override: None,
+            isolation: None,
+            container_image: None,
+            mounts: None,
+            auth: None,
+        };
+        let err = write_endpoint_to_disk(&config_file, &dup, None)
+            .expect_err("duplicate create must be rejected");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+
+        // Rename onto an existing name is rejected the same way.
+        let mut renamed = dup.clone();
+        renamed.name = "existing".to_string();
+        std::fs::write(
+            &config_file,
+            format!("{before}\n[[endpoints]]\nname = \"other\"\ntransport = \"stdio\"\ncommand = \"echo\"\n"),
+        )
+        .unwrap();
+        let err = write_endpoint_to_disk(&config_file, &renamed, Some("other"))
+            .expect_err("rename onto taken name must be rejected");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+
+        // Same-name update (no rename) still succeeds.
+        write_endpoint_to_disk(&config_file, &dup, Some("existing"))
+            .expect("same-name update must pass the duplicate guard");
     }
 
     #[tokio::test]
