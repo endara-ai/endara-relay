@@ -1610,6 +1610,15 @@ impl McpAdapter for StdioAdapter {
             let start = Instant::now();
             let result = self.send_external_request("tools/call", Some(params)).await;
             let duration_ms = start.elapsed().as_millis();
+            // A transport-level `Ok` can still carry a tool-level error
+            // envelope (`{ content: [...], isError: true }`). Surface it as a
+            // failed call in the tracing line and overlay events — mirroring
+            // the registry's durable capture — while forwarding the envelope
+            // to the client unchanged.
+            let tool_error = result
+                .as_ref()
+                .ok()
+                .and_then(crate::adapter::tool_result_error_message);
             let client_name = span_ctx
                 .client
                 .as_ref()
@@ -1620,8 +1629,8 @@ impl McpAdapter for StdioAdapter {
                 .as_ref()
                 .and_then(|c| c.version.clone())
                 .unwrap_or_default();
-            match &result {
-                Ok(_) => tracing::info!(
+            match (&result, &tool_error) {
+                (Ok(_), None) => tracing::info!(
                     tool = %name,
                     status = "ok",
                     duration_ms = duration_ms,
@@ -1629,7 +1638,16 @@ impl McpAdapter for StdioAdapter {
                     client_version = ?client_version,
                     "Tool call completed"
                 ),
-                Err(e) => tracing::warn!(
+                (Ok(_), Some(msg)) => tracing::warn!(
+                    tool = %name,
+                    status = "error",
+                    duration_ms = duration_ms,
+                    error = %msg,
+                    client_name = ?client_name,
+                    client_version = ?client_version,
+                    "Tool call failed"
+                ),
+                (Err(e), _) => tracing::warn!(
                     tool = %name,
                     status = "error",
                     duration_ms = duration_ms,
@@ -1642,14 +1660,21 @@ impl McpAdapter for StdioAdapter {
             if let Some(bus) = self.event_bus.get() {
                 let duration_ms_u64 = duration_ms as u64;
                 let ts = iso8601_now();
-                match &result {
-                    Ok(_) => bus.send(ToolCallEvent::Completed {
+                match (&result, &tool_error) {
+                    (Ok(_), None) => bus.send(ToolCallEvent::Completed {
                         request_id,
                         ts,
                         duration_ms: duration_ms_u64,
                         status: "ok".into(),
                     }),
-                    Err(e) => bus.send(ToolCallEvent::Failed {
+                    (Ok(_), Some(msg)) => bus.send(ToolCallEvent::Failed {
+                        request_id,
+                        ts,
+                        duration_ms: duration_ms_u64,
+                        status: "error".into(),
+                        error_message: msg.clone(),
+                    }),
+                    (Err(e), _) => bus.send(ToolCallEvent::Failed {
                         request_id,
                         ts,
                         duration_ms: duration_ms_u64,
@@ -3317,5 +3342,103 @@ with open(record_path, "w") as rec:
                 }
             });
         });
+    }
+
+    /// Create a StdioAdapter whose mock server answers `tools/call` with a
+    /// tool-level error envelope (`isError: true`) when the tool is named
+    /// `fail`, and a plain success envelope otherwise.
+    fn make_iserror_adapter() -> StdioAdapter {
+        let script = r#"
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+        if req.get("method") == "tools/call" and req.get("params", {}).get("name") == "fail":
+            result = {"content": [{"type": "text", "text": "invalid_grant"}], "isError": True}
+        else:
+            result = {"content": [{"type": "text", "text": "all good"}]}
+        resp = {"jsonrpc": "2.0", "result": result, "id": req.get("id")}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+    except Exception:
+        pass
+"#;
+        StdioAdapter::new(StdioConfig {
+            command: "python3".to_string(),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: HashMap::new(),
+            ..Default::default()
+        })
+    }
+
+    /// A transport-level `Ok` whose envelope carries `isError: true` must be
+    /// surfaced as a FAILED call: the event bus receives `Started` → `Failed`
+    /// (not `Completed`) with the captured message, matching the registry's
+    /// durable capture. The envelope itself is still forwarded unchanged.
+    #[tokio::test]
+    async fn call_tool_iserror_envelope_emits_failed_event() {
+        use crate::events::{ToolCallEvent, ToolCallEventBus};
+
+        let mut adapter = make_iserror_adapter();
+        adapter.spawn_process().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let bus = ToolCallEventBus::with_default_capacity();
+        adapter.set_event_bus(bus.clone());
+        let mut rx = bus.subscribe();
+
+        let value = adapter
+            .call_tool("fail", serde_json::json!({}))
+            .await
+            .expect("isError envelope is still a transport-level Ok");
+        assert_eq!(value["isError"], true, "envelope forwarded unchanged");
+
+        match rx.try_recv().expect("started event must be buffered") {
+            ToolCallEvent::Started { .. } => {}
+            other => panic!("expected Started, got {other:?}"),
+        }
+        match rx.try_recv().expect("terminal event must be buffered") {
+            ToolCallEvent::Failed {
+                status,
+                error_message,
+                ..
+            } => {
+                assert_eq!(status, "error");
+                assert_eq!(error_message, "invalid_grant");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        adapter.shutdown().await.unwrap();
+    }
+
+    /// A plain success envelope (`isError` absent) keeps the pre-existing
+    /// behavior: a `Completed` event with `status=ok`.
+    #[tokio::test]
+    async fn call_tool_success_envelope_emits_completed_event() {
+        use crate::events::{ToolCallEvent, ToolCallEventBus};
+
+        let mut adapter = make_iserror_adapter();
+        adapter.spawn_process().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let bus = ToolCallEventBus::with_default_capacity();
+        adapter.set_event_bus(bus.clone());
+        let mut rx = bus.subscribe();
+
+        adapter
+            .call_tool("echo", serde_json::json!({}))
+            .await
+            .expect("success envelope");
+
+        match rx.try_recv().expect("started event must be buffered") {
+            ToolCallEvent::Started { .. } => {}
+            other => panic!("expected Started, got {other:?}"),
+        }
+        match rx.try_recv().expect("terminal event must be buffered") {
+            ToolCallEvent::Completed { status, .. } => assert_eq!(status, "ok"),
+            other => panic!("expected Completed, got {other:?}"),
+        }
+        adapter.shutdown().await.unwrap();
     }
 }

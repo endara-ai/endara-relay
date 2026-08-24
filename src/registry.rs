@@ -1,5 +1,5 @@
 use crate::adapter::stdio::iso8601_now;
-use crate::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
+use crate::adapter::{tool_result_error_message, AdapterError, HealthStatus, McpAdapter, ToolInfo};
 use crate::events::{current_request_context, ToolCallEvent, ToolCallEventBus};
 use crate::observability::pipeline::{CaptureRecord, CapturedPayloads, Observability};
 use crate::observability::store::CallRecord;
@@ -1831,35 +1831,6 @@ fn compile_input_schema(prefixed_name: &str, schema: &serde_json::Value) -> Opti
     }
 }
 
-/// Upper bound on a captured tool-level `error_message`, in characters. Tool
-/// error envelopes are usually short, but a misbehaving server could return a
-/// large blob; cap it so the durable row stays bounded.
-const MAX_CAPTURED_ERROR_MESSAGE_CHARS: usize = 2048;
-
-/// Inspect a transport-level `Ok` `tools/call` result for a tool-level error
-/// envelope (`{ content: [...], isError: true }`). Returns the captured
-/// `error_message` (the first `content[].text` string, truncated) when the tool
-/// reported an error, or `None` for a normal success (`isError` absent/false).
-fn tool_result_error_message(value: &serde_json::Value) -> Option<String> {
-    if value.get("isError").and_then(|e| e.as_bool()) != Some(true) {
-        return None;
-    }
-    let text = value
-        .get("content")
-        .and_then(|c| c.as_array())
-        .and_then(|items| {
-            items
-                .iter()
-                .find_map(|item| item.get("text").and_then(|t| t.as_str()))
-        })
-        .unwrap_or("tool call returned an error result");
-    let truncated: String = text
-        .chars()
-        .take(MAX_CAPTURED_ERROR_MESSAGE_CHARS)
-        .collect();
-    Some(truncated)
-}
-
 /// Format the collected validation errors into the model-friendly MCP error
 /// text (spec §5.5). All errors from a single pass are listed together so the
 /// model can correct every field in one retry.
@@ -2400,51 +2371,6 @@ mod tests {
     use crate::adapter::StartingAdapter;
     use async_trait::async_trait;
     use serde_json::json;
-
-    #[test]
-    fn tool_result_iserror_envelope_is_captured_as_failure() {
-        // A transport-level `Ok` carrying a tool-level error envelope must be
-        // recorded as a failed call with a non-empty error_message taken from
-        // the first text item in `content`.
-        let envelope = json!({
-            "content": [{ "type": "text", "text": "invalid_grant" }],
-            "isError": true,
-        });
-        let msg =
-            tool_result_error_message(&envelope).expect("isError envelope captured as failure");
-        assert_eq!(msg, "invalid_grant");
-    }
-
-    #[test]
-    fn tool_result_success_envelope_is_not_a_failure() {
-        // `isError` absent → success; explicit `isError: false` → success.
-        assert!(tool_result_error_message(&json!({ "content": [] })).is_none());
-        assert!(tool_result_error_message(&json!({
-            "content": [{ "type": "text", "text": "ok" }],
-            "isError": false,
-        }))
-        .is_none());
-    }
-
-    #[test]
-    fn tool_result_iserror_without_text_still_yields_message() {
-        // isError with no usable text content still produces a non-empty
-        // error_message so the durable row reflects the failure.
-        let msg = tool_result_error_message(&json!({ "isError": true, "content": [] }))
-            .expect("isError envelope captured as failure");
-        assert!(!msg.is_empty());
-    }
-
-    #[test]
-    fn tool_result_error_message_is_truncated() {
-        let long = "x".repeat(MAX_CAPTURED_ERROR_MESSAGE_CHARS + 500);
-        let msg = tool_result_error_message(&json!({
-            "isError": true,
-            "content": [{ "type": "text", "text": long }],
-        }))
-        .expect("isError envelope captured as failure");
-        assert_eq!(msg.chars().count(), MAX_CAPTURED_ERROR_MESSAGE_CHARS);
-    }
 
     /// Regression: an `execute_tools` JS batch reuses one inbound
     /// `request_uid` across all its inner `tools/call`s. The observability

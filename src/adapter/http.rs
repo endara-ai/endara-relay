@@ -1457,15 +1457,28 @@ impl McpAdapter for HttpAdapter {
             // unless a JIT interceptor is attached (none are today).
             let result = self.maybe_intercept_401(result).await;
             let duration_ms = start.elapsed().as_millis();
+            // A transport-level `Ok` can still carry a tool-level error
+            // envelope (`{ content: [...], isError: true }`). Surface it as a
+            // failed call in the activity log, tracing line, and overlay
+            // events — mirroring the registry's durable capture — while
+            // forwarding the envelope to the client unchanged.
+            let tool_error = result
+                .as_ref()
+                .ok()
+                .and_then(crate::adapter::tool_result_error_message);
             let now = chrono::Utc::now()
                 .format("%Y-%m-%dT%H:%M:%S%.3fZ")
                 .to_string();
-            let log_line = match &result {
-                Ok(_) => format!(
+            let log_line = match (&result, &tool_error) {
+                (Ok(_), None) => format!(
                     "{}  INFO call_tool tool={} status=ok duration={}ms",
                     now, name, duration_ms
                 ),
-                Err(e) => format!(
+                (Ok(_), Some(msg)) => format!(
+                    "{}  WARN call_tool tool={} status=error duration={}ms error={}",
+                    now, name, duration_ms, msg
+                ),
+                (Err(e), _) => format!(
                     "{}  WARN call_tool tool={} status=error duration={}ms error={}",
                     now, name, duration_ms, e
                 ),
@@ -1481,8 +1494,8 @@ impl McpAdapter for HttpAdapter {
                 .as_ref()
                 .and_then(|c| c.version.clone())
                 .unwrap_or_default();
-            match &result {
-                Ok(_) => tracing::info!(
+            match (&result, &tool_error) {
+                (Ok(_), None) => tracing::info!(
                     tool = %name,
                     status = "ok",
                     duration_ms = duration_ms,
@@ -1490,7 +1503,16 @@ impl McpAdapter for HttpAdapter {
                     client_version = ?client_version,
                     "Tool call completed"
                 ),
-                Err(e) => tracing::warn!(
+                (Ok(_), Some(msg)) => tracing::warn!(
+                    tool = %name,
+                    status = "error",
+                    duration_ms = duration_ms,
+                    error = %msg,
+                    client_name = ?client_name,
+                    client_version = ?client_version,
+                    "Tool call failed"
+                ),
+                (Err(e), _) => tracing::warn!(
                     tool = %name,
                     status = "error",
                     duration_ms = duration_ms,
@@ -1503,14 +1525,21 @@ impl McpAdapter for HttpAdapter {
             if let Some(bus) = self.event_bus.get() {
                 let duration_ms_u64 = duration_ms as u64;
                 let ts = iso8601_now();
-                match &result {
-                    Ok(_) => bus.send(ToolCallEvent::Completed {
+                match (&result, &tool_error) {
+                    (Ok(_), None) => bus.send(ToolCallEvent::Completed {
                         request_id,
                         ts,
                         duration_ms: duration_ms_u64,
                         status: "ok".into(),
                     }),
-                    Err(e) => bus.send(ToolCallEvent::Failed {
+                    (Ok(_), Some(msg)) => bus.send(ToolCallEvent::Failed {
+                        request_id,
+                        ts,
+                        duration_ms: duration_ms_u64,
+                        status: "error".into(),
+                        error_message: msg.clone(),
+                    }),
+                    (Err(e), _) => bus.send(ToolCallEvent::Failed {
                         request_id,
                         ts,
                         duration_ms: duration_ms_u64,
@@ -2496,6 +2525,113 @@ mod tests {
         match result {
             Err(AdapterError::HttpError { status: 401, .. }) => {}
             other => panic!("expected HttpError {{ 401 }}, got {:?}", other),
+        }
+        server.abort();
+    }
+
+    // --- isError tool results surfaced as failures ---
+
+    /// Fixture whose `POST /mcp` answers every JSON-RPC request with the given
+    /// `result` payload. Minimal enough for direct `call_tool` tests — the
+    /// application/json response path does not validate the JSON-RPC id.
+    async fn spawn_fixed_result_fixture(
+        result: serde_json::Value,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let router = Router::new().route(
+            "/mcp",
+            post(move || {
+                let result = result.clone();
+                async move { Json(json!({"jsonrpc": "2.0", "result": result, "id": 1})) }
+            }),
+        );
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        (base, handle)
+    }
+
+    /// A transport-level `Ok` whose envelope carries `isError: true` must be
+    /// surfaced as a FAILED call: the activity log records `status=error` with
+    /// the captured message, and the event bus receives `Started` → `Failed`
+    /// (not `Completed`), matching the registry's durable capture. The
+    /// envelope itself is still forwarded unchanged.
+    #[tokio::test]
+    async fn call_tool_iserror_envelope_logs_error_and_emits_failed_event() {
+        let (base, server) = spawn_fixed_result_fixture(json!({
+            "content": [{"type": "text", "text": "invalid_grant"}],
+            "isError": true,
+        }))
+        .await;
+        let adapter = HttpAdapter::new(HttpConfig::new(format!("{}/mcp", base)));
+        let bus = ToolCallEventBus::with_default_capacity();
+        adapter.set_event_bus(bus.clone());
+        let mut rx = bus.subscribe();
+
+        let value = adapter
+            .call_tool("search", json!({}))
+            .await
+            .expect("isError envelope is still a transport-level Ok");
+        assert_eq!(value["isError"], true, "envelope forwarded unchanged");
+
+        let log = adapter.activity_log().await;
+        let line = log.last().expect("activity log line recorded");
+        assert!(line.contains("status=error"), "got: {line}");
+        assert!(line.contains("invalid_grant"), "got: {line}");
+
+        match rx.try_recv().expect("started event must be buffered") {
+            ToolCallEvent::Started { .. } => {}
+            other => panic!("expected Started, got {other:?}"),
+        }
+        match rx.try_recv().expect("terminal event must be buffered") {
+            ToolCallEvent::Failed {
+                status,
+                error_message,
+                ..
+            } => {
+                assert_eq!(status, "error");
+                assert_eq!(error_message, "invalid_grant");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        server.abort();
+    }
+
+    /// A plain success envelope (`isError` absent) keeps the pre-existing
+    /// behavior: `status=ok` activity-log line and a `Completed` event.
+    #[tokio::test]
+    async fn call_tool_success_envelope_logs_ok_and_emits_completed_event() {
+        let (base, server) = spawn_fixed_result_fixture(json!({
+            "content": [{"type": "text", "text": "all good"}],
+        }))
+        .await;
+        let adapter = HttpAdapter::new(HttpConfig::new(format!("{}/mcp", base)));
+        let bus = ToolCallEventBus::with_default_capacity();
+        adapter.set_event_bus(bus.clone());
+        let mut rx = bus.subscribe();
+
+        adapter
+            .call_tool("search", json!({}))
+            .await
+            .expect("success envelope");
+
+        let log = adapter.activity_log().await;
+        let line = log.last().expect("activity log line recorded");
+        assert!(line.contains("status=ok"), "got: {line}");
+
+        match rx.try_recv().expect("started event must be buffered") {
+            ToolCallEvent::Started { .. } => {}
+            other => panic!("expected Started, got {other:?}"),
+        }
+        match rx.try_recv().expect("terminal event must be buffered") {
+            ToolCallEvent::Completed { status, .. } => assert_eq!(status, "ok"),
+            other => panic!("expected Completed, got {other:?}"),
         }
         server.abort();
     }
