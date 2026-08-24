@@ -2215,6 +2215,15 @@ async fn oauth_callback(
         issued_at: Some(now_secs),
     };
 
+    // Commit phase: serialize against "Reset authorization" for this
+    // endpoint. The lock is held from the generation re-check below through
+    // every side effect (IdP credential save, token save, adapter apply), so
+    // a reset cannot land between the check and the commit and be undone by
+    // this callback persisting the pre-reset grant. The reset holds the same
+    // lock across its generation bump + disconnect.
+    let commit_lock = flow_mgr.commit_lock(&flow.endpoint_name).await;
+    let _commit_guard = commit_lock.lock().await;
+
     // Reset-generation re-check: the token exchange above is a network round
     // trip, so a reset can land while this callback is in flight (after the
     // pre-exchange check). Refuse to commit under a stale generation so the
@@ -6457,6 +6466,107 @@ mod tests {
             "error page must explain the flow was superseded by a reset: {body_str}"
         );
         assert!(tm.load(endpoint_name).await.unwrap().is_none());
+    }
+
+    /// Commit-lock serialization (post-check race): a reset that lands
+    /// AFTER the callback finished the token exchange but BEFORE its commit
+    /// must still win. The test holds the per-endpoint commit lock (as
+    /// `oauth_reset` does), lets the callback complete the exchange and
+    /// block on the lock, bumps the generation under the lock, then
+    /// releases it — the callback's post-exchange re-check must refuse the
+    /// commit even though its pre-exchange check passed.
+    #[tokio::test]
+    async fn oauth_callback_commit_blocked_by_reset_holding_commit_lock() {
+        use axum::body::to_bytes;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let token_hits = Arc::new(AtomicUsize::new(0));
+        let hits = token_hits.clone();
+        let router = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let hits = hits.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    "{\"access_token\":\"pre-reset\",\"token_type\":\"Bearer\",\"expires_in\":3600}"
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let token_endpoint = format!("http://127.0.0.1:{}/token", addr.port());
+
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        let endpoint_name = "commit-lock-ep";
+
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let pkce = crate::oauth::PkceChallenge::generate();
+        let state_param = flow_mgr
+            .start_flow(
+                endpoint_name,
+                &token_endpoint,
+                "pre-reset-client",
+                None,
+                pkce,
+                "http://127.0.0.1:9400/oauth/callback",
+                None,
+                false,
+            )
+            .await;
+
+        let mut app_state = test_app_state();
+        app_state.oauth_flow_manager = Some(flow_mgr.clone());
+        app_state.token_manager = Some(tm.clone());
+
+        // Simulate a concurrent reset: grab the commit lock BEFORE the
+        // callback runs, so the callback exchanges tokens and then blocks
+        // at its commit phase.
+        let lock = flow_mgr.commit_lock(endpoint_name).await;
+        let guard = lock.lock().await;
+
+        let params = OAuthCallbackParams {
+            code: Some("authcode".to_string()),
+            state: Some(state_param),
+            error: None,
+            iss: None,
+        };
+        let callback = tokio::spawn(oauth_callback(State(app_state), Query(params)));
+
+        // Wait for the token exchange to complete (pre-exchange generation
+        // check passed, callback is now blocked on the commit lock).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while token_hits.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "token exchange never happened");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !callback.is_finished(),
+            "callback must block on the commit lock"
+        );
+
+        // The reset half, still under the lock: bump the generation.
+        flow_mgr.invalidate_endpoint(endpoint_name).await;
+        drop(guard);
+
+        // The callback resumes, re-checks the generation, and must refuse.
+        let resp = callback.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body_str = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            body_str.contains("superseded by a reset"),
+            "post-exchange commit must be refused under a stale generation: {body_str}"
+        );
+        assert!(
+            tm.load(endpoint_name).await.unwrap().is_none(),
+            "pre-reset grant must not be persisted after the reset"
+        );
     }
 
     /// After a successful interactive re-authorization the callback must

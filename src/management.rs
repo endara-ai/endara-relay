@@ -2390,6 +2390,23 @@ async fn oauth_reset(
         }
     };
 
+    // Serialize the whole discard (generation bump + disconnect + DCR
+    // restore) against the callback's commit phase: the callback holds this
+    // same per-endpoint lock from its post-exchange generation check through
+    // its token save / adapter apply, so a callback mid-commit either
+    // finishes before we bump (and its tokens are wiped by the disconnect
+    // below) or checks the generation after our bump and refuses to commit.
+    // Without it a callback that passed its check could persist the
+    // pre-reset grant AFTER our disconnect, undoing the reset.
+    let commit_guard = match state.oauth_flow_manager {
+        Some(ref flow_mgr) => Some(flow_mgr.commit_lock(&name).await),
+        None => None,
+    };
+    let _commit_guard = match commit_guard {
+        Some(ref lock) => Some(lock.lock().await),
+        None => None,
+    };
+
     // Invalidate pending flows for this endpoint and bump its reset
     // generation BEFORE disconnecting: an authorize URL handed out by a
     // pre-reset `/oauth/start` stays valid for up to FLOW_MAX_AGE, and its
@@ -2425,6 +2442,11 @@ async fn oauth_reset(
             warn!(endpoint = %name, error = %e, "Reset: failed to restore client registration after disconnect");
         }
     }
+
+    // Release before starting the replacement flow: `oauth_start_inner`
+    // performs discovery (network) and must not hold the commit lock.
+    drop(_commit_guard);
+    drop(commit_guard);
 
     oauth_start_inner(state, name, true).await
 }

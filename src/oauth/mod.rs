@@ -12,6 +12,7 @@ pub mod url_guard;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -133,6 +134,11 @@ pub struct OAuthFlowManager {
     /// Per-endpoint reset generation counters (absent entry == generation 0).
     /// Bumped by [`invalidate_endpoint`](Self::invalidate_endpoint).
     generations: RwLock<HashMap<String, u64>>,
+    /// Per-endpoint commit locks serializing a callback's token commit
+    /// (post-exchange generation check + token save + adapter apply)
+    /// against a "Reset authorization" (generation bump + disconnect).
+    /// See [`commit_lock`](Self::commit_lock).
+    commit_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl OAuthFlowManager {
@@ -140,6 +146,7 @@ impl OAuthFlowManager {
         Self {
             pending: RwLock::new(HashMap::new()),
             generations: RwLock::new(HashMap::new()),
+            commit_locks: tokio::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -160,6 +167,12 @@ impl OAuthFlowManager {
         iss_parameter_supported: bool,
     ) -> String {
         let state = generate_state();
+        // Hold the generations read lock through the pending insert so
+        // `invalidate_endpoint` (generations write → pending write) cannot
+        // bump the generation between sampling and insertion — that would
+        // hand the caller an authorize URL whose callback is guaranteed to
+        // be rejected as stale. Same lock order as `invalidate_endpoint`.
+        let generations = self.generations.read().await;
         let flow = PendingFlow {
             endpoint_name: endpoint_name.to_string(),
             code_verifier: pkce.code_verifier,
@@ -172,9 +185,10 @@ impl OAuthFlowManager {
             idp_issuer: None,
             idp_credential_key: None,
             created_at: Instant::now(),
-            generation: self.current_generation(endpoint_name).await,
+            generation: *generations.get(endpoint_name).unwrap_or(&0),
         };
         self.pending.write().await.insert(state.clone(), flow);
+        drop(generations);
         state
     }
 
@@ -208,6 +222,8 @@ impl OAuthFlowManager {
         idp_credential_key: &str,
     ) -> String {
         let state = generate_state();
+        // Generations read lock held through the insert — see `start_flow`.
+        let generations = self.generations.read().await;
         let flow = PendingFlow {
             endpoint_name: endpoint_name.to_string(),
             code_verifier: pkce.code_verifier,
@@ -220,9 +236,10 @@ impl OAuthFlowManager {
             idp_issuer: Some(idp_issuer.to_string()),
             idp_credential_key: Some(idp_credential_key.to_string()),
             created_at: Instant::now(),
-            generation: self.current_generation(endpoint_name).await,
+            generation: *generations.get(endpoint_name).unwrap_or(&0),
         };
         self.pending.write().await.insert(state.clone(), flow);
+        drop(generations);
         state
     }
 
@@ -272,6 +289,23 @@ impl OAuthFlowManager {
     /// a callback from a pre-reset flow cannot clobber the reset.
     pub async fn is_current(&self, flow: &PendingFlow) -> bool {
         flow.generation == self.current_generation(&flow.endpoint_name).await
+    }
+
+    /// The endpoint's commit lock. `/oauth/callback` holds it across its
+    /// post-exchange generation check AND the token save / adapter apply;
+    /// "Reset authorization" holds it across the generation bump +
+    /// disconnect. This closes the time-of-check/time-of-use window where a
+    /// reset lands after the callback's generation check but before its
+    /// commit finishes — with the lock, either the commit completes first
+    /// (and the reset then wipes the freshly saved tokens) or the reset
+    /// completes first (and the callback's check sees the stale generation).
+    pub async fn commit_lock(&self, endpoint_name: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.commit_locks
+            .lock()
+            .await
+            .entry(endpoint_name.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Test-only: re-insert a flow under a chosen state key, preserving its
