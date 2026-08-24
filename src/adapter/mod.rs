@@ -43,6 +43,40 @@ pub(crate) fn merge_request_params(
     }
 }
 
+/// Upper bound on a captured tool-level `error_message`, in characters. Tool
+/// error envelopes are usually short, but a misbehaving server could return a
+/// large blob; cap it so the durable row stays bounded.
+pub(crate) const MAX_CAPTURED_ERROR_MESSAGE_CHARS: usize = 2048;
+
+/// Inspect a transport-level `Ok` `tools/call` result for a tool-level error
+/// envelope (`{ content: [...], isError: true }`). Returns the captured
+/// `error_message` (the first `content[].text` string, truncated) when the tool
+/// reported an error, or `None` for a normal success (`isError` absent/false).
+///
+/// Shared by the registry's durable capture (`registry.rs`) and the transport
+/// adapters' `call_tool` completion handling so an isError envelope is
+/// surfaced as a failed call consistently across the durable rows, the
+/// per-server logs, and the overlay event bus.
+pub(crate) fn tool_result_error_message(value: &Value) -> Option<String> {
+    if value.get("isError").and_then(|e| e.as_bool()) != Some(true) {
+        return None;
+    }
+    let text = value
+        .get("content")
+        .and_then(|c| c.as_array())
+        .and_then(|items| {
+            items
+                .iter()
+                .find_map(|item| item.get("text").and_then(|t| t.as_str()))
+        })
+        .unwrap_or("tool call returned an error result");
+    let truncated: String = text
+        .chars()
+        .take(MAX_CAPTURED_ERROR_MESSAGE_CHARS)
+        .collect();
+    Some(truncated)
+}
+
 /// Health status of an adapter.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum HealthStatus {
@@ -574,6 +608,52 @@ impl McpAdapter for StartingAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn tool_result_iserror_envelope_is_captured_as_failure() {
+        // A transport-level `Ok` carrying a tool-level error envelope must be
+        // recorded as a failed call with a non-empty error_message taken from
+        // the first text item in `content`.
+        let envelope = json!({
+            "content": [{ "type": "text", "text": "invalid_grant" }],
+            "isError": true,
+        });
+        let msg =
+            tool_result_error_message(&envelope).expect("isError envelope captured as failure");
+        assert_eq!(msg, "invalid_grant");
+    }
+
+    #[test]
+    fn tool_result_success_envelope_is_not_a_failure() {
+        // `isError` absent → success; explicit `isError: false` → success.
+        assert!(tool_result_error_message(&json!({ "content": [] })).is_none());
+        assert!(tool_result_error_message(&json!({
+            "content": [{ "type": "text", "text": "ok" }],
+            "isError": false,
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn tool_result_iserror_without_text_still_yields_message() {
+        // isError with no usable text content still produces a non-empty
+        // error_message so the durable row reflects the failure.
+        let msg = tool_result_error_message(&json!({ "isError": true, "content": [] }))
+            .expect("isError envelope captured as failure");
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    fn tool_result_error_message_is_truncated() {
+        let long = "x".repeat(MAX_CAPTURED_ERROR_MESSAGE_CHARS + 500);
+        let msg = tool_result_error_message(&json!({
+            "isError": true,
+            "content": [{ "type": "text", "text": long }],
+        }))
+        .expect("isError envelope captured as failure");
+        assert_eq!(msg.chars().count(), MAX_CAPTURED_ERROR_MESSAGE_CHARS);
+    }
 
     /// A validation-failed endpoint registered as a `FailedAdapter` should
     /// still surface its configured `server_type_override` via
