@@ -215,13 +215,25 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
             return;
         };
 
-        let oauth_state = adapter.state.read().await.clone();
+        // Snapshot state AND generation inside one read-lock critical
+        // section: generation bumps only happen inside state write-lock
+        // sections, so holding the read lock guarantees the pair is
+        // coherent — a bump cannot interleave between the two reads and
+        // hand the probe a post-apply generation while it still probes
+        // the pre-apply adapter.
+        let (oauth_state, generation) = {
+            let state = adapter.state.read().await;
+            let generation = adapter
+                .lifecycle_generation
+                .load(std::sync::atomic::Ordering::Relaxed);
+            (state.clone(), generation)
+        };
         match classify_tick_action(&oauth_state) {
             TickAction::Skip => continue,
             TickAction::Probe => {
                 let result = probe_inner(&adapter).await;
                 let action = classify_probe_result(result, &mut consecutive_failures, threshold);
-                apply_probe_action(&adapter, action, threshold, &oauth_state).await;
+                apply_probe_action(&adapter, action, threshold, &oauth_state, generation).await;
             }
             TickAction::Recover => {
                 attempt_recovery(&adapter).await;
@@ -241,6 +253,7 @@ async fn apply_probe_action(
     action: ProbeAction,
     threshold: u32,
     oauth_state: &OAuthState,
+    dispatched_generation: u64,
 ) {
     match action {
         ProbeAction::MarkHealthy => {
@@ -286,13 +299,52 @@ async fn apply_probe_action(
             );
         }
         ProbeAction::AuthFailed => {
+            // The probe ran without holding the state lock, so an apply /
+            // refresh may have taken over mid-probe (state moved off
+            // `Authenticated`, e.g. to `Refreshing`). Re-check under the
+            // write lock and only apply the stale 401 if the state that
+            // dispatched this probe still holds; otherwise the in-flight
+            // lifecycle operation's own outcome decides the final state,
+            // and stomping it here would resurrect the error banner
+            // mid-apply. The state check alone has an ABA hole: an entire
+            // apply (Authenticated → Refreshing → Authenticated, publishing
+            // a NEW inner adapter) can complete mid-probe, so the enum
+            // matches again while the 401 belongs to the replaced adapter.
+            // The lifecycle generation catches exactly that: it is bumped
+            // inside every state write-lock section and snapshotted with
+            // the state under one read lock at dispatch, so "generation
+            // unchanged" here proves no transition — hence no apply —
+            // interleaved, and the probed adapter is still the published
+            // one.
+            let mut state = adapter.state.write().await;
+            let current_generation = adapter
+                .lifecycle_generation
+                .load(std::sync::atomic::Ordering::Relaxed);
+            if *state != OAuthState::Authenticated || current_generation != dispatched_generation {
+                debug!(
+                    oauth_state = ?*state,
+                    dispatched_generation = dispatched_generation,
+                    current_generation = current_generation,
+                    result = "stale",
+                    "heartbeat probe got 401 but the lifecycle moved on \
+                     mid-probe (state changed or an apply ran); dropping \
+                     stale result"
+                );
+                return;
+            }
             adapter.metrics.inc_heartbeat_unhealthy();
             warn!(
                 oauth_state = ?oauth_state,
                 result = "unhealthy",
                 "heartbeat probe got 401, transitioning to AuthRequired"
             );
-            *adapter.state.write().await = OAuthState::AuthRequired;
+            *state = OAuthState::AuthRequired;
+            // Keep the invariant "every state write bumps the generation
+            // inside the write critical section" (see
+            // `lifecycle_generation`).
+            adapter
+                .lifecycle_generation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -576,8 +628,11 @@ mod tests {
         threshold: u32,
     ) {
         let oauth_state = adapter.state.read().await.clone();
+        let generation = adapter
+            .lifecycle_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
         let action = classify_probe_result(result, failures, threshold);
-        apply_probe_action(adapter, action, threshold, &oauth_state).await;
+        apply_probe_action(adapter, action, threshold, &oauth_state, generation).await;
     }
 
     /// Set the adapter into the `Authenticated` / `Healthy` baseline that
@@ -738,6 +793,134 @@ mod tests {
                 i
             );
         }
+    }
+
+    /// Regression: a probe is dispatched while `Authenticated`, but an
+    /// apply/refresh moves the state to `Refreshing` before the probe's 401
+    /// result is applied. The stale `AuthFailed` must be DROPPED — not
+    /// stomp the in-flight apply with `AuthRequired` (which would resurrect
+    /// the error banner mid-apply).
+    #[tokio::test]
+    async fn heartbeat_stale_auth_failed_mid_apply_is_dropped() {
+        let threshold = 3;
+        let inner = make_test_inner(threshold);
+        arm_healthy(&inner).await;
+
+        // Snapshot what the loop read when it dispatched the probe.
+        let dispatched_state = inner.state.read().await.clone();
+        let dispatched_gen = inner
+            .lifecycle_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(dispatched_state, OAuthState::Authenticated);
+
+        // An apply takes over mid-probe.
+        *inner.state.write().await = OAuthState::Refreshing;
+
+        // The probe's 401 result lands afterwards: it must be dropped.
+        let mut failures = 0u32;
+        let action = classify_probe_result(auth(), &mut failures, threshold);
+        assert_eq!(action, ProbeAction::AuthFailed);
+        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
+
+        assert_eq!(
+            *inner.state.read().await,
+            OAuthState::Refreshing,
+            "stale probe 401 must not overwrite an in-flight apply"
+        );
+        // No unhealthy metric increment for a dropped stale result.
+        let snap = inner.metrics.snapshot();
+        assert_eq!(snap.oauth_heartbeat_probe_total_unhealthy, 0);
+
+        // Control: with the state still Authenticated and the generation
+        // unchanged, the 401 applies.
+        *inner.state.write().await = OAuthState::Authenticated;
+        let action = classify_probe_result(auth(), &mut failures, threshold);
+        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
+        assert_eq!(*inner.state.read().await, OAuthState::AuthRequired);
+    }
+
+    /// Regression (ABA): an ENTIRE apply completes mid-probe — the state
+    /// goes Authenticated → Refreshing → Authenticated and a NEW inner
+    /// adapter is published. The state enum matches `Authenticated` again
+    /// when the old probe's 401 lands, but the result belongs to the
+    /// replaced adapter: the lifecycle generation (bumped inside every
+    /// state write-lock section) must cause the stale 401 to be dropped.
+    #[tokio::test]
+    async fn heartbeat_stale_auth_failed_after_full_apply_aba_is_dropped() {
+        let threshold = 3;
+        let inner = make_test_inner(threshold);
+        arm_healthy(&inner).await;
+
+        // Probe dispatched: snapshot state + generation (the loop reads
+        // both under one state read lock).
+        let dispatched_state = inner.state.read().await.clone();
+        let dispatched_gen = inner
+            .lifecycle_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(dispatched_state, OAuthState::Authenticated);
+
+        // A full apply completes mid-probe via the real transition path,
+        // which bumps the generation inside each state write: the state
+        // returns to Authenticated (mirrors apply_tokens_inner's sequence).
+        inner
+            .transition_to(OAuthState::Refreshing, "test: apply takes over")
+            .await;
+        inner
+            .transition_to(OAuthState::Authenticated, "test: apply finished")
+            .await;
+
+        // The old probe's 401 lands: state matches but generation differs —
+        // the stale result must be dropped.
+        let mut failures = 0u32;
+        let action = classify_probe_result(auth(), &mut failures, threshold);
+        assert_eq!(action, ProbeAction::AuthFailed);
+        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
+
+        assert_eq!(
+            *inner.state.read().await,
+            OAuthState::Authenticated,
+            "stale probe 401 must not stomp the freshly applied adapter (ABA)"
+        );
+        let snap = inner.metrics.snapshot();
+        assert_eq!(snap.oauth_heartbeat_probe_total_unhealthy, 0);
+    }
+
+    /// Pins the invariant the stale-probe drop check relies on: every state
+    /// write bumps `lifecycle_generation` inside the same write-lock
+    /// critical section — both `transition_to` and the heartbeat's own
+    /// AuthFailed arm — so "generation unchanged" proves no transition
+    /// (hence no apply/publish) interleaved with a probe.
+    #[tokio::test]
+    async fn every_state_write_bumps_lifecycle_generation() {
+        let threshold = 3;
+        let inner = make_test_inner(threshold);
+        arm_healthy(&inner).await;
+        let load = |inner: &OAuthAdapterInner| {
+            inner
+                .lifecycle_generation
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+
+        let g0 = load(&inner);
+        inner
+            .transition_to(OAuthState::Refreshing, "test: bump check")
+            .await;
+        assert_eq!(load(&inner), g0 + 1, "transition_to must bump");
+        inner
+            .transition_to(OAuthState::Authenticated, "test: bump check")
+            .await;
+        assert_eq!(load(&inner), g0 + 2, "transition_to must bump");
+
+        // The heartbeat's AuthFailed arm writes AuthRequired directly under
+        // the write lock; it must bump too.
+        let dispatched_state = inner.state.read().await.clone();
+        let dispatched_gen = load(&inner);
+        let mut failures = 0u32;
+        let action = classify_probe_result(auth(), &mut failures, threshold);
+        assert_eq!(action, ProbeAction::AuthFailed);
+        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
+        assert_eq!(*inner.state.read().await, OAuthState::AuthRequired);
+        assert_eq!(load(&inner), g0 + 3, "AuthFailed arm must bump");
     }
 
     // -- Recovery-from-ConnectionFailed harness -----------------------------
