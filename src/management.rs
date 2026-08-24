@@ -9043,7 +9043,6 @@ command = "echo"
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
-
     #[tokio::test]
     async fn oauth_refresh_needs_login_rejected() {
         let tmp = tempfile::tempdir().unwrap();
@@ -11355,7 +11354,6 @@ command = "echo"
         assert!(authorize_url.contains("&prompt=consent"));
         assert!(authorize_url.contains("&access_type=offline"));
     }
-
 
     #[tokio::test]
     async fn oauth_start_with_oauth_server_url_errors_on_transient_discovery_failure() {
