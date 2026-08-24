@@ -283,6 +283,12 @@ pub struct OAuthSetupSession {
     pub client_id: Option<String>,
     /// Client secret (optional).
     pub client_secret: Option<String>,
+    /// Whether the session's client credentials were minted via true DCR
+    /// (RFC 7591) during this setup. Persisted as the DCR record's
+    /// `registered_via_dcr` when the commit has to defensively save the
+    /// credentials, so recovered records keep their re-registration
+    /// self-heal eligibility. `false` for manual/CIMD credentials.
+    pub registered_via_dcr: bool,
     /// Obtained tokens (populated after callback).
     pub tokens: Option<TokenSet>,
     /// Current session status.
@@ -330,6 +336,7 @@ impl OAuthSetupManager {
             issuer: None,
             client_id: None,
             client_secret: None,
+            registered_via_dcr: false,
             tokens: None,
             status: SetupSessionStatus::AwaitingCredentials,
             created_at: Instant::now(),

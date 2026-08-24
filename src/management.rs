@@ -3060,6 +3060,7 @@ async fn oauth_setup(
                 .get_session_mut(&session_id, |s| {
                     s.client_id = Some(client_id.clone());
                     s.client_secret = client_secret.clone();
+                    s.registered_via_dcr = used_dcr;
                     s.status = crate::oauth::SetupSessionStatus::AwaitingAuth;
                 })
                 .await;
@@ -3196,6 +3197,8 @@ async fn oauth_setup_credentials(
         .get_session_mut(&session_id, |s| {
             s.client_id = Some(body.client_id.clone());
             s.client_secret = body.client_secret.clone();
+            // Manually-supplied credentials are never DCR-provenanced.
+            s.registered_via_dcr = false;
             s.status = crate::oauth::SetupSessionStatus::AwaitingAuth;
             (
                 s.authorization_endpoint.clone(),
@@ -3338,7 +3341,10 @@ async fn oauth_setup_status(
 /// live in the DCR store (`{name}.dcr.json` via `TokenManager`). Only the
 /// non-secret `client_id` is stamped into the `[[endpoints]]` entry. If no
 /// DCR record was persisted during setup, the session's credentials are
-/// defensively saved to the store here before the config is written.
+/// defensively saved to the store (atomic save-if-absent under the DCR
+/// write lock, carrying the session's registration provenance) before the
+/// config is written. A pre-existing record that does not match the
+/// session's credentials rejects the commit with `409 dcr_record_mismatch`.
 async fn oauth_setup_commit(
     State(state): State<ManagementState>,
     Path(id): Path<String>,
@@ -3457,12 +3463,28 @@ async fn oauth_setup_commit(
 
     // Defensive persistence: if the setup flow did not write a DCR record
     // (e.g. an older/partial flow), save the session's client credentials to
-    // the store now so they survive without a TOML `client_secret`. Never
-    // overwrites an existing record.
+    // the store now so they survive without a TOML `client_secret`. The
+    // save-if-absent runs atomically under the DCR write lock (`update_dcr`),
+    // so a record written concurrently between commit's read and write can
+    // never be clobbered. When a record already exists it must carry this
+    // session's credentials: a mismatched record (stale file left behind by
+    // an endpoint deletion, or a same-name session) would shadow the
+    // committed `client_id` at credential-resolution time, so the commit is
+    // rejected before anything is written to config.toml.
     if let (Some(ref tm), Some(ref cid)) = (&state.token_manager, &session.client_id) {
-        match tm.load_dcr(&session.name).await {
-            Ok(None) => {
-                let creds = DcrCredentials {
+        enum DcrCommitError {
+            Mismatch { stored_client_id: String },
+            Token(TokenError),
+        }
+        impl From<TokenError> for DcrCommitError {
+            fn from(e: TokenError) -> Self {
+                DcrCommitError::Token(e)
+            }
+        }
+
+        let outcome = tm
+            .update_dcr(&session.name, |existing| match existing {
+                None => Ok(Some(DcrCredentials {
                     client_id: cid.clone(),
                     client_secret: session.client_secret.clone(),
                     client_secret_expires_at: 0,
@@ -3471,25 +3493,54 @@ async fn oauth_setup_commit(
                         .unwrap_or_default()
                         .as_secs(),
                     issuer: session.issuer.clone(),
-                    // The session does not record registration provenance, so
-                    // never claim DCR provenance for this defensive save.
-                    registered_via_dcr: false,
+                    // Provenance tracked on the session: true only when the
+                    // credentials were minted via RFC 7591 DCR during setup,
+                    // so recovered records keep self-heal eligibility.
+                    registered_via_dcr: session.registered_via_dcr,
                     ..Default::default()
-                };
-                if let Err(e) = tm.save_dcr(&session.name, &creds).await {
-                    warn!(
-                        endpoint = %session.name,
-                        error = %e,
-                        "Failed to persist client credentials at commit"
-                    );
+                })),
+                Some(existing) => {
+                    if existing.client_id == *cid
+                        && existing.client_secret == session.client_secret
+                    {
+                        // Existing record matches this session — keep it
+                        // (preserves registered_at/issuer/provenance and any
+                        // resource credentials).
+                        Ok(Some(existing))
+                    } else {
+                        Err(DcrCommitError::Mismatch {
+                            stored_client_id: existing.client_id,
+                        })
+                    }
                 }
+            })
+            .await;
+
+        match outcome {
+            Ok(_) => {}
+            Err(DcrCommitError::Mismatch { stored_client_id }) => {
+                warn!(
+                    endpoint = %session.name,
+                    stored_client_id = %stored_client_id,
+                    "Stored DCR record does not match the setup session's credentials; refusing to commit"
+                );
+                return error_response(
+                    StatusCode::CONFLICT,
+                    "dcr_record_mismatch",
+                    Some(
+                        "A stored credential record for this endpoint name does not \
+                         match this setup session's client credentials. Delete the \
+                         endpoint's stored credentials or re-run setup under a \
+                         different name.",
+                    ),
+                )
+                .into_response();
             }
-            Ok(Some(_)) => {}
-            Err(e) => {
+            Err(DcrCommitError::Token(e)) => {
                 warn!(
                     endpoint = %session.name,
                     error = %e,
-                    "Failed to read DCR credentials at commit; skipping defensive save"
+                    "Failed to read/write DCR credentials at commit; skipping defensive save"
                 );
             }
         }
@@ -9159,6 +9210,189 @@ command = "echo"
         assert_eq!(creds.client_secret.as_deref(), Some("super-secret"));
         assert_eq!(creds.issuer.as_deref(), Some("https://auth.example.com"));
         assert!(!creds.registered_via_dcr);
+    }
+
+    /// Helper: build a commit-ready authorized session and return the app +
+    /// paths + token manager. The session's fields are customized by `f`.
+    async fn commit_fixture<F>(
+        name: &str,
+        f: F,
+    ) -> (
+        axum::Router,
+        uuid::Uuid,
+        std::path::PathBuf,
+        Arc<TokenManager>,
+        tempfile::TempDir,
+    )
+    where
+        F: FnOnce(&mut crate::oauth::OAuthSetupSession),
+    {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        std::fs::write(&config_path, "").unwrap();
+        let token_dir = tmp.path().join("tokens");
+        std::fs::create_dir_all(&token_dir).unwrap();
+        let token_manager = Arc::new(TokenManager::new(token_dir));
+
+        let mut state = test_state_with_setup().await;
+        state.config_path = Some(config_path.clone());
+        state.token_manager = Some(token_manager.clone());
+
+        let setup_mgr = state.setup_manager.as_ref().unwrap();
+        let session_id = setup_mgr
+            .create_session(name.into(), "https://mcp.example.com".into(), None, None, None)
+            .await;
+        setup_mgr
+            .get_session_mut(&session_id, |s| {
+                s.authorization_endpoint = Some("https://auth.example.com/authorize".into());
+                s.token_endpoint = Some("https://auth.example.com/token".into());
+                s.status = crate::oauth::SetupSessionStatus::Authorized;
+                s.tokens = Some(crate::token_manager::TokenSet {
+                    access_token: "tok".into(),
+                    refresh_token: None,
+                    expires_at: None,
+                    token_type: "Bearer".into(),
+                    scope: None,
+                    issued_at: None,
+                });
+                f(s);
+            })
+            .await;
+
+        (
+            management_routes(state),
+            session_id,
+            config_path,
+            token_manager,
+            tmp,
+        )
+    }
+
+    /// The defensive save must persist the session's tracked registration
+    /// provenance: credentials minted via DCR during setup produce a
+    /// `registered_via_dcr: true` record (keeping the RFC 7591 self-heal
+    /// paths reachable), not a hardcoded `false`.
+    #[tokio::test]
+    async fn oauth_setup_commit_defensive_save_preserves_dcr_provenance() {
+        let (app, session_id, _config_path, token_manager, _tmp) =
+            commit_fixture("dcr-ep", |s| {
+                s.issuer = Some("https://auth.example.com".into());
+                s.client_id = Some("dcr-minted".into());
+                s.client_secret = Some("dcr-secret".into());
+                s.registered_via_dcr = true;
+            })
+            .await;
+
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let creds = token_manager
+            .load_dcr("dcr-ep")
+            .await
+            .unwrap()
+            .expect("defensive save must write a DCR record");
+        assert_eq!(creds.client_id, "dcr-minted");
+        assert_eq!(creds.client_secret.as_deref(), Some("dcr-secret"));
+        assert_eq!(creds.issuer.as_deref(), Some("https://auth.example.com"));
+        assert!(
+            creds.registered_via_dcr,
+            "DCR provenance from the session must be persisted"
+        );
+    }
+
+    /// Save-if-absent: a pre-existing record carrying the session's
+    /// credentials is kept verbatim (registered_at / issuer / provenance
+    /// untouched) — commit never clobbers it with a fresh defensive record.
+    #[tokio::test]
+    async fn oauth_setup_commit_keeps_matching_existing_dcr_record_intact() {
+        let (app, session_id, _config_path, token_manager, _tmp) =
+            commit_fixture("keep-ep", |s| {
+                s.client_id = Some("client-123".into());
+                s.client_secret = Some("secret-456".into());
+            })
+            .await;
+
+        let original = DcrCredentials {
+            client_id: "client-123".to_string(),
+            client_secret: Some("secret-456".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 42,
+            issuer: Some("https://original.example.com".to_string()),
+            registered_via_dcr: true,
+            ..Default::default()
+        };
+        token_manager.save_dcr("keep-ep", &original).await.unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let loaded = token_manager.load_dcr("keep-ep").await.unwrap().unwrap();
+        assert_eq!(loaded, original, "existing DCR record must be kept verbatim");
+    }
+
+    /// A pre-existing record that does NOT match the session's credentials
+    /// (stale file after endpoint deletion, or a same-name session) must
+    /// reject the commit: otherwise the TOML would carry the session's
+    /// `client_id` while credential resolution prefers the store's different
+    /// pair. Nothing may be written to config.toml, and the stored record
+    /// stays untouched.
+    #[tokio::test]
+    async fn oauth_setup_commit_rejects_mismatched_dcr_record() {
+        let (app, session_id, config_path, token_manager, _tmp) =
+            commit_fixture("mm-ep", |s| {
+                s.client_id = Some("session-client".into());
+                s.client_secret = Some("session-secret".into());
+            })
+            .await;
+
+        let stale = DcrCredentials {
+            client_id: "stale-client".to_string(),
+            client_secret: Some("stale-secret".to_string()),
+            client_secret_expires_at: 0,
+            registered_at: 7,
+            issuer: Some("https://other.example.com".to_string()),
+            registered_via_dcr: true,
+            ..Default::default()
+        };
+        token_manager.save_dcr("mm-ep", &stale).await.unwrap();
+
+        let resp = app
+            .oneshot(
+                Request::post(format!("/api/oauth/setup/{}/commit", session_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let body = body_json(resp).await;
+        assert_eq!(body["error"], "dcr_record_mismatch");
+
+        // config.toml untouched — no endpoint entry was committed.
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            !contents.contains("mm-ep"),
+            "commit must not write config.toml on mismatch; got:\n{}",
+            contents
+        );
+
+        // Stored record untouched.
+        let loaded = token_manager.load_dcr("mm-ep").await.unwrap().unwrap();
+        assert_eq!(loaded, stale);
     }
 
     /// Round-trip: a commit driven by a session created with
