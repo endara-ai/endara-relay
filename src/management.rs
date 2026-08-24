@@ -2535,11 +2535,14 @@ async fn oauth_refresh(
     drop(inners_guard);
 
     // Attempt refresh
+    let refresh_epoch = inner.current_grant_epoch();
     match inner.do_token_refresh().await {
         Ok(new_tokens) => {
             let expires_at = new_tokens.expires_at;
             let refreshed_at = new_tokens.issued_at;
-            inner.apply_refreshed_tokens(new_tokens).await;
+            inner
+                .apply_refreshed_tokens(new_tokens, refresh_epoch)
+                .await;
 
             let status = {
                 let s = inner.state.read().await;
