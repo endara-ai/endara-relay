@@ -16,8 +16,38 @@ use tracing::{debug, trace, warn};
 /// Error type for heartbeat probes.
 #[derive(Debug)]
 enum ProbeError {
+    /// Transport-dead: the upstream did not answer at the transport level
+    /// (connect failure, timeout, or a send error with no HTTP status).
     Network(String),
+    /// Alive-but-erroring: the upstream answered, but with an error (HTTP
+    /// status > 0 other than 401, JSON-RPC error, protocol error).
+    Upstream(String),
+    /// 401 from the upstream — credentials are no longer accepted.
     Auth,
+}
+
+/// Classify an [`AdapterError`] as a transport-dead ("upstream is gone")
+/// signal versus an alive-but-erroring one. Mirrors
+/// `HttpAdapter::is_transport_dead` (http.rs): dead is only `ConnectionFailed`,
+/// `Timeout`, or `HttpError { status: 0 }` — a server answering with a
+/// non-zero HTTP status, JSON-RPC error, or protocol error is alive.
+fn is_transport_dead(err: &AdapterError) -> bool {
+    matches!(
+        err,
+        AdapterError::ConnectionFailed(_)
+            | AdapterError::Timeout(_)
+            | AdapterError::HttpError { status: 0, .. }
+    )
+}
+
+/// Map a probe's `AdapterError` to a `ProbeError`: 401 → `Auth`,
+/// transport-dead → `Network`, everything else → `Upstream`.
+fn classify_adapter_error(e: AdapterError) -> ProbeError {
+    match e {
+        AdapterError::HttpError { status: 401, .. } => ProbeError::Auth,
+        e if is_transport_dead(&e) => ProbeError::Network(e.to_string()),
+        e => ProbeError::Upstream(e.to_string()),
+    }
 }
 
 /// Action the heartbeat loop should take in response to a probe result.
@@ -28,19 +58,26 @@ enum ProbeError {
 enum ProbeAction {
     /// Reset failure counter and mark inner_health as Healthy.
     MarkHealthy,
-    /// Network failure but below the threshold — leave inner_health alone,
+    /// Probe failure but below the threshold — leave inner_health alone,
     /// just log at debug. `failures` is the new (post-increment) count.
     BelowThreshold { failures: u32, reason: String },
-    /// Network failure reached the threshold — mark Unhealthy.
-    MarkUnhealthy { reason: String },
+    /// Probe failure reached the threshold — mark Unhealthy.
+    /// `transport_dead` records whether the threshold-crossing failure was a
+    /// transport-dead one (`Network`) or an alive-but-erroring upstream
+    /// (`Upstream`); it selects the health message written by
+    /// `apply_probe_action`.
+    MarkUnhealthy {
+        reason: String,
+        transport_dead: bool,
+    },
     /// Auth failure — reset counter and transition to AuthRequired.
     AuthFailed,
 }
 
 /// Apply hysteresis to a probe result.
 ///
-/// Mutates `failures` in place: increments on `Network`, resets on `Ok` or
-/// `Auth`. Returns the action the loop should perform.
+/// Mutates `failures` in place: increments on `Network`/`Upstream`, resets on
+/// `Ok` or `Auth`. Returns the action the loop should perform.
 fn classify_probe_result(
     result: Result<(), ProbeError>,
     failures: &mut u32,
@@ -55,16 +92,31 @@ fn classify_probe_result(
             *failures = 0;
             ProbeAction::AuthFailed
         }
-        Err(ProbeError::Network(reason)) => {
-            *failures = failures.saturating_add(1);
-            if *failures >= threshold {
-                ProbeAction::MarkUnhealthy { reason }
-            } else {
-                ProbeAction::BelowThreshold {
-                    failures: *failures,
-                    reason,
-                }
-            }
+        Err(ProbeError::Network(reason)) => record_probe_failure(reason, true, failures, threshold),
+        Err(ProbeError::Upstream(reason)) => {
+            record_probe_failure(reason, false, failures, threshold)
+        }
+    }
+}
+
+/// Shared hysteresis increment for both failure kinds (`Network` /
+/// `Upstream`); `transport_dead` is carried through to `MarkUnhealthy`.
+fn record_probe_failure(
+    reason: String,
+    transport_dead: bool,
+    failures: &mut u32,
+    threshold: u32,
+) -> ProbeAction {
+    *failures = failures.saturating_add(1);
+    if *failures >= threshold {
+        ProbeAction::MarkUnhealthy {
+            reason,
+            transport_dead,
+        }
+    } else {
+        ProbeAction::BelowThreshold {
+            failures: *failures,
+            reason,
         }
     }
 }
@@ -132,8 +184,7 @@ async fn probe_inner(inner: &OAuthAdapterInner) -> Result<(), ProbeError> {
     let timeout_secs = inner.config.probe_timeout_secs;
     match tokio::time::timeout(Duration::from_secs(timeout_secs), adapter.list_tools()).await {
         Ok(Ok(_)) => Ok(()),
-        Ok(Err(AdapterError::HttpError { status: 401, .. })) => Err(ProbeError::Auth),
-        Ok(Err(e)) => Err(ProbeError::Network(e.to_string())),
+        Ok(Err(e)) => Err(classify_adapter_error(e)),
         Err(_) => Err(ProbeError::Network(format!(
             "probe timed out after {}s",
             timeout_secs
@@ -211,14 +262,25 @@ async fn apply_probe_action(
                 "heartbeat probe failed below threshold; not flipping inner_health"
             );
         }
-        ProbeAction::MarkUnhealthy { reason } => {
-            *adapter.inner_health.write().await =
-                HealthStatus::Unhealthy("upstream unreachable".into());
+        ProbeAction::MarkUnhealthy {
+            reason,
+            transport_dead,
+        } => {
+            // "upstream unreachable" only when the upstream is genuinely
+            // dead at the transport level; an alive-but-erroring upstream
+            // (403/5xx/JSON-RPC/protocol) surfaces its actual error text.
+            let message = if transport_dead {
+                "upstream unreachable".to_string()
+            } else {
+                reason.clone()
+            };
+            *adapter.inner_health.write().await = HealthStatus::Unhealthy(message);
             adapter.metrics.inc_heartbeat_unhealthy();
             warn!(
                 oauth_state = ?oauth_state,
                 result = "unhealthy",
                 threshold = threshold,
+                transport_dead = transport_dead,
                 reason = %reason,
                 "heartbeat probe failed at threshold"
             );
@@ -241,6 +303,10 @@ mod tests {
 
     fn net(reason: &str) -> Result<(), ProbeError> {
         Err(ProbeError::Network(reason.to_string()))
+    }
+
+    fn upstream(reason: &str) -> Result<(), ProbeError> {
+        Err(ProbeError::Upstream(reason.to_string()))
     }
 
     fn ok() -> Result<(), ProbeError> {
@@ -284,9 +350,106 @@ mod tests {
 
         assert_eq!(failures, 3);
         match a3 {
-            ProbeAction::MarkUnhealthy { reason } => assert_eq!(reason, "dns"),
+            ProbeAction::MarkUnhealthy {
+                reason,
+                transport_dead,
+            } => {
+                assert_eq!(reason, "dns");
+                assert!(transport_dead, "Network failures are transport-dead");
+            }
             other => panic!("expected MarkUnhealthy, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn three_consecutive_upstream_failures_flip_to_unhealthy_not_transport_dead() {
+        let mut failures: u32 = 0;
+        let threshold = 3;
+
+        let _ = classify_probe_result(
+            upstream("HTTP error 403: forbidden"),
+            &mut failures,
+            threshold,
+        );
+        let _ = classify_probe_result(
+            upstream("HTTP error 403: forbidden"),
+            &mut failures,
+            threshold,
+        );
+        let a3 = classify_probe_result(
+            upstream("HTTP error 403: forbidden"),
+            &mut failures,
+            threshold,
+        );
+
+        assert_eq!(failures, 3);
+        match a3 {
+            ProbeAction::MarkUnhealthy {
+                reason,
+                transport_dead,
+            } => {
+                assert_eq!(reason, "HTTP error 403: forbidden");
+                assert!(!transport_dead, "Upstream failures are alive-but-erroring");
+            }
+            other => panic!("expected MarkUnhealthy, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn classify_adapter_error_maps_transport_dead_vs_upstream() {
+        // 401 → Auth.
+        assert!(matches!(
+            classify_adapter_error(AdapterError::HttpError {
+                status: 401,
+                body: "unauthorized".into(),
+            }),
+            ProbeError::Auth
+        ));
+
+        // Transport-dead (mirrors HttpAdapter::is_transport_dead) → Network.
+        assert!(matches!(
+            classify_adapter_error(AdapterError::ConnectionFailed("refused".into())),
+            ProbeError::Network(_)
+        ));
+        assert!(matches!(
+            classify_adapter_error(AdapterError::Timeout(30)),
+            ProbeError::Network(_)
+        ));
+        assert!(matches!(
+            classify_adapter_error(AdapterError::HttpError {
+                status: 0,
+                body: "send error".into(),
+            }),
+            ProbeError::Network(_)
+        ));
+
+        // Alive-but-erroring → Upstream, carrying the real error text.
+        match classify_adapter_error(AdapterError::HttpError {
+            status: 403,
+            body: "forbidden".into(),
+        }) {
+            ProbeError::Upstream(reason) => assert_eq!(reason, "HTTP error 403: forbidden"),
+            other => panic!("expected Upstream, got {:?}", other),
+        }
+        assert!(matches!(
+            classify_adapter_error(AdapterError::HttpError {
+                status: 500,
+                body: "boom".into(),
+            }),
+            ProbeError::Upstream(_)
+        ));
+        assert!(matches!(
+            classify_adapter_error(AdapterError::JsonRpcError {
+                code: -32000,
+                message: "nope".into(),
+                data: None,
+            }),
+            ProbeError::Upstream(_)
+        ));
+        assert!(matches!(
+            classify_adapter_error(AdapterError::ProtocolError("bad".into())),
+            ProbeError::Upstream(_)
+        ));
     }
 
     #[test]
@@ -333,7 +496,7 @@ mod tests {
         let action = classify_probe_result(net("boom"), &mut failures, 1);
         assert_eq!(failures, 1);
         match action {
-            ProbeAction::MarkUnhealthy { reason } => assert_eq!(reason, "boom"),
+            ProbeAction::MarkUnhealthy { reason, .. } => assert_eq!(reason, "boom"),
             other => panic!("expected MarkUnhealthy, got {:?}", other),
         }
     }
@@ -472,6 +635,64 @@ mod tests {
         let snap = inner.metrics.snapshot();
         assert_eq!(snap.oauth_heartbeat_probe_total_unhealthy, 1);
         assert_eq!(snap.oauth_heartbeat_probe_total_healthy, 0);
+    }
+
+    /// Regression: an alive-but-erroring upstream (e.g. Gmail MCP answering
+    /// 403) must surface its actual error text at the threshold, not the
+    /// transport-dead "upstream unreachable".
+    #[tokio::test]
+    async fn heartbeat_upstream_errors_surface_real_reason_not_unreachable() {
+        let threshold = 3;
+        let inner = make_test_inner(threshold);
+        arm_healthy(&inner).await;
+
+        let mut failures = 0u32;
+        for _ in 0..threshold {
+            let err = AdapterError::HttpError {
+                status: 403,
+                body: "forbidden".into(),
+            };
+            step_once(
+                &inner,
+                Err(classify_adapter_error(err)),
+                &mut failures,
+                threshold,
+            )
+            .await;
+        }
+        assert_eq!(failures, threshold);
+        match &*inner.inner_health.read().await {
+            HealthStatus::Unhealthy(reason) => {
+                assert!(
+                    reason.contains("HTTP error 403"),
+                    "message must carry the 403 error text, got {:?}",
+                    reason
+                );
+                assert_ne!(reason, "upstream unreachable");
+            }
+            other => panic!("expected Unhealthy, got {:?}", other),
+        };
+    }
+
+    /// The 3-tick hysteresis applies to alive-but-erroring failures too: two
+    /// upstream errors must not flip inner_health.
+    #[tokio::test]
+    async fn heartbeat_upstream_errors_below_threshold_do_not_flip() {
+        let threshold = 3;
+        let inner = make_test_inner(threshold);
+        arm_healthy(&inner).await;
+
+        let mut failures = 0u32;
+        for _ in 0..(threshold - 1) {
+            step_once(
+                &inner,
+                upstream("HTTP error 500: boom"),
+                &mut failures,
+                threshold,
+            )
+            .await;
+            assert_eq!(*inner.inner_health.read().await, HealthStatus::Healthy);
+        }
     }
 
     #[tokio::test]
