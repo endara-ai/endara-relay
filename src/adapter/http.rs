@@ -250,7 +250,8 @@ impl HttpAdapter {
     ///
     /// Top-level constructor kept for completeness; OAuth wrapping uses
     /// [`HttpAdapter::new_with_client_inner`] instead so the inner adapter
-    /// does not create its own `endpoint` tracing span.
+    /// shares the wrapper's `endpoint` tracing span rather than creating
+    /// its own.
     #[allow(dead_code)]
     pub fn new_with_client(config: HttpConfig, client: Client) -> Self {
         let span = tracing::info_span!(
@@ -264,12 +265,22 @@ impl HttpAdapter {
 
     /// Create a new HttpAdapter intended to be wrapped by another adapter
     /// (currently `OAuthAdapter`) that already owns the per-endpoint
-    /// `endpoint` tracing span. The inner adapter uses `tracing::Span::none()`
-    /// so its `.instrument(self.span.clone())` calls become no-ops and events
-    /// are attached to the enclosing wrapper's span instead, avoiding a
-    /// duplicated `endpoint=<name>` field.
-    pub fn new_with_client_inner(config: HttpConfig, client: Client) -> Self {
-        Self::with_span(config, client, tracing::Span::none())
+    /// `endpoint` tracing span. The wrapper passes that span in so the inner
+    /// adapter's `.instrument(self.span.clone())` calls enter the wrapper's
+    /// span and its events (tool-call completed/failed lines, handshake
+    /// logging) carry the `endpoint`/`transport` fields the desktop Logs tab
+    /// attributes lines by. The inner adapter never builds a span of its own,
+    /// so exactly one `endpoint` span is in scope — no duplicated
+    /// `endpoint=<name>` field.
+    ///
+    /// The `server_type` once-guard is pre-flipped: the wrapper owns that
+    /// record on the shared span (behind its own once-guard), and inner
+    /// adapters are rebuilt on every token swap — a fresh inner guard would
+    /// re-append `server_type` to the shared span on each rebuild.
+    pub fn new_with_client_inner(config: HttpConfig, client: Client, span: tracing::Span) -> Self {
+        let adapter = Self::with_span(config, client, span);
+        adapter.server_type_recorded.store(true, Ordering::Relaxed);
+        adapter
     }
 
     fn with_span(config: HttpConfig, client: Client, span: tracing::Span) -> Self {
@@ -1661,6 +1672,31 @@ mod tests {
         // so this is a no-op.
         adapter.record_server_type_once("some-server");
         adapter.record_server_type_once("other-name");
+        assert!(adapter.server_type_recorded_flag());
+    }
+
+    /// An inner adapter built for wrapping (`new_with_client_inner`) shares
+    /// the wrapper's `endpoint` span, so its `server_type` once-guard must be
+    /// pre-flipped: the wrapper owns that record behind its own once-guard,
+    /// and inner adapters are rebuilt on every token swap — a fresh guard
+    /// would re-append `server_type` to the shared span on each rebuild.
+    #[test]
+    fn new_with_client_inner_preflips_server_type_guard() {
+        let span = tracing::info_span!(
+            "endpoint",
+            endpoint = "test",
+            transport = "oauth",
+            server_type = tracing::field::Empty,
+        );
+        let adapter = HttpAdapter::new_with_client_inner(
+            HttpConfig::new("http://localhost:8080/mcp"),
+            Client::new(),
+            span,
+        );
+        assert!(adapter.server_type_recorded_flag());
+
+        // Recording is a no-op — the guard never resets.
+        adapter.record_server_type_once("some-server");
         assert!(adapter.server_type_recorded_flag());
     }
 
