@@ -132,6 +132,13 @@ write_dirs = ["/absolute/path/to/exports"]
                                   # sandbox scripts may write into via writeFile();
                                   # a leading ~/ is expanded to your home directory
                                   # (default: none — writing disabled). Hot-reloadable.
+listen_ips = ["100.101.102.103"]  # Optional — extra private-scope IPs the MCP TCP
+                                  # listener also binds on, alongside the always-bound
+                                  # 127.0.0.1 (default: none — loopback only). Only
+                                  # RFC 1918, CGNAT 100.64.0.0/10 (Tailscale), and
+                                  # IPv6 ULA fc00::/7 addresses are eligible; public
+                                  # IPs and wildcards (0.0.0.0 / ::) are refused.
+                                  # See "listen_ips and network exposure" below.
 
 # STDIO endpoint — spawns a child process
 [[endpoints]]
@@ -213,6 +220,20 @@ endpoints = ["filesystem"]
 js_execution = false
 toon_output = false
 ```
+
+### `listen_ips` and network exposure
+
+By default the relay's MCP listener binds only `127.0.0.1` — nothing on your network can reach it. `listen_ips` opts additional local IPs in, so other machines (e.g. peers on a Tailscale tailnet or your LAN) can use the relay. Loopback is always bound regardless; omitting the key or setting it to `[]` keeps the pre-existing loopback-only behavior.
+
+Only private-scope addresses are eligible:
+
+- IPv4 RFC 1918 — `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`
+- IPv4 CGNAT / shared address space — `100.64.0.0/10` (Tailscale node addresses)
+- IPv6 unique-local — `fc00::/7`
+
+Wildcards (`0.0.0.0`, `::`), public, multicast, broadcast, and link-local addresses are **never bound**. Ineligible or unparseable entries are skipped with a startup warning rather than aborting startup, and duplicates are bound once. Entries are resolved when the listener binds at startup, so changing `listen_ips` requires a restart.
+
+> **⚠️ Security warning:** every IP you list exposes the full MCP endpoint — all aggregated tools, resources, and prompts — to anyone who can reach that address, with no authentication. Only list addresses on networks where you trust every host (e.g. your own tailnet). The management API is unaffected: it stays on the local Unix-domain socket / Named Pipe and is never reachable over TCP.
 
 ### Environment variable resolution
 
@@ -368,6 +389,7 @@ A curated subset of the API:
 | `POST` | `/api/endpoints/:name/disable` &nbsp;/ `enable` | Hide or restore an endpoint without removing it |
 | `GET` | `/api/config` | View current config (env values redacted) |
 | `POST` | `/api/config/reload` | Trigger a config reload |
+| `GET` | `/api/network-interfaces` | Detected private/CGNAT/ULA interface addresses eligible for `[relay] listen_ips`, plus the currently configured `listen_ips` |
 | `GET` | `/api/events/tool-calls` | Server-Sent Events stream of every tool call (in-flight, success, failure, duration, calling client) |
 | `GET` | `/api/observability/calls` | Query recorded tool calls (filter by endpoint, tool, status, time window) |
 | `GET` | `/api/observability/calls/:request_uid` | Full request/response payload for one recorded call |

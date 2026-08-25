@@ -97,6 +97,7 @@ fn test_config() -> Config {
             observability: ObservabilityConfig::default(),
             log_retention_days: None,
             write_dirs: None,
+            listen_ips: None,
         },
         endpoints: vec![EndpointConfig {
             name: "echo".to_string(),
@@ -321,6 +322,48 @@ async fn test_management_api_config() {
     assert_eq!(endpoints.len(), 1);
     assert_eq!(endpoints[0]["name"], "echo");
     assert_eq!(endpoints[0]["transport"], "stdio");
+}
+
+#[tokio::test]
+async fn test_management_api_network_interfaces() {
+    let (addr, _handle) =
+        start_management_server(vec![("echo-ep", MockAdapter::healthy_with_tools(vec![]))]).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("http://{}/api/network-interfaces", addr))
+        .send()
+        .await
+        .expect("request failed");
+    assert!(resp.status().is_success());
+    let body: Value = resp.json().await.unwrap();
+
+    // test_config() has listen_ips: None → echoed as an empty list.
+    assert_eq!(body["listen_ips"], json!([]));
+
+    // The interface list is machine-dependent, but the filtering invariants
+    // are not: every entry has the documented shape and re-classifies as
+    // eligible (never loopback, unspecified, link-local, or public).
+    let interfaces = body["interfaces"].as_array().expect("interfaces array");
+    for iface in interfaces {
+        assert!(iface["name"].as_str().is_some());
+        let ip_str = iface["ip"].as_str().expect("ip string");
+        let ip: std::net::IpAddr = ip_str.parse().expect("valid IP literal");
+        assert_eq!(
+            endara_relay::listen_ips::classify_listen_ip(ip),
+            endara_relay::listen_ips::ListenIpClass::Eligible,
+            "route returned ineligible address {ip}"
+        );
+        assert!(!ip.is_loopback());
+        assert!(!ip.is_unspecified());
+        let family = iface["family"].as_str().unwrap();
+        assert!(matches!(family, "v4" | "v6"));
+        assert_eq!(family == "v4", ip.is_ipv4());
+        assert!(matches!(
+            iface["kind"].as_str().unwrap(),
+            "private" | "cgnat" | "ula"
+        ));
+    }
 }
 
 async fn start_management_server_with_config(

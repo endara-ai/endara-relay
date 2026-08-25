@@ -90,6 +90,17 @@ pub struct RelayConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub write_dirs: Option<Vec<PathBuf>>,
+    /// Extra IPs the MCP TCP listener additionally binds on. Loopback
+    /// (`127.0.0.1`) is always bound regardless. Only private-scope addresses
+    /// are eligible: IPv4 RFC 1918 (`10/8`, `172.16/12`, `192.168/16`), IPv4
+    /// CGNAT `100.64.0.0/10` (Tailscale), and IPv6 ULA `fc00::/7`. Wildcards
+    /// (`0.0.0.0` / `::`), public, multicast, broadcast, and link-local
+    /// entries are never bound — they are skipped with a startup warning (see
+    /// `crate::listen_ips`). `None`/empty means loopback only (the
+    /// pre-existing behavior).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listen_ips: Option<Vec<String>>,
 }
 
 impl Default for RelayConfig {
@@ -115,6 +126,7 @@ impl Default for RelayConfig {
             observability: ObservabilityConfig::default(),
             log_retention_days: None,
             write_dirs: None,
+            listen_ips: None,
         }
     }
 }
@@ -2007,6 +2019,7 @@ js_execution = false
                 observability: ObservabilityConfig::default(),
                 log_retention_days: None,
                 write_dirs: None,
+                listen_ips: None,
             },
             endpoints,
             profiles: None,
@@ -3369,6 +3382,64 @@ write_dirs = []
             parsed.relay.write_dirs,
             Some(vec![PathBuf::from("/tmp/media")])
         );
+    }
+
+    // --- listen_ips tests ---
+
+    #[test]
+    fn listen_ips_parses_under_relay_table() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+listen_ips = ["100.101.102.103", "192.168.1.5"]
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.relay.listen_ips,
+            Some(vec![
+                "100.101.102.103".to_string(),
+                "192.168.1.5".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn listen_ips_omitted_is_none() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.relay.listen_ips, None);
+        assert_eq!(default_config().relay.listen_ips, None);
+    }
+
+    #[test]
+    fn listen_ips_empty_list_parses() {
+        let toml_str = r#"
+[relay]
+machine_name = "test"
+listen_ips = []
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.relay.listen_ips, Some(vec![]));
+    }
+
+    #[test]
+    fn listen_ips_round_trips() {
+        let config = Config {
+            relay: RelayConfig {
+                machine_name: "test".to_string(),
+                listen_ips: Some(vec!["10.0.0.7".to_string()]),
+                ..RelayConfig::default()
+            },
+            endpoints: vec![],
+            profiles: None,
+            organizations: Vec::new(),
+        };
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+        assert_eq!(parsed.relay.listen_ips, Some(vec!["10.0.0.7".to_string()]));
     }
 
     // --- resolve_write_roots tests ---

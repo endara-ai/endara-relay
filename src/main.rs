@@ -21,6 +21,7 @@ mod advertise;
 mod container_runtime;
 mod container_stats;
 mod jsonrpc;
+mod listen_ips;
 mod local_network;
 mod prefix;
 mod profile_registry;
@@ -919,8 +920,12 @@ async fn main() {
             let router = build_router(state);
             let mgmt_router = management::management_routes(mgmt_state);
 
-            // Bind to loopback only; the relay is a local-only service.
+            // Always bind loopback; the relay is a local-only service unless
+            // `[relay] listen_ips` opts additional private-scope IPs in
+            // (ineligible entries are skipped with a warning, never bound).
             let addr: SocketAddr = ([127, 0, 0, 1], port).into();
+            let extra_addrs =
+                listen_ips::resolve_extra_listen_addrs(cfg.relay.listen_ips.as_deref(), port);
 
             // Start the management listener on its IPC path. We do this
             // *before* binding the MCP TCP listener so that callers observing
@@ -1030,9 +1035,25 @@ async fn main() {
             // Keep the management handle alive for the rest of the process.
             let _mgmt_handle = mgmt_handle;
 
-            match start_server(router, addr).await {
+            match start_server(router.clone(), addr).await {
                 Ok((bound_addr, handle)) => {
                     info!(addr = %bound_addr, "MCP server running");
+
+                    // Bind each opted-in extra listener with the same router.
+                    // A bind failure here (e.g. interface down) is non-fatal:
+                    // loopback remains the guaranteed listener. Dropping the
+                    // extra handle detaches the server task, which runs until
+                    // the shared graceful-shutdown signal fires.
+                    for extra in extra_addrs {
+                        match start_server(router.clone(), extra).await {
+                            Ok((extra_addr, _extra_handle)) => {
+                                info!(addr = %extra_addr, "MCP server additionally listening");
+                            }
+                            Err(e) => {
+                                warn!(addr = %extra, error = %e, "Failed to bind extra listen_ips address; continuing without it");
+                            }
+                        }
+                    }
 
                     // Spawn config file watcher for hot-reload
                     let _watcher_handle = ConfigWatcher::start(

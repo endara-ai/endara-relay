@@ -6,6 +6,7 @@ pub mod container_stats;
 pub mod events;
 pub mod js_sandbox;
 pub mod jsonrpc;
+pub mod listen_ips;
 pub mod local_network;
 pub mod management;
 pub mod management_listener;
