@@ -32,6 +32,7 @@ fn empty_config() -> Config {
             observability: ObservabilityConfig::default(),
             log_retention_days: None,
             write_dirs: None,
+            listen_ips: None,
         },
         endpoints: vec![EndpointConfig {
             name: "echo".to_string(),

@@ -603,6 +603,112 @@ async fn get_config(State(state): State<ManagementState>) -> impl IntoResponse {
     Json(sanitized).into_response()
 }
 
+/// One detected interface address eligible for `[relay] listen_ips`.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct NetworkInterfaceInfo {
+    /// OS interface name (e.g. `eth0`, `tailscale0`).
+    pub name: String,
+    /// The address as an IP literal.
+    pub ip: String,
+    /// `"v4"` or `"v6"`.
+    pub family: &'static str,
+    /// `"private"` (RFC 1918), `"cgnat"` (100.64.0.0/10), or `"ula"` (fc00::/7).
+    pub kind: &'static str,
+}
+
+#[derive(Serialize)]
+struct NetworkInterfacesResponse {
+    interfaces: Vec<NetworkInterfaceInfo>,
+    /// Canonicalized echo of `[relay] listen_ips` so the UI can render
+    /// toggle state: parsed, eligibility-filtered, and deduplicated with the
+    /// same rules the relay uses to bind (`canonical_listen_ips`), so every
+    /// entry compares equal to an interface `ip` string and no malformed or
+    /// non-bindable configured value leaks into the payload.
+    listen_ips: Vec<String>,
+    /// Present only when interface enumeration itself failed, so the UI can
+    /// distinguish "couldn't detect interfaces" from "no eligible
+    /// interfaces on this host" (both carry `interfaces: []`). Omitted on
+    /// success to keep the payload backward compatible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Filter raw `(interface name, address)` candidates down to the addresses
+/// the relay may bind, using the same eligibility classifier as
+/// `[relay] listen_ips` (`crate::listen_ips`). Loopback, unspecified
+/// (0.0.0.0 / ::), link-local, and public addresses never pass; exact
+/// duplicates are dropped.
+pub fn filter_network_interfaces(
+    candidates: &[(String, std::net::IpAddr)],
+) -> Vec<NetworkInterfaceInfo> {
+    let mut out: Vec<NetworkInterfaceInfo> = Vec::new();
+    for (name, ip) in candidates {
+        let Some(kind) = crate::listen_ips::eligible_ip_kind(*ip) else {
+            continue;
+        };
+        let family = match ip {
+            std::net::IpAddr::V4(_) => "v4",
+            std::net::IpAddr::V6(_) => "v6",
+        };
+        let info = NetworkInterfaceInfo {
+            name: name.clone(),
+            ip: ip.to_string(),
+            family,
+            kind,
+        };
+        if !out.contains(&info) {
+            out.push(info);
+        }
+    }
+    out
+}
+
+/// Build the `GET /api/network-interfaces` payload from an enumeration
+/// outcome: `Ok(candidates)` filters to eligible addresses; `Err(msg)`
+/// yields an empty interface list with the failure surfaced in `error`.
+fn network_interfaces_response(
+    candidates: Result<Vec<(String, std::net::IpAddr)>, String>,
+    listen_ips: Vec<String>,
+) -> NetworkInterfacesResponse {
+    match candidates {
+        Ok(candidates) => NetworkInterfacesResponse {
+            interfaces: filter_network_interfaces(&candidates),
+            listen_ips,
+            error: None,
+        },
+        Err(e) => NetworkInterfacesResponse {
+            interfaces: Vec::new(),
+            listen_ips,
+            error: Some(e),
+        },
+    }
+}
+
+/// GET /api/network-interfaces
+///
+/// Detected candidate interfaces for the desktop "Network exposure" UI,
+/// filtered to `listen_ips`-eligible addresses only, plus the currently
+/// configured `[relay] listen_ips` for toggle state. An enumeration failure
+/// still returns 200 with `interfaces: []` but carries an `error` field so
+/// the UI can distinguish it from a host with no eligible interfaces.
+async fn get_network_interfaces(State(state): State<ManagementState>) -> impl IntoResponse {
+    let candidates: Result<Vec<(String, std::net::IpAddr)>, String> = if_addrs::get_if_addrs()
+        .map(|ifaces| {
+            ifaces
+                .into_iter()
+                .map(|i| (i.name.clone(), i.ip()))
+                .collect()
+        })
+        .map_err(|e| {
+            warn!(error = %e, "Failed to enumerate network interfaces");
+            format!("failed to enumerate network interfaces: {e}")
+        });
+    let listen_ips = crate::listen_ips::canonical_listen_ips(
+        state.config.read().await.relay.listen_ips.as_deref(),
+    );
+    Json(network_interfaces_response(candidates, listen_ips))
+}
+
 #[derive(Serialize)]
 struct SanitizedConfig {
     relay: SanitizedRelay,
@@ -618,6 +724,12 @@ struct SanitizedRelay {
     /// the desktop Settings tab can render the Observability section; contains
     /// no secrets, so it is surfaced verbatim.
     observability: ObservabilityConfig,
+    /// `[relay] listen_ips` as configured (no secrets), surfaced verbatim so
+    /// the sanitized config view reflects the full non-secret `[relay]`
+    /// surface. The canonicalized toggle-state view lives at
+    /// `GET /api/network-interfaces`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    listen_ips: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -640,6 +752,7 @@ fn sanitize_config(config: &Config) -> SanitizedConfig {
             machine_name: config.relay.machine_name.clone(),
             local_js_execution: config.relay.local_js_execution,
             observability: config.relay.observability.clone(),
+            listen_ips: config.relay.listen_ips.clone(),
         },
         endpoints: config
             .endpoints
@@ -5774,6 +5887,7 @@ pub fn management_routes(state: ManagementState) -> Router {
         .route("/api/catalog", get(get_catalog))
         .route("/api/config", get(get_config))
         .route("/api/config/reload", post(reload_config))
+        .route("/api/network-interfaces", get(get_network_interfaces))
         .route("/api/test-connection", post(test_connection))
         // Profile CRUD (R4.A) — spec §8.1, §8.2.
         .route("/api/profiles", get(list_profiles).post(create_profile))
@@ -7161,6 +7275,7 @@ mod tests {
                 observability: crate::config::ObservabilityConfig::default(),
                 log_retention_days: None,
                 write_dirs: None,
+                listen_ips: None,
             },
             endpoints: vec![EndpointConfig {
                 name: "echo".to_string(),
@@ -7495,18 +7610,155 @@ mod tests {
     #[tokio::test]
     async fn management_config_sanitized() {
         let state = test_state(vec![]).await;
+        let config = state.config.clone();
         let app = management_routes(state);
         let resp = app
+            .clone()
             .oneshot(Request::get("/api/config").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
         assert_eq!(body["relay"]["machine_name"], "test-machine");
+        // listen_ips is omitted while unset (backward-compatible payload).
+        assert!(body["relay"].get("listen_ips").is_none());
         let ep = &body["endpoints"][0];
         assert_eq!(ep["name"], "echo");
         // env values should be redacted
         assert_eq!(ep["env"]["SECRET"], "***");
+
+        // Once configured, the sanitized view surfaces [relay] listen_ips
+        // verbatim (it contains no secrets).
+        {
+            let mut cfg = config.write().await;
+            cfg.relay.listen_ips = Some(vec!["100.101.102.103".to_string()]);
+        }
+        let resp = app
+            .oneshot(Request::get("/api/config").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["relay"]["listen_ips"],
+            serde_json::json!(["100.101.102.103"])
+        );
+    }
+
+    #[test]
+    fn network_interfaces_response_surfaces_enumeration_failure() {
+        let resp = network_interfaces_response(
+            Err("boom".to_string()),
+            vec!["100.101.102.103".to_string()],
+        );
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["error"], "boom");
+        assert_eq!(json["interfaces"], serde_json::json!([]));
+        // The rest of the payload keeps its shape so the UI stays compatible.
+        assert_eq!(json["listen_ips"], serde_json::json!(["100.101.102.103"]));
+    }
+
+    #[test]
+    fn network_interfaces_response_omits_error_on_success() {
+        let candidates = vec![("eth0".to_string(), "192.168.1.5".parse().unwrap())];
+        let resp = network_interfaces_response(Ok(candidates), Vec::new());
+        let json = serde_json::to_value(&resp).unwrap();
+        // No `error` key at all on success — an empty interface list from a
+        // successful enumeration stays distinguishable from a failure.
+        assert!(json.as_object().unwrap().get("error").is_none());
+        assert_eq!(json["interfaces"][0]["ip"], "192.168.1.5");
+    }
+
+    #[test]
+    fn filter_network_interfaces_keeps_only_eligible_addresses() {
+        let candidates: Vec<(String, std::net::IpAddr)> = [
+            ("lo", "127.0.0.1"),
+            ("lo", "::1"),
+            ("any", "0.0.0.0"),
+            ("any6", "::"),
+            ("ll", "169.254.1.1"),
+            ("ll6", "fe80::1"),
+            ("wan", "8.8.8.8"),
+            ("wan6", "2001:db8::1"),
+            ("eth0", "192.168.1.5"),
+            ("tailscale0", "100.101.102.103"),
+            ("ula0", "fd12:3456:789a::1"),
+        ]
+        .iter()
+        .map(|(n, ip)| (n.to_string(), ip.parse().unwrap()))
+        .collect();
+
+        let out = filter_network_interfaces(&candidates);
+        let summary: Vec<(&str, &str, &str, &str)> = out
+            .iter()
+            .map(|i| (i.name.as_str(), i.ip.as_str(), i.family, i.kind))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("eth0", "192.168.1.5", "v4", "private"),
+                ("tailscale0", "100.101.102.103", "v4", "cgnat"),
+                ("ula0", "fd12:3456:789a::1", "v6", "ula"),
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_network_interfaces_dedupes_exact_duplicates() {
+        let ip: std::net::IpAddr = "10.0.0.7".parse().unwrap();
+        let candidates = vec![("eth0".to_string(), ip), ("eth0".to_string(), ip)];
+        assert_eq!(filter_network_interfaces(&candidates).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn management_network_interfaces_echoes_listen_ips_and_filters() {
+        let state = test_state(vec![]).await;
+        {
+            let mut cfg = state.config.write().await;
+            // Deliberately messy: whitespace, a non-canonical IPv6 spelling
+            // plus its canonical duplicate, a public address, an unparseable
+            // entry, and the default loopback. The echo must apply the same
+            // parse/filter/canonicalize/dedupe rules used for binding.
+            cfg.relay.listen_ips = Some(vec![
+                " fd12:0:0::1 ".to_string(),
+                "fd12::1".to_string(),
+                "8.8.8.8".to_string(),
+                "not-an-ip".to_string(),
+                "100.101.102.103".to_string(),
+                "127.0.0.1".to_string(),
+            ]);
+        }
+        let app = management_routes(state);
+        let resp = app
+            .oneshot(
+                Request::get("/api/network-interfaces")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(
+            body["listen_ips"],
+            serde_json::json!(["fd12::1", "100.101.102.103"])
+        );
+        // Interface content is machine-dependent, but the filtering invariant
+        // is not: no loopback/unspecified/link-local/public address may
+        // appear, and every entry re-classifies as eligible.
+        for iface in body["interfaces"].as_array().unwrap() {
+            let ip: std::net::IpAddr = iface["ip"].as_str().unwrap().parse().unwrap();
+            assert_eq!(
+                crate::listen_ips::classify_listen_ip(ip),
+                crate::listen_ips::ListenIpClass::Eligible,
+                "route returned ineligible address {ip}"
+            );
+            assert!(matches!(iface["family"].as_str().unwrap(), "v4" | "v6"));
+            assert!(matches!(
+                iface["kind"].as_str().unwrap(),
+                "private" | "cgnat" | "ula"
+            ));
+        }
     }
 
     #[tokio::test]
@@ -10607,6 +10859,7 @@ command = "echo"
                 observability: crate::config::ObservabilityConfig::default(),
                 log_retention_days: None,
                 write_dirs: None,
+                listen_ips: None,
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
@@ -11153,6 +11406,7 @@ command = "echo"
                 observability: crate::config::ObservabilityConfig::default(),
                 log_retention_days: None,
                 write_dirs: None,
+                listen_ips: None,
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
@@ -12945,6 +13199,7 @@ command = "echo"
                 observability: crate::config::ObservabilityConfig::default(),
                 log_retention_days: None,
                 write_dirs: None,
+                listen_ips: None,
             },
             endpoints: vec![EndpointConfig {
                 name: name.to_string(),
@@ -13072,6 +13327,7 @@ client_id = "client123"
                 observability: crate::config::ObservabilityConfig::default(),
                 log_retention_days: None,
                 write_dirs: None,
+                listen_ips: None,
             },
             endpoints: vec![],
             profiles: None,
@@ -13139,6 +13395,7 @@ client_id = "client123"
                 observability: crate::config::ObservabilityConfig::default(),
                 log_retention_days: None,
                 write_dirs: None,
+                listen_ips: None,
             },
             endpoints: endpoint_names
                 .iter()
@@ -13704,6 +13961,7 @@ client_id = "client123"
                 observability: crate::config::ObservabilityConfig::default(),
                 log_retention_days: None,
                 write_dirs: None,
+                listen_ips: None,
             },
             endpoints: vec![EndpointConfig {
                 name: "existing".to_string(),

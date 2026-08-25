@@ -66,7 +66,7 @@ async fn setup_server() -> (SocketAddr, AdapterRegistry, tokio::task::JoinHandle
     let router = build_router(state);
     // Bind to port 0 to get a random available port
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-    let (bound_addr, handle) = start_server(router, addr)
+    let (bound_addr, handle) = start_server(router, addr, tokio::sync::watch::channel(false).1)
         .await
         .expect("server start failed");
 
@@ -256,7 +256,7 @@ async fn setup_native_toon_server(toon_enabled: bool) -> (SocketAddr, tokio::tas
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-    let (bound_addr, handle) = start_server(router, addr)
+    let (bound_addr, handle) = start_server(router, addr, tokio::sync::watch::channel(false).1)
         .await
         .expect("server start failed");
     (bound_addr, handle)
@@ -430,7 +430,7 @@ async fn profile_tools_list_excludes_out_of_profile_tools() {
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-    let (addr, _handle) = start_server(router, addr)
+    let (addr, _handle) = start_server(router, addr, tokio::sync::watch::channel(false).1)
         .await
         .expect("server start failed");
 
@@ -618,7 +618,7 @@ async fn oauth_login_heals_stale_empty_tools_list() {
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-    let (addr, _handle) = start_server(router, addr)
+    let (addr, _handle) = start_server(router, addr, tokio::sync::watch::channel(false).1)
         .await
         .expect("server start failed");
     let client = reqwest::Client::new();
