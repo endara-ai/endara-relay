@@ -124,12 +124,23 @@ pub fn eligible_ip_kind(ip: IpAddr) -> Option<&'static str> {
 fn accepted_listen_ips(listen_ips: Option<&[String]>, warn_on_skip: bool) -> Vec<IpAddr> {
     let mut ips: Vec<IpAddr> = Vec::new();
     for entry in listen_ips.unwrap_or_default() {
-        let Ok(ip) = entry.trim().parse::<IpAddr>() else {
+        let Ok(mut ip) = entry.trim().parse::<IpAddr>() else {
             if warn_on_skip {
                 warn!(entry = %entry, "Ignoring unparseable [relay] listen_ips entry");
             }
             continue;
         };
+        // Normalize IPv4-mapped IPv6 (`::ffff:a.b.c.d`) to the embedded IPv4
+        // address before classification and dedup, matching how the
+        // classifier already treats mapped addresses. This makes the default
+        // `127.0.0.1` redundancy drop catch `::ffff:127.0.0.1`, collapses a
+        // mapped entry against its plain-v4 duplicate, and binds an AF_INET
+        // socket instead of a platform-dependent AF_INET6 mapped bind.
+        if let IpAddr::V6(v6) = ip {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                ip = IpAddr::V4(v4);
+            }
+        }
         match classify_listen_ip(ip) {
             ListenIpClass::Ineligible(reason) => {
                 if warn_on_skip {
@@ -313,6 +324,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn ipv4_mapped_loopback_is_dropped_as_redundant() {
+        assert!(resolve(&["::ffff:127.0.0.1"], 9400).is_empty());
+    }
+
+    #[test]
+    fn ipv4_mapped_entries_normalize_to_plain_v4_binds() {
+        assert_eq!(
+            resolve(&["::ffff:192.168.1.10"], 9400),
+            vec!["192.168.1.10:9400".parse().unwrap()]
+        );
+    }
+
+    #[test]
+    fn ipv4_mapped_entries_dedupe_against_plain_v4_duplicates() {
+        assert_eq!(
+            resolve(&["::ffff:10.0.0.7", "10.0.0.7"], 9400),
+            vec!["10.0.0.7:9400".parse().unwrap()]
+        );
+    }
+
     fn canonical(entries: &[&str]) -> Vec<String> {
         let owned: Vec<String> = entries.iter().map(|s| s.to_string()).collect();
         canonical_listen_ips(Some(&owned))
@@ -345,6 +377,14 @@ mod tests {
     #[test]
     fn canonical_listen_ips_keeps_non_default_loopback_like_binding() {
         assert_eq!(canonical(&["::1"]), vec!["::1".to_string()]);
+    }
+
+    #[test]
+    fn canonical_listen_ips_normalizes_ipv4_mapped_to_plain_v4() {
+        assert_eq!(
+            canonical(&["::ffff:192.168.1.10", "::ffff:127.0.0.1"]),
+            vec!["192.168.1.10".to_string()]
+        );
     }
 
     #[test]
