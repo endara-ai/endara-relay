@@ -43,7 +43,7 @@ use js_sandbox::MetaToolHandler;
 use oauth::{OAuthFlowManager, OAuthSetupManager};
 use profile_registry::ProfileRegistry;
 use registry::AdapterRegistry;
-use server::{build_router, start_server, AppState};
+use server::{build_router, spawn_shutdown_coordinator, start_server, AppState};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -960,6 +960,13 @@ async fn main() {
                 .relay
                 .startup_init_timeout_secs
                 .unwrap_or(config::DEFAULT_STARTUP_INIT_TIMEOUT_SECS);
+            // One persistent shutdown coordinator for the whole process: a
+            // single task owns the OS-signal receivers and flips a watch
+            // channel every listener observes. A signal that arrives at any
+            // point — during the startup wait, between the loopback bind and
+            // an extra bind, or later — is never missed by a listener bound
+            // after it, unlike per-listener one-shot signal futures.
+            let mut shutdown_rx = spawn_shutdown_coordinator();
             let mut shutdown_during_wait = false;
             if total_inits > 0 && timeout_secs > 0 {
                 let timeout = Duration::from_secs(timeout_secs);
@@ -976,7 +983,7 @@ async fn main() {
                     _ = tokio::time::sleep(timeout) => {
                         // Handles are dropped here; tasks keep running.
                     }
-                    _ = server::shutdown_signal() => {
+                    _ = shutdown_rx.wait_for(|v| *v) => {
                         shutdown_during_wait = true;
                     }
                 }
@@ -1036,24 +1043,31 @@ async fn main() {
             // Keep the management handle alive for the rest of the process.
             let _mgmt_handle = mgmt_handle;
 
-            match start_server(router.clone(), addr).await {
+            match start_server(router.clone(), addr, shutdown_rx.clone()).await {
                 Ok((bound_addr, handle)) => {
                     info!(addr = %bound_addr, "MCP server running");
 
                     // Resolve extras against the *bound* port (not the CLI
                     // value) so `--port 0` propagates the kernel-assigned
                     // port to every extra listener, and bind each one with
-                    // the same router. A bind failure here (e.g. interface
-                    // down) is non-fatal: loopback remains the guaranteed
-                    // listener. Handles are retained so shutdown awaits
-                    // every listener's graceful drain, not just loopback's.
+                    // the same router and the same shutdown watch channel.
+                    // A bind failure here (e.g. interface down) is
+                    // non-fatal: loopback remains the guaranteed listener.
+                    // Handles are retained so shutdown awaits every
+                    // listener's graceful drain, not just loopback's.
                     let extra_addrs = listen_ips::resolve_extra_listen_addrs(
                         cfg.relay.listen_ips.as_deref(),
                         bound_addr.port(),
                     );
                     let mut extra_handles = Vec::new();
                     for extra in extra_addrs {
-                        match start_server(router.clone(), extra).await {
+                        // Stop binding once shutdown has been signaled; the
+                        // already-bound listeners are draining.
+                        if *shutdown_rx.borrow() {
+                            info!(addr = %extra, "Shutdown already signaled; skipping extra listener bind");
+                            continue;
+                        }
+                        match start_server(router.clone(), extra, shutdown_rx.clone()).await {
                             Ok((extra_addr, extra_handle)) => {
                                 info!(addr = %extra_addr, "MCP server additionally listening");
                                 extra_handles.push(extra_handle);

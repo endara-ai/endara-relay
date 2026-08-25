@@ -66,7 +66,7 @@ async fn setup_js_server(js_mode: bool) -> (SocketAddr, tokio::task::JoinHandle<
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-    let (bound_addr, handle) = start_server(router, addr)
+    let (bound_addr, handle) = start_server(router, addr, tokio::sync::watch::channel(false).1)
         .await
         .expect("server start failed");
     (bound_addr, handle)

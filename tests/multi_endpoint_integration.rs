@@ -100,7 +100,7 @@ async fn setup_multi_endpoint_server() -> (SocketAddr, AdapterRegistry, tokio::t
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-    let (bound_addr, handle) = start_server(router, addr)
+    let (bound_addr, handle) = start_server(router, addr, tokio::sync::watch::channel(false).1)
         .await
         .expect("server start failed");
 
@@ -253,7 +253,7 @@ async fn test_multi_endpoint_overlapping_tool_names() {
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-    let (bound_addr, _handle) = start_server(router, addr)
+    let (bound_addr, _handle) = start_server(router, addr, tokio::sync::watch::channel(false).1)
         .await
         .expect("server start failed");
 

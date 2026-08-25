@@ -2772,11 +2772,31 @@ pub(crate) async fn shutdown_signal() {
     }
 }
 
+/// Spawn the process-wide shutdown coordinator: a single task that waits for
+/// an OS shutdown signal (SIGINT/SIGTERM/SIGHUP) and flips the returned watch
+/// channel to `true`. Every listener observes the same channel, so a signal
+/// arriving before a listener is bound is still seen by it — unlike
+/// per-listener one-shot signal receivers, which miss signals delivered
+/// before they were installed.
+pub fn spawn_shutdown_coordinator() -> tokio::sync::watch::Receiver<bool> {
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        shutdown_signal().await;
+        let _ = tx.send(true);
+    });
+    rx
+}
+
 /// Start the HTTP server and return the bound address.
-/// The server runs until the provided shutdown signal completes.
+/// The server runs until the shutdown watch channel flips to `true`
+/// (see [`spawn_shutdown_coordinator`]); a channel already at `true`
+/// shuts the server down immediately. If the sender is dropped without
+/// ever signaling (e.g. tests that never shut down), the server keeps
+/// running, matching the old never-fired signal behavior.
 pub async fn start_server(
     router: Router,
     addr: SocketAddr,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> std::io::Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
@@ -2784,7 +2804,13 @@ pub async fn start_server(
 
     let handle = tokio::spawn(async move {
         axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(async move {
+                // `wait_for` resolves immediately if the channel is already
+                // `true`, so a listener bound after the signal still drains.
+                if shutdown.wait_for(|v| *v).await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            })
             .await
             .ok();
     });
@@ -2985,6 +3011,35 @@ mod tests {
         assert_eq!(merged.version.as_deref(), Some("0.1.0"));
         assert_eq!(merged.user_agent.as_deref(), Some("claude-desktop/0.7"));
         assert_eq!(merged.origin.as_deref(), Some("https://claude.ai"));
+    }
+
+    #[tokio::test]
+    async fn start_server_drains_when_shutdown_flips_after_bind() {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let (_addr, handle) = start_server(Router::new(), "127.0.0.1:0".parse().unwrap(), rx)
+            .await
+            .unwrap();
+        tx.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("server did not drain after shutdown was signaled")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_server_bound_after_shutdown_signal_still_drains() {
+        // Regression: a listener bound *after* the shutdown signal fired must
+        // still observe it. With per-listener one-shot signal receivers it
+        // would wait forever; the shared watch channel resolves immediately.
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        tx.send(true).unwrap();
+        let (_addr, handle) = start_server(Router::new(), "127.0.0.1:0".parse().unwrap(), rx)
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("late-bound server did not observe pre-existing shutdown signal")
+            .unwrap();
     }
 
     #[tokio::test]

@@ -85,7 +85,7 @@ async fn setup_server(write_roots: Vec<PathBuf>) -> (SocketAddr, tokio::task::Jo
     };
     let router = build_router(state);
     let addr: SocketAddr = ([127, 0, 0, 1], 0).into();
-    let (bound_addr, handle) = start_server(router, addr)
+    let (bound_addr, handle) = start_server(router, addr, tokio::sync::watch::channel(false).1)
         .await
         .expect("server start failed");
     (bound_addr, handle)
