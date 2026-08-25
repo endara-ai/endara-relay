@@ -5,9 +5,10 @@
 //! private-scope addresses may be listed: IPv4 RFC 1918 (`10.0.0.0/8`,
 //! `172.16.0.0/12`, `192.168.0.0/16`), IPv4 CGNAT `100.64.0.0/10`
 //! (Tailscale), and IPv6 unique-local `fc00::/7`. Wildcards (`0.0.0.0`,
-//! `::`), public addresses, multicast, broadcast, and link-local addresses
-//! are never bound. Entries that fail the check are skipped with a warning
-//! instead of aborting startup — loopback remains the guaranteed listener.
+//! `::`), public addresses, multicast, broadcast, link-local, and loopback
+//! addresses are never bound (loopback is redundant with the always-bound
+//! listener). Entries that fail the check are skipped with a warning instead
+//! of aborting startup — loopback remains the guaranteed listener.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tracing::warn;
@@ -17,8 +18,8 @@ use tracing::warn;
 pub enum ListenIpClass {
     /// Private-scope address the relay may bind: RFC 1918, CGNAT, or ULA.
     Eligible,
-    /// Loopback — accepted, but redundant with the always-bound loopback
-    /// listener.
+    /// Loopback — never bound as an extra listener: redundant with the
+    /// always-bound `127.0.0.1` and outside the private/CGNAT/ULA allowlist.
     Loopback,
     /// Never bound; carries the reason for the startup warning.
     Ineligible(&'static str),
@@ -116,11 +117,11 @@ pub fn eligible_ip_kind(ip: IpAddr) -> Option<&'static str> {
 }
 
 /// Shared acceptance core for `[relay] listen_ips`: trim + parse each entry,
-/// drop unparseable and ineligible entries as well as the default
-/// `127.0.0.1`, and dedupe on the parsed `IpAddr` (so equivalent spellings
-/// like `fd12:0:0::1` and `fd12::1` collapse). `warn_on_skip` gates the
-/// startup warnings so read-only callers (the management API echo) stay
-/// silent.
+/// drop unparseable, ineligible, and loopback entries (loopback is redundant
+/// with the always-bound `127.0.0.1` listener), and dedupe on the parsed
+/// `IpAddr` (so equivalent spellings like `fd12:0:0::1` and `fd12::1`
+/// collapse). `warn_on_skip` gates the startup warnings so read-only callers
+/// (the management API echo) stay silent.
 fn accepted_listen_ips(listen_ips: Option<&[String]>, warn_on_skip: bool) -> Vec<IpAddr> {
     let mut ips: Vec<IpAddr> = Vec::new();
     for entry in listen_ips.unwrap_or_default() {
@@ -152,8 +153,16 @@ fn accepted_listen_ips(listen_ips: Option<&[String]>, warn_on_skip: bool) -> Vec
                 }
                 continue;
             }
-            ListenIpClass::Loopback if ip == IpAddr::V4(Ipv4Addr::LOCALHOST) => continue,
-            ListenIpClass::Loopback | ListenIpClass::Eligible => {}
+            ListenIpClass::Loopback => {
+                if warn_on_skip && ip != IpAddr::V4(Ipv4Addr::LOCALHOST) {
+                    warn!(
+                        entry = %entry,
+                        "Ignoring loopback [relay] listen_ips entry; 127.0.0.1 is always bound and only RFC 1918, CGNAT (100.64.0.0/10), and IPv6 ULA (fc00::/7) addresses may be added"
+                    );
+                }
+                continue;
+            }
+            ListenIpClass::Eligible => {}
         }
         if !ips.contains(&ip) {
             ips.push(ip);
@@ -165,10 +174,10 @@ fn accepted_listen_ips(listen_ips: Option<&[String]>, warn_on_skip: bool) -> Vec
 /// Resolve `[relay] listen_ips` into the extra socket addresses to bind
 /// alongside the always-bound `127.0.0.1:port` listener.
 ///
-/// Unparseable or ineligible entries are skipped with a `warn!` rather than
-/// aborting startup. Loopback entries are accepted (a non-default loopback
-/// address like `::1` is bound), but the default `127.0.0.1` itself and
-/// duplicate entries are dropped so no address is ever bound twice.
+/// Unparseable, ineligible, and loopback entries are skipped with a `warn!`
+/// rather than aborting startup (the default `127.0.0.1` is dropped
+/// silently — it is exactly what the primary listener binds), and duplicate
+/// entries are dropped so no address is ever bound twice.
 pub fn resolve_extra_listen_addrs(listen_ips: Option<&[String]>, port: u16) -> Vec<SocketAddr> {
     accepted_listen_ips(listen_ips, true)
         .into_iter()
@@ -179,10 +188,10 @@ pub fn resolve_extra_listen_addrs(listen_ips: Option<&[String]>, port: u16) -> V
 /// Canonicalize `[relay] listen_ips` for the management API's
 /// `GET /api/network-interfaces` toggle-state echo: the same acceptance
 /// rules as [`resolve_extra_listen_addrs`] (trim, parse, drop
-/// unparseable/ineligible entries and the default `127.0.0.1`, dedupe),
-/// rendered via `IpAddr`'s canonical `Display` so entries compare equal to
-/// the interface list's `ip` strings. Emits no warnings — this is a
-/// read-side view, not startup validation.
+/// unparseable/ineligible/loopback entries, dedupe), rendered via
+/// `IpAddr`'s canonical `Display` so entries compare equal to the interface
+/// list's `ip` strings. Emits no warnings — this is a read-side view, not
+/// startup validation.
 pub fn canonical_listen_ips(listen_ips: Option<&[String]>) -> Vec<String> {
     accepted_listen_ips(listen_ips, false)
         .into_iter()
@@ -312,8 +321,9 @@ mod tests {
     }
 
     #[test]
-    fn non_default_loopback_entry_is_accepted() {
-        assert_eq!(resolve(&["::1"], 9400), vec!["[::1]:9400".parse().unwrap()]);
+    fn all_loopback_entries_are_dropped() {
+        assert!(resolve(&["::1"], 9400).is_empty());
+        assert!(resolve(&["127.0.0.2"], 9400).is_empty());
     }
 
     #[test]
@@ -375,8 +385,8 @@ mod tests {
     }
 
     #[test]
-    fn canonical_listen_ips_keeps_non_default_loopback_like_binding() {
-        assert_eq!(canonical(&["::1"]), vec!["::1".to_string()]);
+    fn canonical_listen_ips_drops_loopback_like_binding() {
+        assert!(canonical(&["::1", "127.0.0.2"]).is_empty());
     }
 
     #[test]
