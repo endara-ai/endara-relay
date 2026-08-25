@@ -923,9 +923,10 @@ async fn main() {
             // Always bind loopback; the relay is a local-only service unless
             // `[relay] listen_ips` opts additional private-scope IPs in
             // (ineligible entries are skipped with a warning, never bound).
+            // Extra addresses are resolved after the loopback bind succeeds,
+            // against the port the kernel actually assigned, so `--port 0`
+            // keeps every listener on the same port.
             let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-            let extra_addrs =
-                listen_ips::resolve_extra_listen_addrs(cfg.relay.listen_ips.as_deref(), port);
 
             // Start the management listener on its IPC path. We do this
             // *before* binding the MCP TCP listener so that callers observing
@@ -1039,15 +1040,23 @@ async fn main() {
                 Ok((bound_addr, handle)) => {
                     info!(addr = %bound_addr, "MCP server running");
 
-                    // Bind each opted-in extra listener with the same router.
-                    // A bind failure here (e.g. interface down) is non-fatal:
-                    // loopback remains the guaranteed listener. Dropping the
-                    // extra handle detaches the server task, which runs until
-                    // the shared graceful-shutdown signal fires.
+                    // Resolve extras against the *bound* port (not the CLI
+                    // value) so `--port 0` propagates the kernel-assigned
+                    // port to every extra listener, and bind each one with
+                    // the same router. A bind failure here (e.g. interface
+                    // down) is non-fatal: loopback remains the guaranteed
+                    // listener. Handles are retained so shutdown awaits
+                    // every listener's graceful drain, not just loopback's.
+                    let extra_addrs = listen_ips::resolve_extra_listen_addrs(
+                        cfg.relay.listen_ips.as_deref(),
+                        bound_addr.port(),
+                    );
+                    let mut extra_handles = Vec::new();
                     for extra in extra_addrs {
                         match start_server(router.clone(), extra).await {
-                            Ok((extra_addr, _extra_handle)) => {
+                            Ok((extra_addr, extra_handle)) => {
                                 info!(addr = %extra_addr, "MCP server additionally listening");
+                                extra_handles.push(extra_handle);
                             }
                             Err(e) => {
                                 warn!(addr = %extra, error = %e, "Failed to bind extra listen_ips address; continuing without it");
@@ -1072,6 +1081,13 @@ async fn main() {
                     );
 
                     handle.await.ok();
+                    // Each extra listener shares the same graceful-shutdown
+                    // signal; await its drain too before tearing down
+                    // adapters so in-flight requests on extra listeners are
+                    // not interrupted.
+                    for extra_handle in extra_handles {
+                        extra_handle.await.ok();
+                    }
 
                     // Shut down all adapters gracefully (kills STDIO child processes, etc.)
                     info!("Shutting down all adapters");

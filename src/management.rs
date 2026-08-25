@@ -619,7 +619,11 @@ pub struct NetworkInterfaceInfo {
 #[derive(Serialize)]
 struct NetworkInterfacesResponse {
     interfaces: Vec<NetworkInterfaceInfo>,
-    /// Echo of `[relay] listen_ips` so the UI can render toggle state.
+    /// Canonicalized echo of `[relay] listen_ips` so the UI can render
+    /// toggle state: parsed, eligibility-filtered, and deduplicated with the
+    /// same rules the relay uses to bind (`canonical_listen_ips`), so every
+    /// entry compares equal to an interface `ip` string and no malformed or
+    /// non-bindable configured value leaks into the payload.
     listen_ips: Vec<String>,
 }
 
@@ -670,14 +674,9 @@ async fn get_network_interfaces(State(state): State<ManagementState>) -> impl In
         }
     };
     let interfaces = filter_network_interfaces(&candidates);
-    let listen_ips = state
-        .config
-        .read()
-        .await
-        .relay
-        .listen_ips
-        .clone()
-        .unwrap_or_default();
+    let listen_ips = crate::listen_ips::canonical_listen_ips(
+        state.config.read().await.relay.listen_ips.as_deref(),
+    );
     Json(NetworkInterfacesResponse {
         interfaces,
         listen_ips,
@@ -7613,7 +7612,18 @@ mod tests {
         let state = test_state(vec![]).await;
         {
             let mut cfg = state.config.write().await;
-            cfg.relay.listen_ips = Some(vec!["100.101.102.103".to_string()]);
+            // Deliberately messy: whitespace, a non-canonical IPv6 spelling
+            // plus its canonical duplicate, a public address, an unparseable
+            // entry, and the default loopback. The echo must apply the same
+            // parse/filter/canonicalize/dedupe rules used for binding.
+            cfg.relay.listen_ips = Some(vec![
+                " fd12:0:0::1 ".to_string(),
+                "fd12::1".to_string(),
+                "8.8.8.8".to_string(),
+                "not-an-ip".to_string(),
+                "100.101.102.103".to_string(),
+                "127.0.0.1".to_string(),
+            ]);
         }
         let app = management_routes(state);
         let resp = app
@@ -7626,7 +7636,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
-        assert_eq!(body["listen_ips"], serde_json::json!(["100.101.102.103"]));
+        assert_eq!(
+            body["listen_ips"],
+            serde_json::json!(["fd12::1", "100.101.102.103"])
+        );
         // Interface content is machine-dependent, but the filtering invariant
         // is not: no loopback/unspecified/link-local/public address may
         // appear, and every entry re-classifies as eligible.

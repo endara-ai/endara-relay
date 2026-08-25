@@ -115,6 +115,42 @@ pub fn eligible_ip_kind(ip: IpAddr) -> Option<&'static str> {
     })
 }
 
+/// Shared acceptance core for `[relay] listen_ips`: trim + parse each entry,
+/// drop unparseable and ineligible entries as well as the default
+/// `127.0.0.1`, and dedupe on the parsed `IpAddr` (so equivalent spellings
+/// like `fd12:0:0::1` and `fd12::1` collapse). `warn_on_skip` gates the
+/// startup warnings so read-only callers (the management API echo) stay
+/// silent.
+fn accepted_listen_ips(listen_ips: Option<&[String]>, warn_on_skip: bool) -> Vec<IpAddr> {
+    let mut ips: Vec<IpAddr> = Vec::new();
+    for entry in listen_ips.unwrap_or_default() {
+        let Ok(ip) = entry.trim().parse::<IpAddr>() else {
+            if warn_on_skip {
+                warn!(entry = %entry, "Ignoring unparseable [relay] listen_ips entry");
+            }
+            continue;
+        };
+        match classify_listen_ip(ip) {
+            ListenIpClass::Ineligible(reason) => {
+                if warn_on_skip {
+                    warn!(
+                        entry = %entry,
+                        reason,
+                        "Ignoring ineligible [relay] listen_ips entry; only RFC 1918, CGNAT (100.64.0.0/10), and IPv6 ULA (fc00::/7) addresses may be bound"
+                    );
+                }
+                continue;
+            }
+            ListenIpClass::Loopback if ip == IpAddr::V4(Ipv4Addr::LOCALHOST) => continue,
+            ListenIpClass::Loopback | ListenIpClass::Eligible => {}
+        }
+        if !ips.contains(&ip) {
+            ips.push(ip);
+        }
+    }
+    ips
+}
+
 /// Resolve `[relay] listen_ips` into the extra socket addresses to bind
 /// alongside the always-bound `127.0.0.1:port` listener.
 ///
@@ -123,30 +159,24 @@ pub fn eligible_ip_kind(ip: IpAddr) -> Option<&'static str> {
 /// address like `::1` is bound), but the default `127.0.0.1` itself and
 /// duplicate entries are dropped so no address is ever bound twice.
 pub fn resolve_extra_listen_addrs(listen_ips: Option<&[String]>, port: u16) -> Vec<SocketAddr> {
-    let mut addrs: Vec<SocketAddr> = Vec::new();
-    for entry in listen_ips.unwrap_or_default() {
-        let Ok(ip) = entry.trim().parse::<IpAddr>() else {
-            warn!(entry = %entry, "Ignoring unparseable [relay] listen_ips entry");
-            continue;
-        };
-        match classify_listen_ip(ip) {
-            ListenIpClass::Ineligible(reason) => {
-                warn!(
-                    entry = %entry,
-                    reason,
-                    "Ignoring ineligible [relay] listen_ips entry; only RFC 1918, CGNAT (100.64.0.0/10), and IPv6 ULA (fc00::/7) addresses may be bound"
-                );
-                continue;
-            }
-            ListenIpClass::Loopback if ip == IpAddr::V4(Ipv4Addr::LOCALHOST) => continue,
-            ListenIpClass::Loopback | ListenIpClass::Eligible => {}
-        }
-        let addr = SocketAddr::new(ip, port);
-        if !addrs.contains(&addr) {
-            addrs.push(addr);
-        }
-    }
-    addrs
+    accepted_listen_ips(listen_ips, true)
+        .into_iter()
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect()
+}
+
+/// Canonicalize `[relay] listen_ips` for the management API's
+/// `GET /api/network-interfaces` toggle-state echo: the same acceptance
+/// rules as [`resolve_extra_listen_addrs`] (trim, parse, drop
+/// unparseable/ineligible entries and the default `127.0.0.1`, dedupe),
+/// rendered via `IpAddr`'s canonical `Display` so entries compare equal to
+/// the interface list's `ip` strings. Emits no warnings — this is a
+/// read-side view, not startup validation.
+pub fn canonical_listen_ips(listen_ips: Option<&[String]>) -> Vec<String> {
+    accepted_listen_ips(listen_ips, false)
+        .into_iter()
+        .map(|ip| ip.to_string())
+        .collect()
 }
 
 #[cfg(test)]
@@ -281,6 +311,53 @@ mod tests {
             resolve(&[" 10.0.0.7 ", "10.0.0.7"], 9400),
             vec!["10.0.0.7:9400".parse().unwrap()]
         );
+    }
+
+    fn canonical(entries: &[&str]) -> Vec<String> {
+        let owned: Vec<String> = entries.iter().map(|s| s.to_string()).collect();
+        canonical_listen_ips(Some(&owned))
+    }
+
+    #[test]
+    fn canonical_listen_ips_trims_and_canonicalizes() {
+        assert_eq!(
+            canonical(&[" fd12:0:0::1 ", " 10.0.0.7"]),
+            vec!["fd12::1".to_string(), "10.0.0.7".to_string()]
+        );
+    }
+
+    #[test]
+    fn canonical_listen_ips_dedupes_equivalent_spellings() {
+        assert_eq!(
+            canonical(&["fd12:0:0::1", "fd12::1", "fd12:0000::1"]),
+            vec!["fd12::1".to_string()]
+        );
+    }
+
+    #[test]
+    fn canonical_listen_ips_drops_what_binding_would_not_accept() {
+        assert_eq!(
+            canonical(&["8.8.8.8", "0.0.0.0", "not-an-ip", "127.0.0.1"]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn canonical_listen_ips_keeps_non_default_loopback_like_binding() {
+        assert_eq!(canonical(&["::1"]), vec!["::1".to_string()]);
+    }
+
+    #[test]
+    fn canonical_listen_ips_matches_resolve_extra_listen_addrs() {
+        let entries: Vec<String> = [" fd12:0:0::1 ", "192.168.1.5", "8.8.8.8", "127.0.0.1"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let bound: Vec<String> = resolve_extra_listen_addrs(Some(&entries), 9400)
+            .iter()
+            .map(|a| a.ip().to_string())
+            .collect();
+        assert_eq!(canonical_listen_ips(Some(&entries)), bound);
     }
 
     fn kind(s: &str) -> Option<&'static str> {
