@@ -660,7 +660,10 @@ pub fn filter_network_interfaces(
 /// configured `[relay] listen_ips` for toggle state.
 async fn get_network_interfaces(State(state): State<ManagementState>) -> impl IntoResponse {
     let candidates: Vec<(String, std::net::IpAddr)> = match if_addrs::get_if_addrs() {
-        Ok(ifaces) => ifaces.into_iter().map(|i| (i.name.clone(), i.ip())).collect(),
+        Ok(ifaces) => ifaces
+            .into_iter()
+            .map(|i| (i.name.clone(), i.ip()))
+            .collect(),
         Err(e) => {
             warn!(error = %e, "Failed to enumerate network interfaces");
             Vec::new()
@@ -7623,10 +7626,7 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_json(resp).await;
-        assert_eq!(
-            body["listen_ips"],
-            serde_json::json!(["100.101.102.103"])
-        );
+        assert_eq!(body["listen_ips"], serde_json::json!(["100.101.102.103"]));
         // Interface content is machine-dependent, but the filtering invariant
         // is not: no loopback/unspecified/link-local/public address may
         // appear, and every entry re-classifies as eligible.

@@ -260,10 +260,7 @@ mod tests {
     #[test]
     fn ineligible_and_unparseable_entries_are_skipped() {
         assert_eq!(
-            resolve(
-                &["8.8.8.8", "0.0.0.0", "::", "not-an-ip", "10.1.2.3"],
-                9400
-            ),
+            resolve(&["8.8.8.8", "0.0.0.0", "::", "not-an-ip", "10.1.2.3"], 9400),
             vec!["10.1.2.3:9400".parse().unwrap()]
         );
     }
