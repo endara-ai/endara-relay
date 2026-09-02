@@ -652,11 +652,18 @@ impl HttpAdapter {
     /// `health` write lock so they transition atomically with respect to
     /// [`Self::note_transport_failure`] — there is no interleaving that can
     /// leave the counter and health disagreeing.
+    ///
+    /// On an actual `Unhealthy` → `Healthy` flip (only — not on every
+    /// success) a `tools_changed` tick is emitted so the registry invalidates
+    /// any merged catalog rebuilt without this endpoint's tools during the
+    /// outage. Mirrors the SSE adapter's post-reconnect tick. `SendError`
+    /// (no subscribers) is harmless — drop it.
     async fn note_request_success(&self) {
         let mut health = self.health.write().await;
         self.transport_failures.store(0, Ordering::SeqCst);
         if matches!(*health, HealthStatus::Unhealthy(_)) {
             *health = HealthStatus::Healthy;
+            let _ = self.tools_changed_tx.send(());
         }
     }
 
@@ -2816,6 +2823,47 @@ mod tests {
             adapter.transport_failures.load(Ordering::SeqCst),
             0,
             "a successful request must reset the failure counter"
+        );
+
+        server.abort();
+    }
+
+    /// Reactive-health recovery must emit a `tools_changed` tick so the
+    /// registry invalidates the merged catalog that may have been rebuilt
+    /// without this endpoint's tools during the outage — and ONLY on the
+    /// actual Unhealthy→Healthy flip, not on every success.
+    #[tokio::test]
+    async fn recovery_flip_emits_tools_changed_tick_once() {
+        // GET 405 so the test doesn't depend on the SSE channel; POST returns ok.
+        let (url, server) = start_fake_http_server(true).await;
+        let adapter = HttpAdapter::new(HttpConfig::new(url));
+        let mut rx = adapter.subscribe_tools_changed().expect("Some receiver");
+        // Simulate a prior run of transport failures that demoted the adapter.
+        *adapter.health.write().await = HealthStatus::Unhealthy("upstream unreachable".into());
+        adapter.transport_failures.store(5, Ordering::SeqCst);
+
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("live server should answer successfully");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert!(
+            rx.try_recv().is_ok(),
+            "Unhealthy→Healthy flip must emit a tools_changed tick"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the flip must emit exactly one tick"
+        );
+
+        // A further success while already Healthy must NOT tick.
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("live server should answer successfully");
+        assert!(
+            rx.try_recv().is_err(),
+            "a success while already Healthy must not emit a tick"
         );
 
         server.abort();
