@@ -318,10 +318,15 @@ pub struct OAuthAdapterInner {
     /// (e.g. an OAuth callback re-login under a different account/scope, see
     /// PR #140 review) without spamming clients with `list_changed` on
     /// routine token refreshes. `None` until a probe succeeds; cleared when
-    /// the inner adapter is torn down AND whenever the forwarder relays an
+    /// the inner adapter is torn down, whenever the forwarder relays an
     /// inner `tools_changed` tick (the upstream drifted from the probed
     /// baseline, so the next Some→Some swap must tick to be safe — see
-    /// `swap_tools_forwarder`). `Arc` so the forwarder task can share it.
+    /// `swap_tools_forwarder`), AND on any transition into a degraded state
+    /// (`AuthRequired`/`ConnectionFailed`/`Disconnected` — the registry may
+    /// rebuild the merged catalog without this endpoint's tools while
+    /// degraded, so the recovery apply must tick even if the tool set is
+    /// unchanged; see `transition_to`). `Arc` so the forwarder task can
+    /// share it.
     last_tools_fingerprint: Arc<RwLock<Option<u64>>>,
     /// Serializes [`Self::apply_tokens`] end-to-end. The OAuth callback,
     /// proactive refresh, and reactive (401) refresh can all apply tokens
@@ -402,6 +407,18 @@ impl OAuthAdapterInner {
     /// records it in the ring buffer, emits a tracing event, and updates
     /// the state.
     pub async fn transition_to(&self, new_state: OAuthState, reason: &str) {
+        // Entering a degraded state means the registry may rebuild the
+        // merged catalog without this endpoint's tools; clear the
+        // fingerprint baseline so the next successful `apply_tokens` hits
+        // the `(None, Some(_))` branch and ticks even when the tool set is
+        // unchanged. `Refreshing`/`Authenticated` keep the baseline so
+        // routine refreshes stay silent (PR #140 review).
+        if matches!(
+            new_state,
+            OAuthState::AuthRequired | OAuthState::ConnectionFailed | OAuthState::Disconnected
+        ) {
+            *self.last_tools_fingerprint.write().await = None;
+        }
         let mut state = self.state.write().await;
         let mut history = self.transition_history.write().await;
         let old = do_transition(&mut state, new_state.clone(), reason, &mut history);
@@ -4707,6 +4724,59 @@ mod tests {
             recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
             "Some→None inner readiness transition must emit a synthetic outer tick"
         );
+    }
+
+    /// Regression: a transition into a degraded state (e.g. a refresh
+    /// failure landing in `AuthRequired`) must clear the fingerprint
+    /// baseline. While degraded the registry may rebuild the merged catalog
+    /// without this endpoint's tools, so the recovery `apply_tokens` must
+    /// tick even when the probed tool set is UNCHANGED — without the clear,
+    /// the A==A comparison would suppress the tick and leave the endpoint's
+    /// tools missing from the catalog until an unrelated invalidation.
+    #[tokio::test]
+    async fn degraded_transition_clears_fingerprint_so_recovery_apply_ticks() {
+        let tool_name = Arc::new(std::sync::RwLock::new("alpha".to_string()));
+        let (url, server) = spawn_mcp_server_with_mutable_tools(tool_name.clone()).await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+
+        // Baseline: apply with tool set A → fingerprint stored.
+        adapter.inner.apply_tokens(make_token_set("first")).await;
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "None→Some must tick"
+        );
+        assert!(
+            adapter.inner.last_tools_fingerprint.read().await.is_some(),
+            "baseline fingerprint must be stored after a successful probe"
+        );
+        drain(&mut outer_rx).await;
+
+        // Simulate a refresh failure: the adapter degrades to AuthRequired
+        // (same transition `do_token_refresh` performs on a non-2xx token
+        // response).
+        adapter
+            .inner
+            .transition_to(OAuthState::AuthRequired, "test: refresh failure")
+            .await;
+        assert!(
+            adapter.inner.last_tools_fingerprint.read().await.is_none(),
+            "degrading to AuthRequired must clear the fingerprint baseline"
+        );
+
+        // Recovery re-login reproducing the SAME tool set A: the baseline is
+        // unknown, so the Some→Some swap must tick so the registry restores
+        // the endpoint's tools to the merged catalog.
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "recovery apply after a degraded state must tick even if the \
+             probed set matches the pre-failure baseline"
+        );
+        server.abort();
     }
 
     /// Spawn an in-process MCP server that also answers `tools/list` with a
