@@ -59,6 +59,10 @@ pub(super) fn open_root(path: &Path) -> io::Result<OwnedFd> {
 /// `O_CREAT` is not supported — create files through the directory handle
 /// returned by [`open_dir_beneath_creating`] instead. A symlink component
 /// surfaces as `ELOOP`, on both the `openat2` and the walk paths.
+// `allow(dead_code)`: the readFile call site lands in a follow-up change;
+// keep the allow until then so both targets stay warning-clean under
+// `clippy -D warnings`.
+#[allow(dead_code)]
 pub(super) fn open_beneath(
     root: BorrowedFd<'_>,
     rel_path: &Path,
@@ -220,12 +224,14 @@ fn validated_components(rel_path: &Path) -> io::Result<Vec<&OsStr>> {
     Ok(out)
 }
 
-fn c_string(s: &OsStr) -> io::Result<CString> {
+pub(super) fn c_string(s: &OsStr) -> io::Result<CString> {
     CString::new(s.as_bytes())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL byte"))
 }
 
-fn openat(
+/// `openat(2)` of `name` relative to `dirfd`; the caller supplies every flag
+/// (including `O_CLOEXEC`/`O_NOFOLLOW`) and the creation `mode`.
+pub(super) fn openat(
     dirfd: libc::c_int,
     name: &OsStr,
     flags: libc::c_int,

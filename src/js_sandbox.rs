@@ -22,11 +22,8 @@ use tracing::Instrument;
 use crate::adapter::{AdapterError, ToolInfo};
 use crate::registry::MetaToolRegistry;
 
-// Beneath-root open primitives for readFile/writeFile. The call sites land
-// in follow-up changes; keep the allow until then so both targets stay
-// warning-clean under `clippy -D warnings`.
+// Beneath-root open primitives for readFile/writeFile.
 #[cfg(unix)]
-#[allow(dead_code)]
 mod open_beneath;
 
 // ---------------------------------------------------------------------------
@@ -1264,26 +1261,151 @@ fn write_dirs_rejection_message(op: &str, path_str: &str, write_roots: &[PathBuf
     msg
 }
 
-/// Write `bytes` to `dest` via a temp file in the destination directory plus
-/// an atomic rename, creating missing parent directories first. `dest` must
-/// already be validated by [`resolve_write_path`] against `root` (the
-/// allowlisted root it matched), so any directories created here sit inside
-/// that root. After `create_dir_all` the destination directory is
-/// re-canonicalized and containment is re-asserted, closing the
-/// validate→write window in which a checked directory could be swapped for
-/// a symlink pointing outside the root. If the root itself was deleted
-/// after config resolution, `create_dir_all` recreates it — still inside
-/// the allowed prefix; the "directories are never auto-created" stance in
-/// [`crate::config::resolve_write_roots`] only covers resolution time. On
-/// failure the temp file is removed — no partial destination file is ever
-/// observable.
-fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
+/// Split `dest` into its parent directory and file name for [`write_atomic`].
+fn split_write_dest(dest: &Path) -> Result<(&Path, &std::ffi::OsStr), String> {
     let dir = dest
         .parent()
         .ok_or_else(|| format!("writeFile: '{}' has no parent directory", dest.display()))?;
     let file_name = dest
         .file_name()
         .ok_or_else(|| format!("writeFile: '{}' does not name a file", dest.display()))?;
+    Ok((dir, file_name))
+}
+
+/// Unique temp-file name next to `file_name` for [`write_atomic`].
+fn write_tmp_name(file_name: &std::ffi::OsStr) -> String {
+    // Process-wide monotonic counter: concurrent writes to the same
+    // destination can observe the same SystemTime, so the timestamp alone
+    // does not make the temp name unique within this process.
+    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        ".{}.{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        unique,
+        seq
+    )
+}
+
+/// Write `bytes` to `dest` via a temp file in the destination directory plus
+/// an atomic rename, creating missing parent directories first. `dest` must
+/// already be validated by [`resolve_write_path`] against `root` (the
+/// allowlisted root it matched). Every filesystem step is anchored to a
+/// directory handle of `root`: missing parents are created with `mkdirat`
+/// along an `openat` walk that refuses to follow symlinks
+/// ([`open_beneath::open_dir_beneath_creating`]), the temp file is created
+/// with `openat(O_CREAT | O_EXCL)` on the destination directory handle, and
+/// the publish is a `renameat` on that same handle. Because `dest` is
+/// canonical, any symlink the walk meets is a post-validation swap and fails
+/// the write — nothing is created or written outside the root, no matter
+/// how the path is re-pointed concurrently. If the root itself was deleted
+/// after config resolution the write fails (the root handle cannot be
+/// opened); the "directories are never auto-created" stance in
+/// [`crate::config::resolve_write_roots`] only covers resolution time. On
+/// failure the temp file is removed — no partial destination file is ever
+/// observable.
+#[cfg(unix)]
+fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
+    use std::os::unix::io::{AsFd as _, AsRawFd as _};
+
+    let (dir, file_name) = split_write_dest(dest)?;
+    let escaped = || {
+        format!(
+            "writeFile: '{}' escaped the configured write directory during the write",
+            dest.display()
+        )
+    };
+    let rel_dir = dir.strip_prefix(root).map_err(|_| escaped())?;
+    let parent_dirs_error = |e: std::io::Error| {
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            return escaped();
+        }
+        format!(
+            "writeFile: failed to create parent directories for '{}': {}",
+            dest.display(),
+            e
+        )
+    };
+    let root_fd = open_beneath::open_root(root).map_err(parent_dirs_error)?;
+    let dir_fd = open_beneath::open_dir_beneath_creating(root_fd.as_fd(), rel_dir)
+        .map_err(parent_dirs_error)?;
+    let tmp = std::ffi::OsString::from(write_tmp_name(file_name));
+    // O_EXCL guarantees this call exclusively owns the temp file even if the
+    // name somehow collides (e.g. across processes); 0o666 matches what
+    // `OpenOptions::create_new` would apply before the umask.
+    let write_result = open_beneath::openat(
+        dir_fd.as_raw_fd(),
+        &tmp,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+        0o666,
+    )
+    .map(std::fs::File::from)
+    .and_then(|mut f| std::io::Write::write_all(&mut f, bytes));
+    if let Err(e) = write_result {
+        let _ = unlinkat(dir_fd.as_raw_fd(), &tmp);
+        return Err(format!(
+            "writeFile: failed to write '{}': {}",
+            dest.display(),
+            e
+        ));
+    }
+    if let Err(e) = renameat(dir_fd.as_raw_fd(), &tmp, file_name) {
+        let _ = unlinkat(dir_fd.as_raw_fd(), &tmp);
+        return Err(format!(
+            "writeFile: failed to finalise '{}': {}",
+            dest.display(),
+            e
+        ));
+    }
+    Ok(())
+}
+
+/// `renameat(2)` of `from` to `to`, both relative to `dirfd`.
+#[cfg(unix)]
+fn renameat(
+    dirfd: libc::c_int,
+    from: &std::ffi::OsStr,
+    to: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    let c_from = open_beneath::c_string(from)?;
+    let c_to = open_beneath::c_string(to)?;
+    // SAFETY: `dirfd` is an open directory fd and both names are valid
+    // NUL-terminated strings that outlive the call.
+    let rc = unsafe { libc::renameat(dirfd, c_from.as_ptr(), dirfd, c_to.as_ptr()) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `unlinkat(2)` of the file `name` relative to `dirfd`.
+#[cfg(unix)]
+fn unlinkat(dirfd: libc::c_int, name: &std::ffi::OsStr) -> std::io::Result<()> {
+    let c_name = open_beneath::c_string(name)?;
+    // SAFETY: `dirfd` is an open directory fd and `c_name` a valid
+    // NUL-terminated string that outlives the call.
+    let rc = unsafe { libc::unlinkat(dirfd, c_name.as_ptr(), 0) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Non-unix [`write_atomic`]: after `create_dir_all` the destination
+/// directory is re-canonicalized and containment is re-asserted, narrowing
+/// (but not closing — this platform has no beneath-root open) the
+/// validate→write window in which a checked directory could be swapped for
+/// a symlink pointing outside the root. If the root itself was deleted after
+/// config resolution, `create_dir_all` recreates it — still inside the
+/// allowed prefix.
+#[cfg(not(unix))]
+fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
+    let (dir, file_name) = split_write_dest(dest)?;
     std::fs::create_dir_all(dir).map_err(|e| {
         format!(
             "writeFile: failed to create parent directories for '{}': {}",
@@ -1300,22 +1422,7 @@ fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
         ));
     }
     let final_dest = canonical_dir.join(file_name);
-    // Process-wide monotonic counter: concurrent writes to the same
-    // destination can observe the same SystemTime, so the timestamp alone
-    // does not make the temp name unique within this process.
-    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp = canonical_dir.join(format!(
-        ".{}.{}.{}.{}.tmp",
-        file_name.to_string_lossy(),
-        std::process::id(),
-        unique,
-        seq
-    ));
+    let tmp = canonical_dir.join(write_tmp_name(file_name));
     // create_new(true) guarantees this call exclusively owns the temp file
     // even if the name somehow collides (e.g. across processes).
     let write_result = std::fs::OpenOptions::new()
@@ -3388,6 +3495,70 @@ mod tests {
             msg
         );
         assert!(dir_entries(outside.path()).is_empty());
+    }
+
+    /// Simulates the validate→write race: `dest` is the canonical path
+    /// `resolve_write_path` produced, but by the time `write_atomic` runs an
+    /// intermediate component has been swapped for a symlink (out of the root,
+    /// and — separately — to a directory inside it). The dirfd-anchored walk
+    /// must reject the swap at every depth and create nothing anywhere: no
+    /// parents, no temp file, no destination.
+    #[cfg(unix)]
+    #[test]
+    fn test_write_atomic_rejects_intermediate_symlink_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::create_dir_all(root.join("keep/deep")).unwrap();
+        // "swapped" was validated as a real directory; now it is a link out.
+        std::os::unix::fs::symlink(outside.path(), root.join("swapped")).unwrap();
+        // A swap deeper in an existing chain.
+        std::os::unix::fs::symlink(outside.path(), root.join("keep/deep/out")).unwrap();
+        // A swap that stays inside the root is still a swap and still rejected.
+        std::os::unix::fs::symlink(root.join("real"), root.join("inner")).unwrap();
+
+        for rel in [
+            "swapped/x.txt",
+            "swapped/new/sub/x.txt",
+            "keep/deep/out/x.txt",
+            "keep/deep/out/new/x.txt",
+            "inner/x.txt",
+            "inner/new/x.txt",
+        ] {
+            let dest = root.join(rel);
+            let err = write_atomic(&dest, b"d", &root).unwrap_err();
+            assert!(
+                err.contains("escaped the configured write directory during the write"),
+                "{}: unexpected error: {}",
+                rel,
+                err
+            );
+        }
+        assert!(dir_entries(outside.path()).is_empty());
+        assert!(dir_entries(&root.join("real")).is_empty());
+        assert_eq!(
+            dir_entries(&root.join("keep/deep")),
+            vec!["out".to_string()]
+        );
+        assert_eq!(
+            dir_entries(&root),
+            vec![
+                "inner".to_string(),
+                "keep".to_string(),
+                "real".to_string(),
+                "swapped".to_string()
+            ]
+        );
+
+        // Sanity: a genuine (symlink-free) chain still gets created and written.
+        let ok_dest = root.join("keep/deep/fresh/x.txt");
+        write_atomic(&ok_dest, b"ok", &root).unwrap();
+        assert_eq!(std::fs::read(&ok_dest).unwrap(), b"ok");
+        assert_eq!(
+            dir_entries(&root.join("keep/deep/fresh")),
+            vec!["x.txt".to_string()]
+        );
     }
 
     #[tokio::test]
