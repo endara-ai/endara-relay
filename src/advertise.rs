@@ -45,6 +45,7 @@ pub const EXECUTE_TOOLS_BASE: &str = concat!(
     "Use `tools[\"tool_name\"](args)` only when you need the raw MCP envelope (`{ content, structuredContent, isError }`) — for example to inspect `isError` without throwing or to read the literal `content[0].text`. ",
     "Calling an unknown tool name throws an error that lists the closest matching tools. ",
     "Pass `{ retry: 3 }` as the third argument (e.g. `await call(\"name\", args, { retry: 3 })`) to retry transient errors on tools whose annotations declare `readOnlyHint` or `idempotentHint`. ",
+    "Scripts can also access files on the relay host with the `writeFile(absPath, data, opts?)` and `readFile(absPath, opts?)` globals — absolute paths only, `{ encoding: \"utf8\" }` (default) or `{ encoding: \"base64\" }` for binary data, and both are scoped to the user-configured `[relay] write_dirs` directories (with none configured, filesystem access is disabled). ",
     "Use `return` to send data back.\n\n",
     "Examples:\n",
     "```js\n",
@@ -67,6 +68,10 @@ pub const EXECUTE_TOOLS_BASE: &str = concat!(
     "// Use the tools[...] indexer when you need the raw MCP envelope.\n",
     "const r = await tools[\"todoist__get-tasks\"]({ limit: 5 });\n",
     "return r.structuredContent;\n",
+    "```\n",
+    "```js\n",
+    "// Fetch a binary file from an allowlisted directory as base64.\n",
+    "return readFile(\"/absolute/path/to/exports/photo.jpg\", { encoding: \"base64\" });\n",
     "```",
 );
 

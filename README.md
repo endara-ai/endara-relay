@@ -338,9 +338,9 @@ return { repos: repos.length, firstRepoIssues: issues };
 
 The JS sandbox is powered by [boa_engine](https://crates.io/crates/boa_engine) and runs entirely in-process — no external runtime needed.
 
-#### Writing files from the sandbox
+#### Reading and writing files from the sandbox
 
-Scripts can save results to disk with the `writeFile(absPath, data, opts?)` global — but only into directories you explicitly allowlist under `[relay] write_dirs` (absolute paths, `~/` shorthand accepted; also manageable from Endara Desktop's Settings). With no `write_dirs` configured, writing is disabled entirely.
+Scripts can save results to disk with the `writeFile(absPath, data, opts?)` global — but only into directories you explicitly allowlist under `[relay] write_dirs` (absolute paths, `~/` shorthand accepted; also manageable from Endara Desktop's Settings). With no `write_dirs` configured, filesystem access is disabled entirely.
 
 `writeFile` is synchronous: it returns the canonical path of the written file, and throws a JS `Error` on any rejection or failure — never leaving a partial file behind. `data` must be a string (objects are rejected, not coerced — `JSON.stringify` first).
 
@@ -354,6 +354,14 @@ writeFile("/absolute/path/to/exports/logo.png", pngBase64, { encoding: "base64" 
 - **Atomic writes** — data is written to a temp file in the destination directory and renamed into place, so readers never observe partial files.
 - **Encodings** — `utf8` (default) writes the string as-is; `base64` decodes the payload first.
 - **Per-run limits** — a single script run may write at most 64 files, 32 MB per file, and 256 MB in total; a breach throws before the offending file is written. The relay never deletes files it wrote.
+
+Scripts can also fetch files from the relay host with the `readFile(absPath, opts?)` global. It is scoped to the same `write_dirs` allowlist (same symlink-safe containment; no `write_dirs`, no reading) and is synchronous: it returns the file's contents as a string and throws a JS `Error` on any rejection or failure. `utf8` (default) returns the text as-is and rejects non-UTF-8 files; `base64` encodes the raw bytes, so a remote MCP client can retrieve binary files:
+
+```javascript
+return readFile("/absolute/path/to/exports/photo.jpg", { encoding: "base64" });
+```
+
+Reads have the same per-run limits as writes — at most 64 files, 32 MB per file (checked against the on-disk size before any bytes are read), and 256 MB in total per script run.
 
 ### TOON tool output
 
