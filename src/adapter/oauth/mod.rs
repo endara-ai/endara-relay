@@ -325,8 +325,12 @@ pub struct OAuthAdapterInner {
     /// (`AuthRequired`/`ConnectionFailed`/`Disconnected` — the registry may
     /// rebuild the merged catalog without this endpoint's tools while
     /// degraded, so the recovery apply must tick even if the tool set is
-    /// unchanged; see `transition_to`). `Arc` so the forwarder task can
-    /// share it.
+    /// unchanged). Both state writers perform the degraded-state clear via
+    /// [`Self::clear_fingerprint_on_degraded`]: `transition_to`, and
+    /// `transition_if_current` AFTER its grant-epoch check passes — a
+    /// stale grant's refresh failure is skipped entirely and must not wipe
+    /// the CURRENT grant's baseline (that would make the next routine
+    /// refresh tick spuriously). `Arc` so the forwarder task can share it.
     last_tools_fingerprint: Arc<RwLock<Option<u64>>>,
     /// Serializes [`Self::apply_tokens`] end-to-end. The OAuth callback,
     /// proactive refresh, and reactive (401) refresh can all apply tokens
@@ -400,6 +404,31 @@ impl OAuthAdapterInner {
         Some(hasher.finish())
     }
 
+    /// Clear the tools-fingerprint baseline when `new_state` is degraded
+    /// (`AuthRequired`/`ConnectionFailed`/`Disconnected`). Entering a
+    /// degraded state means the registry may rebuild the merged catalog
+    /// without this endpoint's tools; clearing the baseline makes the next
+    /// successful `apply_tokens` hit the `(None, Some(_))` branch and tick
+    /// even when the tool set is unchanged. `Refreshing`/`Authenticated`
+    /// keep the baseline so routine refreshes stay silent (PR #140 review).
+    ///
+    /// Called by both state writers ([`Self::transition_to`] and
+    /// [`Self::transition_if_current`]) inside the `state` write critical
+    /// section — and, in `transition_if_current`, only AFTER the
+    /// grant-epoch check passes: a stale grant's refresh failure must not
+    /// wipe the current grant's baseline. Nothing holds the fingerprint
+    /// lock while acquiring the state lock (the forwarder task and
+    /// `apply_tokens_inner` take it in standalone statements), so taking
+    /// it under the state write lock is deadlock-free.
+    async fn clear_fingerprint_on_degraded(&self, new_state: &OAuthState) {
+        if matches!(
+            new_state,
+            OAuthState::AuthRequired | OAuthState::ConnectionFailed | OAuthState::Disconnected
+        ) {
+            *self.last_tools_fingerprint.write().await = None;
+        }
+    }
+
     /// Transition to a new `OAuthState`.
     ///
     /// This is the **single writer** of `self.state`. It acquires the state
@@ -407,19 +436,11 @@ impl OAuthAdapterInner {
     /// records it in the ring buffer, emits a tracing event, and updates
     /// the state.
     pub async fn transition_to(&self, new_state: OAuthState, reason: &str) {
-        // Entering a degraded state means the registry may rebuild the
-        // merged catalog without this endpoint's tools; clear the
-        // fingerprint baseline so the next successful `apply_tokens` hits
-        // the `(None, Some(_))` branch and ticks even when the tool set is
-        // unchanged. `Refreshing`/`Authenticated` keep the baseline so
-        // routine refreshes stay silent (PR #140 review).
-        if matches!(
-            new_state,
-            OAuthState::AuthRequired | OAuthState::ConnectionFailed | OAuthState::Disconnected
-        ) {
-            *self.last_tools_fingerprint.write().await = None;
-        }
         let mut state = self.state.write().await;
+        // Inside the state write critical section so the baseline clear is
+        // atomic with the transition itself (no window where the state is
+        // degraded but the baseline still holds, or vice versa).
+        self.clear_fingerprint_on_degraded(&new_state).await;
         let mut history = self.transition_history.write().await;
         let old = do_transition(&mut state, new_state.clone(), reason, &mut history);
         // Bumped inside the write critical section so "generation
@@ -475,6 +496,10 @@ impl OAuthAdapterInner {
             );
             return false;
         }
+        // Epoch check passed: this failure belongs to the CURRENT grant, so
+        // the degraded-state baseline clear applies (a stale grant's
+        // failure returns above without touching the baseline).
+        self.clear_fingerprint_on_degraded(&new_state).await;
         let mut history = self.transition_history.write().await;
         let old = do_transition(&mut state, new_state.clone(), reason, &mut history);
         // Bumped inside the write critical section like every other state
@@ -4755,9 +4780,10 @@ mod tests {
         );
         drain(&mut outer_rx).await;
 
-        // Simulate a refresh failure: the adapter degrades to AuthRequired
-        // (same transition `do_token_refresh` performs on a non-2xx token
-        // response).
+        // Degrade via the unconditional writer, `transition_to` (post-#148
+        // the production refresh-failure paths degrade via
+        // `transition_if_current` instead — that path is pinned by
+        // `epoch_guarded_degraded_transition_clears_fingerprint` below).
         adapter
             .inner
             .transition_to(OAuthState::AuthRequired, "test: refresh failure")
@@ -4775,6 +4801,102 @@ mod tests {
             recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
             "recovery apply after a degraded state must tick even if the \
              probed set matches the pre-failure baseline"
+        );
+        server.abort();
+    }
+
+    /// Regression (PR #151 review): post-#148/#149 the production refresh
+    /// failure paths degrade via `transition_if_current`, which bypassed
+    /// the fingerprint clear that lived only in `transition_to` — so the
+    /// primary scenario (token refresh failed → AuthRequired → re-login
+    /// with an unchanged tool set) still suppressed the recovery tick.
+    /// Pins both halves of the epoch-guarded behavior: a CURRENT-epoch
+    /// degraded transition clears the baseline (recovery apply ticks), and
+    /// a STALE-epoch one is skipped without touching the current grant's
+    /// baseline (no spurious tick on the next routine refresh).
+    #[tokio::test]
+    async fn epoch_guarded_degraded_transition_clears_fingerprint() {
+        let tool_name = Arc::new(std::sync::RwLock::new("alpha".to_string()));
+        let (url, server) = spawn_mcp_server_with_mutable_tools(tool_name.clone()).await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+
+        // Baseline: apply with tool set A → fingerprint stored.
+        adapter.inner.apply_tokens(make_token_set("first")).await;
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "None→Some must tick"
+        );
+        assert!(
+            adapter.inner.last_tools_fingerprint.read().await.is_some(),
+            "baseline fingerprint must be stored after a successful probe"
+        );
+        drain(&mut outer_rx).await;
+
+        // Refresh failure against the CURRENT grant: degrade through the
+        // epoch-guarded path exactly as `do_token_refresh` does on a
+        // non-2xx token response.
+        let current_epoch = adapter.inner.current_grant_epoch();
+        assert!(
+            adapter
+                .inner
+                .transition_if_current(
+                    current_epoch,
+                    OAuthState::AuthRequired,
+                    "test: refresh failure (current epoch)",
+                )
+                .await,
+            "current-epoch transition must be performed"
+        );
+        assert!(
+            adapter.inner.last_tools_fingerprint.read().await.is_none(),
+            "current-epoch degradation via transition_if_current must clear \
+             the fingerprint baseline"
+        );
+
+        // Recovery re-login reproducing the SAME tool set A must tick.
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "recovery apply after an epoch-guarded degradation must tick \
+             even if the probed set matches the pre-failure baseline"
+        );
+        drain(&mut outer_rx).await;
+        assert!(
+            adapter.inner.last_tools_fingerprint.read().await.is_some(),
+            "recovery apply must re-establish the fingerprint baseline"
+        );
+
+        // A STALE grant's refresh failure (epoch bumped by the re-login
+        // above) must be skipped entirely: no transition, and the CURRENT
+        // grant's baseline stays intact — wiping it would make the next
+        // routine refresh tick spuriously.
+        assert!(
+            !adapter
+                .inner
+                .transition_if_current(
+                    current_epoch,
+                    OAuthState::AuthRequired,
+                    "test: refresh failure (stale epoch)",
+                )
+                .await,
+            "stale-epoch transition must be skipped"
+        );
+        assert!(
+            adapter.inner.last_tools_fingerprint.read().await.is_some(),
+            "stale-epoch transition_if_current must NOT clear the current \
+             grant's fingerprint baseline"
+        );
+
+        // And the next routine unchanged-tool-set refresh stays silent.
+        adapter.inner.apply_tokens(make_token_set("third")).await;
+        assert!(
+            !recv_tick(&mut outer_rx, Duration::from_millis(200)).await,
+            "unchanged Some→Some swap after a skipped stale-epoch \
+             transition must not emit a spurious tick"
         );
         server.abort();
     }
