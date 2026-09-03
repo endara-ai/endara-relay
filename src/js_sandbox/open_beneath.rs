@@ -276,18 +276,23 @@ fn validated_open_components(rel_path: &Path, final_flags: libc::c_int) -> io::R
 /// Open the directory `rel_dir` beneath `root`, creating any missing
 /// component with `mkdirat(2)` (mode `0o777`, subject to umask) and
 /// returning a handle to the final directory. `writeFile` creates its temp
-/// file and `renameat`s it relative to that handle, so nothing it does can
-/// land outside the root. An empty `rel_dir` returns a fresh handle to `root`
-/// itself. A pre-existing symlink anywhere in the chain is `ELOOP`.
+/// file and `renameat`s it relative to that handle, so none of its lookups
+/// can be redirected through a symlink or re-resolved from `/`. The handle is
+/// a capability: it was beneath the root when resolved, and the caller's
+/// later operations are anchored to it, not re-validated (see the module doc
+/// for the rename-out residual that leaves). An empty `rel_dir` returns a
+/// fresh handle to `root` itself. A pre-existing symlink anywhere in the
+/// chain is `ELOOP`.
 ///
 /// On Linux with `openat2`, every directory handle — including the one
 /// re-opened after each `mkdirat` — is resolved from `root` over the full
 /// accumulated relative path with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`,
 /// never chained off the previous handle. The kernel therefore re-checks
 /// containment of the whole prefix at every step and reports an
-/// intermediate renamed out of the root during resolution as `EXDEV`, so the
-/// write fails closed instead of following the moved directory. Elsewhere
-/// the portable walk ([`open_dir_beneath_creating_walk`]) is used.
+/// intermediate renamed out of the root during resolution as `EXDEV`, so
+/// this function fails closed instead of following the moved directory
+/// while it is still resolving. Elsewhere the portable walk
+/// ([`open_dir_beneath_creating_walk`]) is used.
 pub(super) fn open_dir_beneath_creating(
     root: BorrowedFd<'_>,
     rel_dir: &Path,

@@ -1703,8 +1703,8 @@ fn open_for_read(source: &Path, _root: &Path) -> std::io::Result<std::fs::File> 
 /// Path-level type pre-check for `readFile`: rejects directories and
 /// non-regular entries (FIFOs, devices, sockets) before anything is opened.
 /// On unix the stat is anchored beneath `root` with the same containment as
-/// [`open_for_read`] — no symlink is followed at any component, and nothing
-/// outside the root is ever looked up — and it never opens the entry, so a
+/// [`open_for_read`] — no symlink is followed at any component, and no
+/// lookup is re-resolved from `/` — and it never opens the entry, so a
 /// device driver's `open` cannot run. Errors use the same messages as a
 /// failed open.
 #[cfg(unix)]
