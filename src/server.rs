@@ -3671,6 +3671,23 @@ mod tests {
             exec_desc.contains("readOnlyHint") && exec_desc.contains("idempotentHint"),
             "execute_tools description should mention readOnlyHint / idempotentHint as the gating annotations for retry"
         );
+        assert!(
+            exec_desc.contains("writeFile(absPath, data, opts?)")
+                && exec_desc.contains("readFile(absPath, opts?)"),
+            "execute_tools description should document the writeFile and readFile globals"
+        );
+        assert!(
+            exec_desc.contains("utf8") && exec_desc.contains("base64"),
+            "execute_tools description should document the utf8/base64 encodings"
+        );
+        assert!(
+            exec_desc.contains("write_dirs"),
+            "execute_tools description should say filesystem access is scoped to write_dirs"
+        );
+        assert!(
+            exec_desc.contains("return readFile("),
+            "execute_tools description should include a readFile example"
+        );
     }
 
     #[test]
