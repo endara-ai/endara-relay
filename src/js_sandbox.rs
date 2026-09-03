@@ -4792,13 +4792,18 @@ return errors;
         let sandbox = write_sandbox(vec![root.clone()]).await;
         let sub = root.join("sub");
         std::fs::create_dir(&sub).unwrap();
-        let script = format!("return readFile({});", js_quote(sub.to_str().unwrap()));
-        let err = sandbox.execute(&script).await.unwrap_err();
-        assert!(
-            format!("{}", err).contains("is a directory"),
-            "unexpected error: {}",
-            err
-        );
+        // A subdirectory and the allowlisted root itself (an empty relative
+        // path beneath the anchor) both report "is a directory".
+        for target in [&sub, &root] {
+            let script = format!("return readFile({});", js_quote(target.to_str().unwrap()));
+            let err = sandbox.execute(&script).await.unwrap_err();
+            assert!(
+                format!("{}", err).contains("is a directory"),
+                "{}: unexpected error: {}",
+                target.display(),
+                err
+            );
+        }
     }
 
     #[tokio::test]

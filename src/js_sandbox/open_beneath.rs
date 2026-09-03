@@ -12,8 +12,8 @@
 //! Two strategies share one contract:
 //! - Linux ≥ 5.6: a single `openat2(2)` with `RESOLVE_BENEATH |
 //!   RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`, enforced by the kernel.
-//!   `ENOSYS`/`EINVAL` (old kernel, seccomp) is remembered once and every
-//!   later call takes the walk.
+//!   `ENOSYS`/`EINVAL`/`EPERM` (old kernel, seccomp) is remembered once and
+//!   every later call takes the walk.
 //! - Everywhere else (macOS, old Linux): a component-by-component `openat(2)`
 //!   walk. Intermediates are opened `O_DIRECTORY | O_NOFOLLOW` (`O_PATH` on
 //!   Linux, `O_SEARCH` on Apple, so only search permission is needed), the final
@@ -132,10 +132,14 @@ pub(super) fn open_beneath_walk(
 /// the final one included — is `ELOOP`. Linux takes an `openat2(O_PATH)`
 /// and `fstat`s the handle; elsewhere (and on kernels without `openat2`)
 /// the walk ends in `fstatat(AT_SYMLINK_NOFOLLOW)` on the last directory
-/// handle.
+/// handle. An empty `rel_path` names `root` itself, which is stat'ed
+/// directly (the caller then reports it as a directory).
 pub(super) fn stat_beneath(root: BorrowedFd<'_>, rel_path: &Path) -> io::Result<libc::stat> {
     #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
-    let components = validated_open_components(rel_path, 0)?;
+    let components = validated_components(rel_path)?;
+    if components.is_empty() {
+        return fstatat_nofollow(root.as_raw_fd(), OsStr::new("."));
+    }
     #[cfg(target_os = "linux")]
     {
         let normalized: std::path::PathBuf = components.iter().collect();
@@ -151,10 +155,10 @@ pub(super) fn stat_beneath(root: BorrowedFd<'_>, rel_path: &Path) -> io::Result<
 /// The portable walk behind [`stat_beneath`], exposed for the same reason
 /// as [`open_beneath_walk`].
 pub(super) fn stat_beneath_walk(root: BorrowedFd<'_>, rel_path: &Path) -> io::Result<libc::stat> {
-    let components = validated_open_components(rel_path, 0)?;
-    let (last, parents) = components
-        .split_last()
-        .expect("validated_open_components rejects empty paths");
+    let components = validated_components(rel_path)?;
+    let Some((last, parents)) = components.split_last() else {
+        return fstatat_nofollow(root.as_raw_fd(), OsStr::new("."));
+    };
     let dir = walk_parents(root, parents)?;
     let at = dir.as_ref().map_or(root.as_raw_fd(), |d| d.as_raw_fd());
     reject_symlink_stat(fstatat_nofollow(at, last)?)
@@ -359,8 +363,12 @@ mod openat2 {
         resolve: u64,
     }
 
-    /// Set once `openat2` reports `ENOSYS`/`EINVAL`, so the probe is paid
-    /// once per process and every later open goes straight to the walk.
+    /// Set once `openat2` reports `ENOSYS`/`EINVAL`/`EPERM`, so the probe is
+    /// paid once per process and every later open goes straight to the walk.
+    /// `EPERM` is how a seccomp default-deny profile answers an unlisted
+    /// syscall; nothing this module passes to `openat2` (no `O_NOATIME`, no
+    /// write modes) can earn a genuine per-file `EPERM`, and the walk would
+    /// surface one anyway.
     static UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 
     /// `Some(result)` when `openat2` handled the open, `None` when the
@@ -399,7 +407,10 @@ mod openat2 {
         };
         if fd < 0 {
             let e = io::Error::last_os_error();
-            if matches!(e.raw_os_error(), Some(libc::ENOSYS) | Some(libc::EINVAL)) {
+            if matches!(
+                e.raw_os_error(),
+                Some(libc::ENOSYS) | Some(libc::EINVAL) | Some(libc::EPERM)
+            ) {
                 UNSUPPORTED.store(true, Ordering::Relaxed);
                 return None;
             }
@@ -660,6 +671,7 @@ mod tests {
             assert_eq!(kind("top.txt"), libc::S_IFREG, "{}", name);
             assert_eq!(kind("a/b"), libc::S_IFDIR, "{}", name);
             assert_eq!(kind("a/fifo"), libc::S_IFIFO, "{}", name);
+            assert_eq!(kind(""), libc::S_IFDIR, "{}: empty path is the root", name);
 
             let e = statter(root.as_fd(), Path::new("a/b/missing.txt")).unwrap_err();
             assert_eq!(e.kind(), io::ErrorKind::NotFound, "{}: {}", name, e);
