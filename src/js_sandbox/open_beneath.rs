@@ -26,16 +26,23 @@
 //!   swapped for a symlink is caught, and `..`/absolute components never
 //!   reach the kernel.
 //!
-//! One caveat is inherent to `openat` walks and remains on the portable tier:
-//! a directory that has already been opened and is then renamed out of the
-//! root stays pinned, and the remaining components resolve inside it wherever
-//! it now lives. Moving it requires write permission on both its in-root
-//! parent and the destination parent (and `rename(2)` cannot cross a mount),
-//! so the walk can only be redirected into a directory the concurrent actor
-//! could already write to — never into an arbitrary location — and it still
-//! never follows a symlink or a `..`. `openat2` detects that case as well
-//! (`EXDEV` when the rename happens during resolution), which is why it is
-//! preferred wherever the kernel offers it. Closing it on macOS with
+//! One caveat is inherent to handle-based containment and applies to both
+//! tiers: a directory handle is a capability, and a directory that has
+//! already been opened and is then renamed out of the root stays pinned —
+//! whatever is done relative to that handle afterwards happens wherever the
+//! directory now lives. On the portable tier this covers the remaining
+//! components of the walk; on both tiers it covers the returned handle itself
+//! (e.g. the `openat`/`renameat` that `write_atomic` issues on the directory
+//! handle after `open_dir_beneath_creating` returns). `openat2` only enforces
+//! containment while it resolves a path (`EXDEV` if a component is renamed
+//! out mid-resolution, and every step of the creating open restarts from the
+//! root), which is why it is preferred where the kernel offers it, but it
+//! does not protect a handle once returned. Moving a directory requires write
+//! permission on both its in-root parent and the destination parent (and
+//! `rename(2)` cannot cross a mount), so on either tier the write can only be
+//! redirected into a directory the concurrent actor could already write to —
+//! never into an arbitrary location — and no lookup ever follows a symlink or
+//! a `..`. Narrowing the portable tier's walk residual on macOS with
 //! `O_RESOLVE_BENEATH | O_NOFOLLOW_ANY` is tracked in
 //! <https://github.com/endara-ai/endara-relay/issues/158>.
 

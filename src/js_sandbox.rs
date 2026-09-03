@@ -1304,9 +1304,14 @@ fn write_tmp_name(file_name: &std::ffi::OsStr) -> String {
 /// directory handle, and the publish is a `renameat` on that same handle.
 /// Because `dest` is canonical, any symlink met on the way is a
 /// post-validation swap and fails the write (`ELOOP`), as does a directory
-/// renamed out of the root while `openat2` resolves it (`EXDEV`) — nothing
-/// is created or written outside the root, no matter how the path is
-/// re-pointed concurrently. If the root itself was deleted
+/// renamed out of the root while `openat2` resolves it (`EXDEV`): no lookup
+/// here can be redirected through a symlink, on any tier. Containment is
+/// enforced while the directory handle is resolved, not afterwards — the
+/// handle is a capability, so if the destination directory itself is renamed
+/// out of the root between `open_dir_beneath_creating` returning and the
+/// `renameat`, the file lands wherever that directory now lives (a location
+/// the renaming actor could already write to; see the caveat in
+/// [`open_beneath`]). If the root itself was deleted
 /// after config resolution the write fails (the root handle cannot be
 /// opened); the "directories are never auto-created" stance in
 /// [`crate::config::resolve_write_roots`] only covers resolution time. On
