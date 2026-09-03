@@ -35,7 +35,9 @@
 //! could already write to — never into an arbitrary location — and it still
 //! never follows a symlink or a `..`. `openat2` detects that case as well
 //! (`EXDEV` when the rename happens during resolution), which is why it is
-//! preferred wherever the kernel offers it.
+//! preferred wherever the kernel offers it. Closing it on macOS with
+//! `O_RESOLVE_BENEATH | O_NOFOLLOW_ANY` is tracked in
+//! <https://github.com/endara-ai/endara-relay/issues/158>.
 
 use std::ffi::{CString, OsStr};
 use std::fs::File;
