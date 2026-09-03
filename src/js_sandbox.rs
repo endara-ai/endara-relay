@@ -1549,19 +1549,21 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
 
 /// Open `source` read-only for `readFile`. On unix the open carries
 /// `O_NONBLOCK`, so a FIFO with no writer (or a device) returns a handle
-/// immediately instead of parking the sandbox thread, and `O_NOFOLLOW`, so a
+/// immediately instead of parking the sandbox thread; `O_NOFOLLOW`, so a
 /// symlink swapped in for the already-canonicalized final component fails
-/// with `ELOOP` rather than being followed. The caller must still fstat the
-/// returned handle and reject anything that is not a regular file; regular
-/// files are unaffected by `O_NONBLOCK`, so the bounded read that follows
-/// behaves exactly as a blocking open would.
+/// with `ELOOP` rather than being followed; and `O_NOCTTY`, so a tty device
+/// node can never become the controlling terminal as a side effect of the
+/// open (std does not set it). The caller must still fstat the returned
+/// handle and reject anything that is not a regular file; regular files are
+/// unaffected by these flags, so the bounded read that follows behaves
+/// exactly as a plain open would.
 fn open_for_read(source: &Path) -> std::io::Result<std::fs::File> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY);
     }
     opts.open(source)
 }
