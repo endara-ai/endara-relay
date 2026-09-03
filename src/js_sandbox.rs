@@ -148,11 +148,14 @@ struct SandboxState {
     /// [`ReadLimits::default`]; tests may shrink them via
     /// [`JsSandbox::with_read_limits`].
     read_limits: ReadLimits,
-    /// Number of files successfully read by `readFile` during this run.
-    /// A fresh [`SandboxState`] is installed per run, so this resets per run.
+    /// Number of files `readFile` has pulled from disk during this run,
+    /// counted as soon as the filesystem read succeeds (whether or not the
+    /// contents then decode). A fresh [`SandboxState`] is installed per run,
+    /// so this resets per run.
     files_read: usize,
-    /// Total bytes successfully read by `readFile` during this run.
-    /// A fresh [`SandboxState`] is installed per run, so this resets per run.
+    /// Total bytes `readFile` has pulled from disk during this run, counted
+    /// the same way as `files_read`. A fresh [`SandboxState`] is installed
+    /// per run, so this resets per run.
     bytes_read: usize,
 }
 
@@ -1409,7 +1412,12 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
     let (source, _matched_root) = resolve_write_path("readFile", &path_str, &write_roots)
         .map_err(|msg| JsNativeError::error().with_message(msg))?;
 
-    let meta = match std::fs::metadata(&source) {
+    // Only regular files are readable. Opening a FIFO blocks until a writer
+    // appears, and reading a device or socket can block indefinitely, inside
+    // a native call the JS deadline cannot interrupt. Check the path first so
+    // the common case never opens such an entry at all; the handle metadata
+    // below re-validates whatever inode was actually opened.
+    let path_meta = match std::fs::metadata(&source) {
         Ok(meta) => meta,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(JsNativeError::error()
@@ -1422,26 +1430,29 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
                 .into())
         }
     };
-    if meta.is_dir() {
-        return Err(JsNativeError::error()
-            .with_message(format!(
-                "readFile: '{}' is a directory, not a file",
-                path_str
-            ))
-            .into());
-    }
-    // Only regular files are readable. Reading a FIFO, device, or socket
-    // would block the sandbox thread inside a native call that the JS
-    // deadline cannot interrupt, so reject them before touching the file.
-    if !meta.is_file() {
-        return Err(JsNativeError::error()
-            .with_message(format!(
-                "readFile: '{}' is not a regular file (FIFOs, devices, and \
-                 sockets cannot be read)",
-                path_str
-            ))
-            .into());
-    }
+    reject_non_regular(&path_str, &path_meta)?;
+
+    // Open once and derive metadata from the handle so the type/size checks
+    // and the bounded read below all apply to the same inode, rather than
+    // to whatever the pathname resolves to on a second lookup.
+    let mut file = match std::fs::File::open(&source) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(JsNativeError::error()
+                .with_message(format!("readFile: '{}' does not exist", path_str))
+                .into())
+        }
+        Err(e) => {
+            return Err(JsNativeError::error()
+                .with_message(format!("readFile: failed to read '{}': {}", path_str, e))
+                .into())
+        }
+    };
+    let meta = file.metadata().map_err(|e| {
+        JsNativeError::error()
+            .with_message(format!("readFile: failed to read '{}': {}", path_str, e))
+    })?;
+    reject_non_regular(&path_str, &meta)?;
 
     // Size caps are checked against the on-disk size so an oversized file
     // is rejected before any bytes are read or allocated.
@@ -1465,11 +1476,42 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
             .into());
     }
 
-    let bytes = std::fs::read(&source).map_err(|e| {
+    // The metadata size is only a hint: the file can grow between the check
+    // and the read. Bound the read itself by the remaining allowance and
+    // reject if more bytes than that are available.
+    let allowed = limits
+        .max_file_bytes
+        .min(limits.max_total_bytes_per_run.saturating_sub(bytes_read));
+    let bytes = read_bounded(&mut file, allowed, file_len.min(allowed)).map_err(|e| {
         JsNativeError::error()
             .with_message(format!("readFile: failed to read '{}': {}", path_str, e))
     })?;
+    drop(file);
+    let Some(bytes) = bytes else {
+        return Err(JsNativeError::error()
+            .with_message(format!(
+                "readFile: '{}' exceeds the remaining read allowance of {} bytes \
+                 (per-file limit {} bytes, per-run total limit {} bytes, {} bytes \
+                 already read)",
+                path_str,
+                allowed,
+                limits.max_file_bytes,
+                limits.max_total_bytes_per_run,
+                bytes_read
+            ))
+            .into());
+    };
     let read_len = bytes.len();
+
+    // Account for the read as soon as the bytes have been pulled from disk,
+    // before decoding. Otherwise a script could read the same non-UTF-8 file
+    // in a loop, fail decoding each time, and never consume quota.
+    SANDBOX_STATE.with(|cell| {
+        if let Some(state) = cell.borrow_mut().as_mut() {
+            state.files_read += 1;
+            state.bytes_read = state.bytes_read.saturating_add(read_len);
+        }
+    });
 
     let contents = match encoding.as_str() {
         "utf8" => String::from_utf8(bytes).map_err(|_| {
@@ -1485,14 +1527,46 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
         }
     };
 
-    SANDBOX_STATE.with(|cell| {
-        if let Some(state) = cell.borrow_mut().as_mut() {
-            state.files_read += 1;
-            state.bytes_read = state.bytes_read.saturating_add(read_len);
-        }
-    });
-
     Ok(JsValue::from(boa_engine::js_string!(contents.as_str())))
+}
+
+fn reject_non_regular(path_str: &str, meta: &std::fs::Metadata) -> JsResult<()> {
+    if meta.is_dir() {
+        return Err(JsNativeError::error()
+            .with_message(format!(
+                "readFile: '{}' is a directory, not a file",
+                path_str
+            ))
+            .into());
+    }
+    if !meta.is_file() {
+        return Err(JsNativeError::error()
+            .with_message(format!(
+                "readFile: '{}' is not a regular file (FIFOs, devices, and \
+                 sockets cannot be read)",
+                path_str
+            ))
+            .into());
+    }
+    Ok(())
+}
+
+/// Read at most `allowed` bytes from `reader`. Returns `Ok(None)` if the
+/// reader yields more than `allowed` bytes, so a file that grows after its
+/// size was checked cannot exceed the caller's budget.
+fn read_bounded<R: std::io::Read>(
+    reader: &mut R,
+    allowed: usize,
+    capacity_hint: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let take_len = u64::try_from(allowed).unwrap_or(u64::MAX).saturating_add(1);
+    let mut bytes = Vec::with_capacity(capacity_hint);
+    reader.take(take_len).read_to_end(&mut bytes)?;
+    if bytes.len() > allowed {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -3960,6 +4034,67 @@ return "ok";
             let result = sandbox.execute(&script).await.unwrap();
             assert_eq!(result, json!("ok"), "run '{}' should succeed", run);
         }
+    }
+
+    #[tokio::test]
+    async fn test_read_file_utf8_decode_failure_consumes_file_quota() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()])
+            .await
+            .with_read_limits(ReadLimits {
+                max_file_bytes: 1024,
+                max_files_per_run: 1,
+                max_total_bytes_per_run: 1024,
+            });
+        std::fs::write(root.join("bin.dat"), [0xffu8, 0xfe, 0xfd]).unwrap();
+        std::fs::write(root.join("ok.txt"), "fine").unwrap();
+        // The first read pulls bytes from disk and only then fails to decode;
+        // it must still count against the per-run file quota so the second
+        // read is refused rather than succeeding.
+        let script = format!(
+            r#"
+var root = {};
+var first = null;
+try {{ readFile(root + "/bin.dat"); }} catch (e) {{ first = String(e); }}
+var second = null;
+try {{ readFile(root + "/ok.txt"); }} catch (e) {{ second = String(e); }}
+return {{ first: first, second: second }};
+"#,
+            js_quote(root.to_str().unwrap())
+        );
+        let result = sandbox.execute(&script).await.unwrap();
+        let first = result["first"].as_str().unwrap_or_default();
+        let second = result["second"].as_str().unwrap_or_default();
+        assert!(
+            first.contains("does not contain valid UTF-8"),
+            "unexpected first error: {}",
+            first
+        );
+        assert!(
+            second.contains("per-run limit of 1 file reads"),
+            "unexpected second error: {}",
+            second
+        );
+    }
+
+    #[test]
+    fn test_read_bounded_rejects_growth_past_cap() {
+        // Simulates a file whose size check passed but which grew before the
+        // read: the reader yields more bytes than the allowance.
+        let mut grown = std::io::Cursor::new(vec![b'x'; 11]);
+        assert_eq!(read_bounded(&mut grown, 10, 10).unwrap(), None);
+
+        let mut exact = std::io::Cursor::new(vec![b'x'; 10]);
+        assert_eq!(
+            read_bounded(&mut exact, 10, 10).unwrap(),
+            Some(vec![b'x'; 10])
+        );
+
+        let mut empty = std::io::Cursor::new(Vec::<u8>::new());
+        assert_eq!(read_bounded(&mut empty, 0, 0).unwrap(), Some(Vec::new()));
+        let mut one = std::io::Cursor::new(vec![b'x']);
+        assert_eq!(read_bounded(&mut one, 0, 0).unwrap(), None);
     }
 
     #[tokio::test]
