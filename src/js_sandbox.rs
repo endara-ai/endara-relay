@@ -1420,28 +1420,35 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
 
     // Only regular files are readable. Opening a FIFO blocks until a writer
     // appears, and reading a device or socket can block indefinitely, inside
-    // a native call the JS deadline cannot interrupt. Check the path first so
-    // the common case never opens such an entry at all; the handle metadata
+    // a native call the JS deadline cannot interrupt. Without a non-blocking
+    // open the only defence is a path-level type check, which leaves a
+    // regular-file→FIFO swap window before the open; the handle metadata
     // below re-validates whatever inode was actually opened.
-    let path_meta = match std::fs::metadata(&source) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(JsNativeError::error()
-                .with_message(format!("readFile: '{}' does not exist", path_str))
-                .into())
-        }
-        Err(e) => {
-            return Err(JsNativeError::error()
-                .with_message(format!("readFile: failed to read '{}': {}", path_str, e))
-                .into())
-        }
-    };
-    reject_non_regular(&path_str, &path_meta)?;
+    #[cfg(not(unix))]
+    {
+        let path_meta = match std::fs::metadata(&source) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(JsNativeError::error()
+                    .with_message(format!("readFile: '{}' does not exist", path_str))
+                    .into())
+            }
+            Err(e) => {
+                return Err(JsNativeError::error()
+                    .with_message(format!("readFile: failed to read '{}': {}", path_str, e))
+                    .into())
+            }
+        };
+        reject_non_regular(&path_str, &path_meta)?;
+    }
 
     // Open once and derive metadata from the handle so the type/size checks
     // and the bounded read below all apply to the same inode, rather than
-    // to whatever the pathname resolves to on a second lookup.
-    let mut file = match std::fs::File::open(&source) {
+    // to whatever the pathname resolves to on a second lookup. On unix the
+    // open itself cannot block (`O_NONBLOCK`) and cannot follow a symlink
+    // swapped in for the canonicalized final component (`O_NOFOLLOW`), so no
+    // path-level pre-check is needed: the fstat on the handle is authoritative.
+    let mut file = match open_for_read(&source) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return Err(JsNativeError::error()
@@ -1539,6 +1546,25 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
     };
 
     Ok(JsValue::from(boa_engine::js_string!(contents.as_str())))
+}
+
+/// Open `source` read-only for `readFile`. On unix the open carries
+/// `O_NONBLOCK`, so a FIFO with no writer (or a device) returns a handle
+/// immediately instead of parking the sandbox thread, and `O_NOFOLLOW`, so a
+/// symlink swapped in for the already-canonicalized final component fails
+/// with `ELOOP` rather than being followed. The caller must still fstat the
+/// returned handle and reject anything that is not a regular file; regular
+/// files are unaffected by `O_NONBLOCK`, so the bounded read that follows
+/// behaves exactly as a blocking open would.
+fn open_for_read(source: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    opts.open(source)
 }
 
 fn reject_non_regular(path_str: &str, meta: &std::fs::Metadata) -> JsResult<()> {
@@ -3878,8 +3904,10 @@ return {{ written: written, back: JSON.parse(readFile(written)) }};
             .expect("mkfifo must be available on unix");
         assert!(status.success(), "mkfifo failed: {:?}", status);
         let script = format!("return readFile({});", js_quote(fifo.to_str().unwrap()));
-        // With no writer attached, opening the FIFO for read would block
-        // forever — the rejection must happen before any read is attempted.
+        // With no writer attached, a blocking open of the FIFO would park the
+        // sandbox thread forever. On unix there is no path-level pre-check any
+        // more: the open is non-blocking and the handle fstat is what rejects
+        // it, before any read is attempted.
         let err = tokio::time::timeout(Duration::from_secs(5), sandbox.execute(&script))
             .await
             .expect("readFile on a FIFO must not block")
@@ -3890,6 +3918,66 @@ return {{ written: written, back: JSON.parse(readFile(written)) }};
             "unexpected error: {}",
             msg
         );
+    }
+
+    /// The handle path on its own: with `O_NONBLOCK` the open of a writer-less
+    /// FIFO returns a handle instead of blocking, and it is the fstat on that
+    /// handle — not a path-level check — that identifies it as non-regular.
+    /// This is the property that closes the regular-file→FIFO swap window.
+    #[cfg(unix)]
+    #[test]
+    fn test_open_for_read_fifo_returns_handle_and_fstat_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo must be available on unix");
+        assert!(status.success(), "mkfifo failed: {:?}", status);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(open_for_read(&fifo).map(|f| f.metadata()));
+        });
+        let opened = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("open of a writer-less FIFO must not block")
+            .expect("O_NONBLOCK open of a FIFO must succeed");
+        let meta = opened.expect("fstat on the FIFO handle must succeed");
+        assert!(!meta.is_file(), "FIFO must not fstat as a regular file");
+        assert!(!meta.is_dir());
+        assert!(
+            reject_non_regular("pipe", &meta).is_err(),
+            "handle fstat must reject the FIFO"
+        );
+    }
+
+    /// `O_NOFOLLOW` still rejects a symlink in the final component at open
+    /// time — the swap-after-canonicalize case — while a regular file opened
+    /// with the same flags reads normally.
+    #[cfg(unix)]
+    #[test]
+    fn test_open_for_read_rejects_final_component_symlink() {
+        use std::io::Read as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real.txt");
+        std::fs::write(&target, "plain").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = open_for_read(&link).expect_err("O_NOFOLLOW must refuse a symlink");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "unexpected error: {}",
+            err
+        );
+
+        let mut file = open_for_read(&target).unwrap();
+        assert!(file.metadata().unwrap().is_file());
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "plain");
     }
 
     #[tokio::test]
