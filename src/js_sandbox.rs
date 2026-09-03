@@ -1454,6 +1454,15 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
                 .with_message(format!("readFile: '{}' does not exist", path_str))
                 .into())
         }
+        #[cfg(unix)]
+        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
+            return Err(JsNativeError::error()
+                .with_message(format!(
+                    "readFile: '{}' is a symbolic link and cannot be read",
+                    path_str
+                ))
+                .into())
+        }
         Err(e) => {
             return Err(JsNativeError::error()
                 .with_message(format!("readFile: failed to read '{}': {}", path_str, e))
@@ -1548,8 +1557,10 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
 }
 
 /// Open `source` read-only for `readFile`. On unix the open carries
-/// `O_NONBLOCK`, so a FIFO with no writer (or a device) returns a handle
-/// immediately instead of parking the sandbox thread; `O_NOFOLLOW`, so a
+/// `O_NONBLOCK`, so a FIFO with no writer returns a handle immediately
+/// instead of parking the sandbox thread (this is guaranteed for FIFOs only;
+/// a device driver's open may still block, which is why the caller keeps its
+/// path-level type pre-check); `O_NOFOLLOW`, so a
 /// symlink swapped in for the already-canonicalized final component fails
 /// with `ELOOP` rather than being followed; and `O_NOCTTY`, so a tty device
 /// node can never become the controlling terminal as a side effect of the
