@@ -22,6 +22,13 @@ use tracing::Instrument;
 use crate::adapter::{AdapterError, ToolInfo};
 use crate::registry::MetaToolRegistry;
 
+// Beneath-root open primitives for readFile/writeFile. The call sites land
+// in follow-up changes; keep the allow until then so both targets stay
+// warning-clean under `clippy -D warnings`.
+#[cfg(unix)]
+#[allow(dead_code)]
+mod open_beneath;
+
 // ---------------------------------------------------------------------------
 // Retry tuning (Wave 3)
 // ---------------------------------------------------------------------------
