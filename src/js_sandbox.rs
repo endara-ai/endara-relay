@@ -1447,28 +1447,8 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
     // (`O_NONBLOCK`) and cannot follow a symlink swapped in for the
     // canonicalized final component (`O_NOFOLLOW`); the fstat on the handle
     // is authoritative.
-    let mut file = match open_for_read(&source) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(JsNativeError::error()
-                .with_message(format!("readFile: '{}' does not exist", path_str))
-                .into())
-        }
-        #[cfg(unix)]
-        Err(e) if e.raw_os_error() == Some(libc::ELOOP) => {
-            return Err(JsNativeError::error()
-                .with_message(format!(
-                    "readFile: '{}' is a symbolic link and cannot be read",
-                    path_str
-                ))
-                .into())
-        }
-        Err(e) => {
-            return Err(JsNativeError::error()
-                .with_message(format!("readFile: failed to read '{}': {}", path_str, e))
-                .into())
-        }
-    };
+    let mut file = open_for_read(&source)
+        .map_err(|e| JsNativeError::error().with_message(open_error_message(&path_str, &e)))?;
     let meta = file.metadata().map_err(|e| {
         JsNativeError::error()
             .with_message(format!("readFile: failed to read '{}': {}", path_str, e))
@@ -1577,6 +1557,24 @@ fn open_for_read(source: &Path) -> std::io::Result<std::fs::File> {
         opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY);
     }
     opts.open(source)
+}
+
+/// JS-facing message for a failed [`open_for_read`]. A missing file and, on
+/// unix, the `ELOOP` that `O_NOFOLLOW` returns for a symlink in the final
+/// component get self-explanatory messages; everything else carries the OS
+/// error text.
+fn open_error_message(path_str: &str, e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        return format!("readFile: '{}' does not exist", path_str);
+    }
+    #[cfg(unix)]
+    if e.raw_os_error() == Some(libc::ELOOP) {
+        return format!(
+            "readFile: '{}' is a symbolic link and cannot be read",
+            path_str
+        );
+    }
+    format!("readFile: failed to read '{}': {}", path_str, e)
 }
 
 fn reject_non_regular(path_str: &str, meta: &std::fs::Metadata) -> JsResult<()> {
@@ -3965,8 +3963,12 @@ return {{ written: written, back: JSON.parse(readFile(written)) }};
     }
 
     /// `O_NOFOLLOW` still rejects a symlink in the final component at open
-    /// time — the swap-after-canonicalize case — while a regular file opened
-    /// with the same flags reads normally.
+    /// time — the swap-after-canonicalize case — and the `ELOOP` it returns
+    /// is surfaced as a self-explanatory symlink message rather than the raw
+    /// OS text, while a regular file opened with the same flags reads
+    /// normally. (End to end this arm is only reachable via the swap race:
+    /// `resolve_write_path` canonicalizes a pre-existing final-component
+    /// symlink away before the open.)
     #[cfg(unix)]
     #[test]
     fn test_open_for_read_rejects_final_component_symlink() {
@@ -3983,6 +3985,16 @@ return {{ written: written, back: JSON.parse(readFile(written)) }};
             Some(libc::ELOOP),
             "unexpected error: {}",
             err
+        );
+        let msg = open_error_message("/root/link.txt", &err);
+        assert_eq!(
+            msg,
+            "readFile: '/root/link.txt' is a symbolic link and cannot be read"
+        );
+        assert!(
+            !msg.contains("Too many levels"),
+            "raw ELOOP text must not leak: {}",
+            msg
         );
 
         let mut file = open_for_read(&target).unwrap();
