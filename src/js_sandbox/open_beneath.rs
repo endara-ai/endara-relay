@@ -39,18 +39,30 @@ const INTERMEDIATE_FLAGS: libc::c_int =
     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
 
 /// Open the directory at `path` as an anchor for the beneath-root helpers.
-/// `path` is a trusted (canonical) allowlisted root.
+/// `path` is a trusted (canonical) allowlisted root. The open is
+/// `O_NOFOLLOW`, so a symlink swapped in for the root's *final* component
+/// after config resolution is rejected with `ELOOP` rather than followed.
+/// The root's ancestors are still resolved by the kernel as for any absolute
+/// path — a swap above the root is outside this primitive's trusted-root
+/// contract and is not detected here.
 pub(super) fn open_root(path: &Path) -> io::Result<OwnedFd> {
     let c_path = c_string(path.as_os_str())?;
     // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
     let fd = unsafe {
         libc::open(
             c_path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if fd < 0 {
-        return Err(io::Error::last_os_error());
+        let e = io::Error::last_os_error();
+        // Same Linux ENOTDIR-for-a-symlink quirk as `open_intermediate`.
+        if e.raw_os_error() == Some(libc::ENOTDIR)
+            && is_symlink_at(libc::AT_FDCWD, path.as_os_str())
+        {
+            return Err(io::Error::from_raw_os_error(libc::ELOOP));
+        }
+        return Err(e);
     }
     // SAFETY: `fd` is a freshly opened descriptor exclusively owned here.
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
@@ -388,6 +400,30 @@ mod tests {
                 assert_eq!(read_to_string(file), "nested", "{}: {:?}", name, spelling);
             }
         }
+    }
+
+    /// The root path itself swapped for a symlink (to a directory inside or
+    /// outside the temp tree) is refused: `open_root` must never anchor the
+    /// helpers to a directory the link chose. A real directory still opens.
+    #[test]
+    fn test_open_root_rejects_symlink_at_root_final_component() {
+        let outer = tempfile::tempdir().unwrap();
+        let real = outer.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("top.txt"), "top").unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        symlink(&real, outer.path().join("swapped_in")).unwrap();
+        symlink(elsewhere.path(), outer.path().join("swapped_out")).unwrap();
+        symlink("dangling", outer.path().join("swapped_dangling")).unwrap();
+
+        for name in ["swapped_in", "swapped_out", "swapped_dangling"] {
+            let e = open_root(&outer.path().join(name)).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::ELOOP), "{}: {}", name, e);
+        }
+
+        let root = open_root(&real).unwrap();
+        let top = open_beneath(root.as_fd(), Path::new("top.txt"), READ_FLAGS).unwrap();
+        assert_eq!(read_to_string(top), "top");
     }
 
     #[test]
