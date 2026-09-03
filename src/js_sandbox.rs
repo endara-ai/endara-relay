@@ -1560,9 +1560,10 @@ fn open_for_read(source: &Path) -> std::io::Result<std::fs::File> {
 }
 
 /// JS-facing message for a failed [`open_for_read`]. A missing file and, on
-/// unix, the `ELOOP` that `O_NOFOLLOW` returns for a symlink in the final
-/// component get self-explanatory messages; everything else carries the OS
-/// error text.
+/// unix, `ELOOP` get self-explanatory messages; everything else carries the
+/// OS error text. `ELOOP` is returned both when `O_NOFOLLOW` rejects a
+/// symlink in the final component and when an intermediate component
+/// resolves through a symlink loop, so the message covers both.
 fn open_error_message(path_str: &str, e: &std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::NotFound {
         return format!("readFile: '{}' does not exist", path_str);
@@ -1570,7 +1571,8 @@ fn open_error_message(path_str: &str, e: &std::io::Error) -> String {
     #[cfg(unix)]
     if e.raw_os_error() == Some(libc::ELOOP) {
         return format!(
-            "readFile: '{}' is a symbolic link and cannot be read",
+            "readFile: '{}' refers to a symbolic link or a path containing a \
+             symbolic link loop, which cannot be read",
             path_str
         );
     }
@@ -3989,7 +3991,8 @@ return {{ written: written, back: JSON.parse(readFile(written)) }};
         let msg = open_error_message("/root/link.txt", &err);
         assert_eq!(
             msg,
-            "readFile: '/root/link.txt' is a symbolic link and cannot be read"
+            "readFile: '/root/link.txt' refers to a symbolic link or a path \
+             containing a symbolic link loop, which cannot be read"
         );
         assert!(
             !msg.contains("Too many levels"),
