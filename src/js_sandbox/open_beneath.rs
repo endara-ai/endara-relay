@@ -15,7 +15,8 @@
 //!   `ENOSYS`/`EINVAL` (old kernel, seccomp) is remembered once and every
 //!   later call takes the walk.
 //! - Everywhere else (macOS, old Linux): a component-by-component `openat(2)`
-//!   walk. Intermediates are opened `O_DIRECTORY | O_NOFOLLOW`, the final
+//!   walk. Intermediates are opened `O_DIRECTORY | O_NOFOLLOW` (`O_PATH` on
+//!   Linux, so only search permission is needed), the final
 //!   component with the caller's flags plus `O_NOFOLLOW`, so a symlink at any
 //!   depth fails with `ELOOP`. Every step is relative to the previous
 //!   directory handle, so no lookup ever re-resolves an ancestor: a component
@@ -33,9 +34,19 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::io::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::path::{Component, Path};
 
-/// `O_CLOEXEC` is always added so the handles never leak into spawned MCP
-/// server processes.
-const INTERMEDIATE_FLAGS: libc::c_int =
+/// Flags for every directory anchor (the root and each intermediate). On
+/// Linux they are `O_PATH` handles: traversal then needs only search
+/// permission, as a normal pathname lookup does, whereas an `O_RDONLY`
+/// directory open would also demand read permission and fail with `EACCES`
+/// beneath an execute-only directory. Every use of these handles is an
+/// `*at(2)` call, which accepts `O_PATH` descriptors. Other unixes have no
+/// `O_PATH`, so `O_RDONLY` is used there. `O_CLOEXEC` is always added so the
+/// handles never leak into spawned MCP server processes.
+#[cfg(target_os = "linux")]
+const DIR_ANCHOR_FLAGS: libc::c_int =
+    libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+#[cfg(not(target_os = "linux"))]
+const DIR_ANCHOR_FLAGS: libc::c_int =
     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
 
 /// Open the directory at `path` as an anchor for the beneath-root helpers.
@@ -48,12 +59,7 @@ const INTERMEDIATE_FLAGS: libc::c_int =
 pub(super) fn open_root(path: &Path) -> io::Result<OwnedFd> {
     let c_path = c_string(path.as_os_str())?;
     // SAFETY: `c_path` is a valid NUL-terminated string that outlives the call.
-    let fd = unsafe {
-        libc::open(
-            c_path.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
+    let fd = unsafe { libc::open(c_path.as_ptr(), DIR_ANCHOR_FLAGS) };
     if fd < 0 {
         let e = io::Error::last_os_error();
         // Same Linux ENOTDIR-for-a-symlink quirk as `open_intermediate`.
@@ -106,11 +112,7 @@ pub(super) fn open_beneath_walk(
     let (last, parents) = components
         .split_last()
         .expect("validated_open_components rejects empty paths");
-    let mut dir: Option<OwnedFd> = None;
-    for name in parents {
-        let at = dir.as_ref().map_or(root.as_raw_fd(), |d| d.as_raw_fd());
-        dir = Some(open_intermediate(at, name)?);
-    }
+    let dir = walk_parents(root, parents)?;
     let at = dir.as_ref().map_or(root.as_raw_fd(), |d| d.as_raw_fd());
     let fd = openat(
         at,
@@ -121,13 +123,66 @@ pub(super) fn open_beneath_walk(
     Ok(File::from(fd))
 }
 
+/// `stat(2)` information for `rel_path` beneath `root` with the same
+/// containment as [`open_beneath`] but without opening the entry itself, so
+/// a device node's driver `open` never runs. A symlink at any component —
+/// the final one included — is `ELOOP`. Linux takes an `openat2(O_PATH)`
+/// and `fstat`s the handle; elsewhere (and on kernels without `openat2`)
+/// the walk ends in `fstatat(AT_SYMLINK_NOFOLLOW)` on the last directory
+/// handle.
+pub(super) fn stat_beneath(root: BorrowedFd<'_>, rel_path: &Path) -> io::Result<libc::stat> {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    let components = validated_open_components(rel_path, 0)?;
+    #[cfg(target_os = "linux")]
+    {
+        let normalized: std::path::PathBuf = components.iter().collect();
+        if let Some(result) = openat2::open(root, &normalized, libc::O_PATH) {
+            // With `O_PATH | O_NOFOLLOW`, openat2 hands back a handle to a
+            // trailing symlink instead of failing; normalise that to ELOOP.
+            return reject_symlink_stat(fstat(&result?)?);
+        }
+    }
+    stat_beneath_walk(root, rel_path)
+}
+
+/// The portable walk behind [`stat_beneath`], exposed for the same reason
+/// as [`open_beneath_walk`].
+pub(super) fn stat_beneath_walk(root: BorrowedFd<'_>, rel_path: &Path) -> io::Result<libc::stat> {
+    let components = validated_open_components(rel_path, 0)?;
+    let (last, parents) = components
+        .split_last()
+        .expect("validated_open_components rejects empty paths");
+    let dir = walk_parents(root, parents)?;
+    let at = dir.as_ref().map_or(root.as_raw_fd(), |d| d.as_raw_fd());
+    reject_symlink_stat(fstatat_nofollow(at, last)?)
+}
+
+fn reject_symlink_stat(st: libc::stat) -> io::Result<libc::stat> {
+    if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+        return Err(io::Error::from_raw_os_error(libc::ELOOP));
+    }
+    Ok(st)
+}
+
+/// Open each directory in `parents` relative to the previous handle (the
+/// first relative to `root`). `None` when there are no parents, i.e. the
+/// final component lives directly in `root`.
+fn walk_parents(root: BorrowedFd<'_>, parents: &[&OsStr]) -> io::Result<Option<OwnedFd>> {
+    let mut dir: Option<OwnedFd> = None;
+    for name in parents {
+        let at = dir.as_ref().map_or(root.as_raw_fd(), |d| d.as_raw_fd());
+        dir = Some(open_intermediate(at, name)?);
+    }
+    Ok(dir)
+}
+
 /// Open one intermediate component as a directory without following
 /// symlinks. Linux reports a symlink here as `ENOTDIR` (the link itself is
 /// not a directory once `O_NOFOLLOW` stops resolution); that case is
 /// normalised to `ELOOP` so callers see the same error the final component,
 /// `openat2`, and macOS produce.
 fn open_intermediate(dirfd: libc::c_int, name: &OsStr) -> io::Result<OwnedFd> {
-    match openat(dirfd, name, INTERMEDIATE_FLAGS, 0) {
+    match openat(dirfd, name, DIR_ANCHOR_FLAGS, 0) {
         Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) && is_symlink_at(dirfd, name) => {
             Err(io::Error::from_raw_os_error(libc::ELOOP))
         }
@@ -136,9 +191,12 @@ fn open_intermediate(dirfd: libc::c_int, name: &OsStr) -> io::Result<OwnedFd> {
 }
 
 fn is_symlink_at(dirfd: libc::c_int, name: &OsStr) -> bool {
-    let Ok(c_name) = c_string(name) else {
-        return false;
-    };
+    fstatat_nofollow(dirfd, name).is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFLNK)
+}
+
+/// `fstatat(2)` of `name` relative to `dirfd` with `AT_SYMLINK_NOFOLLOW`.
+fn fstatat_nofollow(dirfd: libc::c_int, name: &OsStr) -> io::Result<libc::stat> {
+    let c_name = c_string(name)?;
     let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: `dirfd` is an open descriptor, `c_name` a valid C string, and
     // `st` is only read after fstatat reports success.
@@ -151,11 +209,23 @@ fn is_symlink_at(dirfd: libc::c_int, name: &OsStr) -> bool {
         )
     };
     if rc != 0 {
-        return false;
+        return Err(io::Error::last_os_error());
     }
     // SAFETY: fstatat succeeded, so `st` is initialised.
-    let st = unsafe { st.assume_init() };
-    st.st_mode & libc::S_IFMT == libc::S_IFLNK
+    Ok(unsafe { st.assume_init() })
+}
+
+#[cfg(target_os = "linux")]
+fn fstat(file: &File) -> io::Result<libc::stat> {
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: `file` holds an open descriptor and `st` is only read after
+    // fstat reports success.
+    let rc = unsafe { libc::fstat(file.as_raw_fd(), st.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstat succeeded, so `st` is initialised.
+    Ok(unsafe { st.assume_init() })
 }
 
 /// [`validated_components`] plus the file-open rules: the path must name at
@@ -189,7 +259,7 @@ pub(super) fn open_dir_beneath_creating(
     rel_dir: &Path,
 ) -> io::Result<OwnedFd> {
     let components = validated_components(rel_dir)?;
-    let mut dir = openat(root.as_raw_fd(), OsStr::new("."), INTERMEDIATE_FLAGS, 0)?;
+    let mut dir = openat(root.as_raw_fd(), OsStr::new("."), DIR_ANCHOR_FLAGS, 0)?;
     for name in &components {
         dir = match open_intermediate(dir.as_raw_fd(), name) {
             Ok(fd) => fd,
@@ -551,6 +621,113 @@ mod tests {
                 .expect("openat2 still available")
                 .unwrap_err();
             assert_eq!(via_link.raw_os_error(), Some(libc::ELOOP));
+        }
+    }
+
+    type Statter = fn(BorrowedFd<'_>, &Path) -> io::Result<libc::stat>;
+
+    const STATTERS: [(&str, Statter); 2] = [
+        ("stat_beneath", stat_beneath),
+        ("stat_beneath_walk", stat_beneath_walk),
+    ];
+
+    /// `stat_beneath` reports the entry type without opening it (a FIFO with
+    /// no writer is answered immediately) and, like the opens, treats a
+    /// symlink at any depth as a post-canonicalize swap.
+    #[test]
+    fn test_stat_beneath_reports_type_and_rejects_symlinks() {
+        let (dir, root) = nested_root();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("c.txt"), "outside").unwrap();
+        symlink(outside.path(), dir.path().join("a/out")).unwrap();
+        symlink(dir.path().join("a"), dir.path().join("link")).unwrap();
+        symlink(outside.path().join("c.txt"), dir.path().join("a/b/leaf")).unwrap();
+        let fifo = c_string(dir.path().join("a/fifo").as_os_str()).unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+
+        for (name, statter) in STATTERS {
+            let kind = |rel: &str| {
+                statter(root.as_fd(), Path::new(rel))
+                    .unwrap_or_else(|e| panic!("{}: {}: {}", name, rel, e))
+                    .st_mode
+                    & libc::S_IFMT
+            };
+            assert_eq!(kind("a/b/c.txt"), libc::S_IFREG, "{}", name);
+            assert_eq!(kind("top.txt"), libc::S_IFREG, "{}", name);
+            assert_eq!(kind("a/b"), libc::S_IFDIR, "{}", name);
+            assert_eq!(kind("a/fifo"), libc::S_IFIFO, "{}", name);
+
+            let e = statter(root.as_fd(), Path::new("a/b/missing.txt")).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::NotFound, "{}: {}", name, e);
+            for rel in ["link/b/c.txt", "a/out/c.txt", "a/b/leaf"] {
+                let e = statter(root.as_fd(), Path::new(rel)).unwrap_err();
+                assert_eq!(
+                    e.raw_os_error(),
+                    Some(libc::ELOOP),
+                    "{}: {}: {}",
+                    name,
+                    rel,
+                    e
+                );
+            }
+            let e = statter(root.as_fd(), Path::new("../x")).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{}: {}", name, e);
+        }
+    }
+
+    /// Anchors are `O_PATH` on Linux, so a file beneath a directory without
+    /// read permission (search only — plus write, so creation can be
+    /// exercised too) stays reachable exactly as it is through a plain
+    /// pathname open, where an `O_RDONLY` directory anchor would fail with
+    /// `EACCES`. Root bypasses permission checks, so the test is skipped
+    /// there.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_anchors_traverse_execute_only_directories() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (dir, root) = nested_root();
+        let locked = dir.path().join("a/b");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o311)).unwrap();
+        let restore = || {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        assert_eq!(
+            std::fs::read_dir(&locked).map(|_| ()).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied,
+            "precondition: a/b must not be readable"
+        );
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for (name, opener) in OPENERS {
+                let file = opener(root.as_fd(), Path::new("a/b/c.txt"), READ_FLAGS)
+                    .unwrap_or_else(|e| panic!("{}: {}", name, e));
+                assert_eq!(read_to_string(file), "nested", "{}", name);
+            }
+            for (name, statter) in STATTERS {
+                let st = statter(root.as_fd(), Path::new("a/b/c.txt"))
+                    .unwrap_or_else(|e| panic!("{}: {}", name, e));
+                assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFREG, "{}", name);
+            }
+            let handle = open_dir_beneath_creating(root.as_fd(), Path::new("a/b")).unwrap();
+            create_file_at(&handle, "via_exec_only.txt", "ok");
+            assert_eq!(
+                std::fs::read_to_string(locked.join("via_exec_only.txt")).unwrap(),
+                "ok"
+            );
+            let exec_only_root = open_root(&locked).unwrap();
+            let file =
+                open_beneath(exec_only_root.as_fd(), Path::new("c.txt"), READ_FLAGS).unwrap();
+            assert_eq!(read_to_string(file), "nested");
+        }));
+        restore();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
         }
     }
 

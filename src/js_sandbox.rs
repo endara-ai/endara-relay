@@ -1534,25 +1534,14 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
 
     // Only regular files are readable. Opening a FIFO blocks until a writer
     // appears, and reading a device or socket can block indefinitely, inside
-    // a native call the JS deadline cannot interrupt. Check the path first so
+    // a native call the JS deadline cannot interrupt. Check the type first so
     // the common case never opens such an entry at all — `O_NONBLOCK` below
     // covers FIFOs, but a device driver's open can still block or have side
     // effects — then re-validate the handle metadata for whatever inode was
-    // actually opened.
-    let path_meta = match std::fs::metadata(&source) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(JsNativeError::error()
-                .with_message(format!("readFile: '{}' does not exist", path_str))
-                .into())
-        }
-        Err(e) => {
-            return Err(JsNativeError::error()
-                .with_message(format!("readFile: failed to read '{}': {}", path_str, e))
-                .into())
-        }
-    };
-    reject_non_regular(&path_str, &path_meta)?;
+    // actually opened. On unix the pre-check is anchored beneath the root
+    // like the open, so it never stats (or leaks the existence of) anything
+    // a swapped-in symlink points at.
+    precheck_for_read(&path_str, &source, &matched_root)?;
 
     // Open once and derive metadata from the handle so the type/size checks
     // and the bounded read below all apply to the same inode, rather than
@@ -1693,6 +1682,45 @@ fn open_for_read(source: &Path, _root: &Path) -> std::io::Result<std::fs::File> 
     std::fs::OpenOptions::new().read(true).open(source)
 }
 
+/// Path-level type pre-check for `readFile`: rejects directories and
+/// non-regular entries (FIFOs, devices, sockets) before anything is opened.
+/// On unix the stat is anchored beneath `root` with the same containment as
+/// [`open_for_read`] — no symlink is followed at any component, and nothing
+/// outside the root is ever looked up — and it never opens the entry, so a
+/// device driver's `open` cannot run. Errors use the same messages as a
+/// failed open.
+#[cfg(unix)]
+fn precheck_for_read(path_str: &str, source: &Path, root: &Path) -> JsResult<()> {
+    let st = stat_for_read(source, root)
+        .map_err(|e| JsNativeError::error().with_message(open_error_message(path_str, &e)))?;
+    let kind = st.st_mode & libc::S_IFMT;
+    reject_non_regular_kind(path_str, kind == libc::S_IFDIR, kind == libc::S_IFREG)
+}
+
+/// Non-unix [`precheck_for_read`]: a plain `metadata` of the canonical path.
+#[cfg(not(unix))]
+fn precheck_for_read(path_str: &str, source: &Path, _root: &Path) -> JsResult<()> {
+    let meta = std::fs::metadata(source)
+        .map_err(|e| JsNativeError::error().with_message(open_error_message(path_str, &e)))?;
+    reject_non_regular(path_str, &meta)
+}
+
+/// Anchored `stat` of `source` beneath `root` (see [`open_for_read`] for the
+/// containment contract; this is its non-opening counterpart).
+#[cfg(unix)]
+fn stat_for_read(source: &Path, root: &Path) -> std::io::Result<libc::stat> {
+    use std::os::unix::io::AsFd as _;
+
+    let rel = source.strip_prefix(root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path escaped its matched write directory before the open",
+        )
+    })?;
+    let root_fd = open_beneath::open_root(root)?;
+    open_beneath::stat_beneath(root_fd.as_fd(), rel)
+}
+
 /// JS-facing message for a failed [`open_for_read`]. A missing file and, on
 /// unix, `ELOOP` get self-explanatory messages; everything else carries the
 /// OS error text. `ELOOP` is what the beneath-root open returns for a
@@ -1714,7 +1742,11 @@ fn open_error_message(path_str: &str, e: &std::io::Error) -> String {
 }
 
 fn reject_non_regular(path_str: &str, meta: &std::fs::Metadata) -> JsResult<()> {
-    if meta.is_dir() {
+    reject_non_regular_kind(path_str, meta.is_dir(), meta.is_file())
+}
+
+fn reject_non_regular_kind(path_str: &str, is_dir: bool, is_file: bool) -> JsResult<()> {
+    if is_dir {
         return Err(JsNativeError::error()
             .with_message(format!(
                 "readFile: '{}' is a directory, not a file",
@@ -1722,7 +1754,7 @@ fn reject_non_regular(path_str: &str, meta: &std::fs::Metadata) -> JsResult<()> 
             ))
             .into());
     }
-    if !meta.is_file() {
+    if !is_file {
         return Err(JsNativeError::error()
             .with_message(format!(
                 "readFile: '{}' is not a regular file (FIFOs, devices, and \
@@ -4257,12 +4289,24 @@ return {{ written: written, back: JSON.parse(readFile(written)) }};
                 rel,
                 msg
             );
+            // The type pre-check is anchored the same way: it must not stat
+            // through the swapped-in link either.
+            let err = stat_for_read(&source, root)
+                .expect_err("pre-check must refuse an intermediate symlink");
+            assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{}: {}", rel, err);
         }
 
         // Not beneath the matched root at all: refused without opening.
         let err = open_for_read(&outside.path().join("f.txt"), root)
             .expect_err("a path outside the root must be refused");
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{}", err);
+        let err = stat_for_read(&outside.path().join("f.txt"), root)
+            .expect_err("a path outside the root must not be statted");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{}", err);
+
+        // The genuine nested path pre-checks as a regular file.
+        let st = stat_for_read(&root.join("real/deep/f.txt"), root).unwrap();
+        assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFREG);
 
         // Sanity: the genuine (symlink-free) nested path still reads.
         let mut file = open_for_read(&root.join("real/deep/f.txt"), root).unwrap();
