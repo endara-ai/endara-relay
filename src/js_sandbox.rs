@@ -1488,18 +1488,16 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
     let allowed = limits
         .max_file_bytes
         .min(limits.max_total_bytes_per_run.saturating_sub(bytes_read));
-    let (bytes, exceeded) =
-        read_bounded(&mut file, allowed, file_len.min(allowed)).map_err(|e| {
-            JsNativeError::error()
-                .with_message(format!("readFile: failed to read '{}': {}", path_str, e))
-        })?;
+    let mut bytes = Vec::with_capacity(file_len.min(allowed));
+    let outcome = read_bounded(&mut file, allowed, &mut bytes);
     drop(file);
     let read_len = bytes.len();
 
-    // Account for the read as soon as the bytes have been pulled from disk,
-    // before the over-cap check and before decoding. Otherwise a script
-    // could loop on a file that keeps growing past the cap, or on a
-    // non-UTF-8 file, fail each time, and never consume quota.
+    // Account for the read as soon as the bytes have been pulled from disk —
+    // on every exit: I/O error (which may have appended partial data),
+    // over-cap, and before decoding. Otherwise a script could loop on a file
+    // that keeps failing, growing past the cap, or that is not UTF-8, and
+    // never consume quota.
     SANDBOX_STATE.with(|cell| {
         if let Some(state) = cell.borrow_mut().as_mut() {
             state.files_read += 1;
@@ -1507,6 +1505,10 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
         }
     });
 
+    let exceeded = outcome.map_err(|e| {
+        JsNativeError::error()
+            .with_message(format!("readFile: failed to read '{}': {}", path_str, e))
+    })?;
     if exceeded {
         return Err(JsNativeError::error()
             .with_message(format!(
@@ -1560,22 +1562,22 @@ fn reject_non_regular(path_str: &str, meta: &std::fs::Metadata) -> JsResult<()> 
     Ok(())
 }
 
-/// Read at most `allowed + 1` bytes from `reader`. The returned flag is
+/// Read at most `allowed + 1` bytes from `reader` into `bytes`. Returns
 /// `true` when the reader yielded more than `allowed` bytes, so a file that
-/// grows after its size was checked cannot exceed the caller's budget. The
-/// bytes actually pulled are returned in both cases so the caller can
-/// account for the I/O that happened.
+/// grows after its size was checked cannot exceed the caller's budget.
+/// Whatever was pulled stays appended to `bytes` on every outcome — including
+/// an I/O error after partial data — so the caller can account for the I/O
+/// that actually happened.
 fn read_bounded<R: std::io::Read>(
     reader: &mut R,
     allowed: usize,
-    capacity_hint: usize,
-) -> std::io::Result<(Vec<u8>, bool)> {
+    bytes: &mut Vec<u8>,
+) -> std::io::Result<bool> {
     use std::io::Read as _;
     let take_len = u64::try_from(allowed).unwrap_or(u64::MAX).saturating_add(1);
-    let mut bytes = Vec::with_capacity(capacity_hint);
-    reader.take(take_len).read_to_end(&mut bytes)?;
-    let exceeded = bytes.len() > allowed;
-    Ok((bytes, exceeded))
+    let start = bytes.len();
+    reader.take(take_len).read_to_end(bytes)?;
+    Ok(bytes.len() - start > allowed)
 }
 
 // ---------------------------------------------------------------------------
@@ -4137,21 +4139,105 @@ return {{ first: first, second: second }};
         // Exactly allowed + 1 bytes are pulled so the caller can account
         // for the I/O that happened even though the read is rejected.
         let mut grown = std::io::Cursor::new(vec![b'x'; 50]);
-        assert_eq!(
-            read_bounded(&mut grown, 10, 10).unwrap(),
-            (vec![b'x'; 11], true)
-        );
+        let mut buf = Vec::new();
+        assert!(read_bounded(&mut grown, 10, &mut buf).unwrap());
+        assert_eq!(buf, vec![b'x'; 11]);
 
         let mut exact = std::io::Cursor::new(vec![b'x'; 10]);
-        assert_eq!(
-            read_bounded(&mut exact, 10, 10).unwrap(),
-            (vec![b'x'; 10], false)
-        );
+        let mut buf = Vec::new();
+        assert!(!read_bounded(&mut exact, 10, &mut buf).unwrap());
+        assert_eq!(buf, vec![b'x'; 10]);
 
         let mut empty = std::io::Cursor::new(Vec::<u8>::new());
-        assert_eq!(read_bounded(&mut empty, 0, 0).unwrap(), (Vec::new(), false));
+        let mut buf = Vec::new();
+        assert!(!read_bounded(&mut empty, 0, &mut buf).unwrap());
+        assert!(buf.is_empty());
         let mut one = std::io::Cursor::new(vec![b'x']);
-        assert_eq!(read_bounded(&mut one, 0, 0).unwrap(), (vec![b'x'], true));
+        let mut buf = Vec::new();
+        assert!(read_bounded(&mut one, 0, &mut buf).unwrap());
+        assert_eq!(buf, vec![b'x']);
+    }
+
+    /// A reader that yields some data and then fails, like a network or FUSE
+    /// filesystem returning partial content before an error.
+    struct PartialThenError {
+        remaining: usize,
+    }
+
+    impl std::io::Read for PartialThenError {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::other("link dropped"));
+            }
+            let n = self.remaining.min(out.len());
+            out[..n].fill(b'p');
+            self.remaining -= n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn test_read_bounded_keeps_partial_bytes_on_io_error() {
+        let mut reader = PartialThenError { remaining: 7 };
+        let mut buf = Vec::new();
+        let err = read_bounded(&mut reader, 100, &mut buf).unwrap_err();
+        assert_eq!(err.to_string(), "link dropped");
+        // The partial data is still in the buffer so the caller can charge
+        // quota for the I/O that happened before the failure.
+        assert_eq!(buf, vec![b'p'; 7]);
+    }
+
+    /// End-to-end check that a read failing with an I/O error still counts
+    /// against the per-run file quota. On Linux `/proc/self/mem` is a regular
+    /// file whose read at offset 0 fails with EIO (the address is unmapped),
+    /// so it deterministically produces a real read error after a successful
+    /// open. Reading one's own `/proc/self/mem` needs ptrace access to self;
+    /// if the environment forbids it at `open`, there is no read-error seam
+    /// to exercise and the test bails out early.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_read_file_io_error_consumes_file_quota() {
+        let root = std::fs::canonicalize("/proc/self").unwrap();
+        let mem = root.join("mem");
+        if std::fs::File::open(&mem).is_err() {
+            eprintln!("skipping: /proc/self/mem cannot be opened in this environment");
+            return;
+        }
+        let sandbox = write_sandbox(vec![root.clone()])
+            .await
+            .with_read_limits(ReadLimits {
+                max_file_bytes: 64,
+                max_files_per_run: 3,
+                max_total_bytes_per_run: 1024,
+            });
+        let script = format!(
+            r#"
+var p = {};
+var errors = [];
+for (var i = 0; i < 4; i++) {{
+  try {{ readFile(p); errors.push(null); }} catch (e) {{ errors.push(String(e)); }}
+}}
+return errors;
+"#,
+            js_quote(mem.to_str().unwrap())
+        );
+        let result = sandbox.execute(&script).await.unwrap();
+        let errors = result.as_array().unwrap();
+        assert_eq!(errors.len(), 4);
+        for err in &errors[..3] {
+            let msg = err.as_str().unwrap_or_default();
+            assert!(
+                msg.contains("readFile: failed to read"),
+                "unexpected error: {}",
+                msg
+            );
+        }
+        let last = errors[3].as_str().unwrap_or_default();
+        assert!(
+            last.contains("per-run limit of 3 file reads"),
+            "unexpected error: {}",
+            last
+        );
     }
 
     /// A file that yields more bytes than its `fstat` size claims stands in
