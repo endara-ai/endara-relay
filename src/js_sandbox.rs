@@ -1297,13 +1297,16 @@ fn write_tmp_name(file_name: &std::ffi::OsStr) -> String {
 /// already be validated by [`resolve_write_path`] against `root` (the
 /// allowlisted root it matched). Every filesystem step is anchored to a
 /// directory handle of `root`: missing parents are created with `mkdirat`
-/// along an `openat` walk that refuses to follow symlinks
-/// ([`open_beneath::open_dir_beneath_creating`]), the temp file is created
-/// with `openat(O_CREAT | O_EXCL)` on the destination directory handle, and
-/// the publish is a `renameat` on that same handle. Because `dest` is
-/// canonical, any symlink the walk meets is a post-validation swap and fails
-/// the write — nothing is created or written outside the root, no matter
-/// how the path is re-pointed concurrently. If the root itself was deleted
+/// along a beneath-root open that refuses to follow symlinks
+/// ([`open_beneath::open_dir_beneath_creating`] — `openat2` re-resolving
+/// from the root at every step on Linux, an `openat` walk elsewhere), the
+/// temp file is created with `openat(O_CREAT | O_EXCL)` on the destination
+/// directory handle, and the publish is a `renameat` on that same handle.
+/// Because `dest` is canonical, any symlink met on the way is a
+/// post-validation swap and fails the write (`ELOOP`), as does a directory
+/// renamed out of the root while `openat2` resolves it (`EXDEV`) — nothing
+/// is created or written outside the root, no matter how the path is
+/// re-pointed concurrently. If the root itself was deleted
 /// after config resolution the write fails (the root handle cannot be
 /// opened); the "directories are never auto-created" stance in
 /// [`crate::config::resolve_write_roots`] only covers resolution time. On
@@ -1322,7 +1325,7 @@ fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
     };
     let rel_dir = dir.strip_prefix(root).map_err(|_| escaped())?;
     let parent_dirs_error = |e: std::io::Error| {
-        if e.raw_os_error() == Some(libc::ELOOP) {
+        if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::EXDEV)) {
             return escaped();
         }
         format!(

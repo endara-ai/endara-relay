@@ -10,10 +10,13 @@
 //! which turns that swap into a hard error instead of an escape.
 //!
 //! Two strategies share one contract:
-//! - Linux ≥ 5.6: a single `openat2(2)` with `RESOLVE_BENEATH |
+//! - Linux ≥ 5.6: `openat2(2)` from the root handle with `RESOLVE_BENEATH |
 //!   RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`, enforced by the kernel.
-//!   `ENOSYS`/`EINVAL`/`EPERM` (old kernel, seccomp) is remembered once and
-//!   every later call takes the walk.
+//!   Opens and stats are a single call; the directory-creating open used by
+//!   `writeFile` re-resolves the whole accumulated prefix from the root after
+//!   every step, so containment is re-checked each time rather than inherited
+//!   from a previously opened handle. `ENOSYS`/`EINVAL`/`EPERM` (old kernel,
+//!   seccomp) is remembered once and every later call takes the walk.
 //! - Everywhere else (macOS, old Linux): a component-by-component `openat(2)`
 //!   walk. Intermediates are opened `O_DIRECTORY | O_NOFOLLOW` (`O_PATH` on
 //!   Linux, `O_SEARCH` on Apple, so only search permission is needed), the final
@@ -21,11 +24,18 @@
 //!   depth fails with `ELOOP`. Every step is relative to the previous
 //!   directory handle, so no lookup ever re-resolves an ancestor: a component
 //!   swapped for a symlink is caught, and `..`/absolute components never
-//!   reach the kernel. One caveat inherent to `openat` walks: a directory
-//!   that has already been opened and is then renamed out of the root stays
-//!   pinned, and the remaining components resolve inside it wherever it now
-//!   lives. `openat2` additionally detects that case (`EXDEV`); the walk
-//!   cannot, though it still never follows a symlink or a `..`.
+//!   reach the kernel.
+//!
+//! One caveat is inherent to `openat` walks and remains on the portable tier:
+//! a directory that has already been opened and is then renamed out of the
+//! root stays pinned, and the remaining components resolve inside it wherever
+//! it now lives. Moving it requires write permission on both its in-root
+//! parent and the destination parent (and `rename(2)` cannot cross a mount),
+//! so the walk can only be redirected into a directory the concurrent actor
+//! could already write to — never into an arbitrary location — and it still
+//! never follows a symlink or a `..`. `openat2` detects that case as well
+//! (`EXDEV` when the rename happens during resolution), which is why it is
+//! preferred wherever the kernel offers it.
 
 use std::ffi::{CString, OsStr};
 use std::fs::File;
@@ -254,14 +264,98 @@ fn validated_open_components(rel_path: &Path, final_flags: libc::c_int) -> io::R
     Ok(components)
 }
 
-/// Walk `rel_dir` beneath `root` like [`open_beneath_walk`], creating any
-/// missing directory with `mkdirat(2)` (mode `0o777`, subject to umask) and
+/// Open the directory `rel_dir` beneath `root`, creating any missing
+/// component with `mkdirat(2)` (mode `0o777`, subject to umask) and
 /// returning a handle to the final directory. `writeFile` creates its temp
 /// file and `renameat`s it relative to that handle, so nothing it does can
 /// land outside the root. An empty `rel_dir` returns a fresh handle to `root`
-/// itself. Pre-existing symlinks in the chain are rejected with `ELOOP`, so
-/// this always uses the walk (there is no create-parents `openat2`).
+/// itself. A pre-existing symlink anywhere in the chain is `ELOOP`.
+///
+/// On Linux with `openat2`, every directory handle — including the one
+/// re-opened after each `mkdirat` — is resolved from `root` over the full
+/// accumulated relative path with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS`,
+/// never chained off the previous handle. The kernel therefore re-checks
+/// containment of the whole prefix at every step and reports an
+/// intermediate renamed out of the root during resolution as `EXDEV`, so the
+/// write fails closed instead of following the moved directory. Elsewhere
+/// the portable walk ([`open_dir_beneath_creating_walk`]) is used.
 pub(super) fn open_dir_beneath_creating(
+    root: BorrowedFd<'_>,
+    rel_dir: &Path,
+) -> io::Result<OwnedFd> {
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    let components = validated_components(rel_dir)?;
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(result) = open_dir_beneath_creating_openat2(root, &components) {
+            return result;
+        }
+    }
+    open_dir_beneath_creating_walk(root, rel_dir)
+}
+
+/// The `openat2` tier of [`open_dir_beneath_creating`]. `None` when the
+/// syscall is unavailable (nothing has been created yet in that case, since
+/// the probe is decided by the first call and latched process-wide).
+#[cfg(target_os = "linux")]
+fn open_dir_beneath_creating_openat2(
+    root: BorrowedFd<'_>,
+    components: &[&OsStr],
+) -> Option<io::Result<OwnedFd>> {
+    let mut so_far = std::path::PathBuf::new();
+    let mut dir = match openat(root.as_raw_fd(), OsStr::new("."), DIR_ANCHOR_FLAGS, 0) {
+        Ok(fd) => fd,
+        Err(e) => return Some(Err(e)),
+    };
+    for name in components {
+        so_far.push(name);
+        dir = match open_dir_beneath_openat2(root, dir.as_raw_fd(), name, &so_far)? {
+            Ok(fd) => fd,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // `dir` was itself resolved beneath `root`; the re-open below
+                // re-resolves the whole prefix from `root`, so a directory that
+                // moved out in between is not followed.
+                if let Err(e) = mkdirat_tolerating_exists(dir.as_raw_fd(), name) {
+                    return Some(Err(e));
+                }
+                match open_dir_beneath_openat2(root, dir.as_raw_fd(), name, &so_far)? {
+                    Ok(fd) => fd,
+                    Err(e) => return Some(Err(e)),
+                }
+            }
+            Err(e) => return Some(Err(e)),
+        };
+    }
+    Some(Ok(dir))
+}
+
+/// `openat2(root, rel_dir)` as a directory anchor. `parent`/`name` identify
+/// the same entry relative to its already-opened parent, only used to
+/// normalise Linux's `ENOTDIR`-for-a-trailing-symlink to `ELOOP` (with
+/// `O_NOFOLLOW` the kernel does not resolve — and so does not reject — a
+/// trailing symlink; `O_DIRECTORY` then fails on it with `ENOTDIR`).
+#[cfg(target_os = "linux")]
+fn open_dir_beneath_openat2(
+    root: BorrowedFd<'_>,
+    parent: libc::c_int,
+    name: &OsStr,
+    rel_dir: &Path,
+) -> Option<io::Result<OwnedFd>> {
+    Some(match openat2::open(root, rel_dir, DIR_ANCHOR_FLAGS)? {
+        Ok(file) => Ok(OwnedFd::from(file)),
+        Err(e) if e.raw_os_error() == Some(libc::ENOTDIR) && is_symlink_at(parent, name) => {
+            Err(io::Error::from_raw_os_error(libc::ELOOP))
+        }
+        Err(e) => Err(e),
+    })
+}
+
+/// The portable `openat(2)`/`mkdirat(2)` walk behind
+/// [`open_dir_beneath_creating`]: each component is opened relative to the
+/// previous handle, so no ancestor is ever re-resolved and no symlink is
+/// followed. Exposed separately so it stays tested on kernels that take the
+/// `openat2` tier.
+pub(super) fn open_dir_beneath_creating_walk(
     root: BorrowedFd<'_>,
     rel_dir: &Path,
 ) -> io::Result<OwnedFd> {
@@ -271,23 +365,30 @@ pub(super) fn open_dir_beneath_creating(
         dir = match open_intermediate(dir.as_raw_fd(), name) {
             Ok(fd) => fd,
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let c_name = c_string(name)?;
-                // SAFETY: `dir` is an open directory fd and `c_name` a valid C string.
-                let rc = unsafe { libc::mkdirat(dir.as_raw_fd(), c_name.as_ptr(), 0o777) };
-                if rc < 0 {
-                    let e = io::Error::last_os_error();
-                    // Lost a race with a concurrent creator: the open below
-                    // decides whether what appeared is an acceptable directory.
-                    if e.kind() != io::ErrorKind::AlreadyExists {
-                        return Err(e);
-                    }
-                }
+                mkdirat_tolerating_exists(dir.as_raw_fd(), name)?;
                 open_intermediate(dir.as_raw_fd(), name)?
             }
             Err(e) => return Err(e),
         };
     }
     Ok(dir)
+}
+
+/// `mkdirat(2)` of `name` under `dirfd` (mode `0o777`, subject to umask).
+/// `EEXIST` is not an error: the caller lost a race with a concurrent
+/// creator and its following open decides whether what appeared is an
+/// acceptable directory.
+fn mkdirat_tolerating_exists(dirfd: libc::c_int, name: &OsStr) -> io::Result<()> {
+    let c_name = c_string(name)?;
+    // SAFETY: `dirfd` is an open directory fd and `c_name` a valid C string.
+    let rc = unsafe { libc::mkdirat(dirfd, c_name.as_ptr(), 0o777) };
+    if rc < 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() != io::ErrorKind::AlreadyExists {
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 /// Split `rel_path` into its plain components, rejecting absolute paths,
@@ -730,25 +831,29 @@ mod tests {
                     .unwrap_or_else(|e| panic!("{}: {}", name, e));
                 assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFREG, "{}", name);
             }
-            let handle = open_dir_beneath_creating(root.as_fd(), Path::new("a/b")).unwrap();
-            create_file_at(&handle, "via_exec_only.txt", "ok");
-            assert_eq!(
-                std::fs::read_to_string(locked.join("via_exec_only.txt")).unwrap(),
-                "ok"
-            );
+            for (name, creator) in CREATORS {
+                let handle = creator(root.as_fd(), Path::new("a/b"))
+                    .unwrap_or_else(|e| panic!("{}: {}", name, e));
+                let file = format!("via_exec_only_{}.txt", name);
+                create_file_at(&handle, &file, "ok");
+                assert_eq!(std::fs::read_to_string(locked.join(file)).unwrap(), "ok");
+            }
             let exec_only_root = open_root(&locked).unwrap();
             for (name, opener) in OPENERS {
                 let file = opener(exec_only_root.as_fd(), Path::new("c.txt"), READ_FLAGS)
                     .unwrap_or_else(|e| panic!("{} via 0o311 root: {}", name, e));
                 assert_eq!(read_to_string(file), "nested", "{}", name);
             }
-            let handle =
-                open_dir_beneath_creating(exec_only_root.as_fd(), Path::new("new")).unwrap();
-            create_file_at(&handle, "via_exec_only_root.txt", "ok");
-            assert_eq!(
-                std::fs::read_to_string(locked.join("new/via_exec_only_root.txt")).unwrap(),
-                "ok"
-            );
+            for (name, creator) in CREATORS {
+                let handle = creator(exec_only_root.as_fd(), Path::new(name))
+                    .unwrap_or_else(|e| panic!("{} via 0o311 root: {}", name, e));
+                create_file_at(&handle, "via_exec_only_root.txt", "ok");
+                assert_eq!(
+                    std::fs::read_to_string(locked.join(name).join("via_exec_only_root.txt"))
+                        .unwrap(),
+                    "ok"
+                );
+            }
         }));
         restore();
         if let Err(panic) = outcome {
@@ -767,64 +872,142 @@ mod tests {
         File::from(fd).write_all(contents.as_bytes()).unwrap();
     }
 
+    type Creator = fn(BorrowedFd<'_>, &Path) -> io::Result<OwnedFd>;
+
+    /// Like [`OPENERS`]: the public entry point (the `openat2` tier where the
+    /// kernel offers it) and the portable walk directly.
+    const CREATORS: [(&str, Creator); 2] = [
+        ("open_dir_beneath_creating", open_dir_beneath_creating),
+        (
+            "open_dir_beneath_creating_walk",
+            open_dir_beneath_creating_walk,
+        ),
+    ];
+
     #[test]
     fn test_open_dir_beneath_creating_creates_missing_chain_and_returns_usable_dirfd() {
-        let (dir, root) = nested_root();
-        let leaf = open_dir_beneath_creating(root.as_fd(), Path::new("a/new/deeper/leaf")).unwrap();
-        assert!(dir.path().join("a/new/deeper/leaf").is_dir());
-        create_file_at(&leaf, "f.txt", "via dirfd");
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("a/new/deeper/leaf/f.txt")).unwrap(),
-            "via dirfd"
-        );
+        for (name, creator) in CREATORS {
+            let (dir, root) = nested_root();
+            let leaf = creator(root.as_fd(), Path::new("a/new/deeper/leaf"))
+                .unwrap_or_else(|e| panic!("{}: {}", name, e));
+            assert!(dir.path().join("a/new/deeper/leaf").is_dir(), "{}", name);
+            create_file_at(&leaf, "f.txt", "via dirfd");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("a/new/deeper/leaf/f.txt")).unwrap(),
+                "via dirfd",
+                "{}",
+                name
+            );
 
-        // Second walk over the now-existing chain succeeds without recreating.
-        let again =
-            open_dir_beneath_creating(root.as_fd(), Path::new("a/new/deeper/leaf")).unwrap();
-        create_file_at(&again, "g.txt", "again");
-        assert!(dir.path().join("a/new/deeper/leaf/g.txt").is_file());
+            // Second pass over the now-existing chain succeeds without recreating.
+            let again = creator(root.as_fd(), Path::new("a/new/deeper/leaf")).unwrap();
+            create_file_at(&again, "g.txt", "again");
+            assert!(
+                dir.path().join("a/new/deeper/leaf/g.txt").is_file(),
+                "{}",
+                name
+            );
+        }
     }
 
     #[test]
     fn test_open_dir_beneath_creating_empty_path_returns_root_handle() {
-        let (dir, root) = nested_root();
-        let handle = open_dir_beneath_creating(root.as_fd(), Path::new("")).unwrap();
-        create_file_at(&handle, "at_root.txt", "root");
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("at_root.txt")).unwrap(),
-            "root"
-        );
+        for (name, creator) in CREATORS {
+            let (dir, root) = nested_root();
+            let handle = creator(root.as_fd(), Path::new("")).unwrap();
+            create_file_at(&handle, "at_root.txt", "root");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("at_root.txt")).unwrap(),
+                "root",
+                "{}",
+                name
+            );
+        }
     }
 
     #[test]
     fn test_open_dir_beneath_creating_rejects_symlink_components() {
-        let (dir, root) = nested_root();
-        let outside = tempfile::tempdir().unwrap();
-        symlink(outside.path(), dir.path().join("a/out")).unwrap();
-        symlink(outside.path(), dir.path().join("first")).unwrap();
+        for (name, creator) in CREATORS {
+            let (dir, root) = nested_root();
+            let outside = tempfile::tempdir().unwrap();
+            symlink(outside.path(), dir.path().join("a/out")).unwrap();
+            symlink(outside.path(), dir.path().join("first")).unwrap();
 
-        for rel in ["a/out", "a/out/sub", "first/x/y"] {
-            let e = open_dir_beneath_creating(root.as_fd(), Path::new(rel)).unwrap_err();
-            assert_eq!(e.raw_os_error(), Some(libc::ELOOP), "{}: {}", rel, e);
+            for rel in ["a/out", "a/out/sub", "first/x/y"] {
+                let e = creator(root.as_fd(), Path::new(rel)).unwrap_err();
+                assert_eq!(
+                    e.raw_os_error(),
+                    Some(libc::ELOOP),
+                    "{}: {}: {}",
+                    name,
+                    rel,
+                    e
+                );
+            }
+            assert!(!outside.path().join("sub").exists(), "{}", name);
+            assert!(!outside.path().join("x").exists(), "{}", name);
         }
-        assert!(!outside.path().join("sub").exists());
-        assert!(!outside.path().join("x").exists());
     }
 
     #[test]
     fn test_open_dir_beneath_creating_rejects_non_plain_relative_paths() {
-        let (dir, root) = nested_root();
-        for bad in ["/tmp", "../x", "a/../x", "./a"] {
-            let e = open_dir_beneath_creating(root.as_fd(), Path::new(bad)).unwrap_err();
-            assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{:?}: {}", bad, e);
+        for (name, creator) in CREATORS {
+            let (dir, root) = nested_root();
+            for bad in ["/tmp", "../x", "a/../x", "./a"] {
+                let e = creator(root.as_fd(), Path::new(bad)).unwrap_err();
+                assert_eq!(
+                    e.kind(),
+                    io::ErrorKind::InvalidInput,
+                    "{}: {:?}: {}",
+                    name,
+                    bad,
+                    e
+                );
+            }
+            assert!(!dir.path().join("x").exists(), "{}", name);
         }
-        assert!(!dir.path().join("x").exists());
     }
 
     #[test]
     fn test_open_dir_beneath_creating_fails_when_component_is_a_file() {
-        let (_dir, root) = nested_root();
-        let e = open_dir_beneath_creating(root.as_fd(), Path::new("top.txt/sub")).unwrap_err();
+        for (name, creator) in CREATORS {
+            let (_dir, root) = nested_root();
+            let e = creator(root.as_fd(), Path::new("top.txt/sub")).unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::ENOTDIR), "{}: {}", name, e);
+        }
+    }
+
+    /// The `openat2` tier is exercised directly (not only through the
+    /// `CREATORS` matrix, which takes it implicitly) so a kernel with
+    /// `openat2` is known to have run it: creation, the trailing-symlink
+    /// `ENOTDIR` → `ELOOP` normalisation, and the intermediate-symlink
+    /// rejection all match the walk. Skipped where `openat2` is unavailable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_open_dir_beneath_creating_openat2_tier_matches_walk() {
+        let (dir, root) = nested_root();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), dir.path().join("a/out")).unwrap();
+        let tier = |rel: &str| {
+            let components: Vec<&OsStr> = Path::new(rel).iter().collect();
+            open_dir_beneath_creating_openat2(root.as_fd(), &components)
+        };
+        let Some(created) = tier("a/new/deeper") else {
+            return;
+        };
+        create_file_at(&created.unwrap(), "f.txt", "openat2");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a/new/deeper/f.txt")).unwrap(),
+            "openat2"
+        );
+        for rel in ["a/out", "a/out/sub"] {
+            let e = tier(rel).expect("openat2 still available").unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::ELOOP), "{}: {}", rel, e);
+        }
+        assert!(!outside.path().join("sub").exists());
+        let e = tier("top.txt/sub")
+            .expect("openat2 still available")
+            .unwrap_err();
         assert_eq!(e.raw_os_error(), Some(libc::ENOTDIR), "{}", e);
     }
 }
