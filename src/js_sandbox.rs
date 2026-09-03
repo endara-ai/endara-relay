@@ -1232,13 +1232,19 @@ fn resolve_write_path(
 
 /// The actionable "not inside a configured write directory" message,
 /// prefixed with the JS-facing primitive name `op`. When roots are
-/// configured, the currently-allowed directories are listed.
+/// configured, the currently-allowed directories are listed. For `readFile`
+/// the message notes that reads are scoped to the same allowlist as writes.
 fn write_dirs_rejection_message(op: &str, path_str: &str, write_roots: &[PathBuf]) -> String {
+    let scope_note = if op == "readFile" {
+        " (readFile is scoped to the same [relay] write_dirs allowlist as writeFile)"
+    } else {
+        ""
+    };
     let mut msg = format!(
-        "{}: '{}' is not inside a configured write directory. Add one under \
+        "{}: '{}' is not inside a configured write directory{}. Add one under \
          [relay] write_dirs in ~/.endara/config.toml, or in the Endara desktop app \
          under Settings → Write directories.",
-        op, path_str
+        op, path_str, scope_note
     );
     if !write_roots.is_empty() {
         let list = write_roots
@@ -1482,12 +1488,26 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
     let allowed = limits
         .max_file_bytes
         .min(limits.max_total_bytes_per_run.saturating_sub(bytes_read));
-    let bytes = read_bounded(&mut file, allowed, file_len.min(allowed)).map_err(|e| {
-        JsNativeError::error()
-            .with_message(format!("readFile: failed to read '{}': {}", path_str, e))
-    })?;
+    let (bytes, exceeded) =
+        read_bounded(&mut file, allowed, file_len.min(allowed)).map_err(|e| {
+            JsNativeError::error()
+                .with_message(format!("readFile: failed to read '{}': {}", path_str, e))
+        })?;
     drop(file);
-    let Some(bytes) = bytes else {
+    let read_len = bytes.len();
+
+    // Account for the read as soon as the bytes have been pulled from disk,
+    // before the over-cap check and before decoding. Otherwise a script
+    // could loop on a file that keeps growing past the cap, or on a
+    // non-UTF-8 file, fail each time, and never consume quota.
+    SANDBOX_STATE.with(|cell| {
+        if let Some(state) = cell.borrow_mut().as_mut() {
+            state.files_read += 1;
+            state.bytes_read = state.bytes_read.saturating_add(read_len);
+        }
+    });
+
+    if exceeded {
         return Err(JsNativeError::error()
             .with_message(format!(
                 "readFile: '{}' exceeds the remaining read allowance of {} bytes \
@@ -1500,18 +1520,7 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
                 bytes_read
             ))
             .into());
-    };
-    let read_len = bytes.len();
-
-    // Account for the read as soon as the bytes have been pulled from disk,
-    // before decoding. Otherwise a script could read the same non-UTF-8 file
-    // in a loop, fail decoding each time, and never consume quota.
-    SANDBOX_STATE.with(|cell| {
-        if let Some(state) = cell.borrow_mut().as_mut() {
-            state.files_read += 1;
-            state.bytes_read = state.bytes_read.saturating_add(read_len);
-        }
-    });
+    }
 
     let contents = match encoding.as_str() {
         "utf8" => String::from_utf8(bytes).map_err(|_| {
@@ -1551,22 +1560,22 @@ fn reject_non_regular(path_str: &str, meta: &std::fs::Metadata) -> JsResult<()> 
     Ok(())
 }
 
-/// Read at most `allowed` bytes from `reader`. Returns `Ok(None)` if the
-/// reader yields more than `allowed` bytes, so a file that grows after its
-/// size was checked cannot exceed the caller's budget.
+/// Read at most `allowed + 1` bytes from `reader`. The returned flag is
+/// `true` when the reader yielded more than `allowed` bytes, so a file that
+/// grows after its size was checked cannot exceed the caller's budget. The
+/// bytes actually pulled are returned in both cases so the caller can
+/// account for the I/O that happened.
 fn read_bounded<R: std::io::Read>(
     reader: &mut R,
     allowed: usize,
     capacity_hint: usize,
-) -> std::io::Result<Option<Vec<u8>>> {
+) -> std::io::Result<(Vec<u8>, bool)> {
     use std::io::Read as _;
     let take_len = u64::try_from(allowed).unwrap_or(u64::MAX).saturating_add(1);
     let mut bytes = Vec::with_capacity(capacity_hint);
     reader.take(take_len).read_to_end(&mut bytes)?;
-    if bytes.len() > allowed {
-        return Ok(None);
-    }
-    Ok(Some(bytes))
+    let exceeded = bytes.len() > allowed;
+    Ok((bytes, exceeded))
 }
 
 // ---------------------------------------------------------------------------
@@ -3721,6 +3730,13 @@ return "ok";
             msg
         );
         assert!(
+            msg.contains(
+                "readFile is scoped to the same [relay] write_dirs allowlist as writeFile"
+            ),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(
             msg.contains("[relay] write_dirs in ~/.endara/config.toml"),
             "unexpected error: {}",
             msg
@@ -3735,6 +3751,42 @@ return "ok";
             "unexpected error: {}",
             msg
         );
+    }
+
+    #[tokio::test]
+    async fn test_write_file_then_read_file_round_trip_same_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let path = root.join("exports").join("report.json");
+        let script = format!(
+            r#"
+var p = {};
+var written = writeFile(p, JSON.stringify({{ ok: true, n: 3 }}));
+return {{ written: written, back: JSON.parse(readFile(written)) }};
+"#,
+            js_quote(path.to_str().unwrap())
+        );
+        let result = sandbox.execute(&script).await.unwrap();
+        assert_eq!(result["written"], json!(path.to_str().unwrap()));
+        assert_eq!(result["back"], json!({ "ok": true, "n": 3 }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_read_file_allows_symlink_to_file_inside_same_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let sandbox = write_sandbox(vec![root.clone()]).await;
+        let target = root.join("real.txt");
+        std::fs::write(&target, "via-link").unwrap();
+        // A symlink whose target also resolves under the root is contained
+        // and must be readable.
+        let link = root.join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let script = format!("return readFile({});", js_quote(link.to_str().unwrap()));
+        let result = sandbox.execute(&script).await.unwrap();
+        assert_eq!(result, json!("via-link"));
     }
 
     #[tokio::test]
@@ -4082,19 +4134,80 @@ return {{ first: first, second: second }};
     fn test_read_bounded_rejects_growth_past_cap() {
         // Simulates a file whose size check passed but which grew before the
         // read: the reader yields more bytes than the allowance.
-        let mut grown = std::io::Cursor::new(vec![b'x'; 11]);
-        assert_eq!(read_bounded(&mut grown, 10, 10).unwrap(), None);
+        // Exactly allowed + 1 bytes are pulled so the caller can account
+        // for the I/O that happened even though the read is rejected.
+        let mut grown = std::io::Cursor::new(vec![b'x'; 50]);
+        assert_eq!(
+            read_bounded(&mut grown, 10, 10).unwrap(),
+            (vec![b'x'; 11], true)
+        );
 
         let mut exact = std::io::Cursor::new(vec![b'x'; 10]);
         assert_eq!(
             read_bounded(&mut exact, 10, 10).unwrap(),
-            Some(vec![b'x'; 10])
+            (vec![b'x'; 10], false)
         );
 
         let mut empty = std::io::Cursor::new(Vec::<u8>::new());
-        assert_eq!(read_bounded(&mut empty, 0, 0).unwrap(), Some(Vec::new()));
+        assert_eq!(read_bounded(&mut empty, 0, 0).unwrap(), (Vec::new(), false));
         let mut one = std::io::Cursor::new(vec![b'x']);
-        assert_eq!(read_bounded(&mut one, 0, 0).unwrap(), None);
+        assert_eq!(read_bounded(&mut one, 0, 0).unwrap(), (vec![b'x'], true));
+    }
+
+    /// A file that yields more bytes than its `fstat` size claims stands in
+    /// for one that grew between the size check and the read. On Linux,
+    /// `/proc/<pid>/status` is a regular file reporting a length of 0 whose
+    /// contents are non-empty, and `/proc/<pid>` canonicalizes stably, so it
+    /// can act as a read root without any timing dependence.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_read_file_over_cap_bounded_read_consumes_quota() {
+        let root = std::fs::canonicalize("/proc/self").unwrap();
+        let status = root.join("status");
+        let meta = std::fs::metadata(&status).unwrap();
+        assert!(
+            meta.is_file() && meta.len() == 0,
+            "precondition: {:?}",
+            meta
+        );
+
+        let sandbox = write_sandbox(vec![root.clone()])
+            .await
+            .with_read_limits(ReadLimits {
+                max_file_bytes: 8,
+                max_files_per_run: 3,
+                max_total_bytes_per_run: 1024,
+            });
+        // Each over-cap read pulls 9 bytes and fails, but still counts as a
+        // file read; the 4th attempt must be refused by the per-run count.
+        let script = format!(
+            r#"
+var p = {};
+var errors = [];
+for (var i = 0; i < 4; i++) {{
+  try {{ readFile(p); errors.push(null); }} catch (e) {{ errors.push(String(e)); }}
+}}
+return errors;
+"#,
+            js_quote(status.to_str().unwrap())
+        );
+        let result = sandbox.execute(&script).await.unwrap();
+        let errors = result.as_array().unwrap();
+        assert_eq!(errors.len(), 4);
+        for err in &errors[..3] {
+            let msg = err.as_str().unwrap_or_default();
+            assert!(
+                msg.contains("exceeds the remaining read allowance of 8 bytes"),
+                "unexpected error: {}",
+                msg
+            );
+        }
+        let last = errors[3].as_str().unwrap_or_default();
+        assert!(
+            last.contains("per-run limit of 3 file reads"),
+            "unexpected error: {}",
+            last
+        );
     }
 
     #[tokio::test]
