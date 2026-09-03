@@ -656,13 +656,26 @@ impl HttpAdapter {
     /// On an actual `Unhealthy` → `Healthy` flip (only — not on every
     /// success) a `tools_changed` tick is emitted so the registry invalidates
     /// any merged catalog rebuilt without this endpoint's tools during the
-    /// outage. Mirrors the SSE adapter's post-reconnect tick. `SendError`
-    /// (no subscribers) is harmless — drop it.
+    /// outage. The tick is sent AFTER the statement-scoped write guard drops
+    /// (mirroring the SSE adapter's post-reconnect tick): [`Self::health`]
+    /// reads via `try_read` with a `Starting` fallback, so a catalog rebuild
+    /// racing a tick sent under the guard would mislabel the endpoint
+    /// UNAVAILABLE with no corrective tick to follow. A failure interleaving
+    /// between the drop and the send is benign — it just re-demotes health
+    /// and the next recovery flip ticks again. `SendError` (no subscribers)
+    /// is harmless — drop it.
     async fn note_request_success(&self) {
-        let mut health = self.health.write().await;
-        self.transport_failures.store(0, Ordering::SeqCst);
-        if matches!(*health, HealthStatus::Unhealthy(_)) {
-            *health = HealthStatus::Healthy;
+        let flipped = {
+            let mut health = self.health.write().await;
+            self.transport_failures.store(0, Ordering::SeqCst);
+            if matches!(*health, HealthStatus::Unhealthy(_)) {
+                *health = HealthStatus::Healthy;
+                true
+            } else {
+                false
+            }
+        };
+        if flipped {
             let _ = self.tools_changed_tx.send(());
         }
     }
