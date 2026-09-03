@@ -1529,7 +1529,7 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
             .into());
     }
 
-    let (source, _matched_root) = resolve_write_path("readFile", &path_str, &write_roots)
+    let (source, matched_root) = resolve_write_path("readFile", &path_str, &write_roots)
         .map_err(|msg| JsNativeError::error().with_message(msg))?;
 
     // Only regular files are readable. Opening a FIFO blocks until a writer
@@ -1558,10 +1558,11 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
     // and the bounded read below all apply to the same inode, rather than
     // to whatever the pathname resolves to on a second lookup. On unix the
     // open itself cannot block on a FIFO swapped in after the pre-check
-    // (`O_NONBLOCK`) and cannot follow a symlink swapped in for the
-    // canonicalized final component (`O_NOFOLLOW`); the fstat on the handle
+    // (`O_NONBLOCK`) and is anchored beneath the matched root, so a symlink
+    // swapped in for any component of the canonicalized path — not just the
+    // final one — is rejected rather than followed; the fstat on the handle
     // is authoritative.
-    let mut file = open_for_read(&source)
+    let mut file = open_for_read(&source, &matched_root)
         .map_err(|e| JsNativeError::error().with_message(open_error_message(&path_str, &e)))?;
     let meta = file.metadata().map_err(|e| {
         JsNativeError::error()
@@ -1650,34 +1651,53 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
     Ok(JsValue::from(boa_engine::js_string!(contents.as_str())))
 }
 
-/// Open `source` read-only for `readFile`. On unix the open carries
-/// `O_NONBLOCK`, so a FIFO with no writer returns a handle immediately
-/// instead of parking the sandbox thread (this is guaranteed for FIFOs only;
-/// a device driver's open may still block, which is why the caller keeps its
-/// path-level type pre-check); `O_NOFOLLOW`, so a
-/// symlink swapped in for the already-canonicalized final component fails
-/// with `ELOOP` rather than being followed; and `O_NOCTTY`, so a tty device
-/// node can never become the controlling terminal as a side effect of the
-/// open (std does not set it). The caller must still fstat the returned
+/// Open `source` read-only for `readFile`. `source` must already be
+/// validated by [`resolve_write_path`] against `root` (the allowlisted root
+/// it matched). The open is anchored to a directory handle of `root` and
+/// walks `source`'s path relative to it via [`open_beneath::open_beneath`],
+/// which refuses to follow a symlink at any component: because `source` is
+/// canonical, any symlink met is a post-validation swap and fails with
+/// `ELOOP` instead of being followed — possibly out of the root. The open
+/// also carries `O_NONBLOCK`, so a FIFO with no writer returns a handle
+/// immediately instead of parking the sandbox thread (this is guaranteed for
+/// FIFOs only; a device driver's open may still block, which is why the
+/// caller keeps its path-level type pre-check), and `O_NOCTTY`, so a tty
+/// device node can never become the controlling terminal as a side effect of
+/// the open (std does not set it). The caller must still fstat the returned
 /// handle and reject anything that is not a regular file; regular files are
 /// unaffected by these flags, so the bounded read that follows behaves
 /// exactly as a plain open would.
-fn open_for_read(source: &Path) -> std::io::Result<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY);
-    }
-    opts.open(source)
+#[cfg(unix)]
+fn open_for_read(source: &Path, root: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::AsFd as _;
+
+    let rel = source.strip_prefix(root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path escaped its matched write directory before the open",
+        )
+    })?;
+    let root_fd = open_beneath::open_root(root)?;
+    open_beneath::open_beneath(
+        root_fd.as_fd(),
+        rel,
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY,
+    )
+}
+
+/// Non-unix [`open_for_read`]: a plain read-only open of the canonical path.
+/// This platform has no beneath-root open, so the validate→open window is
+/// not closed here.
+#[cfg(not(unix))]
+fn open_for_read(source: &Path, _root: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().read(true).open(source)
 }
 
 /// JS-facing message for a failed [`open_for_read`]. A missing file and, on
 /// unix, `ELOOP` get self-explanatory messages; everything else carries the
-/// OS error text. `ELOOP` is returned both when `O_NOFOLLOW` rejects a
-/// symlink in the final component and when an intermediate component
-/// resolves through a symlink loop, so the message covers both.
+/// OS error text. `ELOOP` is what the beneath-root open returns for a
+/// symlink at any component of the path (final or intermediate) and what
+/// the kernel returns for a symlink loop, so the message covers all three.
 fn open_error_message(path_str: &str, e: &std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::NotFound {
         return format!("readFile: '{}' does not exist", path_str);
@@ -4125,9 +4145,10 @@ return {{ written: written, back: JSON.parse(readFile(written)) }};
             .expect("mkfifo must be available on unix");
         assert!(status.success(), "mkfifo failed: {:?}", status);
 
+        let root = dir.path().to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(open_for_read(&fifo).map(|f| f.metadata()));
+            let _ = tx.send(open_for_read(&fifo, &root).map(|f| f.metadata()));
         });
         let opened = rx
             .recv_timeout(Duration::from_secs(5))
@@ -4159,7 +4180,7 @@ return {{ written: written, back: JSON.parse(readFile(written)) }};
         let link = dir.path().join("link.txt");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let err = open_for_read(&link).expect_err("O_NOFOLLOW must refuse a symlink");
+        let err = open_for_read(&link, dir.path()).expect_err("O_NOFOLLOW must refuse a symlink");
         assert_eq!(
             err.raw_os_error(),
             Some(libc::ELOOP),
@@ -4178,7 +4199,73 @@ return {{ written: written, back: JSON.parse(readFile(written)) }};
             msg
         );
 
-        let mut file = open_for_read(&target).unwrap();
+        let mut file = open_for_read(&target, dir.path()).unwrap();
+        assert!(file.metadata().unwrap().is_file());
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "plain");
+    }
+
+    /// The beneath-root open rejects a symlink swapped in for an
+    /// *intermediate* component of the already-canonicalized path — the case
+    /// a plain `open(2)` with `O_NOFOLLOW` would happily follow — whether the
+    /// link points out of the root or back inside it, and surfaces it through
+    /// the same friendly `ELOOP` message. A path that is not beneath the
+    /// matched root at all is refused before any handle is opened. (End to
+    /// end this arm is only reachable via the swap race: `resolve_write_path`
+    /// canonicalizes pre-existing symlinks away before the open.)
+    #[cfg(unix)]
+    #[test]
+    fn test_open_for_read_rejects_intermediate_symlink_swap() {
+        use std::io::Read as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("f.txt"), "s3cr3t-content").unwrap();
+        std::fs::create_dir_all(root.join("real/deep")).unwrap();
+        std::fs::write(root.join("real/deep/f.txt"), "plain").unwrap();
+        // Out-of-root swap at the first component.
+        std::os::unix::fs::symlink(outside.path(), root.join("swapped")).unwrap();
+        // Out-of-root swap at a middle component.
+        std::os::unix::fs::symlink(outside.path(), root.join("real/out")).unwrap();
+        // In-root swap: still a post-canonicalize change, still rejected.
+        std::os::unix::fs::symlink(root.join("real"), root.join("inner")).unwrap();
+
+        for rel in ["swapped/f.txt", "real/out/f.txt", "inner/deep/f.txt"] {
+            let source = root.join(rel);
+            let err = match open_for_read(&source, root) {
+                Ok(_) => panic!("{}: intermediate symlink must be refused", rel),
+                Err(e) => e,
+            };
+            assert_eq!(
+                err.raw_os_error(),
+                Some(libc::ELOOP),
+                "{}: unexpected error: {}",
+                rel,
+                err
+            );
+            let msg = open_error_message(&format!("/root/{}", rel), &err);
+            assert!(
+                msg.contains("refers to a symbolic link or a path containing a symbolic link loop"),
+                "{}: unexpected message: {}",
+                rel,
+                msg
+            );
+            assert!(
+                !msg.contains("Too many levels") && !msg.contains("Not a directory"),
+                "{}: raw OS text must not leak: {}",
+                rel,
+                msg
+            );
+        }
+
+        // Not beneath the matched root at all: refused without opening.
+        let err = open_for_read(&outside.path().join("f.txt"), root)
+            .expect_err("a path outside the root must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{}", err);
+
+        // Sanity: the genuine (symlink-free) nested path still reads.
+        let mut file = open_for_read(&root.join("real/deep/f.txt"), root).unwrap();
         assert!(file.metadata().unwrap().is_file());
         let mut contents = String::new();
         file.read_to_string(&mut contents).unwrap();

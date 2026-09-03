@@ -17,9 +17,14 @@
 //! - Everywhere else (macOS, old Linux): a component-by-component `openat(2)`
 //!   walk. Intermediates are opened `O_DIRECTORY | O_NOFOLLOW`, the final
 //!   component with the caller's flags plus `O_NOFOLLOW`, so a symlink at any
-//!   depth fails with `ELOOP`. Because every step is relative to the previous
-//!   directory handle, concurrent renames cannot re-point the walk outside the
-//!   root.
+//!   depth fails with `ELOOP`. Every step is relative to the previous
+//!   directory handle, so no lookup ever re-resolves an ancestor: a component
+//!   swapped for a symlink is caught, and `..`/absolute components never
+//!   reach the kernel. One caveat inherent to `openat` walks: a directory
+//!   that has already been opened and is then renamed out of the root stays
+//!   pinned, and the remaining components resolve inside it wherever it now
+//!   lives. `openat2` additionally detects that case (`EXDEV`); the walk
+//!   cannot, though it still never follows a symlink or a `..`.
 
 use std::ffi::{CString, OsStr};
 use std::fs::File;
@@ -59,19 +64,21 @@ pub(super) fn open_root(path: &Path) -> io::Result<OwnedFd> {
 /// `O_CREAT` is not supported — create files through the directory handle
 /// returned by [`open_dir_beneath_creating`] instead. A symlink component
 /// surfaces as `ELOOP`, on both the `openat2` and the walk paths.
-// `allow(dead_code)`: the readFile call site lands in a follow-up change;
-// keep the allow until then so both targets stay warning-clean under
-// `clippy -D warnings`.
-#[allow(dead_code)]
 pub(super) fn open_beneath(
     root: BorrowedFd<'_>,
     rel_path: &Path,
     final_flags: libc::c_int,
 ) -> io::Result<File> {
-    validated_open_components(rel_path, final_flags)?;
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    let components = validated_open_components(rel_path, final_flags)?;
     #[cfg(target_os = "linux")]
-    if let Some(result) = openat2::open(root, rel_path, final_flags) {
-        return result;
+    {
+        // Rebuild the path from the validated components so `openat2` sees
+        // exactly what the walk would (no trailing `/`, no `//`, no `./`).
+        let normalized: std::path::PathBuf = components.iter().collect();
+        if let Some(result) = openat2::open(root, &normalized, final_flags) {
+            return result;
+        }
     }
     open_beneath_walk(root, rel_path, final_flags)
 }
@@ -372,6 +379,14 @@ mod tests {
             assert_eq!(read_to_string(file), "nested", "{}", name);
             let top = opener(root.as_fd(), Path::new("top.txt"), READ_FLAGS).unwrap();
             assert_eq!(read_to_string(top), "top", "{}", name);
+            // Spellings `Path::components` normalizes away must behave the
+            // same on both openers (the openat2 path is rebuilt from the
+            // validated components rather than passed through verbatim).
+            for spelling in ["a/b/c.txt/", "a//b/c.txt", "a/./b/c.txt"] {
+                let file = opener(root.as_fd(), Path::new(spelling), READ_FLAGS)
+                    .unwrap_or_else(|e| panic!("{}: {:?}: {}", name, spelling, e));
+                assert_eq!(read_to_string(file), "nested", "{}: {:?}", name, spelling);
+            }
         }
     }
 
