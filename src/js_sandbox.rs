@@ -1331,7 +1331,17 @@ fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
             e
         )
     };
-    let root_fd = open_beneath::open_root(root).map_err(parent_dirs_error)?;
+    let root_fd = open_beneath::open_root(root).map_err(|e| {
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            return escaped();
+        }
+        format!(
+            "writeFile: configured write directory '{}' is not accessible: {} — recreate it \
+             or update [relay] write_dirs in ~/.endara/config.toml",
+            root.display(),
+            e
+        )
+    })?;
     let dir_fd = open_beneath::open_dir_beneath_creating(root_fd.as_fd(), rel_dir)
         .map_err(parent_dirs_error)?;
     let tmp = std::ffi::OsString::from(write_tmp_name(file_name));
@@ -3611,6 +3621,46 @@ mod tests {
             dir_entries(&root.join("keep/deep/fresh")),
             vec!["x.txt".to_string()]
         );
+    }
+
+    /// A root deleted after config resolution is not recreated (the anchor
+    /// cannot be opened), and the error names the root and the config knob
+    /// rather than blaming parent-directory creation. A root swapped for a
+    /// symlink is still reported as an escape.
+    #[cfg(unix)]
+    #[test]
+    fn test_write_atomic_reports_missing_root_distinctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir).join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+
+        let dest = root.join("a/b.txt");
+        let err = write_atomic(&dest, b"d", &root).unwrap_err();
+        assert!(
+            err.contains(&format!(
+                "configured write directory '{}' is not accessible",
+                root.display()
+            )) && err.contains("[relay] write_dirs"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            !err.contains("failed to create parent directories"),
+            "{}",
+            err
+        );
+        assert!(!root.exists(), "root must not be recreated");
+
+        std::os::unix::fs::symlink(outside.path(), &root).unwrap();
+        let err = write_atomic(&dest, b"d", &root).unwrap_err();
+        assert!(
+            err.contains("escaped the configured write directory during the write"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(dir_entries(outside.path()).is_empty());
     }
 
     #[tokio::test]

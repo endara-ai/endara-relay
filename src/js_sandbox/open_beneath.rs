@@ -16,7 +16,7 @@
 //!   later call takes the walk.
 //! - Everywhere else (macOS, old Linux): a component-by-component `openat(2)`
 //!   walk. Intermediates are opened `O_DIRECTORY | O_NOFOLLOW` (`O_PATH` on
-//!   Linux, so only search permission is needed), the final
+//!   Linux, `O_SEARCH` on Apple, so only search permission is needed), the final
 //!   component with the caller's flags plus `O_NOFOLLOW`, so a symlink at any
 //!   depth fails with `ELOOP`. Every step is relative to the previous
 //!   directory handle, so no lookup ever re-resolves an ancestor: a component
@@ -34,18 +34,21 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::io::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 use std::path::{Component, Path};
 
-/// Flags for every directory anchor (the root and each intermediate). On
-/// Linux they are `O_PATH` handles: traversal then needs only search
-/// permission, as a normal pathname lookup does, whereas an `O_RDONLY`
-/// directory open would also demand read permission and fail with `EACCES`
-/// beneath an execute-only directory. Every use of these handles is an
-/// `*at(2)` call, which accepts `O_PATH` descriptors. Other unixes have no
-/// `O_PATH`, so `O_RDONLY` is used there. `O_CLOEXEC` is always added so the
-/// handles never leak into spawned MCP server processes.
+/// Flags for every directory anchor (the root and each intermediate).
+/// Traversal must need only search permission, as a normal pathname lookup
+/// does; an `O_RDONLY` directory open would also demand read permission and
+/// fail with `EACCES` beneath a `0o311` directory. Linux uses `O_PATH`;
+/// Apple has no `O_PATH` but `O_SEARCH` (`O_EXEC | O_DIRECTORY`), which XNU
+/// authorises as `KAUTH_VNODE_SEARCH` only. Every use of these handles is an
+/// `*at(2)` call, which accepts both kinds of descriptor. Other unixes fall
+/// back to `O_RDONLY`. `O_CLOEXEC` is always added so the handles never leak
+/// into spawned MCP server processes.
 #[cfg(target_os = "linux")]
 const DIR_ANCHOR_FLAGS: libc::c_int =
     libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_vendor = "apple")]
+const DIR_ANCHOR_FLAGS: libc::c_int = libc::O_SEARCH | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 const DIR_ANCHOR_FLAGS: libc::c_int =
     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
 
@@ -676,13 +679,14 @@ mod tests {
         }
     }
 
-    /// Anchors are `O_PATH` on Linux, so a file beneath a directory without
-    /// read permission (search only — plus write, so creation can be
-    /// exercised too) stays reachable exactly as it is through a plain
-    /// pathname open, where an `O_RDONLY` directory anchor would fail with
-    /// `EACCES`. Root bypasses permission checks, so the test is skipped
-    /// there.
-    #[cfg(target_os = "linux")]
+    /// Anchors are `O_PATH` on Linux and `O_SEARCH` on Apple, so a file
+    /// beneath a directory without read permission (`0o311`: search plus
+    /// write, so creation can be exercised too) stays reachable exactly as it
+    /// is through a plain pathname open, where an `O_RDONLY` directory anchor
+    /// would fail with `EACCES`. Covers a `0o311` intermediate and a `0o311`
+    /// root, for both openers, both statters and the creating walk. Root
+    /// bypasses permission checks, so the test is skipped there.
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     #[test]
     fn test_anchors_traverse_execute_only_directories() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -721,9 +725,18 @@ mod tests {
                 "ok"
             );
             let exec_only_root = open_root(&locked).unwrap();
-            let file =
-                open_beneath(exec_only_root.as_fd(), Path::new("c.txt"), READ_FLAGS).unwrap();
-            assert_eq!(read_to_string(file), "nested");
+            for (name, opener) in OPENERS {
+                let file = opener(exec_only_root.as_fd(), Path::new("c.txt"), READ_FLAGS)
+                    .unwrap_or_else(|e| panic!("{} via 0o311 root: {}", name, e));
+                assert_eq!(read_to_string(file), "nested", "{}", name);
+            }
+            let handle =
+                open_dir_beneath_creating(exec_only_root.as_fd(), Path::new("new")).unwrap();
+            create_file_at(&handle, "via_exec_only_root.txt", "ok");
+            assert_eq!(
+                std::fs::read_to_string(locked.join("new/via_exec_only_root.txt")).unwrap(),
+                "ok"
+            );
         }));
         restore();
         if let Err(panic) = outcome {
