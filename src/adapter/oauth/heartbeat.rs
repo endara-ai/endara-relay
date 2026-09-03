@@ -339,6 +339,16 @@ async fn apply_probe_action(
                 result = "unhealthy",
                 "heartbeat probe got 401, transitioning to AuthRequired"
             );
+            // Inside the state write critical section so the baseline
+            // clear is atomic with the degraded transition, matching the
+            // other state writers (`transition_to` /
+            // `transition_if_current`): while AuthRequired the registry
+            // may rebuild the merged catalog without this endpoint's
+            // tools, so the recovery apply must tick even when the
+            // re-probed tool set is unchanged.
+            adapter
+                .clear_fingerprint_on_degraded(&OAuthState::AuthRequired)
+                .await;
             *state = OAuthState::AuthRequired;
             // Keep the invariant "every state write bumps the generation
             // inside the write critical section" (see
@@ -956,7 +966,8 @@ mod tests {
     }
 
     /// Spawn a minimal MCP server so `apply_tokens` can re-init the inner
-    /// adapter and reach `Authenticated`.
+    /// adapter and reach `Authenticated`. Serves a FIXED tool set so the
+    /// fingerprint probe stores a stable `Some` baseline.
     async fn spawn_minimal_mcp_server() -> (String, tokio::task::JoinHandle<()>) {
         use axum::{routing::post, Json, Router};
         use serde_json::{json, Value};
@@ -964,8 +975,8 @@ mod tests {
         async fn handle(Json(body): Json<Value>) -> Json<Value> {
             let id = body.get("id").cloned().unwrap_or(Value::Null);
             let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
-            if method == "initialize" {
-                Json(json!({
+            match method {
+                "initialize" => Json(json!({
                     "jsonrpc": "2.0",
                     "id": id,
                     "result": {
@@ -973,9 +984,19 @@ mod tests {
                         "capabilities": {},
                         "serverInfo": {"name": "test-server", "version": "0.0.1"},
                     },
-                }))
-            } else {
-                Json(json!({"jsonrpc": "2.0", "id": id, "result": {}}))
+                })),
+                "tools/list" => Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "tools": [{
+                            "name": "alpha",
+                            "description": "fixed tool",
+                            "inputSchema": {"type": "object", "properties": {}},
+                        }],
+                    },
+                })),
+                _ => Json(json!({"jsonrpc": "2.0", "id": id, "result": {}})),
             }
         }
 
@@ -1053,5 +1074,90 @@ mod tests {
             OAuthState::ConnectionFailed,
             "recovery must keep retrying without wedging"
         );
+    }
+
+    // -- Heartbeat-401 degradation → recovery-tick regression ---------------
+
+    fn make_tokens(access: &str) -> TokenSet {
+        TokenSet {
+            access_token: access.to_string(),
+            refresh_token: None,
+            expires_at: None,
+            token_type: "Bearer".to_string(),
+            scope: None,
+            issued_at: None,
+        }
+    }
+
+    /// Wait briefly for an outer tick. Returns whether one arrived.
+    async fn recv_outer_tick(
+        rx: &mut tokio::sync::broadcast::Receiver<()>,
+        timeout: Duration,
+    ) -> bool {
+        use tokio::sync::broadcast::error::RecvError;
+        matches!(
+            tokio::time::timeout(timeout, rx.recv()).await,
+            Ok(Ok(())) | Ok(Err(RecvError::Lagged(_)))
+        )
+    }
+
+    /// Drain any already-queued ticks so subsequent `recv` reflects new sends.
+    async fn drain_ticks(rx: &mut tokio::sync::broadcast::Receiver<()>) {
+        while recv_outer_tick(rx, Duration::from_millis(20)).await {}
+    }
+
+    /// Regression (PR #151 review): the heartbeat's AuthFailed arm writes
+    /// `AuthRequired` directly under the state write lock (bypassing
+    /// `transition_to`), so it must ALSO clear the tools-fingerprint
+    /// baseline — without the clear, a heartbeat-401 degradation followed
+    /// by a re-login reproducing the SAME tool set suppresses the recovery
+    /// tick (A==A comparison) and leaves the endpoint's tools missing from
+    /// the merged catalog until an unrelated invalidation.
+    #[tokio::test]
+    async fn heartbeat_401_degradation_clears_fingerprint_so_recovery_apply_ticks() {
+        use crate::adapter::McpAdapter as _;
+
+        let threshold = 3;
+        let (mcp_url, mcp_srv) = spawn_minimal_mcp_server().await;
+        let tmp = tempfile::tempdir().unwrap().keep();
+        let tm = Arc::new(TokenManager::new(tmp));
+        let mut config = make_test_config(threshold);
+        config.url = mcp_url;
+        let mut adapter = OAuthAdapter::new(config, tm);
+        adapter.initialize().await.unwrap();
+        let inner = adapter.shared_inner();
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+
+        // Baseline: apply with the server's fixed tool set → Authenticated
+        // with a stored fingerprint.
+        inner.apply_tokens(make_tokens("first")).await;
+        assert_eq!(*inner.state.read().await, OAuthState::Authenticated);
+        assert!(
+            inner.last_tools_fingerprint.read().await.is_some(),
+            "baseline fingerprint must be stored after a successful probe"
+        );
+        drain_ticks(&mut outer_rx).await;
+
+        // A heartbeat probe 401 lands through the real dispatch path,
+        // degrading to AuthRequired via the AuthFailed arm.
+        let mut failures = 0u32;
+        step_once(&inner, auth(), &mut failures, threshold).await;
+        assert_eq!(*inner.state.read().await, OAuthState::AuthRequired);
+        assert!(
+            inner.last_tools_fingerprint.read().await.is_none(),
+            "heartbeat 401 → AuthRequired must clear the fingerprint baseline"
+        );
+
+        // Recovery re-login reproducing the SAME tool set: the baseline is
+        // unknown, so the Some→Some swap must tick so the registry restores
+        // the endpoint's tools to the merged catalog.
+        inner.apply_tokens(make_tokens("second")).await;
+        assert!(
+            recv_outer_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "recovery apply after a heartbeat-401 degradation must tick even \
+             when the probed tool set is unchanged"
+        );
+
+        mcp_srv.abort();
     }
 }
