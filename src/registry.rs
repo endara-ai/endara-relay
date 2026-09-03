@@ -55,6 +55,12 @@ pub struct RegisteredAdapter {
     /// when the adapter is swapped/restarted) plus an optional upstream-provided
     /// `ttlMs` freshness window honored for 2026 upstreams (see [`CachedTools`]).
     pub(crate) tool_cache: RwLock<Option<CachedTools>>,
+    /// Per-entry invalidation epoch. Bumped by every invalidation of
+    /// `tool_cache` (under that entry's `tool_cache` write lock) so an
+    /// in-flight populate in [`cached_list_tools`](Self::cached_list_tools)
+    /// that started before the invalidation can detect it and discard its
+    /// now-stale result instead of repopulating the cache.
+    pub(crate) tool_cache_epoch: AtomicU64,
     /// Coalesces concurrent cache misses so only one `list_tools()` call is
     /// in-flight per adapter at a time.
     pub(crate) tool_cache_populate_lock: Mutex<()>,
@@ -83,6 +89,21 @@ impl RegisteredAdapter {
     /// completes; if it is still unhealthy the result is returned verbatim
     /// without writing the cache, preserving the invariant that an
     /// unhealthy adapter never poisons the cache.
+    ///
+    /// Every slow-path store is epoch-guarded: the entry's
+    /// `tool_cache_epoch` is read immediately before the underlying
+    /// `list_tools()` call and re-checked under the `tool_cache` write lock
+    /// before storing. If an invalidation bumped the epoch while the call
+    /// was in flight, the (potentially stale) result is discarded rather
+    /// than repopulating a cache that was just cleared, but is still
+    /// returned to the caller — the next read refetches. Invalidators bump
+    /// the epoch under the same write lock, so a bump cannot slip between
+    /// the re-check and the store.
+    ///
+    /// Lock ordering: the populate path is `adapters.read →
+    /// tool_cache_populate_lock → tool_cache.write`; the invalidators are
+    /// `adapters.read → tool_cache.write` and never take the populate lock,
+    /// so there is no cycle.
     pub async fn cached_list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
         // Fast path: healthy adapter with a populated, still-fresh cache
         // returns without taking the populate lock or calling the adapter.
@@ -106,12 +127,11 @@ impl RegisteredAdapter {
                     return Ok(cached.tools.clone());
                 }
             }
+            let epoch_before = self.tool_cache_epoch.load(Ordering::Relaxed);
             let tools = self.adapter.list_tools().await?;
             let expires_at = self.ttl_expiry().await;
-            *self.tool_cache.write().await = Some(CachedTools {
-                tools: tools.clone(),
-                expires_at,
-            });
+            self.store_if_epoch_unchanged(epoch_before, &tools, expires_at)
+                .await;
             return Ok(tools);
         }
         // Still not `Healthy` under the lock: delegate straight to the
@@ -121,15 +141,43 @@ impl RegisteredAdapter {
         // coalesced caller's recovered result short-circuit the rest of
         // the herd while preserving the invariant that a still-unhealthy
         // adapter never poisons the cache.
+        let epoch_before = self.tool_cache_epoch.load(Ordering::Relaxed);
         let tools = self.adapter.list_tools().await?;
         if matches!(self.adapter.health(), HealthStatus::Healthy) {
             let expires_at = self.ttl_expiry().await;
-            *self.tool_cache.write().await = Some(CachedTools {
-                tools: tools.clone(),
+            self.store_if_epoch_unchanged(epoch_before, &tools, expires_at)
+                .await;
+        }
+        Ok(tools)
+    }
+
+    /// Store `tools` into `tool_cache` only if no invalidation bumped
+    /// `tool_cache_epoch` since `epoch_before` was read. The re-check runs
+    /// under the `tool_cache` write lock, matching where invalidators bump.
+    async fn store_if_epoch_unchanged(
+        &self,
+        epoch_before: u64,
+        tools: &[ToolInfo],
+        expires_at: Option<Instant>,
+    ) {
+        let mut cache = self.tool_cache.write().await;
+        if self.tool_cache_epoch.load(Ordering::Relaxed) == epoch_before {
+            *cache = Some(CachedTools {
+                tools: tools.to_vec(),
                 expires_at,
             });
         }
-        Ok(tools)
+    }
+
+    /// Clear `tool_cache` and bump `tool_cache_epoch` atomically with
+    /// respect to [`cached_list_tools`](Self::cached_list_tools)'s store:
+    /// both happen under the `tool_cache` write lock, so an in-flight
+    /// populate either observes the bump at its re-check and discards, or
+    /// stores before the clear and is then cleared.
+    pub(crate) async fn invalidate_tool_cache(&self) {
+        let mut cache = self.tool_cache.write().await;
+        *cache = None;
+        self.tool_cache_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Translate the upstream `ttlMs` hint captured by the adapter's most
@@ -335,6 +383,7 @@ impl AdapterRegistry {
                 disabled: false,
                 disabled_tools: HashSet::new(),
                 tool_cache: RwLock::new(None),
+                tool_cache_epoch: AtomicU64::new(0),
                 tool_cache_populate_lock: Mutex::new(()),
                 tools_changed_task: listener_handle,
             },
@@ -464,11 +513,14 @@ impl AdapterRegistry {
     /// the merged catalog cache, and bump the catalog generation counter.
     /// Used when an adapter is swapped in place (e.g. background init,
     /// restart) so the next read fetches fresh tools from the new adapter.
+    /// The entry's `tool_cache_epoch` is bumped under its `tool_cache` write
+    /// lock so an in-flight `cached_list_tools` populate that started before
+    /// this call discards its stale result instead of repopulating.
     pub async fn invalidate_endpoint_tool_cache(&self, name: &str) {
         {
             let entries = self.adapters.read().await;
             if let Some(entry) = entries.get(name) {
-                *entry.tool_cache.write().await = None;
+                entry.invalidate_tool_cache().await;
             }
         }
         {
@@ -482,11 +534,13 @@ impl AdapterRegistry {
     /// Clear every per-endpoint tools cache without touching the merged
     /// catalog cache or the generation counter. Used internally by
     /// [`invalidate_catalog_cache`] and available to callers that want a
-    /// surgical sweep across all adapters.
+    /// surgical sweep across all adapters. Each entry's `tool_cache_epoch`
+    /// is bumped under its `tool_cache` write lock (see
+    /// [`invalidate_endpoint_tool_cache`]).
     pub async fn invalidate_all_tool_caches(&self) {
         let entries = self.adapters.read().await;
         for entry in entries.values() {
-            *entry.tool_cache.write().await = None;
+            entry.invalidate_tool_cache().await;
         }
     }
 
@@ -3756,6 +3810,7 @@ mod tests {
                     disabled: false,
                     disabled_tools: HashSet::new(),
                     tool_cache: RwLock::new(None),
+                    tool_cache_epoch: AtomicU64::new(0),
                     tool_cache_populate_lock: Mutex::new(()),
                     tools_changed_task: None,
                 },
@@ -4101,9 +4156,11 @@ mod tests {
     /// Adapter whose first `list_tools` call parks on a signal until the
     /// test releases it; later calls return immediately. `entered` flips to
     /// `true` once the first call is inside `list_tools`, so the test can
-    /// wait until the slow rebuild is genuinely parked mid-build.
+    /// wait until the slow rebuild is genuinely parked mid-build. `tools` is
+    /// shared so a test can swap the advertised set while a call is parked;
+    /// the parked call returns the snapshot it took on entry (the stale set).
     struct GatedAdapter {
-        tools: Vec<ToolInfo>,
+        tools: Arc<std::sync::Mutex<Vec<ToolInfo>>>,
         entered: Arc<std::sync::atomic::AtomicBool>,
         release: Arc<tokio::sync::Notify>,
     }
@@ -4114,10 +4171,11 @@ mod tests {
             Ok(())
         }
         async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            let snapshot = self.tools.lock().unwrap().clone();
             if !self.entered.swap(true, Ordering::SeqCst) {
                 self.release.notified().await;
             }
-            Ok(self.tools.clone())
+            Ok(snapshot)
         }
         async fn call_tool(
             &self,
@@ -4148,7 +4206,7 @@ mod tests {
             .register(
                 "ep".into(),
                 Box::new(GatedAdapter {
-                    tools: vec![make_tool("stale_tool")],
+                    tools: Arc::new(std::sync::Mutex::new(vec![make_tool("stale_tool")])),
                     entered: entered.clone(),
                     release: release.clone(),
                 }),
@@ -4204,6 +4262,101 @@ mod tests {
         assert_eq!(
             cached.0[0].name, "fresh_tool",
             "stale rebuild must not clobber the newer catalog"
+        );
+    }
+
+    /// TOCTOU regression at the per-endpoint layer: a slow rebuild whose
+    /// `cached_list_tools` populate is in flight when the endpoint's
+    /// `tool_cache` is invalidated (e.g. a recovery tick) must not repopulate
+    /// that cache with the pre-invalidation tools. The #152 generation guard
+    /// discards the stale *catalog* store, but without a per-entry epoch the
+    /// stale *tool_cache* store lands anyway and the very next catalog
+    /// rebuild — which reads that cache on its fast path — resurrects the
+    /// stale tools with no further tick to correct it.
+    #[tokio::test]
+    async fn test_stale_tool_cache_populate_discarded_after_concurrent_invalidation() {
+        let registry = AdapterRegistry::new();
+        let entered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let gated_tools = Arc::new(std::sync::Mutex::new(vec![make_tool("stale_tool")]));
+        registry
+            .register(
+                "ep1".into(),
+                Box::new(GatedAdapter {
+                    tools: gated_tools.clone(),
+                    entered: entered.clone(),
+                    release: release.clone(),
+                }),
+                "stdio".into(),
+                None,
+                Some("ep1".into()),
+            )
+            .await;
+        // Second endpoint so prefixes apply and the catalog spans both.
+        let (other, _other_calls, _other_tx) = NotifyingAdapter::new(vec![make_tool("other")], 8);
+        registry
+            .register(
+                "ep2".into(),
+                Box::new(other),
+                "stdio".into(),
+                None,
+                Some("ep2".into()),
+            )
+            .await;
+
+        // Rebuild A: parks inside ep1's first `list_tools` holding ep1's
+        // populate lock, having already snapshotted `stale_tool`.
+        let registry_a = registry.clone();
+        let rebuild_a = tokio::spawn(async move { registry_a.refresh_catalog().await });
+        let parked = await_until(std::time::Duration::from_secs(1), || {
+            entered.load(Ordering::SeqCst)
+        })
+        .await;
+        assert!(parked, "rebuild A should be parked inside list_tools");
+
+        // ep1 "recovers" with a new tool set and ticks while A is parked.
+        *gated_tools.lock().unwrap() = vec![make_tool("fresh_tool")];
+        registry.invalidate_endpoint_tool_cache("ep1").await;
+
+        // Let A finish. Its catalog store is discarded by the generation
+        // guard; the question is whether its stale ep1 populate landed.
+        release.notify_one();
+        let _ = rebuild_a.await.unwrap();
+        {
+            let entries = registry.entries().read().await;
+            let cache_guard = entries.get("ep1").unwrap().tool_cache.read().await;
+            let cached_names: Option<Vec<String>> = cache_guard
+                .as_ref()
+                .map(|c| c.tools.iter().map(|t| t.name.clone()).collect());
+            let acceptable = match cached_names.as_deref() {
+                None => true,
+                Some([name]) => name == "fresh_tool",
+                Some(_) => false,
+            };
+            assert!(
+                acceptable,
+                "stale populate must not repopulate ep1's tool_cache; got {cached_names:?}"
+            );
+        }
+
+        // The next catalog read rebuilds (A's store was discarded) and must
+        // reflect ep1's post-recovery tools, not the stale snapshot.
+        let (_catalog, lookup) = registry.merged_catalog_with_lookup().await;
+        let ep1_tools: Vec<&str> = lookup
+            .values()
+            .filter(|(ep, _)| ep == "ep1")
+            .map(|(_, raw)| raw.as_str())
+            .collect();
+        assert_eq!(
+            ep1_tools,
+            vec!["fresh_tool"],
+            "catalog must advertise ep1's fresh tools after the concurrent invalidation"
+        );
+        assert!(
+            lookup
+                .values()
+                .any(|(ep, raw)| ep == "ep2" && raw == "other"),
+            "ep2 should still be in the catalog"
         );
     }
 
