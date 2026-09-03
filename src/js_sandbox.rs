@@ -22,6 +22,10 @@ use tracing::Instrument;
 use crate::adapter::{AdapterError, ToolInfo};
 use crate::registry::MetaToolRegistry;
 
+// Beneath-root open primitives for readFile/writeFile.
+#[cfg(unix)]
+mod open_beneath;
+
 // ---------------------------------------------------------------------------
 // Retry tuning (Wave 3)
 // ---------------------------------------------------------------------------
@@ -1257,26 +1261,169 @@ fn write_dirs_rejection_message(op: &str, path_str: &str, write_roots: &[PathBuf
     msg
 }
 
-/// Write `bytes` to `dest` via a temp file in the destination directory plus
-/// an atomic rename, creating missing parent directories first. `dest` must
-/// already be validated by [`resolve_write_path`] against `root` (the
-/// allowlisted root it matched), so any directories created here sit inside
-/// that root. After `create_dir_all` the destination directory is
-/// re-canonicalized and containment is re-asserted, closing the
-/// validate→write window in which a checked directory could be swapped for
-/// a symlink pointing outside the root. If the root itself was deleted
-/// after config resolution, `create_dir_all` recreates it — still inside
-/// the allowed prefix; the "directories are never auto-created" stance in
-/// [`crate::config::resolve_write_roots`] only covers resolution time. On
-/// failure the temp file is removed — no partial destination file is ever
-/// observable.
-fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
+/// Split `dest` into its parent directory and file name for [`write_atomic`].
+fn split_write_dest(dest: &Path) -> Result<(&Path, &std::ffi::OsStr), String> {
     let dir = dest
         .parent()
         .ok_or_else(|| format!("writeFile: '{}' has no parent directory", dest.display()))?;
     let file_name = dest
         .file_name()
         .ok_or_else(|| format!("writeFile: '{}' does not name a file", dest.display()))?;
+    Ok((dir, file_name))
+}
+
+/// Unique temp-file name next to `file_name` for [`write_atomic`].
+fn write_tmp_name(file_name: &std::ffi::OsStr) -> String {
+    // Process-wide monotonic counter: concurrent writes to the same
+    // destination can observe the same SystemTime, so the timestamp alone
+    // does not make the temp name unique within this process.
+    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        ".{}.{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        unique,
+        seq
+    )
+}
+
+/// Write `bytes` to `dest` via a temp file in the destination directory plus
+/// an atomic rename, creating missing parent directories first. `dest` must
+/// already be validated by [`resolve_write_path`] against `root` (the
+/// allowlisted root it matched). Every filesystem step is anchored to a
+/// directory handle of `root`: missing parents are created with `mkdirat`
+/// along a beneath-root open that refuses to follow symlinks
+/// ([`open_beneath::open_dir_beneath_creating`] — `openat2` re-resolving
+/// from the root at every step on Linux, an `openat` walk elsewhere), the
+/// temp file is created with `openat(O_CREAT | O_EXCL)` on the destination
+/// directory handle, and the publish is a `renameat` on that same handle.
+/// Because `dest` is canonical, any symlink met on the way is a
+/// post-validation swap and fails the write (`ELOOP`), as does a directory
+/// renamed out of the root while `openat2` resolves it (`EXDEV`): no lookup
+/// here can be redirected through a symlink, on any tier. Containment is
+/// enforced while the directory handle is resolved, not afterwards — the
+/// handle is a capability, so if the destination directory itself is renamed
+/// out of the root between `open_dir_beneath_creating` returning and the
+/// `renameat`, the file lands wherever that directory now lives (a location
+/// the renaming actor could already write to; see the caveat in
+/// [`open_beneath`]). If the root itself was deleted
+/// after config resolution the write fails (the root handle cannot be
+/// opened); the "directories are never auto-created" stance in
+/// [`crate::config::resolve_write_roots`] only covers resolution time. On
+/// failure the temp file is removed — no partial destination file is ever
+/// observable.
+#[cfg(unix)]
+fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
+    use std::os::unix::io::{AsFd as _, AsRawFd as _};
+
+    let (dir, file_name) = split_write_dest(dest)?;
+    let escaped = || {
+        format!(
+            "writeFile: '{}' escaped the configured write directory during the write",
+            dest.display()
+        )
+    };
+    let rel_dir = dir.strip_prefix(root).map_err(|_| escaped())?;
+    let parent_dirs_error = |e: std::io::Error| {
+        if matches!(e.raw_os_error(), Some(libc::ELOOP) | Some(libc::EXDEV)) {
+            return escaped();
+        }
+        format!(
+            "writeFile: failed to create parent directories for '{}': {}",
+            dest.display(),
+            e
+        )
+    };
+    let root_fd = open_beneath::open_root(root).map_err(|e| {
+        if e.raw_os_error() == Some(libc::ELOOP) {
+            return escaped();
+        }
+        format!(
+            "writeFile: configured write directory '{}' is not accessible: {} — recreate it \
+             or update [relay] write_dirs in ~/.endara/config.toml",
+            root.display(),
+            e
+        )
+    })?;
+    let dir_fd = open_beneath::open_dir_beneath_creating(root_fd.as_fd(), rel_dir)
+        .map_err(parent_dirs_error)?;
+    let tmp = std::ffi::OsString::from(write_tmp_name(file_name));
+    // O_EXCL guarantees this call exclusively owns the temp file even if the
+    // name somehow collides (e.g. across processes); 0o666 matches what
+    // `OpenOptions::create_new` would apply before the umask.
+    let write_result = open_beneath::openat(
+        dir_fd.as_raw_fd(),
+        &tmp,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+        0o666,
+    )
+    .map(std::fs::File::from)
+    .and_then(|mut f| std::io::Write::write_all(&mut f, bytes));
+    if let Err(e) = write_result {
+        let _ = unlinkat(dir_fd.as_raw_fd(), &tmp);
+        return Err(format!(
+            "writeFile: failed to write '{}': {}",
+            dest.display(),
+            e
+        ));
+    }
+    if let Err(e) = renameat(dir_fd.as_raw_fd(), &tmp, file_name) {
+        let _ = unlinkat(dir_fd.as_raw_fd(), &tmp);
+        return Err(format!(
+            "writeFile: failed to finalise '{}': {}",
+            dest.display(),
+            e
+        ));
+    }
+    Ok(())
+}
+
+/// `renameat(2)` of `from` to `to`, both relative to `dirfd`.
+#[cfg(unix)]
+fn renameat(
+    dirfd: libc::c_int,
+    from: &std::ffi::OsStr,
+    to: &std::ffi::OsStr,
+) -> std::io::Result<()> {
+    let c_from = open_beneath::c_string(from)?;
+    let c_to = open_beneath::c_string(to)?;
+    // SAFETY: `dirfd` is an open directory fd and both names are valid
+    // NUL-terminated strings that outlive the call.
+    let rc = unsafe { libc::renameat(dirfd, c_from.as_ptr(), dirfd, c_to.as_ptr()) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// `unlinkat(2)` of the file `name` relative to `dirfd`.
+#[cfg(unix)]
+fn unlinkat(dirfd: libc::c_int, name: &std::ffi::OsStr) -> std::io::Result<()> {
+    let c_name = open_beneath::c_string(name)?;
+    // SAFETY: `dirfd` is an open directory fd and `c_name` a valid
+    // NUL-terminated string that outlives the call.
+    let rc = unsafe { libc::unlinkat(dirfd, c_name.as_ptr(), 0) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Non-unix [`write_atomic`]: after `create_dir_all` the destination
+/// directory is re-canonicalized and containment is re-asserted, narrowing
+/// (but not closing — this platform has no beneath-root open) the
+/// validate→write window in which a checked directory could be swapped for
+/// a symlink pointing outside the root. If the root itself was deleted after
+/// config resolution, `create_dir_all` recreates it — still inside the
+/// allowed prefix.
+#[cfg(not(unix))]
+fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
+    let (dir, file_name) = split_write_dest(dest)?;
     std::fs::create_dir_all(dir).map_err(|e| {
         format!(
             "writeFile: failed to create parent directories for '{}': {}",
@@ -1293,22 +1440,7 @@ fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
         ));
     }
     let final_dest = canonical_dir.join(file_name);
-    // Process-wide monotonic counter: concurrent writes to the same
-    // destination can observe the same SystemTime, so the timestamp alone
-    // does not make the temp name unique within this process.
-    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let tmp = canonical_dir.join(format!(
-        ".{}.{}.{}.{}.tmp",
-        file_name.to_string_lossy(),
-        std::process::id(),
-        unique,
-        seq
-    ));
+    let tmp = canonical_dir.join(write_tmp_name(file_name));
     // create_new(true) guarantees this call exclusively owns the temp file
     // even if the name somehow collides (e.g. across processes).
     let write_result = std::fs::OpenOptions::new()
@@ -1415,39 +1547,29 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
             .into());
     }
 
-    let (source, _matched_root) = resolve_write_path("readFile", &path_str, &write_roots)
+    let (source, matched_root) = resolve_write_path("readFile", &path_str, &write_roots)
         .map_err(|msg| JsNativeError::error().with_message(msg))?;
 
     // Only regular files are readable. Opening a FIFO blocks until a writer
     // appears, and reading a device or socket can block indefinitely, inside
-    // a native call the JS deadline cannot interrupt. Check the path first so
+    // a native call the JS deadline cannot interrupt. Check the type first so
     // the common case never opens such an entry at all — `O_NONBLOCK` below
     // covers FIFOs, but a device driver's open can still block or have side
     // effects — then re-validate the handle metadata for whatever inode was
-    // actually opened.
-    let path_meta = match std::fs::metadata(&source) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(JsNativeError::error()
-                .with_message(format!("readFile: '{}' does not exist", path_str))
-                .into())
-        }
-        Err(e) => {
-            return Err(JsNativeError::error()
-                .with_message(format!("readFile: failed to read '{}': {}", path_str, e))
-                .into())
-        }
-    };
-    reject_non_regular(&path_str, &path_meta)?;
+    // actually opened. On unix the pre-check is anchored beneath the root
+    // like the open, so it never stats (or leaks the existence of) anything
+    // a swapped-in symlink points at.
+    precheck_for_read(&path_str, &source, &matched_root)?;
 
     // Open once and derive metadata from the handle so the type/size checks
     // and the bounded read below all apply to the same inode, rather than
     // to whatever the pathname resolves to on a second lookup. On unix the
     // open itself cannot block on a FIFO swapped in after the pre-check
-    // (`O_NONBLOCK`) and cannot follow a symlink swapped in for the
-    // canonicalized final component (`O_NOFOLLOW`); the fstat on the handle
+    // (`O_NONBLOCK`) and is anchored beneath the matched root, so a symlink
+    // swapped in for any component of the canonicalized path — not just the
+    // final one — is rejected rather than followed; the fstat on the handle
     // is authoritative.
-    let mut file = open_for_read(&source)
+    let mut file = open_for_read(&source, &matched_root)
         .map_err(|e| JsNativeError::error().with_message(open_error_message(&path_str, &e)))?;
     let meta = file.metadata().map_err(|e| {
         JsNativeError::error()
@@ -1536,34 +1658,92 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
     Ok(JsValue::from(boa_engine::js_string!(contents.as_str())))
 }
 
-/// Open `source` read-only for `readFile`. On unix the open carries
-/// `O_NONBLOCK`, so a FIFO with no writer returns a handle immediately
-/// instead of parking the sandbox thread (this is guaranteed for FIFOs only;
-/// a device driver's open may still block, which is why the caller keeps its
-/// path-level type pre-check); `O_NOFOLLOW`, so a
-/// symlink swapped in for the already-canonicalized final component fails
-/// with `ELOOP` rather than being followed; and `O_NOCTTY`, so a tty device
-/// node can never become the controlling terminal as a side effect of the
-/// open (std does not set it). The caller must still fstat the returned
+/// Open `source` read-only for `readFile`. `source` must already be
+/// validated by [`resolve_write_path`] against `root` (the allowlisted root
+/// it matched). The open is anchored to a directory handle of `root` and
+/// walks `source`'s path relative to it via [`open_beneath::open_beneath`],
+/// which refuses to follow a symlink at any component: because `source` is
+/// canonical, any symlink met is a post-validation swap and fails with
+/// `ELOOP` instead of being followed — possibly out of the root. The open
+/// also carries `O_NONBLOCK`, so a FIFO with no writer returns a handle
+/// immediately instead of parking the sandbox thread (this is guaranteed for
+/// FIFOs only; a device driver's open may still block, which is why the
+/// caller keeps its path-level type pre-check), and `O_NOCTTY`, so a tty
+/// device node can never become the controlling terminal as a side effect of
+/// the open (std does not set it). The caller must still fstat the returned
 /// handle and reject anything that is not a regular file; regular files are
 /// unaffected by these flags, so the bounded read that follows behaves
 /// exactly as a plain open would.
-fn open_for_read(source: &Path) -> std::io::Result<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY);
-    }
-    opts.open(source)
+#[cfg(unix)]
+fn open_for_read(source: &Path, root: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::io::AsFd as _;
+
+    let rel = source.strip_prefix(root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path escaped its matched write directory before the open",
+        )
+    })?;
+    let root_fd = open_beneath::open_root(root)?;
+    open_beneath::open_beneath(
+        root_fd.as_fd(),
+        rel,
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY,
+    )
+}
+
+/// Non-unix [`open_for_read`]: a plain read-only open of the canonical path.
+/// This platform has no beneath-root open, so the validate→open window is
+/// not closed here.
+#[cfg(not(unix))]
+fn open_for_read(source: &Path, _root: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new().read(true).open(source)
+}
+
+/// Path-level type pre-check for `readFile`: rejects directories and
+/// non-regular entries (FIFOs, devices, sockets) before anything is opened.
+/// On unix the stat is anchored beneath `root` with the same containment as
+/// [`open_for_read`] — no symlink is followed at any component, and no
+/// lookup is re-resolved from `/` — and it never opens the entry, so a
+/// device driver's `open` cannot run. Errors use the same messages as a
+/// failed open.
+#[cfg(unix)]
+fn precheck_for_read(path_str: &str, source: &Path, root: &Path) -> JsResult<()> {
+    let st = stat_for_read(source, root)
+        .map_err(|e| JsNativeError::error().with_message(open_error_message(path_str, &e)))?;
+    let kind = st.st_mode & libc::S_IFMT;
+    reject_non_regular_kind(path_str, kind == libc::S_IFDIR, kind == libc::S_IFREG)
+}
+
+/// Non-unix [`precheck_for_read`]: a plain `metadata` of the canonical path.
+#[cfg(not(unix))]
+fn precheck_for_read(path_str: &str, source: &Path, _root: &Path) -> JsResult<()> {
+    let meta = std::fs::metadata(source)
+        .map_err(|e| JsNativeError::error().with_message(open_error_message(path_str, &e)))?;
+    reject_non_regular(path_str, &meta)
+}
+
+/// Anchored `stat` of `source` beneath `root` (see [`open_for_read`] for the
+/// containment contract; this is its non-opening counterpart).
+#[cfg(unix)]
+fn stat_for_read(source: &Path, root: &Path) -> std::io::Result<libc::stat> {
+    use std::os::unix::io::AsFd as _;
+
+    let rel = source.strip_prefix(root).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path escaped its matched write directory before the open",
+        )
+    })?;
+    let root_fd = open_beneath::open_root(root)?;
+    open_beneath::stat_beneath(root_fd.as_fd(), rel)
 }
 
 /// JS-facing message for a failed [`open_for_read`]. A missing file and, on
 /// unix, `ELOOP` get self-explanatory messages; everything else carries the
-/// OS error text. `ELOOP` is returned both when `O_NOFOLLOW` rejects a
-/// symlink in the final component and when an intermediate component
-/// resolves through a symlink loop, so the message covers both.
+/// OS error text. `ELOOP` is what the beneath-root open returns for a
+/// symlink at any component of the path (final or intermediate) and what
+/// the kernel returns for a symlink loop, so the message covers all three.
 fn open_error_message(path_str: &str, e: &std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::NotFound {
         return format!("readFile: '{}' does not exist", path_str);
@@ -1580,7 +1760,11 @@ fn open_error_message(path_str: &str, e: &std::io::Error) -> String {
 }
 
 fn reject_non_regular(path_str: &str, meta: &std::fs::Metadata) -> JsResult<()> {
-    if meta.is_dir() {
+    reject_non_regular_kind(path_str, meta.is_dir(), meta.is_file())
+}
+
+fn reject_non_regular_kind(path_str: &str, is_dir: bool, is_file: bool) -> JsResult<()> {
+    if is_dir {
         return Err(JsNativeError::error()
             .with_message(format!(
                 "readFile: '{}' is a directory, not a file",
@@ -1588,7 +1772,7 @@ fn reject_non_regular(path_str: &str, meta: &std::fs::Metadata) -> JsResult<()> 
             ))
             .into());
     }
-    if !meta.is_file() {
+    if !is_file {
         return Err(JsNativeError::error()
             .with_message(format!(
                 "readFile: '{}' is not a regular file (FIFOs, devices, and \
@@ -3383,6 +3567,110 @@ mod tests {
         assert!(dir_entries(outside.path()).is_empty());
     }
 
+    /// Simulates the validate→write race: `dest` is the canonical path
+    /// `resolve_write_path` produced, but by the time `write_atomic` runs an
+    /// intermediate component has been swapped for a symlink (out of the root,
+    /// and — separately — to a directory inside it). The dirfd-anchored walk
+    /// must reject the swap at every depth and create nothing anywhere: no
+    /// parents, no temp file, no destination.
+    #[cfg(unix)]
+    #[test]
+    fn test_write_atomic_rejects_intermediate_symlink_swap() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        std::fs::create_dir_all(root.join("real")).unwrap();
+        std::fs::create_dir_all(root.join("keep/deep")).unwrap();
+        // "swapped" was validated as a real directory; now it is a link out.
+        std::os::unix::fs::symlink(outside.path(), root.join("swapped")).unwrap();
+        // A swap deeper in an existing chain.
+        std::os::unix::fs::symlink(outside.path(), root.join("keep/deep/out")).unwrap();
+        // A swap that stays inside the root is still a swap and still rejected.
+        std::os::unix::fs::symlink(root.join("real"), root.join("inner")).unwrap();
+
+        for rel in [
+            "swapped/x.txt",
+            "swapped/new/sub/x.txt",
+            "keep/deep/out/x.txt",
+            "keep/deep/out/new/x.txt",
+            "inner/x.txt",
+            "inner/new/x.txt",
+        ] {
+            let dest = root.join(rel);
+            let err = write_atomic(&dest, b"d", &root).unwrap_err();
+            assert!(
+                err.contains("escaped the configured write directory during the write"),
+                "{}: unexpected error: {}",
+                rel,
+                err
+            );
+        }
+        assert!(dir_entries(outside.path()).is_empty());
+        assert!(dir_entries(&root.join("real")).is_empty());
+        assert_eq!(
+            dir_entries(&root.join("keep/deep")),
+            vec!["out".to_string()]
+        );
+        assert_eq!(
+            dir_entries(&root),
+            vec![
+                "inner".to_string(),
+                "keep".to_string(),
+                "real".to_string(),
+                "swapped".to_string()
+            ]
+        );
+
+        // Sanity: a genuine (symlink-free) chain still gets created and written.
+        let ok_dest = root.join("keep/deep/fresh/x.txt");
+        write_atomic(&ok_dest, b"ok", &root).unwrap();
+        assert_eq!(std::fs::read(&ok_dest).unwrap(), b"ok");
+        assert_eq!(
+            dir_entries(&root.join("keep/deep/fresh")),
+            vec!["x.txt".to_string()]
+        );
+    }
+
+    /// A root deleted after config resolution is not recreated (the anchor
+    /// cannot be opened), and the error names the root and the config knob
+    /// rather than blaming parent-directory creation. A root swapped for a
+    /// symlink is still reported as an escape.
+    #[cfg(unix)]
+    #[test]
+    fn test_write_atomic_reports_missing_root_distinctly() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir).join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+
+        let dest = root.join("a/b.txt");
+        let err = write_atomic(&dest, b"d", &root).unwrap_err();
+        assert!(
+            err.contains(&format!(
+                "configured write directory '{}' is not accessible",
+                root.display()
+            )) && err.contains("[relay] write_dirs"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            !err.contains("failed to create parent directories"),
+            "{}",
+            err
+        );
+        assert!(!root.exists(), "root must not be recreated");
+
+        std::os::unix::fs::symlink(outside.path(), &root).unwrap();
+        let err = write_atomic(&dest, b"d", &root).unwrap_err();
+        assert!(
+            err.contains("escaped the configured write directory during the write"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(dir_entries(outside.path()).is_empty());
+    }
+
     #[tokio::test]
     async fn test_write_file_rejects_empty_and_nul_paths() {
         let dir = tempfile::tempdir().unwrap();
@@ -3947,9 +4235,10 @@ return {{ written: written, back: JSON.parse(readFile(written)) }};
             .expect("mkfifo must be available on unix");
         assert!(status.success(), "mkfifo failed: {:?}", status);
 
+        let root = dir.path().to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(open_for_read(&fifo).map(|f| f.metadata()));
+            let _ = tx.send(open_for_read(&fifo, &root).map(|f| f.metadata()));
         });
         let opened = rx
             .recv_timeout(Duration::from_secs(5))
@@ -3981,7 +4270,7 @@ return {{ written: written, back: JSON.parse(readFile(written)) }};
         let link = dir.path().join("link.txt");
         std::os::unix::fs::symlink(&target, &link).unwrap();
 
-        let err = open_for_read(&link).expect_err("O_NOFOLLOW must refuse a symlink");
+        let err = open_for_read(&link, dir.path()).expect_err("O_NOFOLLOW must refuse a symlink");
         assert_eq!(
             err.raw_os_error(),
             Some(libc::ELOOP),
@@ -4000,7 +4289,85 @@ return {{ written: written, back: JSON.parse(readFile(written)) }};
             msg
         );
 
-        let mut file = open_for_read(&target).unwrap();
+        let mut file = open_for_read(&target, dir.path()).unwrap();
+        assert!(file.metadata().unwrap().is_file());
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "plain");
+    }
+
+    /// The beneath-root open rejects a symlink swapped in for an
+    /// *intermediate* component of the already-canonicalized path — the case
+    /// a plain `open(2)` with `O_NOFOLLOW` would happily follow — whether the
+    /// link points out of the root or back inside it, and surfaces it through
+    /// the same friendly `ELOOP` message. A path that is not beneath the
+    /// matched root at all is refused before any handle is opened. (End to
+    /// end this arm is only reachable via the swap race: `resolve_write_path`
+    /// canonicalizes pre-existing symlinks away before the open.)
+    #[cfg(unix)]
+    #[test]
+    fn test_open_for_read_rejects_intermediate_symlink_swap() {
+        use std::io::Read as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("f.txt"), "s3cr3t-content").unwrap();
+        std::fs::create_dir_all(root.join("real/deep")).unwrap();
+        std::fs::write(root.join("real/deep/f.txt"), "plain").unwrap();
+        // Out-of-root swap at the first component.
+        std::os::unix::fs::symlink(outside.path(), root.join("swapped")).unwrap();
+        // Out-of-root swap at a middle component.
+        std::os::unix::fs::symlink(outside.path(), root.join("real/out")).unwrap();
+        // In-root swap: still a post-canonicalize change, still rejected.
+        std::os::unix::fs::symlink(root.join("real"), root.join("inner")).unwrap();
+
+        for rel in ["swapped/f.txt", "real/out/f.txt", "inner/deep/f.txt"] {
+            let source = root.join(rel);
+            let err = match open_for_read(&source, root) {
+                Ok(_) => panic!("{}: intermediate symlink must be refused", rel),
+                Err(e) => e,
+            };
+            assert_eq!(
+                err.raw_os_error(),
+                Some(libc::ELOOP),
+                "{}: unexpected error: {}",
+                rel,
+                err
+            );
+            let msg = open_error_message(&format!("/root/{}", rel), &err);
+            assert!(
+                msg.contains("refers to a symbolic link or a path containing a symbolic link loop"),
+                "{}: unexpected message: {}",
+                rel,
+                msg
+            );
+            assert!(
+                !msg.contains("Too many levels") && !msg.contains("Not a directory"),
+                "{}: raw OS text must not leak: {}",
+                rel,
+                msg
+            );
+            // The type pre-check is anchored the same way: it must not stat
+            // through the swapped-in link either.
+            let err = stat_for_read(&source, root)
+                .expect_err("pre-check must refuse an intermediate symlink");
+            assert_eq!(err.raw_os_error(), Some(libc::ELOOP), "{}: {}", rel, err);
+        }
+
+        // Not beneath the matched root at all: refused without opening.
+        let err = open_for_read(&outside.path().join("f.txt"), root)
+            .expect_err("a path outside the root must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{}", err);
+        let err = stat_for_read(&outside.path().join("f.txt"), root)
+            .expect_err("a path outside the root must not be statted");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "{}", err);
+
+        // The genuine nested path pre-checks as a regular file.
+        let st = stat_for_read(&root.join("real/deep/f.txt"), root).unwrap();
+        assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFREG);
+
+        // Sanity: the genuine (symlink-free) nested path still reads.
+        let mut file = open_for_read(&root.join("real/deep/f.txt"), root).unwrap();
         assert!(file.metadata().unwrap().is_file());
         let mut contents = String::new();
         file.read_to_string(&mut contents).unwrap();
@@ -4433,13 +4800,18 @@ return errors;
         let sandbox = write_sandbox(vec![root.clone()]).await;
         let sub = root.join("sub");
         std::fs::create_dir(&sub).unwrap();
-        let script = format!("return readFile({});", js_quote(sub.to_str().unwrap()));
-        let err = sandbox.execute(&script).await.unwrap_err();
-        assert!(
-            format!("{}", err).contains("is a directory"),
-            "unexpected error: {}",
-            err
-        );
+        // A subdirectory and the allowlisted root itself (an empty relative
+        // path beneath the anchor) both report "is a directory".
+        for target in [&sub, &root] {
+            let script = format!("return readFile({});", js_quote(target.to_str().unwrap()));
+            let err = sandbox.execute(&script).await.unwrap_err();
+            assert!(
+                format!("{}", err).contains("is a directory"),
+                "{}: unexpected error: {}",
+                target.display(),
+                err
+            );
+        }
     }
 
     #[tokio::test]
