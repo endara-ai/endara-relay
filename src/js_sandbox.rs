@@ -1420,34 +1420,33 @@ fn read_file_native(_this: &JsValue, args: &[JsValue], context: &mut Context) ->
 
     // Only regular files are readable. Opening a FIFO blocks until a writer
     // appears, and reading a device or socket can block indefinitely, inside
-    // a native call the JS deadline cannot interrupt. Without a non-blocking
-    // open the only defence is a path-level type check, which leaves a
-    // regular-file→FIFO swap window before the open; the handle metadata
-    // below re-validates whatever inode was actually opened.
-    #[cfg(not(unix))]
-    {
-        let path_meta = match std::fs::metadata(&source) {
-            Ok(meta) => meta,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(JsNativeError::error()
-                    .with_message(format!("readFile: '{}' does not exist", path_str))
-                    .into())
-            }
-            Err(e) => {
-                return Err(JsNativeError::error()
-                    .with_message(format!("readFile: failed to read '{}': {}", path_str, e))
-                    .into())
-            }
-        };
-        reject_non_regular(&path_str, &path_meta)?;
-    }
+    // a native call the JS deadline cannot interrupt. Check the path first so
+    // the common case never opens such an entry at all — `O_NONBLOCK` below
+    // covers FIFOs, but a device driver's open can still block or have side
+    // effects — then re-validate the handle metadata for whatever inode was
+    // actually opened.
+    let path_meta = match std::fs::metadata(&source) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(JsNativeError::error()
+                .with_message(format!("readFile: '{}' does not exist", path_str))
+                .into())
+        }
+        Err(e) => {
+            return Err(JsNativeError::error()
+                .with_message(format!("readFile: failed to read '{}': {}", path_str, e))
+                .into())
+        }
+    };
+    reject_non_regular(&path_str, &path_meta)?;
 
     // Open once and derive metadata from the handle so the type/size checks
     // and the bounded read below all apply to the same inode, rather than
     // to whatever the pathname resolves to on a second lookup. On unix the
-    // open itself cannot block (`O_NONBLOCK`) and cannot follow a symlink
-    // swapped in for the canonicalized final component (`O_NOFOLLOW`), so no
-    // path-level pre-check is needed: the fstat on the handle is authoritative.
+    // open itself cannot block on a FIFO swapped in after the pre-check
+    // (`O_NONBLOCK`) and cannot follow a symlink swapped in for the
+    // canonicalized final component (`O_NOFOLLOW`); the fstat on the handle
+    // is authoritative.
     let mut file = match open_for_read(&source) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -3905,9 +3904,9 @@ return {{ written: written, back: JSON.parse(readFile(written)) }};
         assert!(status.success(), "mkfifo failed: {:?}", status);
         let script = format!("return readFile({});", js_quote(fifo.to_str().unwrap()));
         // With no writer attached, a blocking open of the FIFO would park the
-        // sandbox thread forever. On unix there is no path-level pre-check any
-        // more: the open is non-blocking and the handle fstat is what rejects
-        // it, before any read is attempted.
+        // sandbox thread forever — the rejection must happen before any read
+        // is attempted. The path-level pre-check catches this case; the
+        // handle-path test below covers a FIFO that reaches the open itself.
         let err = tokio::time::timeout(Duration::from_secs(5), sandbox.execute(&script))
             .await
             .expect("readFile on a FIFO must not block")
