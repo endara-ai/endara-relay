@@ -129,9 +129,10 @@ log_retention_days = 7            # Optional — days of daily-rotated relay.log
                                   # 0 disables pruning (default: 7). CLI: --log-retention-days
 write_dirs = ["/absolute/path/to/exports"]
                                   # Optional — allowlist of absolute directories that
-                                  # sandbox scripts may write into via writeFile();
-                                  # a leading ~/ is expanded to your home directory
-                                  # (default: none — writing disabled). Hot-reloadable.
+                                  # sandbox scripts may read and write via readFile()
+                                  # and writeFile(); a leading ~/ is expanded to your
+                                  # home directory (default: none — file access
+                                  # disabled). Hot-reloadable.
 listen_ips = ["100.101.102.103"]  # Optional — extra private-scope IPs the MCP TCP
                                   # listener also binds on, alongside the always-bound
                                   # 127.0.0.1 (default: none — loopback only). Only
