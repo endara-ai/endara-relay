@@ -1110,12 +1110,35 @@ async fn mcp_tools_call(
             if let Some(err) = validate_meta_tool_args(&state, "write_file", &arguments) {
                 return Ok(jsonrpc_response(body.id, err));
             }
-            let path = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let data = arguments.get("data").and_then(|v| v.as_str()).unwrap_or("");
-            let encoding = arguments
-                .get("encoding")
-                .and_then(|v| v.as_str())
-                .unwrap_or("utf8");
+            // Type-check the arguments here even when JSON-Schema validation
+            // is disabled (`relay.validate_inputs = false`): defaulting a
+            // missing or non-string `data` to "" would silently truncate an
+            // existing file and report success. An explicit empty string is
+            // still a valid payload; only `encoding` may be omitted.
+            let Some(path) = arguments.get("path").and_then(|v| v.as_str()) else {
+                return Ok(jsonrpc_response(
+                    body.id,
+                    meta_tool_error_result("write_file: 'path' is required and must be a string"),
+                ));
+            };
+            let Some(data) = arguments.get("data").and_then(|v| v.as_str()) else {
+                return Ok(jsonrpc_response(
+                    body.id,
+                    meta_tool_error_result("write_file: 'data' is required and must be a string"),
+                ));
+            };
+            let encoding = match arguments.get("encoding") {
+                None => "utf8",
+                Some(Value::String(encoding)) => encoding.as_str(),
+                Some(_) => {
+                    return Ok(jsonrpc_response(
+                        body.id,
+                        meta_tool_error_result(
+                            "write_file: 'encoding' must be a string (\"utf8\" or \"base64\") when provided",
+                        ),
+                    ));
+                }
+            };
             return match handler.write_file(path, data, encoding).await {
                 Ok(result) => Ok(jsonrpc_response(
                     body.id,
@@ -4290,6 +4313,73 @@ mod tests {
         let text = result_text(&result);
         assert!(text.contains("encoding"), "{text}");
         assert!(!dest.exists(), "no file may be written");
+    }
+
+    // Regression: with `validate_inputs = false` the JSON-Schema gate is
+    // bypassed, so the dispatch itself must reject a missing or non-string
+    // `data`/`path` instead of defaulting to "" and truncating the file.
+    #[tokio::test]
+    async fn write_file_validation_disabled_rejects_malformed_arguments_and_preserves_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let dest = root.join("keep.txt");
+        std::fs::write(&dest, "original").unwrap();
+        let path = dest.to_str().unwrap();
+
+        let malformed = [
+            ("missing data", json!({ "path": path })),
+            ("null data", json!({ "path": path, "data": null })),
+            ("numeric data", json!({ "path": path, "data": 42 })),
+            ("object data", json!({ "path": path, "data": { "a": 1 } })),
+            ("array data", json!({ "path": path, "data": ["x"] })),
+            ("missing path", json!({ "data": "x" })),
+            ("numeric path", json!({ "path": 1, "data": "x" })),
+            (
+                "numeric encoding",
+                json!({ "path": path, "data": "x", "encoding": 1 }),
+            ),
+            (
+                "null encoding",
+                json!({ "path": path, "data": "x", "encoding": null }),
+            ),
+        ];
+        for (label, arguments) in malformed {
+            let state = write_file_state(root.clone());
+            state.registry.set_validate_inputs(false);
+            let result = call_write_file(state, arguments).await;
+            assert_eq!(result["isError"], true, "{label}: got {result}");
+            let text = result_text(&result);
+            assert!(text.starts_with("write_file: "), "{label}: {text}");
+            assert_eq!(
+                std::fs::read_to_string(&dest).unwrap(),
+                "original",
+                "{label}: existing file must be preserved"
+            );
+        }
+    }
+
+    // An explicitly supplied empty string is a legitimate payload and must
+    // still produce an empty file, with validation both on and off.
+    #[tokio::test]
+    async fn write_file_accepts_explicit_empty_string_data() {
+        for validate in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = canonical_root(&dir);
+            let dest = root.join("empty.txt");
+            std::fs::write(&dest, "original").unwrap();
+            let state = write_file_state(root.clone());
+            state.registry.set_validate_inputs(validate);
+
+            let result =
+                call_write_file(state, json!({ "path": dest.to_str().unwrap(), "data": "" })).await;
+            assert!(
+                result.get("isError").is_none(),
+                "validate={validate}: got {result}"
+            );
+            let inner: Value = serde_json::from_str(result_text(&result)).unwrap();
+            assert_eq!(inner["bytes"], json!(0));
+            assert_eq!(std::fs::read_to_string(&dest).unwrap(), "");
+        }
     }
 
     // A path outside every root is a tool-level error (`isError: true`)

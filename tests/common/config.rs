@@ -20,6 +20,7 @@ pub struct ConfigBuilder {
     endpoints: Vec<EndpointEntry>,
     js_execution_mode: bool,
     toon_output: Option<bool>,
+    validate_inputs: Option<bool>,
     write_dirs: Vec<PathBuf>,
 }
 
@@ -29,6 +30,7 @@ impl ConfigBuilder {
             endpoints: Vec::new(),
             js_execution_mode: false,
             toon_output: None,
+            validate_inputs: None,
             write_dirs: Vec::new(),
         }
     }
@@ -167,6 +169,13 @@ impl ConfigBuilder {
         self
     }
 
+    /// Explicitly set the `validate_inputs` flag. `None` (default) emits no
+    /// `validate_inputs` line, so the relay's own default (`true`) wins.
+    pub fn validate_inputs(mut self, enabled: bool) -> Self {
+        self.validate_inputs = Some(enabled);
+        self
+    }
+
     /// Set the `[relay] write_dirs` allowlist. Empty (default) emits no
     /// `write_dirs` line, so filesystem access stays disabled.
     pub fn write_dirs(mut self, dirs: &[&Path]) -> Self {
@@ -195,6 +204,9 @@ impl ConfigBuilder {
         }
         if let Some(toon) = self.toon_output {
             out.push_str(&format!("toon_output = {}\n", toon));
+        }
+        if let Some(validate) = self.validate_inputs {
+            out.push_str(&format!("validate_inputs = {}\n", validate));
         }
         if !self.write_dirs.is_empty() {
             let dirs: Vec<String> = self

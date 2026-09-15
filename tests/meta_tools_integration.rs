@@ -351,11 +351,23 @@ fn echo_fixture_path() -> PathBuf {
 /// the given `[relay] write_dirs` allowlist. Returns the harness, an
 /// initialized client, and the canonical write root.
 async fn setup_write_file(js_mode: bool, write_root: Option<&Path>) -> (RelayHarness, McpClient) {
+    setup_write_file_with_validation(js_mode, write_root, true).await
+}
+
+/// Like [`setup_write_file`] but with an explicit `[relay] validate_inputs`
+/// setting, so tests can exercise the dispatch path with the JSON-Schema
+/// gate switched off.
+async fn setup_write_file_with_validation(
+    js_mode: bool,
+    write_root: Option<&Path>,
+    validate_inputs: bool,
+) -> (RelayHarness, McpClient) {
     let fixture = echo_fixture_path();
     let mut builder = ConfigBuilder::new()
         .add_stdio("echo", "bash", &[fixture.to_str().unwrap()])
         .js_execution(js_mode)
-        .toon_output(false);
+        .toon_output(false)
+        .validate_inputs(validate_inputs);
     if let Some(root) = write_root {
         builder = builder.write_dirs(&[root]);
     }
@@ -583,4 +595,50 @@ async fn test_write_file_bad_encoding_and_base64_are_tool_errors() {
         !dest.exists(),
         "no partial file may remain after a rejection"
     );
+}
+
+/// Regression: with `validate_inputs = false` the schema gate is skipped, so
+/// a malformed call (missing / null / numeric / object `data`) must still be
+/// rejected at dispatch instead of truncating an existing file to "" and
+/// reporting success. An explicit empty string remains a valid payload.
+#[tokio::test]
+async fn test_write_file_validation_disabled_rejects_malformed_data_and_preserves_file() {
+    let (_dir, root) = canonical_tempdir();
+    let (_harness, client) = setup_write_file_with_validation(false, Some(&root), false).await;
+    let dest = root.join("keep.txt");
+    std::fs::write(&dest, "original").expect("seed file");
+    let path = dest.to_str().unwrap();
+
+    let malformed = [
+        ("missing data", json!({ "path": path })),
+        ("null data", json!({ "path": path, "data": null })),
+        ("numeric data", json!({ "path": path, "data": 42 })),
+        ("object data", json!({ "path": path, "data": { "a": 1 } })),
+        (
+            "numeric encoding",
+            json!({ "path": path, "data": "x", "encoding": 7 }),
+        ),
+        ("numeric path", json!({ "path": 1, "data": "x" })),
+    ];
+    for (label, arguments) in malformed {
+        let resp = client
+            .call_tool("write_file", arguments)
+            .await
+            .expect("call_tool write_file failed");
+        let msg = error_text(&resp);
+        assert!(msg.starts_with("write_file: "), "{label}: {msg}");
+        assert_eq!(
+            std::fs::read_to_string(&dest).expect("file on disk"),
+            "original",
+            "{label}: existing file must not be truncated"
+        );
+    }
+
+    let resp = client
+        .call_tool("write_file", json!({ "path": path, "data": "" }))
+        .await
+        .expect("call_tool write_file failed");
+    let result = parse_write_result(&resp);
+    assert_eq!(result["bytes"].as_u64(), Some(0));
+    assert_eq!(std::fs::read_to_string(&dest).expect("file on disk"), "");
 }
