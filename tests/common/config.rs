@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Describes one endpoint entry in a relay TOML config.
 struct EndpointEntry {
@@ -20,6 +20,7 @@ pub struct ConfigBuilder {
     endpoints: Vec<EndpointEntry>,
     js_execution_mode: bool,
     toon_output: Option<bool>,
+    write_dirs: Vec<PathBuf>,
 }
 
 impl ConfigBuilder {
@@ -28,6 +29,7 @@ impl ConfigBuilder {
             endpoints: Vec::new(),
             js_execution_mode: false,
             toon_output: None,
+            write_dirs: Vec::new(),
         }
     }
 
@@ -165,6 +167,13 @@ impl ConfigBuilder {
         self
     }
 
+    /// Set the `[relay] write_dirs` allowlist. Empty (default) emits no
+    /// `write_dirs` line, so filesystem access stays disabled.
+    pub fn write_dirs(mut self, dirs: &[&Path]) -> Self {
+        self.write_dirs = dirs.iter().map(|p| p.to_path_buf()).collect();
+        self
+    }
+
     /// Serialize the config to a TOML string.
     pub fn build(self) -> String {
         let mut out = String::new();
@@ -186,6 +195,14 @@ impl ConfigBuilder {
         }
         if let Some(toon) = self.toon_output {
             out.push_str(&format!("toon_output = {}\n", toon));
+        }
+        if !self.write_dirs.is_empty() {
+            let dirs: Vec<String> = self
+                .write_dirs
+                .iter()
+                .map(|p| format!("{:?}", p.to_string_lossy()))
+                .collect();
+            out.push_str(&format!("write_dirs = [{}]\n", dirs.join(", ")));
         }
         out.push('\n');
 
