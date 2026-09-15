@@ -348,8 +348,8 @@ fn echo_fixture_path() -> PathBuf {
 }
 
 /// Start a relay backed by the bash echo fixture (no Node.js needed) with
-/// the given `[relay] write_dirs` allowlist. Returns the harness, an
-/// initialized client, and the canonical write root.
+/// the given `[relay] write_dirs` allowlist (already-canonical root).
+/// Returns the harness and an initialized client.
 async fn setup_write_file(js_mode: bool, write_root: Option<&Path>) -> (RelayHarness, McpClient) {
     setup_write_file_with_validation(js_mode, write_root, true).await
 }

@@ -730,7 +730,8 @@ async fn meta_tool_definitions(
                         "description": "How to decode `data` before writing."
                     }
                 },
-                "required": ["path", "data"]
+                "required": ["path", "data"],
+                "additionalProperties": false
             }
         }));
     }
@@ -1794,6 +1795,11 @@ struct ProfileSseFilter {
 ///   when the payload path matches `filter.path` (membership change, JS
 ///   toggle, profile add/remove).
 ///
+/// A relay-wide tick ([`crate::registry::RELAY_WIDE_TOOLS_CHANGED`], e.g. a
+/// `write_dirs` hot reload toggling the `write_file` meta-tool) is forwarded
+/// on every stream irrespective of the filter, since it affects the catalog
+/// of every profile alike.
+///
 /// Both channels treat `Lagged` as an unconditional forward — the client
 /// re-fetches `tools/list` on receipt and re-discovers any missed change.
 fn build_mcp_sse_stream(
@@ -1848,6 +1854,7 @@ fn build_mcp_sse_stream(
                             // open take effect without reconnection.
                             let forward = match &profile_filter {
                                 None => true,
+                                Some(_) if name == crate::registry::RELAY_WIDE_TOOLS_CHANGED => true,
                                 Some(f) => match f.registry.get(&f.path).await {
                                     Some(ctx) => {
                                         ctx.registry_view.allowed_endpoints().contains(&name)
@@ -8505,6 +8512,38 @@ mod tests {
         assert!(
             text.contains("notifications/tools/list_changed"),
             "global /mcp/sse must forward every tick regardless of endpoint (got: {text:?})"
+        );
+    }
+
+    // A relay-wide tick (`RELAY_WIDE_TOOLS_CHANGED`, emitted e.g. by a
+    // `write_dirs` hot reload) is not attributable to any endpoint, so a
+    // profile-scoped stream must forward it even though `*` is never in the
+    // profile's allowed-endpoints set.
+    #[tokio::test]
+    async fn mcp_sse_profiled_forwards_relay_wide_tick() {
+        let state = test_app_state();
+        install_profile(&state, "work", vec!["gmail".into()]).await;
+        let registry = state.registry.clone();
+        let resp = open_profile_sse(state, "work").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let driver = tokio::spawn(async move {
+            drive_ticks_until(
+                registry,
+                crate::registry::RELAY_WIDE_TOOLS_CHANGED,
+                deadline,
+            )
+            .await;
+        });
+        let text = read_sse_until(resp, Duration::from_secs(2), |s| {
+            s.contains("notifications/tools/list_changed")
+        })
+        .await;
+        driver.abort();
+        assert!(
+            text.contains("notifications/tools/list_changed"),
+            "profile stream must forward relay-wide ticks (got: {text:?})"
         );
     }
 

@@ -17,6 +17,14 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 
+/// Payload of a relay-wide tick on [`AdapterRegistry::subscribe_tools_changed`]
+/// that is not attributable to a single endpoint (see
+/// [`AdapterRegistry::tick_tools_changed_relay_wide`]). `*` can never be an
+/// endpoint name (`config::is_valid_endpoint_name` only admits
+/// `[a-z0-9][a-z0-9_-]*`), so consumers that filter ticks by endpoint
+/// membership can recognise it unambiguously and forward unconditionally.
+pub const RELAY_WIDE_TOOLS_CHANGED: &str = "*";
+
 /// A cached `list_tools()` result with an optional freshness deadline.
 ///
 /// `expires_at == None` ⇒ no upstream `ttlMs` hint was provided (legacy
@@ -349,6 +357,16 @@ impl AdapterRegistry {
     /// underlying adapter. Sending on a closed broadcast is ignored.
     pub(crate) fn tick_tools_changed(&self, endpoint: &str) {
         let _ = self.tools_changed_tx.send(endpoint.to_string());
+    }
+
+    /// Emit a relay-wide tools-changed tick that is not attributable to any
+    /// single endpoint (payload [`RELAY_WIDE_TOOLS_CHANGED`]). Used when a
+    /// relay-level meta-tool appears, disappears, or changes its advertised
+    /// description — e.g. a `write_dirs` hot reload toggling `write_file` —
+    /// so every stream, global or profile-scoped, forwards
+    /// `notifications/tools/list_changed` regardless of endpoint membership.
+    pub(crate) fn tick_tools_changed_relay_wide(&self) {
+        self.tick_tools_changed(RELAY_WIDE_TOOLS_CHANGED);
     }
 
     /// Send a synthetic tools-changed tick on the relay-wide broadcast for
