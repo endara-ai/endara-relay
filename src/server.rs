@@ -8,7 +8,7 @@ use crate::registry::AdapterRegistry;
 use crate::token_manager::TokenManager;
 use crate::OAuthAdapterInners;
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::{
         sse::{Event, KeepAlive},
@@ -2767,6 +2767,20 @@ fn is_localhost_origin(origin: &str) -> bool {
     matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]")
 }
 
+/// Request-body budget for the MCP JSON-RPC POST routes.
+///
+/// Axum's default limit is 2 MiB, which is smaller than the `write_file`
+/// per-file cap ([`crate::js_sandbox::MAX_WRITE_FILE_BYTES`], 32 MiB) that
+/// `tools/list` advertises — a large payload would be cut off by the HTTP
+/// layer with a plain-text 413 instead of reaching the tool's actionable
+/// `isError` result. The budget is derived from the largest legitimate
+/// request: a 32 MiB file sent as base64 grows by 4/3 (~42.7 MiB), plus
+/// JSON string escaping and the JSON-RPC envelope, so 48 MiB gives ~5 MiB
+/// of headroom while staying deliberately bounded. Only the JSON-RPC POST
+/// routes get this limit; `GET /mcp/sse`, `/healthz`, `/oauth/callback`
+/// and the management listener keep the axum default.
+pub(crate) const MCP_REQUEST_BODY_LIMIT: usize = 48 * 1024 * 1024;
+
 /// Build the axum Router with all MCP routes.
 ///
 /// CORS is configured to only allow localhost origins (DNS rebinding protection).
@@ -2791,12 +2805,29 @@ pub fn build_router_with_origins(state: AppState, extra_origins: &[String]) -> R
         .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
         .allow_headers([axum::http::header::CONTENT_TYPE]);
 
+    // Raised body budget for the JSON-RPC POST routes only (see
+    // `MCP_REQUEST_BODY_LIMIT`); applied per method-router so the SSE,
+    // healthz and OAuth routes keep axum's default limit.
+    let rpc_limit = DefaultBodyLimit::max(MCP_REQUEST_BODY_LIMIT);
+
     Router::new()
         .route("/healthz", get(healthz))
-        .route("/mcp", post(mcp_unified).delete(mcp_delete))
-        .route("/mcp/initialize", post(mcp_initialize_logged))
-        .route("/mcp/tools/list", post(mcp_tools_list_logged))
-        .route("/mcp/tools/call", post(mcp_tools_call_logged))
+        .route(
+            "/mcp",
+            post(mcp_unified).delete(mcp_delete).layer(rpc_limit),
+        )
+        .route(
+            "/mcp/initialize",
+            post(mcp_initialize_logged).layer(rpc_limit),
+        )
+        .route(
+            "/mcp/tools/list",
+            post(mcp_tools_list_logged).layer(rpc_limit),
+        )
+        .route(
+            "/mcp/tools/call",
+            post(mcp_tools_call_logged).layer(rpc_limit),
+        )
         .route("/mcp/sse", get(mcp_sse))
         // Profile-scoped variants. Per recon D7, axum 0.8 prefers the
         // specific `/mcp/{initialize,tools,sse}` routes above over the
@@ -2804,7 +2835,9 @@ pub fn build_router_with_origins(state: AppState, extra_origins: &[String]) -> R
         // profile names from colliding with the `/mcp/{profile}/sse` path.
         .route(
             "/mcp/{profile}",
-            post(mcp_unified_profiled).delete(mcp_delete_profiled),
+            post(mcp_unified_profiled)
+                .delete(mcp_delete_profiled)
+                .layer(rpc_limit),
         )
         .route("/mcp/{profile}/sse", get(mcp_sse_profiled))
         .route("/oauth/callback", get(oauth_callback))
@@ -4299,6 +4332,108 @@ mod tests {
             text.contains("not inside a configured write directory"),
             "{text}"
         );
+    }
+
+    // --- write_file through the real router (request-body budget) ---
+
+    /// POST a `tools/call write_file` JSON-RPC request through the full
+    /// router (CORS + body-limit layers included) to `uri`, returning the
+    /// HTTP response untouched so callers can assert on status and body.
+    async fn post_write_file_via_router(
+        state: AppState,
+        uri: &str,
+        arguments: Value,
+    ) -> axum::response::Response {
+        use axum::body::Body;
+        use tower::ServiceExt;
+        let body = json!({
+            "jsonrpc": "2.0",
+            "method": "tools/call",
+            "id": 1,
+            "params": { "name": "write_file", "arguments": arguments },
+        });
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        build_router(state).oneshot(request).await.unwrap()
+    }
+
+    // A valid write larger than axum's default 2 MiB body limit must not be
+    // cut off at the HTTP layer with a plain-text 413 — the raised
+    // `MCP_REQUEST_BODY_LIMIT` on the JSON-RPC routes lets it reach the
+    // tool and land on disk, on both the global and profile routes.
+    #[tokio::test]
+    async fn write_file_over_default_body_limit_succeeds_via_router() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let state = write_file_state(root.clone());
+        install_profile_with_flags(&state, "big", vec![], true, false).await;
+        let data = "x".repeat(3 * 1024 * 1024);
+
+        for (uri, name) in [("/mcp", "global.txt"), ("/mcp/big", "profile.txt")] {
+            let dest = root.join(name);
+            let resp = post_write_file_via_router(
+                state.clone(),
+                uri,
+                json!({ "path": dest.to_str().unwrap(), "data": data }),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            let body = body_json(resp).await;
+            assert!(body["result"].get("isError").is_none(), "{uri}: got {body}");
+            let inner: Value = serde_json::from_str(result_text(&body["result"])).unwrap();
+            assert_eq!(inner["bytes"], json!(data.len()), "{uri}");
+            assert_eq!(std::fs::metadata(&dest).unwrap().len(), data.len() as u64);
+        }
+    }
+
+    // One byte over the advertised 32 MiB per-file cap fits inside the
+    // request-body budget, so it reaches the tool and comes back as the
+    // actionable `isError` result (HTTP 200) rather than a transport 413.
+    #[tokio::test]
+    async fn write_file_over_per_file_cap_returns_tool_error_via_router() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let state = write_file_state(root.clone());
+        let dest = root.join("too-big.txt");
+        let data = "x".repeat(crate::js_sandbox::MAX_WRITE_FILE_BYTES + 1);
+
+        let resp = post_write_file_via_router(
+            state,
+            "/mcp",
+            json!({ "path": dest.to_str().unwrap(), "data": data }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["result"]["isError"], true, "got: {body}");
+        let text = result_text(&body["result"]);
+        assert!(text.starts_with("write_file:"), "{text}");
+        assert!(text.contains("exceeds the per-file limit"), "{text}");
+        assert!(!dest.exists(), "no file may be written");
+    }
+
+    // The raised budget is bounded: a body past `MCP_REQUEST_BODY_LIMIT` is
+    // still refused by the HTTP layer before any handler runs.
+    #[tokio::test]
+    async fn write_file_over_request_body_limit_is_rejected_with_413() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let state = write_file_state(root.clone());
+        let dest = root.join("never.txt");
+        let data = "x".repeat(MCP_REQUEST_BODY_LIMIT + 1);
+
+        let resp = post_write_file_via_router(
+            state,
+            "/mcp",
+            json!({ "path": dest.to_str().unwrap(), "data": data }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!dest.exists(), "no file may be written");
     }
 
     // The `validate_inputs = false` toggle bypasses meta-tool validation: a
