@@ -2804,11 +2804,20 @@ fn is_localhost_origin(origin: &str) -> bool {
 /// `tools/list` advertises — a large payload would be cut off by the HTTP
 /// layer with a plain-text 413 instead of reaching the tool's actionable
 /// `isError` result. The budget is derived from the largest legitimate
-/// request: a 32 MiB file sent as base64 grows by 4/3 (~42.7 MiB), plus
-/// JSON string escaping and the JSON-RPC envelope, so 48 MiB gives ~5 MiB
-/// of headroom while staying deliberately bounded. Only the JSON-RPC POST
-/// routes get this limit; `GET /mcp/sse`, `/healthz`, `/oauth/callback`
-/// and the management listener keep the axum default.
+/// request: a 32 MiB file sent as base64 grows by 4/3 (~42.7 MiB) and
+/// needs no JSON escaping, so with the JSON-RPC envelope 48 MiB gives
+/// ~5 MiB of headroom while staying deliberately bounded.
+///
+/// The limit applies to the JSON-serialized request body, not to the
+/// decoded `data`. A `utf8` payload is inflated by JSON string escaping
+/// (`"` and `\` double, control bytes become six-character `\uXXXX`
+/// escapes), so text made mostly of such characters can exceed this limit
+/// while its raw size is still under the 32 MiB per-file cap; the HTTP
+/// layer then answers with a plain 413 before the tool runs. Clients are
+/// told (via the advertised `write_file` description) to send such content
+/// as base64 instead — base64 of a 32 MiB file always fits. Only the
+/// JSON-RPC POST routes get this limit; `GET /mcp/sse`, `/healthz`,
+/// `/oauth/callback` and the management listener keep the axum default.
 pub(crate) const MCP_REQUEST_BODY_LIMIT: usize = 48 * 1024 * 1024;
 
 /// Build the axum Router with all MCP routes.
@@ -4531,6 +4540,76 @@ mod tests {
         .await;
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
         assert!(!dest.exists(), "no file may be written");
+    }
+
+    /// A `utf8` payload whose every byte needs JSON escaping: `"` and `\`
+    /// each serialize as two bytes, so the request body is twice the raw
+    /// size. `raw_len` must be even so the pattern is never split.
+    fn heavily_escaped_text(raw_len: usize) -> String {
+        assert_eq!(raw_len % 2, 0);
+        "\"\\".repeat(raw_len / 2)
+    }
+
+    #[test]
+    fn heavily_escaped_text_doubles_when_json_serialized() {
+        let text = heavily_escaped_text(1024);
+        assert_eq!(text.len(), 1024);
+        // `to_vec` on a bare string yields the escaped body plus the two
+        // surrounding quotes.
+        let serialized = serde_json::to_vec(&text).unwrap();
+        assert_eq!(serialized.len(), 2 * 1024 + 2);
+    }
+
+    // The body limit is measured against the JSON-serialized request, so a
+    // `utf8` payload made of characters that JSON must escape can trip it
+    // while its raw size is still under the 32 MiB per-file cap: 25 MiB of
+    // `"`/`\` serializes to 50 MiB and is refused with a plain 413 before
+    // `write_file` runs. Documented on `MCP_REQUEST_BODY_LIMIT` and in the
+    // advertised description (send such content as base64).
+    #[tokio::test]
+    async fn write_file_escaped_utf8_over_serialized_limit_is_rejected_with_413() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let state = write_file_state(root.clone());
+        let dest = root.join("never.txt");
+        let data = heavily_escaped_text(25 * 1024 * 1024);
+        assert!(data.len() < crate::js_sandbox::MAX_WRITE_FILE_BYTES);
+        assert!(2 * data.len() > MCP_REQUEST_BODY_LIMIT);
+
+        let resp = post_write_file_via_router(
+            state,
+            "/mcp",
+            json!({ "path": dest.to_str().unwrap(), "data": data }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!dest.exists(), "no file may be written");
+    }
+
+    // Companion to the 413 case: the same heavily escaped text at a size
+    // whose serialized form fits the budget (16 MiB raw, 32 MiB on the
+    // wire) reaches the tool and lands byte-for-byte on disk.
+    #[tokio::test]
+    async fn write_file_escaped_utf8_within_serialized_limit_succeeds_via_router() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let state = write_file_state(root.clone());
+        let dest = root.join("escaped.txt");
+        let data = heavily_escaped_text(16 * 1024 * 1024);
+        assert!(2 * data.len() < MCP_REQUEST_BODY_LIMIT);
+
+        let resp = post_write_file_via_router(
+            state,
+            "/mcp",
+            json!({ "path": dest.to_str().unwrap(), "data": data }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert!(body["result"].get("isError").is_none(), "got {body}");
+        let inner: Value = serde_json::from_str(result_text(&body["result"])).unwrap();
+        assert_eq!(inner["bytes"], json!(data.len()));
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), data);
     }
 
     // The `validate_inputs = false` toggle bypasses meta-tool validation: a

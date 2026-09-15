@@ -321,9 +321,14 @@ pub fn write_file_description(roots: &[PathBuf]) -> String {
          file content — `encoding` is `\"utf8\"` (default) for text or `\"base64\"` for \
          binary data. Missing parent directories are created; an existing file is \
          overwritten atomically (no partial file is left behind on failure). Each file \
-         is limited to {} MiB. Returns `{{ path, bytes }}` with the canonical path written \
-         and the number of bytes.",
-        MAX_WRITE_FILE_BYTES / (1024 * 1024)
+         is limited to {max_mib} MiB. The JSON-serialized request must also stay under \
+         {limit_mib} MiB: JSON escaping inflates `\"utf8\"` text (quotes and backslashes \
+         double, control characters become six-character escapes), so text made mostly of \
+         such characters may need to be sent as `\"base64\"` — base64 of a {max_mib} MiB \
+         file always fits. Returns `{{ path, bytes }}` with the canonical path written and \
+         the number of bytes.",
+        max_mib = MAX_WRITE_FILE_BYTES / (1024 * 1024),
+        limit_mib = crate::server::MCP_REQUEST_BODY_LIMIT / (1024 * 1024),
     )
 }
 
@@ -658,6 +663,10 @@ mod tests {
         assert!(desc.contains("parent directories are created"), "{desc}");
         assert!(desc.contains("overwritten atomically"), "{desc}");
         assert!(desc.contains("32 MiB"), "{desc}");
+        assert!(desc.contains("JSON-serialized request"), "{desc}");
+        assert!(desc.contains("48 MiB"), "{desc}");
+        assert!(desc.contains("sent as `\"base64\"`"), "{desc}");
+        assert!(desc.contains("32 MiB file always fits"), "{desc}");
         assert!(desc.contains("{ path, bytes }"), "{desc}");
     }
 
