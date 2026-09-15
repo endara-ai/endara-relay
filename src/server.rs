@@ -1,6 +1,6 @@
 use crate::config::DEFAULT_SESSION_IDENTITY_MAX_SESSIONS;
 use crate::events::ClientIdentity;
-use crate::js_sandbox::MetaToolHandler;
+use crate::js_sandbox::{JsSandboxError, MetaToolHandler};
 use crate::oauth::{OAuthFlowManager, OAuthSetupManager};
 use crate::profile_registry::{ProfileContext, ProfileRegistry};
 use crate::protocol::{self, ProtocolVersion};
@@ -23,6 +23,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -70,7 +71,7 @@ pub struct AppState {
     /// `clientInfo`. Wrapped in `Arc<Mutex<_>>` so [`AppState`] stays
     /// `Clone` and cheap to pass through axum extractors.
     pub session_identities: Arc<Mutex<SessionIdentityStore>>,
-    /// Precompiled JSON-Schema validators for the three relay-defined
+    /// Precompiled JSON-Schema validators for the four relay-defined
     /// meta-tools. Their input shapes never change, so they are compiled once
     /// at startup (see [`MetaToolSchemas::new`]) and shared here. Consulted by
     /// [`validate_meta_tool_args`] at the top of each meta-tool branch in
@@ -79,7 +80,7 @@ pub struct AppState {
 }
 
 /// Precompiled JSON-Schema validators for the relay-defined meta-tools
-/// (`list_tools`, `search_tools`, `execute_tools`), per spec §6.
+/// (`list_tools`, `search_tools`, `execute_tools`, `write_file`), per spec §6.
 ///
 /// Unlike upstream tool schemas — which are compiled lazily and cached on the
 /// [`AdapterRegistry`] — these are owned by the relay and immutable, so they
@@ -96,7 +97,7 @@ impl MetaToolSchemas {
     /// literals, so a compilation failure is a programmer error and panics at
     /// startup rather than silently disabling meta-tool validation.
     pub fn new() -> Arc<Self> {
-        let specs: [(&'static str, Value); 3] = [
+        let specs: [(&'static str, Value); 4] = [
             (
                 "list_tools",
                 json!({
@@ -128,6 +129,19 @@ impl MetaToolSchemas {
                         "script": { "type": "string" }
                     },
                     "required": ["script"],
+                    "additionalProperties": false
+                }),
+            ),
+            (
+                "write_file",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "data": { "type": "string" },
+                        "encoding": { "type": "string", "enum": ["utf8", "base64"], "default": "utf8" }
+                    },
+                    "required": ["path", "data"],
                     "additionalProperties": false
                 }),
             ),
@@ -467,6 +481,17 @@ fn wrap_meta_tool_result(result: Value, toon_enabled: bool) -> Value {
     })
 }
 
+/// Wrap an actionable failure message in the MCP tool-level error envelope
+/// (`isError: true`) — the same shape [`validate_meta_tool_args`] returns, so
+/// clients see runtime rejections (path outside `write_dirs`, invalid base64,
+/// …) exactly like schema failures rather than as JSON-RPC protocol errors.
+fn meta_tool_error_result(text: &str) -> Value {
+    json!({
+        "content": [{ "type": "text", "text": text }],
+        "isError": true,
+    })
+}
+
 /// Validate a meta-tool's `arguments` against its precompiled schema (spec
 /// §6). Returns `Some(isError result)` to short-circuit the branch when the
 /// arguments are invalid; `None` when they pass, when validation is disabled
@@ -608,7 +633,10 @@ async fn mcp_server_discover(
 /// `list_tools` and `search_tools` are always advertised. `execute_tools` is
 /// only included when `js_mode` is on — this matches the invocation-side
 /// gate in `mcp_tools_call`, which rejects `execute_tools` calls when
-/// `local_js_execution` is disabled.
+/// `local_js_execution` is disabled. `write_file` is advertised in BOTH
+/// modes, but only when `write_roots` (the current `[relay] write_dirs`
+/// snapshot) is non-empty — with no configured directory every call would be
+/// rejected, so the tool is hidden instead.
 ///
 /// The descriptions are built dynamically against the supplied [`AdapterRegistry`]
 /// so each `tools/list` response advertises the currently-Healthy server set
@@ -620,6 +648,7 @@ async fn meta_tool_definitions(
     registry: &AdapterRegistry,
     toon_enabled: bool,
     profile_ctx: Option<&ProfileContext>,
+    write_roots: &[PathBuf],
 ) -> Vec<Value> {
     let (list_desc, search_desc) = match profile_ctx {
         Some(ctx) => (
@@ -660,26 +689,51 @@ async fn meta_tool_definitions(
             }
         }),
     ];
-    if !js_mode {
-        return tools;
+    if js_mode {
+        let execute_desc = match profile_ctx {
+            Some(ctx) => {
+                crate::advertise::execute_tools_description_for_profile(&ctx.registry_view).await
+            }
+            None => crate::advertise::execute_tools_description(registry).await,
+        };
+        tools.push(json!({
+            "name": "execute_tools",
+            "description": execute_desc,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "script": { "type": "string" }
+                },
+                "required": ["script"]
+            }
+        }));
     }
-    let execute_desc = match profile_ctx {
-        Some(ctx) => {
-            crate::advertise::execute_tools_description_for_profile(&ctx.registry_view).await
-        }
-        None => crate::advertise::execute_tools_description(registry).await,
-    };
-    tools.push(json!({
-        "name": "execute_tools",
-        "description": execute_desc,
-        "inputSchema": {
-            "type": "object",
-            "properties": {
-                "script": { "type": "string" }
-            },
-            "required": ["script"]
-        }
-    }));
+    if !write_roots.is_empty() {
+        tools.push(json!({
+            "name": "write_file",
+            "description": crate::advertise::write_file_description(write_roots),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute path of the file to write, inside an allowed directory."
+                    },
+                    "data": {
+                        "type": "string",
+                        "description": "File content (UTF-8 text, or base64 when encoding is \"base64\")."
+                    },
+                    "encoding": {
+                        "type": "string",
+                        "enum": ["utf8", "base64"],
+                        "default": "utf8",
+                        "description": "How to decode `data` before writing."
+                    }
+                },
+                "required": ["path", "data"]
+            }
+        }));
+    }
     tools
 }
 
@@ -706,11 +760,25 @@ async fn mcp_tools_list(
     let toon_enabled = profile_ctx
         .map(|c| c.toon_output)
         .unwrap_or(state.toon_enabled);
-    let meta_tools =
-        meta_tool_definitions(js_mode, &state.registry, toon_enabled, profile_ctx).await;
+    // Both the global and per-profile handlers hold the same hot-reloadable
+    // `write_dirs` handle, so this snapshot mirrors what a `write_file` call
+    // dispatched through `mcp_tools_call` would observe.
+    let write_roots = profile_ctx
+        .and_then(|c| c.meta_tool_handler.as_deref())
+        .unwrap_or(&state.meta_tool_handler)
+        .write_roots_snapshot();
+    let meta_tools = meta_tool_definitions(
+        js_mode,
+        &state.registry,
+        toon_enabled,
+        profile_ctx,
+        &write_roots,
+    )
+    .await;
 
     let tools: Vec<Value> = if js_mode {
-        // JS execution mode: only the 3 meta-tools (incl. execute_tools).
+        // JS execution mode: only the meta-tools (list/search/execute_tools,
+        // plus write_file when write_dirs is configured).
         // T7 decision: the JS-mode catalog reduction is SCOPED to
         // `tools/list` only — `resources/*` and `prompts/*` continue to pass
         // through in JS mode (see `mcp_resources_list` /
@@ -914,7 +982,8 @@ async fn mcp_resources_read(
 /// the global [`AppState::js_execution_mode`] / [`AppState::toon_enabled`]
 /// toggles, and the per-profile [`MetaToolHandler`] handles the meta-tool
 /// dispatch so list/search/execute see only the profile's allowed
-/// endpoints.
+/// endpoints. `write_file` is dispatched here too — before the JS-mode
+/// direct-call gate — so it stays callable in both modes.
 async fn mcp_tools_call(
     State(state): State<AppState>,
     Json(body): Json<JsonRpcBody>,
@@ -1032,6 +1101,37 @@ async fn mcp_tools_call(
                 }
                 Err(e) => return Err(jsonrpc_error(body.id, -32603, &e.to_string())),
             }
+        }
+        "write_file" => {
+            // Available in BOTH modes (no js_mode gate). With no configured
+            // `write_dirs` the handler rejects the call with the actionable
+            // "not inside a configured write directory" message, mirroring
+            // the catalog hide in `meta_tool_definitions`.
+            if let Some(err) = validate_meta_tool_args(&state, "write_file", &arguments) {
+                return Ok(jsonrpc_response(body.id, err));
+            }
+            let path = arguments.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let data = arguments.get("data").and_then(|v| v.as_str()).unwrap_or("");
+            let encoding = arguments
+                .get("encoding")
+                .and_then(|v| v.as_str())
+                .unwrap_or("utf8");
+            return match handler.write_file(path, data, encoding).await {
+                Ok(result) => Ok(jsonrpc_response(
+                    body.id,
+                    wrap_meta_tool_result(result, toon_enabled),
+                )),
+                // Path/encoding/size rejections arrive as `JsError` carrying
+                // the same actionable text the sandbox `writeFile` throws;
+                // surface them as tool-level errors, not protocol errors.
+                Err(JsSandboxError::JsError(message)) => {
+                    Ok(jsonrpc_response(body.id, meta_tool_error_result(&message)))
+                }
+                Err(e) => Ok(jsonrpc_response(
+                    body.id,
+                    meta_tool_error_result(&e.to_string()),
+                )),
+            };
         }
         _ => {}
     }
@@ -2822,7 +2922,7 @@ pub async fn start_server(
 mod tests {
     use super::*;
     use crate::adapter::{AdapterError, HealthStatus, McpAdapter, ToolInfo};
-    use crate::js_sandbox::MetaToolHandler;
+    use crate::js_sandbox::{MetaToolHandler, SharedWriteRoots};
     use crate::registry::AdapterRegistry;
     use async_trait::async_trait;
     use std::sync::atomic::AtomicBool;
@@ -2870,14 +2970,22 @@ mod tests {
         }
     }
 
-    /// Build a minimal AppState for testing (no OAuth, no token manager).
+    /// Build a minimal AppState for testing (no OAuth, no token manager,
+    /// no `write_dirs` configured).
     fn test_app_state() -> AppState {
+        test_app_state_with_write_roots(Arc::new(std::sync::RwLock::new(Vec::new())))
+    }
+
+    /// Like [`test_app_state`] but with the given shared `write_dirs` handle
+    /// installed on both the global handler and the profile registry.
+    fn test_app_state_with_write_roots(write_roots: SharedWriteRoots) -> AppState {
         let registry = AdapterRegistry::new();
-        let meta_tool_handler = Arc::new(MetaToolHandler::new(
-            Arc::new(registry.clone()),
-            Duration::from_secs(5),
-        ));
-        let profile_registry = Arc::new(ProfileRegistry::new(registry.clone()));
+        let meta_tool_handler = Arc::new(
+            MetaToolHandler::new(Arc::new(registry.clone()), Duration::from_secs(5))
+                .with_write_roots(write_roots.clone()),
+        );
+        let profile_registry =
+            Arc::new(ProfileRegistry::new(registry.clone()).with_write_roots(write_roots));
         AppState {
             registry,
             js_execution_mode: Arc::new(AtomicBool::new(false)),
@@ -3525,13 +3633,22 @@ mod tests {
     #[tokio::test]
     async fn meta_tool_definitions_contains_expected_tools() {
         let registry = AdapterRegistry::new();
-        let defs = meta_tool_definitions(true, &registry, false, None).await;
+        // No write_dirs configured → write_file hidden, 3 meta-tools.
+        let defs = meta_tool_definitions(true, &registry, false, None, &[]).await;
         assert_eq!(defs.len(), 3);
 
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"list_tools"));
         assert!(names.contains(&"search_tools"));
         assert!(names.contains(&"execute_tools"));
+        assert!(!names.contains(&"write_file"));
+
+        // With a configured root, write_file joins the set.
+        let roots = vec![PathBuf::from("/tmp/relay-out")];
+        let defs = meta_tool_definitions(true, &registry, false, None, &roots).await;
+        assert_eq!(defs.len(), 4);
+        let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"write_file"));
 
         // Each definition must have name, description, inputSchema
         for def in &defs {
@@ -3545,7 +3662,7 @@ mod tests {
     #[tokio::test]
     async fn meta_tool_definitions_hides_execute_tools_when_js_off() {
         let registry = AdapterRegistry::new();
-        let defs = meta_tool_definitions(false, &registry, false, None).await;
+        let defs = meta_tool_definitions(false, &registry, false, None, &[]).await;
         let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"list_tools"));
         assert!(names.contains(&"search_tools"));
@@ -3555,10 +3672,103 @@ mod tests {
         );
     }
 
+    /// Pull the `write_file` definition out of a `meta_tool_definitions`
+    /// result, panicking with the advertised names when it is absent.
+    fn find_write_file(defs: &[Value]) -> &Value {
+        defs.iter()
+            .find(|d| d["name"] == "write_file")
+            .unwrap_or_else(|| {
+                let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
+                panic!("write_file not advertised; got {names:?}")
+            })
+    }
+
+    #[tokio::test]
+    async fn write_file_advertised_in_both_modes_when_roots_configured() {
+        let registry = AdapterRegistry::new();
+        let roots = vec![PathBuf::from("/tmp/relay-out"), PathBuf::from("/srv/data")];
+        for js_mode in [false, true] {
+            let defs = meta_tool_definitions(js_mode, &registry, false, None, &roots).await;
+            let def = find_write_file(&defs);
+            let desc = def["description"].as_str().unwrap();
+            assert!(
+                desc.contains("/tmp/relay-out") && desc.contains("/srv/data"),
+                "js_mode={js_mode}: description must list the allowed roots: {desc}"
+            );
+            assert_eq!(def["inputSchema"]["required"], json!(["path", "data"]));
+            assert_eq!(
+                def["inputSchema"]["properties"]["encoding"]["enum"],
+                json!(["utf8", "base64"])
+            );
+            let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
+            assert_eq!(
+                names.contains(&"execute_tools"),
+                js_mode,
+                "execute_tools gating must be unaffected: {names:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn write_file_hidden_when_no_roots_configured() {
+        let registry = AdapterRegistry::new();
+        for js_mode in [false, true] {
+            let defs = meta_tool_definitions(js_mode, &registry, false, None, &[]).await;
+            let names: Vec<&str> = defs.iter().map(|d| d["name"].as_str().unwrap()).collect();
+            assert!(
+                !names.contains(&"write_file"),
+                "js_mode={js_mode}: write_file must be hidden without write_dirs: {names:?}"
+            );
+        }
+    }
+
+    // `tools/list` end-to-end: the advertised set follows the live shared
+    // handle, so a hot-reloaded `write_dirs` flips `write_file` on and off
+    // without a restart, in both modes.
+    #[tokio::test]
+    async fn mcp_tools_list_write_file_follows_shared_roots() {
+        let shared: SharedWriteRoots = Arc::new(std::sync::RwLock::new(Vec::new()));
+        let state = test_app_state_with_write_roots(Arc::clone(&shared));
+        let list_names = |state: AppState| async move {
+            let body = JsonRpcBody {
+                jsonrpc: Some("2.0".to_string()),
+                method: Some("tools/list".to_string()),
+                params: None,
+                id: Some(json!(1)),
+            };
+            let Json(resp) = mcp_tools_list(State(state), Json(body), None).await;
+            resp["result"]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(!list_names(state.clone())
+            .await
+            .contains(&"write_file".to_string()));
+
+        *shared.write().unwrap() = vec![PathBuf::from("/tmp/relay-out")];
+        let names = list_names(state.clone()).await;
+        assert!(names.contains(&"write_file".to_string()), "{names:?}");
+        assert_eq!(names.len(), 3, "list/search/write_file in normal mode");
+
+        state.js_execution_mode.store(true, Ordering::Relaxed);
+        let names = list_names(state.clone()).await;
+        assert!(names.contains(&"write_file".to_string()), "{names:?}");
+        assert!(names.contains(&"execute_tools".to_string()), "{names:?}");
+        assert_eq!(names.len(), 4, "all four meta-tools in JS mode");
+
+        shared.write().unwrap().clear();
+        let names = list_names(state).await;
+        assert!(!names.contains(&"write_file".to_string()), "{names:?}");
+    }
+
     #[tokio::test]
     async fn test_list_tools_description_documents_return_format() {
         let registry = AdapterRegistry::new();
-        let defs = meta_tool_definitions(true, &registry, false, None).await;
+        let defs = meta_tool_definitions(true, &registry, false, None, &[]).await;
         let list_desc = defs.iter().find(|d| d["name"] == "list_tools").unwrap()["description"]
             .as_str()
             .unwrap();
@@ -3587,7 +3797,7 @@ mod tests {
     #[tokio::test]
     async fn test_search_tools_description_documents_behavior() {
         let registry = AdapterRegistry::new();
-        let defs = meta_tool_definitions(true, &registry, false, None).await;
+        let defs = meta_tool_definitions(true, &registry, false, None, &[]).await;
         let search_desc = defs.iter().find(|d| d["name"] == "search_tools").unwrap()["description"]
             .as_str()
             .unwrap();
@@ -3610,7 +3820,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_tools_description_has_examples() {
         let registry = AdapterRegistry::new();
-        let defs = meta_tool_definitions(true, &registry, false, None).await;
+        let defs = meta_tool_definitions(true, &registry, false, None, &[]).await;
         let exec_desc = defs.iter().find(|d| d["name"] == "execute_tools").unwrap()["description"]
             .as_str()
             .unwrap();
@@ -3902,6 +4112,195 @@ mod tests {
         assert!(inner["tools"].is_array(), "got: {inner}");
     }
 
+    // --- write_file meta-tool dispatch ---
+
+    /// Canonicalized tempdir path, matching what `resolve_write_roots`
+    /// produces for configured roots (on macOS `/var/…` → `/private/var/…`).
+    fn canonical_root(dir: &tempfile::TempDir) -> PathBuf {
+        dir.path().canonicalize().unwrap()
+    }
+
+    /// AppState whose only allowed write root is `root`.
+    fn write_file_state(root: PathBuf) -> AppState {
+        test_app_state_with_write_roots(Arc::new(std::sync::RwLock::new(vec![root])))
+    }
+
+    /// Call `write_file` through `mcp_tools_call` and return the JSON-RPC
+    /// `result` object (panics on a protocol-level error).
+    async fn call_write_file(state: AppState, arguments: Value) -> Value {
+        let body = meta_call_body("write_file", arguments);
+        match mcp_tools_call(State(state), Json(body), None).await {
+            Ok(Json(resp)) => resp["result"].clone(),
+            Err((_, Json(err))) => panic!("expected tool result, got protocol error: {err}"),
+        }
+    }
+
+    /// Text of the single `content` entry in a meta-tool result.
+    fn result_text(result: &Value) -> &str {
+        result["content"][0]["text"].as_str().unwrap()
+    }
+
+    #[tokio::test]
+    async fn write_file_success_writes_into_root_and_returns_path_and_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let state = write_file_state(root.clone());
+        let dest = root.join("nested").join("out.txt");
+
+        let result = call_write_file(
+            state,
+            json!({ "path": dest.to_str().unwrap(), "data": "hello ✓" }),
+        )
+        .await;
+        assert!(result.get("isError").is_none(), "got: {result}");
+        let inner: Value = serde_json::from_str(result_text(&result)).unwrap();
+        assert_eq!(inner["path"], json!(dest.to_str().unwrap()));
+        assert_eq!(inner["bytes"], json!("hello ✓".len()));
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "hello ✓");
+    }
+
+    #[tokio::test]
+    async fn write_file_base64_decodes_binary_payload() {
+        use base64::Engine as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let state = write_file_state(root.clone());
+        let dest = root.join("blob.bin");
+        let bytes: Vec<u8> = (0u8..=255).collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+        let result = call_write_file(
+            state,
+            json!({ "path": dest.to_str().unwrap(), "data": encoded, "encoding": "base64" }),
+        )
+        .await;
+        assert!(result.get("isError").is_none(), "got: {result}");
+        let inner: Value = serde_json::from_str(result_text(&result)).unwrap();
+        assert_eq!(inner["bytes"], json!(256));
+        assert_eq!(std::fs::read(&dest).unwrap(), bytes);
+    }
+
+    // JS mode: `write_file` must be dispatched before the "Direct tool calls
+    // are not allowed" gate, so it succeeds exactly as in normal mode.
+    #[tokio::test]
+    async fn write_file_not_blocked_by_js_mode_direct_call_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let state = write_file_state(root.clone());
+        state.js_execution_mode.store(true, Ordering::Relaxed);
+        let dest = root.join("js-mode.txt");
+
+        let result = call_write_file(
+            state,
+            json!({ "path": dest.to_str().unwrap(), "data": "ok" }),
+        )
+        .await;
+        assert!(result.get("isError").is_none(), "got: {result}");
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn write_file_schema_rejects_missing_path_and_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+
+        let result = call_write_file(write_file_state(root.clone()), json!({ "data": "x" })).await;
+        assert_eq!(result["isError"], true, "got: {result}");
+        let text = result_text(&result);
+        assert!(
+            text.contains("path") && text.contains("required field is missing"),
+            "{text}"
+        );
+
+        let result = call_write_file(
+            write_file_state(root.clone()),
+            json!({ "path": root.join("a.txt").to_str().unwrap() }),
+        )
+        .await;
+        assert_eq!(result["isError"], true, "got: {result}");
+        let text = result_text(&result);
+        assert!(
+            text.contains("data") && text.contains("required field is missing"),
+            "{text}"
+        );
+        assert!(!root.join("a.txt").exists(), "no file may be written");
+    }
+
+    #[tokio::test]
+    async fn write_file_schema_rejects_unknown_property() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let dest = root.join("a.txt");
+        let result = call_write_file(
+            write_file_state(root.clone()),
+            json!({ "path": dest.to_str().unwrap(), "data": "x", "mode": "append" }),
+        )
+        .await;
+        assert_eq!(result["isError"], true, "got: {result}");
+        let text = result_text(&result);
+        assert!(text.contains("'mode'"), "names the bad key: {text}");
+        assert!(text.contains("unknown parameter"), "{text}");
+        assert!(!dest.exists(), "no file may be written");
+    }
+
+    #[tokio::test]
+    async fn write_file_schema_rejects_bad_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let dest = root.join("a.txt");
+        let result = call_write_file(
+            write_file_state(root.clone()),
+            json!({ "path": dest.to_str().unwrap(), "data": "x", "encoding": "hex" }),
+        )
+        .await;
+        assert_eq!(result["isError"], true, "got: {result}");
+        let text = result_text(&result);
+        assert!(text.contains("encoding"), "{text}");
+        assert!(!dest.exists(), "no file may be written");
+    }
+
+    // A path outside every root is a tool-level error (`isError: true`)
+    // carrying the actionable write_dirs message — not a JSON-RPC error.
+    #[tokio::test]
+    async fn write_file_outside_roots_returns_actionable_tool_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let other = tempfile::tempdir().unwrap();
+        let dest = other.path().join("escape.txt");
+        let result = call_write_file(
+            write_file_state(root.clone()),
+            json!({ "path": dest.to_str().unwrap(), "data": "x" }),
+        )
+        .await;
+        assert_eq!(result["isError"], true, "got: {result}");
+        let text = result_text(&result);
+        assert!(text.starts_with("write_file:"), "{text}");
+        assert!(
+            text.contains("not inside a configured write directory"),
+            "{text}"
+        );
+        assert!(text.contains("write_dirs"), "{text}");
+        assert!(
+            text.contains(root.to_str().unwrap()),
+            "lists the currently allowed roots: {text}"
+        );
+        assert!(!dest.exists(), "no file may be written outside the roots");
+    }
+
+    // With no `write_dirs` configured the tool is hidden from `tools/list`,
+    // but a client that calls it anyway still gets the actionable message.
+    #[tokio::test]
+    async fn write_file_with_no_roots_returns_actionable_tool_error() {
+        let state = test_app_state();
+        let result = call_write_file(state, json!({ "path": "/tmp/x.txt", "data": "x" })).await;
+        assert_eq!(result["isError"], true, "got: {result}");
+        let text = result_text(&result);
+        assert!(
+            text.contains("not inside a configured write directory"),
+            "{text}"
+        );
+    }
+
     // The `validate_inputs = false` toggle bypasses meta-tool validation: a
     // wrong key falls through to the handler instead of an `isError` result.
     #[tokio::test]
@@ -4002,7 +4401,7 @@ mod tests {
     #[tokio::test]
     async fn search_tools_advertising_includes_toon_hint_when_enabled() {
         let registry = AdapterRegistry::new();
-        let defs_on = meta_tool_definitions(true, &registry, true, None).await;
+        let defs_on = meta_tool_definitions(true, &registry, true, None, &[]).await;
         let search_desc = defs_on
             .iter()
             .find(|d| d["name"] == "search_tools")
@@ -4014,7 +4413,7 @@ mod tests {
             "expected TOON hint in: {search_desc}"
         );
 
-        let defs_off = meta_tool_definitions(true, &registry, false, None).await;
+        let defs_off = meta_tool_definitions(true, &registry, false, None, &[]).await;
         let search_desc_off = defs_off
             .iter()
             .find(|d| d["name"] == "search_tools")

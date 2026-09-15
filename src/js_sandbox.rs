@@ -163,6 +163,11 @@ struct SandboxState {
     bytes_read: usize,
 }
 
+/// Maximum size of a single file written by the sandbox `writeFile` global
+/// or the `write_file` meta-tool (see [`WriteLimits::max_file_bytes`]).
+/// Exposed so the advertised `write_file` description can quote the cap.
+pub const MAX_WRITE_FILE_BYTES: usize = 32 * 1024 * 1024;
+
 /// Per-run `writeFile` resource limits. These are per-script-run only —
 /// there is no cross-run quota, no TTL sweep, and the relay never deletes
 /// files: a breach throws before the offending file is written and leaves
@@ -181,7 +186,7 @@ struct WriteLimits {
 impl Default for WriteLimits {
     fn default() -> Self {
         Self {
-            max_file_bytes: 32 * 1024 * 1024,
+            max_file_bytes: MAX_WRITE_FILE_BYTES,
             max_files_per_run: 64,
             max_total_bytes_per_run: 256 * 1024 * 1024,
         }
@@ -2238,6 +2243,19 @@ impl MetaToolHandler {
         self
     }
 
+    /// Snapshot the shared `relay.write_dirs` allowlist. The brief
+    /// std-RwLock read never crosses an `.await`; a poisoned lock (a writer
+    /// panicked mid-swap) degrades to writing-disabled rather than
+    /// propagating the panic into the request path. Used per
+    /// `execute_tools` / `write_file` call and by `tools/list` to decide
+    /// whether to advertise `write_file`.
+    pub fn write_roots_snapshot(&self) -> Vec<PathBuf> {
+        self.write_roots
+            .read()
+            .map(|guard| guard.clone())
+            .unwrap_or_default()
+    }
+
     /// Test-only accessor returning the number of times the search index has
     /// been rebuilt. Used to assert cache hit/miss behavior.
     #[cfg(test)]
@@ -2385,15 +2403,9 @@ impl MetaToolHandler {
         client_json: &str,
         request_uid: &str,
     ) -> Result<Value, JsSandboxError> {
-        // Snapshot the shared allowlist for this script run. The brief
-        // std-RwLock read never crosses an `.await`; a poisoned lock (a
-        // writer panicked mid-swap) degrades to writing-disabled rather
-        // than propagating the panic into the request path.
-        let write_roots = self
-            .write_roots
-            .read()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
+        // Snapshot the shared allowlist for this script run so a running
+        // script keeps the allowlist it started with.
+        let write_roots = self.write_roots_snapshot();
         let sandbox = JsSandbox::from_dyn(self.registry.clone(), self.sandbox_timeout)
             .with_client(client_json.to_string())
             .with_request_uid(request_uid.to_string())
@@ -2411,21 +2423,13 @@ impl MetaToolHandler {
     /// a hot reload is observed by the next call. Returns
     /// `{ "path": <canonical path>, "bytes": <count> }`; every rejection maps
     /// to [`JsSandboxError::JsError`] carrying the actionable message.
-    ///
-    /// `allow(dead_code)`: the bin compilation unit flags this until
-    /// `server.rs` dispatches `write_file`.
-    #[allow(dead_code)]
     pub async fn write_file(
         &self,
         path: &str,
         data: &str,
         encoding: &str,
     ) -> Result<Value, JsSandboxError> {
-        let write_roots = self
-            .write_roots
-            .read()
-            .map(|guard| guard.clone())
-            .unwrap_or_default();
+        let write_roots = self.write_roots_snapshot();
         let path = path.to_string();
         let data = data.to_string();
         let encoding = encoding.to_string();
