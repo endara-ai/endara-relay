@@ -1228,7 +1228,7 @@ fn write_file_to_roots(
         )));
     }
 
-    write_atomic(&dest, &bytes, &matched_root).map_err(WriteRejection::Failed)?;
+    write_atomic(op, &dest, &bytes, &matched_root).map_err(WriteRejection::Failed)?;
 
     Ok(WriteOutcome {
         path: dest,
@@ -1331,13 +1331,17 @@ fn write_dirs_rejection_message(op: &str, path_str: &str, write_roots: &[PathBuf
 }
 
 /// Split `dest` into its parent directory and file name for [`write_atomic`].
-fn split_write_dest(dest: &Path) -> Result<(&Path, &std::ffi::OsStr), String> {
+/// `op` flavours the error messages.
+fn split_write_dest<'a>(
+    op: &str,
+    dest: &'a Path,
+) -> Result<(&'a Path, &'a std::ffi::OsStr), String> {
     let dir = dest
         .parent()
-        .ok_or_else(|| format!("writeFile: '{}' has no parent directory", dest.display()))?;
+        .ok_or_else(|| format!("{}: '{}' has no parent directory", op, dest.display()))?;
     let file_name = dest
         .file_name()
-        .ok_or_else(|| format!("writeFile: '{}' does not name a file", dest.display()))?;
+        .ok_or_else(|| format!("{}: '{}' does not name a file", op, dest.display()))?;
     Ok((dir, file_name))
 }
 
@@ -1385,15 +1389,17 @@ fn write_tmp_name(file_name: &std::ffi::OsStr) -> String {
 /// opened); the "directories are never auto-created" stance in
 /// [`crate::config::resolve_write_roots`] only covers resolution time. On
 /// failure the temp file is removed — no partial destination file is ever
-/// observable.
+/// observable. `op` (`"writeFile"` or `"write_file"`) flavours every error
+/// message.
 #[cfg(unix)]
-fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
+fn write_atomic(op: &str, dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
     use std::os::unix::io::{AsFd as _, AsRawFd as _};
 
-    let (dir, file_name) = split_write_dest(dest)?;
+    let (dir, file_name) = split_write_dest(op, dest)?;
     let escaped = || {
         format!(
-            "writeFile: '{}' escaped the configured write directory during the write",
+            "{}: '{}' escaped the configured write directory during the write",
+            op,
             dest.display()
         )
     };
@@ -1403,7 +1409,8 @@ fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
             return escaped();
         }
         format!(
-            "writeFile: failed to create parent directories for '{}': {}",
+            "{}: failed to create parent directories for '{}': {}",
+            op,
             dest.display(),
             e
         )
@@ -1413,8 +1420,9 @@ fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
             return escaped();
         }
         format!(
-            "writeFile: configured write directory '{}' is not accessible: {} — recreate it \
+            "{}: configured write directory '{}' is not accessible: {} — recreate it \
              or update [relay] write_dirs in ~/.endara/config.toml",
+            op,
             root.display(),
             e
         )
@@ -1436,7 +1444,8 @@ fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
     if let Err(e) = write_result {
         let _ = unlinkat(dir_fd.as_raw_fd(), &tmp);
         return Err(format!(
-            "writeFile: failed to write '{}': {}",
+            "{}: failed to write '{}': {}",
+            op,
             dest.display(),
             e
         ));
@@ -1444,7 +1453,8 @@ fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
     if let Err(e) = renameat(dir_fd.as_raw_fd(), &tmp, file_name) {
         let _ = unlinkat(dir_fd.as_raw_fd(), &tmp);
         return Err(format!(
-            "writeFile: failed to finalise '{}': {}",
+            "{}: failed to finalise '{}': {}",
+            op,
             dest.display(),
             e
         ));
@@ -1491,20 +1501,22 @@ fn unlinkat(dirfd: libc::c_int, name: &std::ffi::OsStr) -> std::io::Result<()> {
 /// config resolution, `create_dir_all` recreates it — still inside the
 /// allowed prefix.
 #[cfg(not(unix))]
-fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
-    let (dir, file_name) = split_write_dest(dest)?;
+fn write_atomic(op: &str, dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
+    let (dir, file_name) = split_write_dest(op, dest)?;
     std::fs::create_dir_all(dir).map_err(|e| {
         format!(
-            "writeFile: failed to create parent directories for '{}': {}",
+            "{}: failed to create parent directories for '{}': {}",
+            op,
             dest.display(),
             e
         )
     })?;
     let canonical_dir = std::fs::canonicalize(dir)
-        .map_err(|e| format!("writeFile: failed to resolve '{}': {}", dest.display(), e))?;
+        .map_err(|e| format!("{}: failed to resolve '{}': {}", op, dest.display(), e))?;
     if !canonical_dir.starts_with(root) {
         return Err(format!(
-            "writeFile: '{}' escaped the configured write directory during the write",
+            "{}: '{}' escaped the configured write directory during the write",
+            op,
             dest.display()
         ));
     }
@@ -1520,7 +1532,8 @@ fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
     if let Err(e) = write_result {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!(
-            "writeFile: failed to write '{}': {}",
+            "{}: failed to write '{}': {}",
+            op,
             dest.display(),
             e
         ));
@@ -1528,7 +1541,8 @@ fn write_atomic(dest: &Path, bytes: &[u8], root: &Path) -> Result<(), String> {
     if let Err(e) = std::fs::rename(&tmp, &final_dest) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!(
-            "writeFile: failed to finalise '{}': {}",
+            "{}: failed to finalise '{}': {}",
+            op,
             dest.display(),
             e
         ));
@@ -3715,7 +3729,7 @@ mod tests {
             "inner/new/x.txt",
         ] {
             let dest = root.join(rel);
-            let err = write_atomic(&dest, b"d", &root).unwrap_err();
+            let err = write_atomic("writeFile", &dest, b"d", &root).unwrap_err();
             assert!(
                 err.contains("escaped the configured write directory during the write"),
                 "{}: unexpected error: {}",
@@ -3741,7 +3755,7 @@ mod tests {
 
         // Sanity: a genuine (symlink-free) chain still gets created and written.
         let ok_dest = root.join("keep/deep/fresh/x.txt");
-        write_atomic(&ok_dest, b"ok", &root).unwrap();
+        write_atomic("writeFile", &ok_dest, b"ok", &root).unwrap();
         assert_eq!(std::fs::read(&ok_dest).unwrap(), b"ok");
         assert_eq!(
             dir_entries(&root.join("keep/deep/fresh")),
@@ -3763,7 +3777,7 @@ mod tests {
         std::fs::remove_dir(&root).unwrap();
 
         let dest = root.join("a/b.txt");
-        let err = write_atomic(&dest, b"d", &root).unwrap_err();
+        let err = write_atomic("writeFile", &dest, b"d", &root).unwrap_err();
         assert!(
             err.contains(&format!(
                 "configured write directory '{}' is not accessible",
@@ -3780,7 +3794,7 @@ mod tests {
         assert!(!root.exists(), "root must not be recreated");
 
         std::os::unix::fs::symlink(outside.path(), &root).unwrap();
-        let err = write_atomic(&dest, b"d", &root).unwrap_err();
+        let err = write_atomic("writeFile", &dest, b"d", &root).unwrap_err();
         assert!(
             err.contains("escaped the configured write directory during the write"),
             "unexpected error: {}",
@@ -4292,6 +4306,32 @@ return "ok";
             msg
         );
         assert!(dir_entries(&root).is_empty(), "no partial file may remain");
+    }
+
+    /// A filesystem-level failure inside `write_atomic` (the destination is
+    /// an existing directory, so the final rename fails) must be flavoured
+    /// with the meta-tool name too, and the temp file must be cleaned up.
+    #[tokio::test]
+    async fn test_meta_write_file_filesystem_failure_is_flavoured_and_leaves_no_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_root(&dir);
+        let handler = write_handler(vec![root.clone()]).await;
+        let dest = root.join("existing_dir");
+        std::fs::create_dir(&dest).unwrap();
+
+        let msg = write_file_err(&handler, dest.to_str().unwrap(), "d", "utf8").await;
+        assert!(
+            msg.contains("failed to finalise"),
+            "unexpected error: {}",
+            msg
+        );
+        assert!(!msg.contains("writeFile"), "JS-global name leaked: {}", msg);
+        assert_eq!(
+            dir_entries(&root),
+            vec!["existing_dir".to_string()],
+            "temp file must be removed after a failed rename"
+        );
+        assert!(dir.path().join("existing_dir").is_dir());
     }
 
     #[tokio::test]
