@@ -249,6 +249,12 @@ async fn reload_and_apply(
                 write_roots = guard.len(),
                 "Sandbox write_dirs allowlist updated"
             );
+            drop(guard);
+            // The roots gate whether `write_file` is advertised and are
+            // listed in its description, so any change alters the catalog
+            // seen by every stream. Tick relay-wide so both the global and
+            // per-profile SSE handlers emit `notifications/tools/list_changed`.
+            registry.tick_tools_changed_relay_wide();
         }
     }
 
@@ -2989,6 +2995,7 @@ machine_name = "test"
                 let js_mode = Arc::new(AtomicBool::new(false));
                 let (tm, inners) = test_oauth_infra();
                 let write_roots = empty_write_roots();
+                let mut ticks_rx = registry.subscribe_tools_changed();
 
                 // No write_dirs → allowlist stays empty.
                 assert!(write_roots.read().unwrap().is_empty());
@@ -3018,6 +3025,13 @@ machine_name = "test"
                     vec![allowed_dir.canonicalize().unwrap()],
                     "shared handle must carry the canonicalized new root"
                 );
+                // The roots change alters the advertised catalog (write_file
+                // appears), so a relay-wide tools_changed tick must fire.
+                assert_eq!(
+                    ticks_rx.try_recv().ok().as_deref(),
+                    Some(crate::registry::RELAY_WIDE_TOOLS_CHANGED),
+                    "adding write_dirs must emit a relay-wide tools_changed tick"
+                );
 
                 // Remove the key again → allowlist empties.
                 std::fs::write(&path, CONFIG_NO_WRITE_DIRS).unwrap();
@@ -3038,6 +3052,32 @@ machine_name = "test"
                 assert!(
                     write_roots.read().unwrap().is_empty(),
                     "removing write_dirs must empty the shared handle"
+                );
+                assert_eq!(
+                    ticks_rx.try_recv().ok().as_deref(),
+                    Some(crate::registry::RELAY_WIDE_TOOLS_CHANGED),
+                    "removing write_dirs must emit a relay-wide tools_changed tick"
+                );
+
+                // An unchanged reload must not tick.
+                std::fs::write(&path, CONFIG_NO_WRITE_DIRS).unwrap();
+                reload_and_apply(
+                    &path,
+                    &current_config,
+                    &registry,
+                    &js_mode,
+                    &write_roots,
+                    &profile_registry,
+                    &tm,
+                    &inners,
+                    None,
+                    None,
+                )
+                .await
+                .expect("no-op reload should succeed");
+                assert!(
+                    ticks_rx.try_recv().is_err(),
+                    "unchanged write_dirs must not emit a tools_changed tick"
                 );
             }
 

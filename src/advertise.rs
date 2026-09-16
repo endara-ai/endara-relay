@@ -3,8 +3,10 @@
 //! Renders a deduplicated, alphabetised list of `server_type` values across
 //! **all** currently-registered adapters (regardless of [`HealthStatus`]) and
 //! provides description builders for the meta-tools (`list_tools`,
-//! `search_tools`, `execute_tools`) so each `tools/list` response reflects the
-//! current registry. The same list also feeds `InitializeResult.instructions`.
+//! `search_tools`, `execute_tools`, `write_file`) so each `tools/list`
+//! response reflects the current registry (and, for `write_file`, the current
+//! `[relay] write_dirs` allowlist). The same list also feeds
+//! `InitializeResult.instructions`.
 //! Each adapter's rendered `server_type` is sourced from the cached upstream
 //! handshake value when available and falls back to the configured
 //! `server_type_override`, so endpoints surface immediately even before their
@@ -16,7 +18,9 @@
 //! [`HealthStatus`]: crate::adapter::HealthStatus
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
+use crate::js_sandbox::MAX_WRITE_FILE_BYTES;
 use crate::profile_registry::ProfileRegistryView;
 use crate::registry::AdapterRegistry;
 
@@ -300,6 +304,32 @@ pub async fn execute_tools_description_for_profile(view: &ProfileRegistryView) -
         EXECUTE_TOOLS_BASE,
     )
     .await
+}
+
+/// Build the `write_file` meta-tool description against the current
+/// `[relay] write_dirs` allowlist snapshot. Callers only advertise the tool
+/// when `roots` is non-empty, so the rendered directory list is never blank.
+pub fn write_file_description(roots: &[PathBuf]) -> String {
+    let dirs = roots
+        .iter()
+        .map(|r| format!("`{}`", r.display()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "Write a file on the relay host. `path` must be an absolute path inside one of the \
+         allowed directories (configured via `[relay] write_dirs`): {dirs}. `data` is the \
+         file content — `encoding` is `\"utf8\"` (default) for text or `\"base64\"` for \
+         binary data. Missing parent directories are created; an existing file is \
+         overwritten atomically (no partial file is left behind on failure). Each file \
+         is limited to {max_mib} MiB. The JSON-serialized request must also stay under \
+         {limit_mib} MiB: JSON escaping inflates `\"utf8\"` text (quotes and backslashes \
+         double, control characters become six-character escapes), so text made mostly of \
+         such characters may need to be sent as `\"base64\"` — base64 of a {max_mib} MiB \
+         file always fits. Returns `{{ path, bytes }}` with the canonical path written and \
+         the number of bytes.",
+        max_mib = MAX_WRITE_FILE_BYTES / (1024 * 1024),
+        limit_mib = crate::server::MCP_REQUEST_BODY_LIMIT / (1024 * 1024),
+    )
 }
 
 #[cfg(test)]
@@ -620,6 +650,24 @@ mod tests {
             "unexpected suffix: {}",
             &desc[desc.len().saturating_sub(120)..]
         );
+    }
+
+    #[test]
+    fn write_file_description_lists_allowed_roots_and_rules() {
+        let roots = vec![PathBuf::from("/tmp/one"), PathBuf::from("/home/u/out")];
+        let desc = write_file_description(&roots);
+        assert!(desc.contains("`/tmp/one`, `/home/u/out`"), "{desc}");
+        assert!(desc.contains("absolute path"), "{desc}");
+        assert!(desc.contains("write_dirs"), "{desc}");
+        assert!(desc.contains("utf8") && desc.contains("base64"), "{desc}");
+        assert!(desc.contains("parent directories are created"), "{desc}");
+        assert!(desc.contains("overwritten atomically"), "{desc}");
+        assert!(desc.contains("32 MiB"), "{desc}");
+        assert!(desc.contains("JSON-serialized request"), "{desc}");
+        assert!(desc.contains("48 MiB"), "{desc}");
+        assert!(desc.contains("sent as `\"base64\"`"), "{desc}");
+        assert!(desc.contains("32 MiB file always fits"), "{desc}");
+        assert!(desc.contains("{ path, bytes }"), "{desc}");
     }
 
     #[tokio::test]
