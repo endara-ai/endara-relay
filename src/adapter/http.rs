@@ -194,6 +194,19 @@ pub struct HttpAdapter {
     /// Notified by [`Self::note_transport_failure`] when reactive health flips
     /// the adapter to `Unhealthy`, waking the supervisor to start reconnecting.
     reconnect_notify: Arc<Notify>,
+    /// Serializes handshakes. The caller-owned [`McpAdapter::initialize`]
+    /// (`&mut self`) and the supervisor's [`Self::task_clone`] share the
+    /// session and health state, so `initialize()` can overlap an in-flight
+    /// reconnect handshake — the management enable path re-initializes an
+    /// already-enabled endpoint while its supervisor may be mid-attempt. Two
+    /// concurrent `initialize` exchanges whose responses complete out of
+    /// order would leave the OLDER session id in [`Self::session_id`] while
+    /// the upstream honours the newer one. Both paths hold this across
+    /// [`Self::complete_handshake`], so the committed session is always the
+    /// one from the last-completed handshake. An aborted supervisor (shutdown)
+    /// drops its guard with its future, so `shutdown()` → `initialize()`
+    /// never waits on a dead holder.
+    handshake_lock: Arc<Mutex<()>>,
     /// Set by `shutdown()` / [`Drop`] before the background tasks are torn
     /// down. [`Self::spawn_get_listener`] checks it under the listener slot
     /// lock so a handshake racing shutdown never installs a fresh listener
@@ -354,6 +367,7 @@ impl HttpAdapter {
             recovered_notify: Arc::new(Notify::new()),
             recovery_generation: Arc::new(AtomicU64::new(0)),
             reconnect_notify: Arc::new(Notify::new()),
+            handshake_lock: Arc::new(Mutex::new(())),
             shutting_down: Arc::new(AtomicBool::new(false)),
             owns_background_tasks: true,
         }
@@ -392,6 +406,7 @@ impl HttpAdapter {
             recovered_notify: self.recovered_notify.clone(),
             recovery_generation: self.recovery_generation.clone(),
             reconnect_notify: self.reconnect_notify.clone(),
+            handshake_lock: self.handshake_lock.clone(),
             shutting_down: self.shutting_down.clone(),
             owns_background_tasks: false,
         }
@@ -1355,6 +1370,11 @@ impl HttpAdapter {
     ///   crossing demotes and re-arms — no interleaving leaves the adapter
     ///   `Unhealthy` with nothing retrying (pinned by
     ///   `demotion_during_inflight_handshake_promotes_and_keeps_retrying`).
+    /// * A caller-owned [`McpAdapter::initialize`] never overlaps the
+    ///   attempt: both hold [`Self::handshake_lock`] across
+    ///   [`Self::complete_handshake`], so whichever handshake completes last
+    ///   is also the last to commit its session (pinned by
+    ///   `caller_initialize_waits_for_inflight_supervisor_handshake`).
     ///
     /// The `tools_changed` tick is owned by whichever path performs the
     /// actual `Unhealthy → Healthy` flip (the handshake does it under the
@@ -1426,13 +1446,21 @@ impl HttpAdapter {
                     }
                     result = self.try_discover_probe() => result,
                 };
+                // Serialize with a caller-owned `initialize()` (see
+                // `handshake_lock`). Re-check health once the lock is held:
+                // the handshake that made this attempt wait may have
+                // recovered the adapter, in which case a second `initialize`
+                // would only churn the upstream's session.
+                let handshake = self.handshake_lock.lock().await;
                 if !matches!(*self.health.read().await, HealthStatus::Unhealthy(_)) {
-                    debug!(url = %self.config.url, "HTTP reconnect: recovered reactively during dialect probe, abandoning attempt");
+                    debug!(url = %self.config.url, "HTTP reconnect: recovered during dialect probe or while waiting for the handshake lock, abandoning attempt");
                     self.crash_tracker.lock().await.reset();
                     break;
                 }
 
-                match self.complete_handshake(discover_result, true).await {
+                let outcome = self.complete_handshake(discover_result, true).await;
+                drop(handshake);
+                match outcome {
                     Ok(()) => {
                         info!(url = %self.config.url, "HTTP reconnect succeeded");
                         break;
@@ -1838,8 +1866,18 @@ impl McpAdapter for HttpAdapter {
             // shutdown has already aborted and joined the old supervisor and
             // listener, so clearing the latch here cannot race either of them.
             self.shutting_down.store(false, Ordering::SeqCst);
-            *self.health.write().await = HealthStatus::Starting;
-            if let Err(e) = self.connect_and_handshake().await {
+            // A live supervisor (this is a re-initialize of an enabled
+            // endpoint, e.g. the management enable path) may have a reconnect
+            // handshake in flight on its `task_clone`. Wait for it rather
+            // than racing it for the session id (see `handshake_lock`); the
+            // `Starting` write and our own handshake then run with no other
+            // handshake able to interleave.
+            let outcome = {
+                let _handshake = self.handshake_lock.lock().await;
+                *self.health.write().await = HealthStatus::Starting;
+                self.connect_and_handshake().await
+            };
+            if let Err(e) = outcome {
                 // Same retry contract as a successful start: the adapter is
                 // `Unhealthy(<init error>)` and the supervisor brings it back
                 // once the upstream is reachable. Every `initialize()` caller
@@ -3458,11 +3496,17 @@ mod tests {
     /// parks every `initialize` and then fails it with the configured
     /// [`HeldInitFailure`]. A parked request signals `started` and waits for
     /// `release`, so a test can order itself against an in-flight handshake
-    /// without wall-clock sleeps.
+    /// without wall-clock sleeps. `session_on_arrival` makes the upstream
+    /// honour the session of the most recently RECEIVED `initialize` (issued
+    /// when the request arrives, as a real server does) instead of the most
+    /// recently answered one, so overlapping handshakes whose responses
+    /// complete out of order leave the adapter on a session the upstream
+    /// has already replaced.
     #[derive(Clone)]
     struct SupervisorFixture {
         accepting: Arc<AtomicBool>,
         issue_session: Arc<AtomicBool>,
+        session_on_arrival: Arc<AtomicBool>,
         init_delay_ms: Arc<AtomicU64>,
         init_count: Arc<AtomicU64>,
         get_count: Arc<AtomicU64>,
@@ -3512,6 +3556,7 @@ mod tests {
         let fx = SupervisorFixture {
             accepting: Arc::new(AtomicBool::new(true)),
             issue_session: Arc::new(AtomicBool::new(true)),
+            session_on_arrival: Arc::new(AtomicBool::new(false)),
             init_delay_ms: Arc::new(AtomicU64::new(0)),
             init_count: Arc::new(AtomicU64::new(0)),
             get_count: Arc::new(AtomicU64::new(0)),
@@ -3611,6 +3656,14 @@ mod tests {
                 );
                 return resp;
             }
+            let sid = fx
+                .issue_session
+                .load(Ordering::SeqCst)
+                .then(|| format!("sess-{}", n));
+            let on_arrival = fx.session_on_arrival.load(Ordering::SeqCst);
+            if on_arrival {
+                *fx.current_session.lock().unwrap() = sid.clone();
+            }
             if fx.hold_init.swap(false, Ordering::SeqCst) {
                 fx.started.notify_one();
                 fx.release.notified().await;
@@ -3619,11 +3672,9 @@ mod tests {
             if delay > 0 {
                 tokio::time::sleep(Duration::from_millis(delay)).await;
             }
-            let sid = fx
-                .issue_session
-                .load(Ordering::SeqCst)
-                .then(|| format!("sess-{}", n));
-            *fx.current_session.lock().unwrap() = sid.clone();
+            if !on_arrival {
+                *fx.current_session.lock().unwrap() = sid.clone();
+            }
             let mut resp = Json(json!({
                 "jsonrpc": "2.0",
                 "result": {
@@ -4499,6 +4550,107 @@ mod tests {
         );
         assert_eq!(drain_ticks(&mut rx), 1, "that recovery ticks once");
         assert_eq!(adapter.session_id.read().await.as_deref(), Some("sess-3"));
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 4, Copilot): a caller-owned `initialize()` on an
+    /// already-enabled endpoint (the management enable path re-initializes
+    /// regardless of `was_disabled`) while the supervisor's reconnect
+    /// handshake is in flight on its `task_clone`. Without serialization the
+    /// two `initialize` exchanges overlap and, when their responses complete
+    /// out of order, the OLDER response commits last: the adapter keeps a
+    /// session the upstream has already replaced and every later request
+    /// gets 400. With `handshake_lock` the caller waits for the in-flight
+    /// handshake, then runs its own; the committed session is the one from
+    /// the last-completed handshake and both paths end `Healthy`.
+    /// Deterministic: the fixture parks the supervisor's `initialize`, and
+    /// issues sessions on arrival so an overlap would be observable.
+    #[tokio::test]
+    async fn caller_initialize_waits_for_inflight_supervisor_handshake() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        fx.session_on_arrival.store(true, Ordering::SeqCst);
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        use_fast_backoff(&adapter).await;
+        // Shares every piece of state with `adapter`; lets the test observe
+        // while `adapter` is mutably borrowed by its own `initialize()`.
+        let observer = adapter.task_clone();
+        let mut rx = adapter.subscribe_tools_changed().expect("Some receiver");
+
+        // The supervisor's reconnect handshake is parked at the upstream
+        // (its `sess-2` is already issued and honoured).
+        fx.hold_init.store(true, Ordering::SeqCst);
+        demote_via_transport_failures(&adapter).await;
+        tokio::time::timeout(Duration::from_secs(5), fx.started.notified())
+            .await
+            .expect("supervisor handshake should have started");
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 2);
+
+        // A caller-owned initialize arrives while that handshake is in
+        // flight. It must NOT put a second `initialize` on the wire.
+        {
+            let mut init = adapter.initialize();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(300), &mut init)
+                    .await
+                    .is_err(),
+                "caller initialize waits for the in-flight supervisor handshake"
+            );
+            assert_eq!(
+                fx.init_count.load(Ordering::SeqCst),
+                2,
+                "no overlapping initialize while the supervisor's is in flight"
+            );
+            assert!(
+                matches!(observer.health(), HealthStatus::Unhealthy(_)),
+                "the waiting caller has not touched health yet"
+            );
+
+            // The parked handshake completes (`sess-2`, one flip), then the
+            // caller's own handshake runs and commits `sess-3` — the session
+            // the upstream now honours.
+            fx.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(5), &mut init)
+                .await
+                .expect("caller initialize completes once the lock is released")
+                .expect("caller initialize succeeds");
+        }
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            adapter.session_id.read().await.as_deref(),
+            Some("sess-3"),
+            "the committed session is the last-completed handshake's"
+        );
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert_eq!(observer.health(), HealthStatus::Healthy);
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("requests carry the session the upstream honours");
+        assert_eq!(
+            drain_ticks(&mut rx),
+            1,
+            "the supervisor's flip ticks once; the caller's handshake found no Unhealthy to flip"
+        );
+
+        // The lock is released and the supervisor still runs: a later outage
+        // is recovered as usual.
+        demote_via_transport_failures(&adapter).await;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                adapter.health() == HealthStatus::Healthy
+                    && fx.init_count.load(Ordering::SeqCst) == 4
+            })
+            .await,
+            "the next demotion still drives a supervisor recovery"
+        );
+        assert_eq!(adapter.session_id.read().await.as_deref(), Some("sess-4"));
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("post-recovery request carries the current session");
 
         adapter.shutdown().await.unwrap();
         server.abort();
