@@ -222,6 +222,32 @@ impl TokenPostOutcome {
     }
 }
 
+/// Who owes the outer tools-changed invalidation for an inner recovery.
+///
+/// `acked_generation` is the inner [`HttpAdapter::recovery_generation`]
+/// whose invalidation the heartbeat has already published (with a
+/// `MarkHealthy` commit, see [`OAuthAdapterInner::ack_inner_recovery`]).
+/// `tick_pending` is raised by the forwarder, together with a probe poke,
+/// for a recovery the heartbeat has NOT acknowledged yet
+/// ([`OAuthAdapterInner::note_unacked_recovery`]); the heartbeat publishes
+/// it once the probe's verdict has been committed to `inner_health`
+/// ([`heartbeat::publish_recovery_tick_if_due`]). Ticking before that
+/// commit would let the registry rebuild its catalog against the stale
+/// `Unhealthy` and cache the `[⚠️ UNAVAILABLE]` labels with no later tick
+/// to correct them.
+///
+/// Both live under one lock so one inner recovery yields exactly one outer
+/// tick whichever side observes it first: a recovery performed BY a
+/// heartbeat probe is acknowledged when that probe commits and the
+/// forwarder then drops the matching inner tick, while a forwarder that got
+/// there first has already raised `tick_pending`, which that same commit
+/// consumes. Neither side can slip between the other's check and write.
+#[derive(Debug, Default)]
+struct RecoveryTickState {
+    acked_generation: u64,
+    tick_pending: bool,
+}
+
 /// Shared inner state for an OAuth adapter, wrapped in `Arc` so it can be
 /// referenced from the callback handler and proactive-refresh task.
 pub struct OAuthAdapterInner {
@@ -265,23 +291,16 @@ pub struct OAuthAdapterInner {
     /// catches up after one probe instead of after the next interval tick.
     /// The heartbeat stays the only post-apply writer of `inner_health`.
     probe_now: Arc<Notify>,
-    /// Set together with a recovery poke: the outer invalidation for that
-    /// recovery is owed and the heartbeat publishes it once the probe's
-    /// verdict has been committed to `inner_health` (see
-    /// [`heartbeat::publish_recovery_tick_if_due`]). Ticking before the
-    /// commit would let the registry rebuild its catalog against the stale
-    /// `Unhealthy` and cache the `[⚠️ UNAVAILABLE]` labels with no later
-    /// tick to correct them.
-    recovery_tick_pending: AtomicBool,
-    /// The inner [`HttpAdapter::recovery_generation`] whose outer invalidation
-    /// the heartbeat has already published (with a `MarkHealthy` commit).
-    /// Shared between heartbeat and forwarder so one inner recovery yields
-    /// exactly one outer tick whichever of them observes it first: a
-    /// recovery performed BY a heartbeat probe is acknowledged when that
-    /// probe commits, and the forwarder then drops the matching inner tick
-    /// instead of poking for a second probe that would tick again. Re-seeded
-    /// to the inner's current counter whenever the forwarder is re-bound.
-    acked_recovery_generation: AtomicU64,
+    /// Exactly-once accounting for the outer invalidation an inner recovery
+    /// is owed, shared between the heartbeat and the tools forwarder (see
+    /// [`RecoveryTickState`]). One synchronous lock so the forwarder's
+    /// "unacknowledged → pending" check-and-set and the heartbeat's
+    /// acknowledgement can never interleave into two ticks for one recovery.
+    recovery_tick: std::sync::Mutex<RecoveryTickState>,
+    /// Test-only barrier parking the forwarder between reading the inner
+    /// recovery generation and its check-and-set against `recovery_tick`.
+    #[cfg(test)]
+    forwarder_recovery_gate: OnceLock<Arc<super::http::TestGate>>,
     /// Ring buffer of recent state transitions (max TRANSITION_RING_BUFFER_CAPACITY).
     pub transition_history: RwLock<VecDeque<TransitionRecord>>,
     /// In-process metric counters.
@@ -1539,7 +1558,7 @@ impl OAuthAdapterInner {
                 // Refreshing→Starting) and cache the new tools with a stale
                 // UNAVAILABLE label; inner+health are already published.
                 // A recovery of the OLD inner adapter that the heartbeat
-                // deferred through `Refreshing` (`recovery_tick_pending`) is
+                // deferred through `Refreshing` (`RecoveryTickState::tick_pending`) is
                 // published here as well, folded into the same single tick.
                 heartbeat::publish_recovery_tick_if_due(self, should_tick);
             }
@@ -1724,7 +1743,7 @@ impl OAuthAdapterInner {
     /// counter advanced (see [`Self::poke_heartbeat_on_inner_recovery`]).
     /// The forwarder never writes `inner_health` itself. A recovery tick is
     /// NOT relayed here either: the heartbeat publishes it after the probe
-    /// commits (`recovery_tick_pending`, or `acked_recovery_generation` when
+    /// commits (`RecoveryTickState::tick_pending`, or its `acked_generation` when
     /// the heartbeat's own probe performed the recovery), so the registry
     /// never rebuilds its catalog against a verdict the probe is about to
     /// overturn and one recovery never ticks twice. Ordinary invalidations
@@ -1738,8 +1757,7 @@ impl OAuthAdapterInner {
         let outer_tx = self.outer_tools_changed_tx.clone();
         let fingerprint = self.last_tools_fingerprint.clone();
         let mut seen_recovery = self.inner_recovery_generation().await;
-        self.acked_recovery_generation
-            .store(seen_recovery, Ordering::SeqCst);
+        self.lock_recovery_tick().acked_generation = seen_recovery;
         let weak = Arc::downgrade(self);
         let join = tokio::spawn(async move {
             // `Ok` and `Lagged` both forward a tick; `Closed` ends the task.
@@ -1788,11 +1806,12 @@ impl OAuthAdapterInner {
     ///
     /// Returns `true` when the tick announced a recovery; the caller then
     /// owes no outer tick. When the heartbeat has not acknowledged that
-    /// generation yet, `recovery_tick_pending` is raised BEFORE the poke so
-    /// the heartbeat finds it set when the probe it triggers is applied,
-    /// and publishes the invalidation after that commit. When it already
-    /// has (its own probe performed the recovery and its `MarkHealthy`
-    /// commit ticked, see [`Self::ack_inner_recovery`]), the tick is simply
+    /// generation yet, the pending flag is raised BEFORE the poke (one
+    /// atomic check-and-set, see [`Self::note_unacked_recovery`]) so the
+    /// heartbeat finds it set when the probe it triggers is applied, and
+    /// publishes the invalidation after that commit. When it already has
+    /// (its own probe performed the recovery and its `MarkHealthy` commit
+    /// ticked, see [`Self::ack_inner_recovery`]), the tick is simply
     /// dropped: a second probe would only publish the same recovery again.
     async fn poke_heartbeat_on_inner_recovery(&self, seen_recovery: &mut u64) -> bool {
         let current = self.inner_recovery_generation().await;
@@ -1800,11 +1819,55 @@ impl OAuthAdapterInner {
             return false;
         }
         *seen_recovery = current;
-        if current > self.acked_recovery_generation.load(Ordering::SeqCst) {
-            self.recovery_tick_pending.store(true, Ordering::SeqCst);
+        #[cfg(test)]
+        if let Some(gate) = self.forwarder_recovery_gate.get() {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+        if self.note_unacked_recovery(current) {
             self.probe_now.notify_one();
         }
         true
+    }
+
+    /// Lock the recovery-tick accounting. Never held across an await; a
+    /// poisoned lock only ever holds two plain values, so it is recovered.
+    fn lock_recovery_tick(&self) -> std::sync::MutexGuard<'_, RecoveryTickState> {
+        self.recovery_tick
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Forwarder side: if `generation` is not acknowledged yet, raise the
+    /// pending tick for it and return `true` (the caller then pokes a probe).
+    /// Check and set are one critical section with the heartbeat's
+    /// acknowledgement, so an ack that lands first is seen and one that lands
+    /// after finds the pending flag and consumes it — never both a
+    /// heartbeat-owed tick and a pending one for the same recovery.
+    fn note_unacked_recovery(&self, generation: u64) -> bool {
+        let mut state = self.lock_recovery_tick();
+        if generation > state.acked_generation {
+            state.tick_pending = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Take the pending recovery tick, if any (heartbeat side, after a
+    /// probe verdict has been committed).
+    pub(super) fn take_recovery_tick_pending(&self) -> bool {
+        std::mem::take(&mut self.lock_recovery_tick().tick_pending)
+    }
+
+    #[cfg(test)]
+    fn recovery_tick_pending(&self) -> bool {
+        self.lock_recovery_tick().tick_pending
+    }
+
+    #[cfg(test)]
+    fn set_recovery_tick_pending(&self, pending: bool) {
+        self.lock_recovery_tick().tick_pending = pending;
     }
 
     /// Acknowledge the inner adapter's current recovery generation on behalf
@@ -1816,10 +1879,13 @@ impl OAuthAdapterInner {
     /// a recovery leaves it for the forwarder's corrective poke.
     pub(super) async fn ack_inner_recovery(&self) -> bool {
         let current = self.inner_recovery_generation().await;
-        current
-            > self
-                .acked_recovery_generation
-                .swap(current, Ordering::SeqCst)
+        let mut state = self.lock_recovery_tick();
+        if current > state.acked_generation {
+            state.acked_generation = current;
+            true
+        } else {
+            false
+        }
     }
 
     /// Disconnect: abort refresh task, clear tokens, delete from disk, set
@@ -1939,8 +2005,9 @@ impl OAuthAdapter {
                 inner_health: RwLock::new(HealthStatus::Starting),
                 heartbeat_task_handle: Mutex::new(None),
                 probe_now: Arc::new(Notify::new()),
-                recovery_tick_pending: AtomicBool::new(false),
-                acked_recovery_generation: AtomicU64::new(0),
+                recovery_tick: std::sync::Mutex::new(RecoveryTickState::default()),
+                #[cfg(test)]
+                forwarder_recovery_gate: OnceLock::new(),
                 transition_history: RwLock::new(VecDeque::new()),
                 metrics: OAuthMetrics::new(),
                 refresh_mutex: Mutex::new(()),
@@ -4597,6 +4664,60 @@ mod tests {
         server.abort();
     }
 
+    /// PR #163 review (round 6b, Copilot): the forwarder's "unacknowledged
+    /// → pending" handoff and the heartbeat's acknowledgement must be one
+    /// synchronized step. Otherwise the forwarder can read the generation as
+    /// unacknowledged, the heartbeat acknowledge and publish, and the
+    /// forwarder then raise the pending flag and poke — so the next probe
+    /// publishes a second invalidation for the same recovery. Barrier-driven:
+    /// the forwarder is parked between reading the generation and its
+    /// check-and-set while the heartbeat's healthy commit acknowledges it.
+    #[tokio::test]
+    async fn heartbeat_ack_racing_forwarder_check_emits_one_tick() {
+        let (mut adapter, _fx, server) = armed_probe_adapter(1).await;
+        let gate = super::super::http::TestGate::new();
+        adapter
+            .inner
+            .forwarder_recovery_gate
+            .set(gate.clone())
+            .ok()
+            .expect("gate installed once");
+        let mut rx = adapter.subscribe_tools_changed().unwrap();
+        drain(&mut rx).await;
+
+        // The inner adapter recovers reactively; its recovery tick reaches
+        // the forwarder, which reads the advanced generation and parks.
+        recover_inner_for_real(&adapter).await;
+        tokio::time::timeout(Duration::from_secs(5), gate.reached.notified())
+            .await
+            .expect("forwarder reaches its check-and-set");
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(200)).await,
+            "nothing is published before the heartbeat commits"
+        );
+
+        // Meanwhile the heartbeat's own probe commits `MarkHealthy`,
+        // acknowledging the recovery and publishing its tick.
+        adapter.inner.probe_now.notify_one();
+        assert!(
+            recv_tick(&mut rx, Duration::from_secs(2)).await,
+            "the heartbeat's healthy commit publishes the recovery"
+        );
+
+        // The forwarder resumes: the generation is acknowledged now, so it
+        // must neither raise the pending flag nor poke for another probe.
+        gate.release.notify_one();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        adapter.inner.probe_now.notify_one();
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "a heartbeat ack racing the forwarder's check must not yield a second tick for one recovery"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
     /// PR #163 review (round 6, Copilot): a recovery poke that arrives while
     /// a token apply is in flight (`Refreshing`) must not be published by
     /// the heartbeat's skip path — OAuth health derives to `Starting` there,
@@ -4615,17 +4736,14 @@ mod tests {
             .transition_to(OAuthState::Refreshing, "test: apply in flight")
             .await;
         // The old inner adapter's recovery reaches the forwarder mid-apply.
-        adapter
-            .inner
-            .recovery_tick_pending
-            .store(true, Ordering::SeqCst);
+        adapter.inner.set_recovery_tick_pending(true);
         adapter.inner.probe_now.notify_one();
         assert!(
             !recv_tick(&mut rx, Duration::from_millis(400)).await,
             "a pending recovery must not be published while Refreshing (health derives to Starting)"
         );
         assert!(
-            adapter.inner.recovery_tick_pending.load(Ordering::SeqCst),
+            adapter.inner.recovery_tick_pending(),
             "the pending recovery is preserved through Refreshing"
         );
 
@@ -4638,7 +4756,7 @@ mod tests {
             "the deferred recovery is published once the state is Authenticated"
         );
         assert!(
-            !adapter.inner.recovery_tick_pending.load(Ordering::SeqCst),
+            !adapter.inner.recovery_tick_pending(),
             "publishing consumes the pending recovery"
         );
         adapter.inner.probe_now.notify_one();

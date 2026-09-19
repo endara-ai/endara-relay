@@ -218,8 +218,9 @@ pub struct HttpAdapter {
     /// that nobody will abort.
     shutting_down: Arc<AtomicBool>,
     /// Test-only barrier at the last cancellation point of a handshake: after
-    /// the JIT credential lookup, before the `initialize` POST. Lets a test
-    /// order a reactive recovery deterministically into that await window.
+    /// the JIT credential lookup, before the legacy `initialize` POST, or
+    /// right before the 2026 commit ([`Self::commit_2026_handshake`]). Lets
+    /// a test order a reactive recovery deterministically into that window.
     #[cfg(test)]
     handshake_send_gate: Option<Arc<TestGate>>,
     /// `true` on the adapter the caller owns, `false` on the
@@ -243,9 +244,27 @@ enum HandshakeOutcome {
 /// Two-sided test barrier (see [`HttpAdapter::handshake_send_gate`]): the
 /// adapter signals `reached` and parks on `release`.
 #[cfg(test)]
-struct TestGate {
-    reached: Notify,
-    release: Notify,
+pub(crate) struct TestGate {
+    pub(crate) reached: Notify,
+    pub(crate) release: Notify,
+}
+
+#[cfg(test)]
+impl TestGate {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            reached: Notify::new(),
+            release: Notify::new(),
+        })
+    }
+}
+
+/// A validated upstream identity, extracted from an `initialize` or
+/// `server/discover` result by [`HttpAdapter::validate_server_identity`] and
+/// written to the shared state by [`HttpAdapter::commit_server_identity`].
+struct ServerIdentity {
+    effective: Option<String>,
+    upstream_stripped: String,
 }
 
 /// Lock a background-task handle slot ([`HttpAdapter::listener_handle`] /
@@ -1236,16 +1255,32 @@ impl HttpAdapter {
     }
 
     /// Extract, validate, and record the upstream `serverInfo.name` from an
-    /// `initialize` or `server/discover` result. Sets the adapter unhealthy
-    /// (subject to [`Self::set_handshake_unhealthy`]) and returns `Err` when
-    /// the name is missing or fails sanitization. Shared by the legacy
-    /// handshake and the 2026 stateless paths so both name the endpoint
-    /// identically.
+    /// `initialize` result: [`Self::validate_server_identity`] followed by
+    /// [`Self::commit_server_identity`]. The legacy handshake's post-POST
+    /// path, which runs to completion once the upstream has answered.
     async fn apply_server_identity(
         &self,
         result: &Value,
         supervisor_attempt: bool,
     ) -> Result<(), AdapterError> {
+        let identity = self
+            .validate_server_identity(result, supervisor_attempt)
+            .await?;
+        self.commit_server_identity(identity).await;
+        Ok(())
+    }
+
+    /// Extract and validate the upstream `serverInfo.name` from an
+    /// `initialize` or `server/discover` result without touching the shared
+    /// state. Sets the adapter unhealthy (subject to
+    /// [`Self::set_handshake_unhealthy`]) and returns `Err` when the name is
+    /// missing or fails sanitization. Shared by the legacy handshake and the
+    /// 2026 stateless paths so both name the endpoint identically.
+    async fn validate_server_identity(
+        &self,
+        result: &Value,
+        supervisor_attempt: bool,
+    ) -> Result<ServerIdentity, AdapterError> {
         // Extract serverInfo.name — REQUIRED per MCP spec enforcement
         let raw_name = match result
             .get("serverInfo")
@@ -1290,12 +1325,19 @@ impl HttpAdapter {
         let upstream_stripped = strip_mcp_server_suffix(sanitized.clone());
 
         info!(url = %self.config.url, raw_name = %raw_name, sanitized = %sanitized, effective = ?effective, "MCP server reported serverInfo.name");
-        if let Some(ref name) = effective {
+        Ok(ServerIdentity {
+            effective,
+            upstream_stripped,
+        })
+    }
+
+    /// Write a validated identity to the shared state.
+    async fn commit_server_identity(&self, identity: ServerIdentity) {
+        if let Some(ref name) = identity.effective {
             self.record_server_type_once(name);
         }
-        *self.server_type.write().await = effective;
-        *self.upstream_server_name.write().await = Some(upstream_stripped);
-        Ok(())
+        *self.server_type.write().await = identity.effective;
+        *self.upstream_server_name.write().await = Some(identity.upstream_stripped);
     }
 
     /// Spawn the long-lived `GET <url>` SSE listener for server-initiated
@@ -1445,6 +1487,11 @@ impl HttpAdapter {
     ///   inherent unless the `health` lock were held across network I/O, and
     ///   it is harmless because the attempt commits exactly the session the
     ///   upstream handed it.
+    /// * The 2026 stateless path never reaches the upstream, so it has no
+    ///   point of no return: its currency check and all of its writes share
+    ///   one `health` write lock ([`Self::commit_2026_handshake`]), which
+    ///   covers every await before it generically (pinned by
+    ///   `recovery_before_2026_commit_keeps_legacy_session`).
     /// * A NEWER demotion that lands while `initialize` is in flight is not
     ///   tracked by a generation: a handshake that then succeeds is the most
     ///   recent evidence and promotes to `Healthy`. Its reconnect permit is
@@ -1632,20 +1679,79 @@ impl HttpAdapter {
     async fn mark_handshake_healthy(&self) {
         let flipped = {
             let mut health = self.health.write().await;
-            self.transport_failures.store(0, Ordering::SeqCst);
-            self.handshake_completed.store(true, Ordering::SeqCst);
-            let was_unhealthy = matches!(*health, HealthStatus::Unhealthy(_));
-            *health = HealthStatus::Healthy;
-            if was_unhealthy {
-                self.recovery_generation.fetch_add(1, Ordering::SeqCst);
-            }
-            was_unhealthy
+            self.mark_healthy_locked(&mut health)
         };
+        self.finish_handshake_healthy(flipped).await;
+    }
+
+    /// The `Healthy` write of [`Self::mark_handshake_healthy`], performed by
+    /// the caller under the `health` write lock. Returns whether this write
+    /// performed the `Unhealthy → Healthy` flip.
+    fn mark_healthy_locked(&self, health: &mut HealthStatus) -> bool {
+        self.transport_failures.store(0, Ordering::SeqCst);
+        self.handshake_completed.store(true, Ordering::SeqCst);
+        let was_unhealthy = matches!(*health, HealthStatus::Unhealthy(_));
+        *health = HealthStatus::Healthy;
+        if was_unhealthy {
+            self.recovery_generation.fetch_add(1, Ordering::SeqCst);
+        }
+        was_unhealthy
+    }
+
+    /// The post-lock half of [`Self::mark_handshake_healthy`]: reset the
+    /// backoff and, if `flipped`, publish the recovery.
+    async fn finish_handshake_healthy(&self, flipped: bool) {
         self.crash_tracker.lock().await.reset();
         if flipped {
             self.recovered_notify.notify_waiters();
             let _ = self.tools_changed_tx.send(());
         }
+    }
+
+    /// The single commit point of the 2026 stateless path. The probe is
+    /// read-only and 2026 needs no handshake, so nothing has reached the
+    /// upstream yet: a supervisor attempt stays cancellable right up to here,
+    /// however many awaits the path took to get here (probe, lock waits,
+    /// identity validation). The currency check and every shared write —
+    /// identity, dialect, session, listener, health — run under ONE `health`
+    /// write lock, so a reactive recovery that lands during any of those
+    /// awaits is found by the check and nothing is committed on top of it;
+    /// otherwise an obsolete attempt would switch a `Healthy` adapter to
+    /// sessionless 2026 formatting against the legacy session a caller just
+    /// recovered, with no retry armed to undo it. The caller-owned path
+    /// (`supervisor_attempt == false`) always commits.
+    async fn commit_2026_handshake(
+        &self,
+        identity: ServerIdentity,
+        supervisor_attempt: bool,
+    ) -> HandshakeOutcome {
+        #[cfg(test)]
+        if let Some(gate) = &self.handshake_send_gate {
+            gate.reached.notify_one();
+            gate.release.notified().await;
+        }
+        let flipped = {
+            let mut health = self.health.write().await;
+            if supervisor_attempt && !matches!(*health, HealthStatus::Unhealthy(_)) {
+                debug!(
+                    url = %self.config.url,
+                    "obsolete HTTP reconnect attempt: recovered before the 2026 commit, leaving state untouched"
+                );
+                return HandshakeOutcome::Obsolete;
+            }
+            self.commit_server_identity(identity).await;
+            self.set_upstream_dialect(ProtocolVersion::V2026_07_28)
+                .await;
+            // 2026 is stateless: no notifications/initialized, no session
+            // id. Discard any session left over from a previous (legacy)
+            // connection so it is never echoed at the new upstream.
+            *self.session_id.write().await = None;
+            self.spawn_get_listener().await;
+            self.mark_healthy_locked(&mut health)
+        };
+        self.finish_handshake_healthy(flipped).await;
+        info!(url = %self.config.url, "HTTP MCP adapter initialized (2026 stateless path)");
+        HandshakeOutcome::Completed
     }
 
     /// Set `Unhealthy(reason)` for a failed handshake step. A supervisor
@@ -1742,11 +1848,14 @@ impl HttpAdapter {
     /// `GET` listener and the `Healthy` flip. `supervisor_attempt` marks a
     /// reconnect-supervisor attempt, whose failure writes are conditional
     /// (see [`Self::set_handshake_unhealthy`]) and which stands down with
-    /// [`HandshakeOutcome::Obsolete`] if a reactive recovery lands during
-    /// the JIT credential lookup — the last await before the `initialize`
-    /// POST. From that POST on this runs to completion so the session the
-    /// upstream hands back is always the one the adapter keeps. Takes
-    /// `&self` so the supervisor's [`Self::task_clone`] can drive it.
+    /// [`HandshakeOutcome::Obsolete`] if a reactive recovery lands before
+    /// its point of no return: on the legacy path the JIT credential lookup
+    /// is the last await before the `initialize` POST, from which on this
+    /// runs to completion so the session the upstream hands back is always
+    /// the one the adapter keeps; the 2026 path never reaches the upstream
+    /// and checks under the lock of its single commit
+    /// ([`Self::commit_2026_handshake`]). Takes `&self` so the supervisor's
+    /// [`Self::task_clone`] can drive it.
     async fn complete_handshake(
         &self,
         discover_result: Option<Value>,
@@ -1764,18 +1873,12 @@ impl HttpAdapter {
                 // rejects an invalid 2026 response would leave a `Healthy`
                 // adapter (recovered reactively on its legacy session)
                 // formatting every later request as sessionless 2026 traffic.
-                self.apply_server_identity(result, supervisor_attempt)
+                let identity = self
+                    .validate_server_identity(result, supervisor_attempt)
                     .await?;
-                self.set_upstream_dialect(ProtocolVersion::V2026_07_28)
-                    .await;
-                // 2026 is stateless: no notifications/initialized, no session
-                // id. Discard any session left over from a previous (legacy)
-                // connection so it is never echoed at the new upstream.
-                *self.session_id.write().await = None;
-                self.spawn_get_listener().await;
-                self.mark_handshake_healthy().await;
-                info!(url = %self.config.url, "HTTP MCP adapter initialized (2026 stateless path)");
-                return Ok(HandshakeOutcome::Completed);
+                return Ok(self
+                    .commit_2026_handshake(identity, supervisor_attempt)
+                    .await);
             }
 
             let params = json!({
@@ -5525,6 +5628,81 @@ mod tests {
             adapter.session_id.read().await.as_deref(),
             Some("sess-1"),
             "the recovered session must not be rotated"
+        );
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert!(rx.try_recv().is_err(), "exactly one tick per recovery");
+        assert!(
+            lock_slot(&adapter.reconnect_handle)
+                .as_ref()
+                .is_some_and(|h| !h.is_finished()),
+            "supervisor keeps waiting for the next demotion"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 6b, Copilot): on the 2026 path the supervisor
+    /// must not commit identity, dialect, session, listener and health after
+    /// caller traffic recovered the legacy session during one of the awaits
+    /// between the probe and the commit. Otherwise the adapter stays
+    /// `Healthy` on a legacy connection while formatting every request as
+    /// sessionless 2026 traffic, with no retry armed. The check runs under
+    /// the commit's own lock, so the gate sits at the last await before it.
+    #[tokio::test]
+    async fn recovery_before_2026_commit_keeps_legacy_session() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        let gate = TestGate::new();
+        adapter.handshake_send_gate = Some(gate.clone());
+        // Pre-arm one pass for the caller-owned (legacy) handshake, then
+        // consume the `reached` permit it leaves behind.
+        gate.release.notify_one();
+        adapter.initialize().await.expect("initial handshake");
+        gate.reached.notified().await;
+        use_fast_backoff(&adapter).await;
+        let mut rx = adapter.subscribe_tools_changed().unwrap();
+        assert_eq!(
+            adapter.upstream_dialect().await,
+            ProtocolVersion::V2025_03_26
+        );
+        assert_eq!(adapter.session_id.read().await.as_deref(), Some("sess-1"));
+        let name_before = adapter.upstream_server_name.read().await.clone();
+
+        // The upstream now answers the probe as a 2026 server while still
+        // honouring the legacy session, so the supervisor's attempt takes
+        // the 2026 path.
+        fx.discover_2026.store(true, Ordering::SeqCst);
+        demote_via_transport_failures(&adapter).await;
+        tokio::time::timeout(Duration::from_secs(5), gate.reached.notified())
+            .await
+            .expect("supervisor attempt should reach the 2026 commit point");
+
+        // Caller traffic recovers the legacy session while the attempt is
+        // parked before its commit.
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("live server answers");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        rx.try_recv().expect("one reactive recovery tick");
+
+        gate.release.notify_one();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            adapter.upstream_dialect().await,
+            ProtocolVersion::V2025_03_26,
+            "an attempt obsoleted before the 2026 commit must not switch the dialect"
+        );
+        assert_eq!(
+            adapter.session_id.read().await.as_deref(),
+            Some("sess-1"),
+            "the recovered legacy session must not be cleared"
+        );
+        assert_eq!(
+            *adapter.upstream_server_name.read().await,
+            name_before,
+            "the obsolete attempt's identity must not be committed"
         );
         assert_eq!(adapter.health(), HealthStatus::Healthy);
         assert!(rx.try_recv().is_err(), "exactly one tick per recovery");

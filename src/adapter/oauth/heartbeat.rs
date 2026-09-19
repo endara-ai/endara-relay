@@ -278,7 +278,7 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
 /// Publish the outer tools-changed invalidation the wrapper owes AFTER a
 /// probe verdict has been committed to `inner_health`. Fires at most once
 /// per call when either an inner recovery poke is pending
-/// (`recovery_tick_pending`, raised by the forwarder instead of ticking
+/// (`RecoveryTickState::tick_pending`, raised by the forwarder instead of ticking
 /// itself) or the caller established that this commit owes a tick
 /// (`owed`: the probe flipped `inner_health` from `Unhealthy` to `Healthy`,
 /// or its healthy commit acknowledged an inner recovery the forwarder had
@@ -290,9 +290,7 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
 /// catalog against the committed verdict, never against the one the probe
 /// is about to replace.
 pub(super) fn publish_recovery_tick_if_due(adapter: &OAuthAdapterInner, owed: bool) {
-    let pending = adapter
-        .recovery_tick_pending
-        .swap(false, std::sync::atomic::Ordering::SeqCst);
+    let pending = adapter.take_recovery_tick_pending();
     if pending || owed {
         let _ = adapter.outer_tools_changed_tx.send(());
     }
