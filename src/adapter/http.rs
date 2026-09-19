@@ -1674,6 +1674,12 @@ impl HttpAdapter {
 impl McpAdapter for HttpAdapter {
     async fn initialize(&mut self) -> Result<(), AdapterError> {
         async {
+            // Re-arm after a previous `shutdown()`: that path latches
+            // `shutting_down` so no listener can be installed behind its
+            // drain. A caller-owned initialize is exclusive (`&mut self`) and
+            // shutdown has already aborted and joined the old supervisor and
+            // listener, so clearing the latch here cannot race either of them.
+            self.shutting_down.store(false, Ordering::SeqCst);
             *self.health.write().await = HealthStatus::Starting;
             self.connect_and_handshake().await?;
             // Arm the reconnect supervisor now so a later transport-dead
@@ -3265,6 +3271,7 @@ mod tests {
         issue_session: Arc<AtomicBool>,
         init_delay_ms: Arc<AtomicU64>,
         init_count: Arc<AtomicU64>,
+        get_count: Arc<AtomicU64>,
         current_session: Arc<std::sync::Mutex<Option<String>>>,
         hold_discover: Arc<AtomicBool>,
         fail_init: Arc<AtomicBool>,
@@ -3278,6 +3285,7 @@ mod tests {
             issue_session: Arc::new(AtomicBool::new(true)),
             init_delay_ms: Arc::new(AtomicU64::new(0)),
             init_count: Arc::new(AtomicU64::new(0)),
+            get_count: Arc::new(AtomicU64::new(0)),
             current_session: Arc::new(std::sync::Mutex::new(None)),
             hold_discover: Arc::new(AtomicBool::new(false)),
             fail_init: Arc::new(AtomicBool::new(false)),
@@ -3300,6 +3308,9 @@ mod tests {
         req: axum::extract::Request,
     ) -> axum::response::Response {
         if req.method() != axum::http::Method::POST {
+            if req.method() == axum::http::Method::GET {
+                fx.get_count.fetch_add(1, Ordering::SeqCst);
+            }
             return (StatusCode::METHOD_NOT_ALLOWED, "").into_response();
         }
         if !fx.accepting.load(Ordering::SeqCst) {
@@ -3548,6 +3559,70 @@ mod tests {
         assert_eq!(fx.init_count.load(Ordering::SeqCst), 1);
         assert_eq!(adapter.health(), HealthStatus::Stopped);
 
+        server.abort();
+    }
+
+    /// The management restart fallback calls `shutdown()` and then
+    /// `initialize()` on the same adapter. That second initialize must be a
+    /// full restart: a fresh GET listener (or push invalidations are lost
+    /// for the rest of the process) and a re-armed supervisor that still
+    /// recovers a later demotion — not merely a `Healthy` health flip.
+    #[tokio::test]
+    async fn reinitialize_after_shutdown_restores_listener_and_recovery() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                fx.get_count.load(Ordering::SeqCst) == 1
+            })
+            .await,
+            "first initialize spawns the GET listener"
+        );
+
+        adapter.shutdown().await.expect("shutdown succeeds");
+        assert_eq!(adapter.health(), HealthStatus::Stopped);
+        assert!(lock_slot(&adapter.reconnect_handle).is_none());
+        assert!(lock_slot(&adapter.listener_handle).is_none());
+
+        adapter.initialize().await.expect("re-initialize succeeds");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 2);
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                fx.get_count.load(Ordering::SeqCst) == 2
+            })
+            .await,
+            "re-initialize after shutdown must spawn a replacement GET listener"
+        );
+        assert!(
+            lock_slot(&adapter.listener_handle).is_some(),
+            "re-initialize must install the new listener"
+        );
+        assert!(
+            lock_slot(&adapter.reconnect_handle)
+                .as_ref()
+                .is_some_and(|h| !h.is_finished()),
+            "re-initialize must re-arm the supervisor"
+        );
+
+        // The re-armed lifecycle must still self-heal.
+        use_fast_backoff(&adapter).await;
+        demote_via_transport_failures(&adapter).await;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                adapter.health() == HealthStatus::Healthy
+            })
+            .await,
+            "supervisor re-armed by re-initialize must recover a later demotion"
+        );
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            3,
+            "recovery must come from a supervisor handshake"
+        );
+
+        adapter.shutdown().await.unwrap();
         server.abort();
     }
 
