@@ -194,6 +194,14 @@ pub struct HttpAdapter {
     /// broadcast: both arrive as a tick, only the former advances this
     /// counter. See [`Self::recovery_generation`].
     recovery_generation: Arc<AtomicU64>,
+    /// `true` while a caller-owned [`McpAdapter::initialize`] that found the
+    /// adapter `Unhealthy` is in flight. That path writes `Starting` before
+    /// its handshake, so the commit alone would see `Starting → Healthy` and
+    /// publish nothing; the flag carries the outage across the handshake so
+    /// the commit publishes the same single recovery (generation bump + one
+    /// tick) a supervisor recovery does. Set and consumed under the `health`
+    /// write lock; cleared when that handshake fails.
+    initialize_from_unhealthy: Arc<AtomicBool>,
     /// Notified by [`Self::note_transport_failure`] when reactive health flips
     /// the adapter to `Unhealthy`, waking the supervisor to start reconnecting.
     reconnect_notify: Arc<Notify>,
@@ -413,6 +421,7 @@ impl HttpAdapter {
             reconnect_handle: Arc::new(StdMutex::new(None)),
             recovered_notify: Arc::new(Notify::new()),
             recovery_generation: Arc::new(AtomicU64::new(0)),
+            initialize_from_unhealthy: Arc::new(AtomicBool::new(false)),
             reconnect_notify: Arc::new(Notify::new()),
             handshake_lock: Arc::new(Mutex::new(())),
             shutting_down: Arc::new(AtomicBool::new(false)),
@@ -454,6 +463,7 @@ impl HttpAdapter {
             reconnect_handle: self.reconnect_handle.clone(),
             recovered_notify: self.recovered_notify.clone(),
             recovery_generation: self.recovery_generation.clone(),
+            initialize_from_unhealthy: self.initialize_from_unhealthy.clone(),
             reconnect_notify: self.reconnect_notify.clone(),
             handshake_lock: self.handshake_lock.clone(),
             shutting_down: self.shutting_down.clone(),
@@ -564,6 +574,15 @@ impl HttpAdapter {
     /// that reads it on receipt of the tick sees the new value.
     pub(crate) fn recovery_generation(&self) -> u64 {
         self.recovery_generation.load(Ordering::SeqCst)
+    }
+
+    /// Shared handle onto the counter behind [`Self::recovery_generation`],
+    /// for a subscriber that must keep reading THIS adapter's counter after
+    /// the wrapper it lives in has published a replacement adapter (the
+    /// OAuth forwarder classifies each tick against the adapter that owns
+    /// its receiver, not against whichever adapter is published).
+    pub(crate) fn recovery_generation_handle(&self) -> Arc<AtomicU64> {
+        self.recovery_generation.clone()
     }
 
     /// Apply the JIT 401 interception policy to a tool-call outcome.
@@ -1717,11 +1736,16 @@ impl HttpAdapter {
 
     /// The `Healthy` write of [`Self::mark_handshake_healthy`], performed by
     /// the caller under the `health` write lock. Returns whether this write
-    /// performed the `Unhealthy → Healthy` flip.
+    /// performed the `Unhealthy → Healthy` flip — either directly, or on
+    /// behalf of a caller-owned `initialize()` that found the adapter
+    /// `Unhealthy` and wrote `Starting` before its handshake
+    /// ([`Self::initialize_from_unhealthy`], consumed here either way so it
+    /// never outlives the handshake that set it).
     fn mark_healthy_locked(&self, health: &mut HealthStatus) -> bool {
         self.transport_failures.store(0, Ordering::SeqCst);
         self.handshake_completed.store(true, Ordering::SeqCst);
-        let was_unhealthy = matches!(*health, HealthStatus::Unhealthy(_));
+        let resumed_from_unhealthy = self.initialize_from_unhealthy.swap(false, Ordering::SeqCst);
+        let was_unhealthy = matches!(*health, HealthStatus::Unhealthy(_)) || resumed_from_unhealthy;
         *health = HealthStatus::Healthy;
         if was_unhealthy {
             self.recovery_generation.fetch_add(1, Ordering::SeqCst);
@@ -2142,12 +2166,31 @@ impl McpAdapter for HttpAdapter {
             // than racing it for the session id (see `handshake_lock`); the
             // `Starting` write and our own handshake then run with no other
             // handshake able to interleave.
+            //
+            // The `Starting` write hides an outage from the handshake commit,
+            // which publishes a recovery only on an `Unhealthy → Healthy`
+            // write. A re-initialize of an `Unhealthy` endpoint (the enable
+            // path on an already-enabled entry, or a restart) would then
+            // recover it silently and existing clients would never refresh
+            // their catalog — so the pre-initialize `Unhealthy` is captured
+            // under the same lock that writes `Starting` and the commit
+            // publishes the same single recovery event the supervisor path
+            // does (see `mark_healthy_locked`).
             let outcome = {
                 let _handshake = self.handshake_lock.lock().await;
-                *self.health.write().await = HealthStatus::Starting;
+                {
+                    let mut health = self.health.write().await;
+                    self.initialize_from_unhealthy.store(
+                        matches!(*health, HealthStatus::Unhealthy(_)),
+                        Ordering::SeqCst,
+                    );
+                    *health = HealthStatus::Starting;
+                }
                 self.connect_and_handshake().await
             };
             if let Err(e) = outcome {
+                self.initialize_from_unhealthy
+                    .store(false, Ordering::SeqCst);
                 // Same retry contract as a successful start: the adapter is
                 // `Unhealthy(<init error>)` and the supervisor brings it back
                 // once the upstream is reachable. Every `initialize()` caller
@@ -6393,6 +6436,109 @@ mod tests {
         );
 
         server.abort();
+    }
+
+    /// PR #163 review (round 6d, Copilot): a caller-owned `initialize()` on
+    /// an `Unhealthy` adapter (the management enable path on an
+    /// already-enabled entry, or a restart) writes `Starting` before its
+    /// handshake, so the commit alone sees `Starting → Healthy` and would
+    /// publish nothing — the endpoint would recover without clients ever
+    /// refreshing their catalog. The re-initialize must publish the same
+    /// single recovery event the supervisor path does: one
+    /// `recovery_generation` bump and one `tools_changed` tick. The
+    /// supervisor is disarmed first so no reconnect attempt races the caller.
+    #[tokio::test]
+    async fn caller_reinitialize_of_unhealthy_adapter_publishes_one_recovery() {
+        let (url, server) = start_fake_http_server(true).await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        if let Some(supervisor) = lock_slot(&adapter.reconnect_handle).take() {
+            supervisor.abort();
+        }
+        adapter.demote_via_transport_failures_for_test().await;
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+        let mut rx = adapter.subscribe_tools_changed().expect("Some receiver");
+        drain_ticks(&mut rx);
+        let generation = adapter.recovery_generation();
+
+        adapter.initialize().await.expect("re-initialize succeeds");
+
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert_eq!(
+            adapter.recovery_generation(),
+            generation + 1,
+            "a caller-owned re-initialize of an Unhealthy adapter must publish the recovery"
+        );
+        assert_eq!(
+            recv_ticks(&mut rx, Duration::from_secs(2)).await,
+            1,
+            "one recovery publishes exactly one tick"
+        );
+        assert!(
+            !adapter.initialize_from_unhealthy.load(Ordering::SeqCst),
+            "the pre-initialize state is consumed by the commit"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// Guard for the above: re-initializing a `Healthy` adapter is not a
+    /// recovery — `Healthy → Starting → Healthy` neither advances
+    /// `recovery_generation` nor ticks.
+    #[tokio::test]
+    async fn caller_reinitialize_of_healthy_adapter_publishes_nothing() {
+        let (url, server) = start_fake_http_server(true).await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        let mut rx = adapter.subscribe_tools_changed().expect("Some receiver");
+        drain_ticks(&mut rx);
+        let generation = adapter.recovery_generation();
+
+        adapter.initialize().await.expect("re-initialize succeeds");
+
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert_eq!(
+            adapter.recovery_generation(),
+            generation,
+            "re-initializing a Healthy adapter is not a recovery"
+        );
+        assert_eq!(
+            recv_ticks(&mut rx, Duration::from_millis(400)).await,
+            0,
+            "re-initializing a Healthy adapter publishes no tick"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// The captured pre-initialize state does not outlive a FAILED
+    /// re-initialize: the adapter is `Unhealthy(<init error>)` again and the
+    /// eventual recovery is a genuine flip in its own right, published once.
+    #[tokio::test]
+    async fn failed_reinitialize_clears_the_captured_unhealthy_state() {
+        let (url, server) = start_fake_http_server(true).await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        if let Some(supervisor) = lock_slot(&adapter.reconnect_handle).take() {
+            supervisor.abort();
+        }
+        adapter.demote_via_transport_failures_for_test().await;
+        server.abort();
+        // The upstream is gone: the re-initialize fails and arms a retry.
+        adapter
+            .initialize()
+            .await
+            .expect_err("re-initialize against a dead upstream fails");
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+        assert!(
+            !adapter.initialize_from_unhealthy.load(Ordering::SeqCst),
+            "a failed re-initialize clears the captured state"
+        );
+
+        adapter.shutdown().await.unwrap();
     }
 
     // --- 2026 stateless Streamable HTTP path (T8) ---

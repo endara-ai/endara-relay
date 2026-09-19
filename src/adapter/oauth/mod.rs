@@ -249,6 +249,31 @@ struct RecoveryTickState {
     tick_pending: bool,
 }
 
+/// What the inner→outer tools-changed forwarder binds to: an inner
+/// adapter's tools-changed receiver together with the recovery counter of
+/// THAT SAME adapter. The two are captured as a pair so a tick is always
+/// classified against the adapter that sent it — never against whichever
+/// adapter is published in `inner_adapter` at the time the tick is handled.
+/// During a token apply the replacement is published before the old
+/// forwarder is aborted; an old-adapter recovery tick resuming in that
+/// window would otherwise read the replacement's counter (typically `0`),
+/// pass as an ordinary notification and be forwarded while OAuth reports
+/// `Starting` (see [`OAuthAdapterInner::swap_tools_forwarder`]).
+struct InnerTickSource {
+    rx: broadcast::Receiver<()>,
+    recovery_generation: Arc<AtomicU64>,
+}
+
+impl InnerTickSource {
+    /// Bind to `adapter`; `None` when it exposes no tools-changed broadcast.
+    fn bind(adapter: &HttpAdapter) -> Option<Self> {
+        Some(Self {
+            rx: adapter.subscribe_tools_changed()?,
+            recovery_generation: adapter.recovery_generation_handle(),
+        })
+    }
+}
+
 /// Shared inner state for an OAuth adapter, wrapped in `Arc` so it can be
 /// referenced from the callback handler and proactive-refresh task.
 pub struct OAuthAdapterInner {
@@ -1520,7 +1545,7 @@ impl OAuthAdapterInner {
                 // probe, so routine Some→Some token refreshes with an
                 // unchanged tool set stay silent and clients aren't spammed
                 // with `list_changed` on every refresh.
-                let rx = adapter.subscribe_tools_changed();
+                let source = InnerTickSource::bind(&adapter);
                 let new_fingerprint = Self::probe_tools_fingerprint(&adapter).await;
                 let was_listable = {
                     let mut guard = self.inner_adapter.write().await;
@@ -1529,7 +1554,7 @@ impl OAuthAdapterInner {
                     was
                 };
                 *self.inner_health.write().await = HealthStatus::Healthy;
-                self.swap_tools_forwarder(rx).await;
+                self.swap_tools_forwarder(source).await;
                 let should_tick = if !was_listable {
                     true
                 } else {
@@ -1723,10 +1748,10 @@ impl OAuthAdapterInner {
         RefreshCommitOutcome::Committed
     }
 
-    /// Abort any existing inner→outer tools-changed forwarder and, if `rx` is
-    /// `Some`, spawn a fresh forwarder that pumps each inner tick into
-    /// `outer_tools_changed_tx`. `Lagged` is forwarded as a tick (matching the
-    /// registry listener); `Closed` ends the task.
+    /// Abort any existing inner→outer tools-changed forwarder and, if
+    /// `source` is `Some`, spawn a fresh forwarder that pumps each inner tick
+    /// into `outer_tools_changed_tx`. `Lagged` is forwarded as a tick
+    /// (matching the registry listener); `Closed` ends the task.
     ///
     /// Each relayed tick also clears `last_tools_fingerprint`: an inner
     /// `tools_changed` notification means the upstream tool set drifted from
@@ -1742,6 +1767,17 @@ impl OAuthAdapterInner {
     /// inner's [`HttpAdapter::recovery_generation`] when it binds and, on
     /// each tick, asks the heartbeat for an immediate probe only when that
     /// counter advanced (see [`Self::poke_heartbeat_on_inner_recovery`]).
+    /// The counter it reads is the one captured in `source` — the counter of
+    /// the adapter that owns the receiver — never the published inner's: a
+    /// token apply publishes the replacement adapter before this forwarder
+    /// is aborted, and an old-adapter recovery tick handled in that window
+    /// must still be classified against the old adapter (against the
+    /// replacement's fresh counter it would pass as an ordinary tick and be
+    /// forwarded while OAuth reports `Starting`, letting a racing registry
+    /// rebuild cache the tools as unavailable with nothing to correct it
+    /// when the apply's own fingerprint probe fails). Classified correctly
+    /// it raises the pending recovery, which the apply publishes once the
+    /// state is back to `Authenticated`.
     /// The forwarder never writes `inner_health` itself. A recovery tick is
     /// NOT relayed here either: the heartbeat publishes it after the probe
     /// commits (`RecoveryTickState::tick_pending`, or its `acked_generation` when
@@ -1749,15 +1785,21 @@ impl OAuthAdapterInner {
     /// never rebuilds its catalog against a verdict the probe is about to
     /// overturn and one recovery never ticks twice. Ordinary invalidations
     /// are relayed immediately as before.
-    async fn swap_tools_forwarder(self: &Arc<Self>, rx: Option<broadcast::Receiver<()>>) {
+    async fn swap_tools_forwarder(self: &Arc<Self>, source: Option<InnerTickSource>) {
         let mut handle_guard = self.inner_forwarder_handle.lock().await;
         if let Some(h) = handle_guard.take() {
             h.abort();
         }
-        let Some(mut rx) = rx else { return };
+        let Some(InnerTickSource {
+            mut rx,
+            recovery_generation,
+        }) = source
+        else {
+            return;
+        };
         let outer_tx = self.outer_tools_changed_tx.clone();
         let fingerprint = self.last_tools_fingerprint.clone();
-        let mut seen_recovery = self.inner_recovery_generation().await;
+        let mut seen_recovery = recovery_generation.load(Ordering::SeqCst);
         self.lock_recovery_tick().acked_generation = seen_recovery;
         let weak = Arc::downgrade(self);
         let join = tokio::spawn(async move {
@@ -1767,7 +1809,10 @@ impl OAuthAdapterInner {
                 let recovery_tick = match weak.upgrade() {
                     Some(inner) => {
                         inner
-                            .poke_heartbeat_on_inner_recovery(&mut seen_recovery)
+                            .poke_heartbeat_on_inner_recovery(
+                                &recovery_generation,
+                                &mut seen_recovery,
+                            )
                             .await
                     }
                     None => false,
@@ -1814,8 +1859,16 @@ impl OAuthAdapterInner {
     /// (its own probe performed the recovery and its `MarkHealthy` commit
     /// ticked, see [`Self::settle_recovery_after_healthy_verdict`]), the tick is simply
     /// dropped: a second probe would only publish the same recovery again.
-    async fn poke_heartbeat_on_inner_recovery(&self, seen_recovery: &mut u64) -> bool {
-        let current = self.inner_recovery_generation().await;
+    ///
+    /// `recovery_generation` is the counter of the adapter that sent the
+    /// tick (captured with its receiver, see [`InnerTickSource`]), so the
+    /// classification holds even after a replacement adapter is published.
+    async fn poke_heartbeat_on_inner_recovery(
+        &self,
+        recovery_generation: &AtomicU64,
+        seen_recovery: &mut u64,
+    ) -> bool {
+        let current = recovery_generation.load(Ordering::SeqCst);
         if current <= *seen_recovery {
             return false;
         }
@@ -4368,6 +4421,16 @@ mod tests {
         )
     }
 
+    /// A forwarder source over a bare channel standing in for an inner
+    /// adapter that never recovers (its recovery counter stays at `0`, so
+    /// every tick classifies as an ordinary invalidation).
+    fn plain_tick_source(rx: broadcast::Receiver<()>) -> Option<InnerTickSource> {
+        Some(InnerTickSource {
+            rx,
+            recovery_generation: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
     #[tokio::test]
     async fn subscribe_tools_changed_returns_some() {
         let adapter = make_adapter(make_config());
@@ -4381,7 +4444,10 @@ mod tests {
         let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
 
         let (inner_tx, inner_rx) = broadcast::channel::<()>(16);
-        adapter.inner.swap_tools_forwarder(Some(inner_rx)).await;
+        adapter
+            .inner
+            .swap_tools_forwarder(plain_tick_source(inner_rx))
+            .await;
 
         inner_tx.send(()).expect("inner send");
         assert!(
@@ -4533,7 +4599,10 @@ mod tests {
         // A plain invalidation on the inner channel (recovery generation
         // unchanged: the inner adapter is Healthy and never flipped).
         let (inner_tx, inner_rx) = broadcast::channel::<()>(16);
-        adapter.inner.swap_tools_forwarder(Some(inner_rx)).await;
+        adapter
+            .inner
+            .swap_tools_forwarder(plain_tick_source(inner_rx))
+            .await;
         inner_tx.send(()).expect("inner send");
         assert!(
             recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
@@ -4876,6 +4945,91 @@ mod tests {
         server.abort();
     }
 
+    /// PR #163 review (round 6d, Copilot): during a token apply the
+    /// replacement inner adapter is published before the old forwarder is
+    /// aborted. An old-adapter recovery tick handled in that window must be
+    /// classified against the OLD adapter's recovery counter — read against
+    /// the published replacement's fresh counter it passes as an ordinary
+    /// notification and is forwarded while the lifecycle is `Refreshing`
+    /// (outer health `Starting`), where a racing registry rebuild caches the
+    /// tools as unavailable and an apply whose fingerprint probe fails never
+    /// corrects it. The window is reproduced exactly: the old adapter is
+    /// taken out of the slot and kept alive, a replacement is published in
+    /// its place with the forwarder still bound to the old one, the
+    /// lifecycle is `Refreshing`, and the old adapter then recovers for real.
+    #[tokio::test]
+    async fn old_inner_recovery_in_refresh_window_is_deferred_not_forwarded() {
+        let (mut adapter, _fx, server) = armed_probe_adapter(3).await;
+        let mut rx = adapter.subscribe_tools_changed().unwrap();
+        drain(&mut rx).await;
+
+        // Take the old inner out of the slot — kept alive, so its broadcast
+        // and the forwarder bound to it stay up — and publish a replacement
+        // in its place, as `apply_tokens_inner` does before it swaps the
+        // forwarder.
+        let old_inner = adapter
+            .inner
+            .inner_adapter
+            .write()
+            .await
+            .take()
+            .expect("inner adapter installed");
+        let mut replacement = OAuthAdapterInner::build_inner_adapter(
+            &adapter.inner.config.url,
+            "second",
+            adapter.inner.config.server_type_override.clone(),
+            adapter.inner.config.endpoint_name.clone(),
+            adapter.inner.span.clone(),
+        );
+        replacement
+            .initialize()
+            .await
+            .expect("the replacement handshake succeeds");
+        assert_eq!(replacement.recovery_generation(), 0);
+        *adapter.inner.inner_adapter.write().await = Some(replacement);
+        adapter
+            .inner
+            .transition_to(OAuthState::Refreshing, "test: apply in flight")
+            .await;
+
+        // The old inner recovers for real; its tick reaches the forwarder.
+        old_inner.demote_via_transport_failures_for_test().await;
+        assert!(matches!(old_inner.health(), HealthStatus::Unhealthy(_)));
+        old_inner
+            .call_tool("x", serde_json::json!({}))
+            .await
+            .expect("live upstream answers");
+        assert_eq!(old_inner.health(), HealthStatus::Healthy);
+        assert!(old_inner.recovery_generation() >= 1);
+
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "an old-inner recovery must not be forwarded while Refreshing (health derives to Starting)"
+        );
+        assert!(
+            adapter.inner.recovery_tick_pending(),
+            "the tick is classified as a recovery of the adapter that sent it and deferred"
+        );
+
+        // The apply completes: the deferred recovery is published once the
+        // state is back to `Authenticated`, and once only.
+        adapter.inner.apply_tokens(make_token_set("third")).await;
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Authenticated);
+        assert!(
+            recv_tick(&mut rx, Duration::from_secs(2)).await,
+            "the deferred recovery is published once the state is Authenticated"
+        );
+        assert!(!adapter.inner.recovery_tick_pending());
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "one deferred recovery publishes one tick"
+        );
+
+        drop(old_inner);
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
     /// PR #163 review (round 6, Copilot): a recovery poke that arrives while
     /// a token apply is in flight (`Refreshing`) must not be published by
     /// the heartbeat's skip path — OAuth health derives to `Starting` there,
@@ -5165,14 +5319,20 @@ mod tests {
 
         // Bind forwarder to inner A.
         let (inner_tx_a, inner_rx_a) = broadcast::channel::<()>(16);
-        adapter.inner.swap_tools_forwarder(Some(inner_rx_a)).await;
+        adapter
+            .inner
+            .swap_tools_forwarder(plain_tick_source(inner_rx_a))
+            .await;
         // Sanity-check: A propagates.
         inner_tx_a.send(()).expect("inner A send");
         assert!(recv_tick(&mut outer_rx, Duration::from_millis(500)).await);
 
         // Swap to inner B (simulates inner-adapter replacement).
         let (inner_tx_b, inner_rx_b) = broadcast::channel::<()>(16);
-        adapter.inner.swap_tools_forwarder(Some(inner_rx_b)).await;
+        adapter
+            .inner
+            .swap_tools_forwarder(plain_tick_source(inner_rx_b))
+            .await;
         drain(&mut outer_rx).await;
 
         // Firing on the OLD inner must NOT propagate (forwarder aborted →
@@ -5209,7 +5369,7 @@ mod tests {
         let (prev_inner_tx, prev_inner_rx) = broadcast::channel::<()>(16);
         adapter
             .inner
-            .swap_tools_forwarder(Some(prev_inner_rx))
+            .swap_tools_forwarder(plain_tick_source(prev_inner_rx))
             .await;
         // Sanity: forwarder propagates ticks before apply_tokens runs.
         prev_inner_tx.send(()).expect("pre-apply send");
@@ -5244,7 +5404,7 @@ mod tests {
         let (post_inner_tx, post_inner_rx) = broadcast::channel::<()>(16);
         adapter
             .inner
-            .swap_tools_forwarder(Some(post_inner_rx))
+            .swap_tools_forwarder(plain_tick_source(post_inner_rx))
             .await;
         post_inner_tx.send(()).expect("post-apply send");
         assert!(
@@ -5261,7 +5421,10 @@ mod tests {
         let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
 
         let (inner_tx, inner_rx) = broadcast::channel::<()>(16);
-        adapter.inner.swap_tools_forwarder(Some(inner_rx)).await;
+        adapter
+            .inner
+            .swap_tools_forwarder(plain_tick_source(inner_rx))
+            .await;
         adapter.inner.swap_tools_forwarder(None).await;
 
         // After abort, the forwarder's receiver is dropped — `send` may return
@@ -5681,7 +5844,10 @@ mod tests {
         // Simulate the inner adapter notifying a tool change (upstream
         // drifted to B): bind the forwarder to a manual channel and tick it.
         let (inner_tx, inner_rx) = broadcast::channel::<()>(16);
-        adapter.inner.swap_tools_forwarder(Some(inner_rx)).await;
+        adapter
+            .inner
+            .swap_tools_forwarder(plain_tick_source(inner_rx))
+            .await;
         inner_tx.send(()).expect("inner send");
         assert!(
             recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
