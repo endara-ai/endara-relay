@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex, Notify, RwLock};
-use tokio::task::{AbortHandle, JoinHandle};
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn, Instrument};
 
@@ -354,9 +354,11 @@ pub struct OAuthAdapterInner {
     /// ticks from each inner adapter's `subscribe_tools_changed` receiver into
     /// this sender.
     outer_tools_changed_tx: broadcast::Sender<()>,
-    /// Abort handle for the current inner→outer tools-changed forwarder task,
-    /// if any. Re-bound on every inner-adapter swap.
-    inner_forwarder_handle: Mutex<Option<AbortHandle>>,
+    /// Join handle of the current inner→outer tools-changed forwarder task,
+    /// if any. Re-bound on every inner-adapter swap; whoever takes it aborts
+    /// AND awaits it, so the forwarder is gone (not merely cancelled) before
+    /// the taker proceeds.
+    inner_forwarder_handle: Mutex<Option<JoinHandle<()>>>,
     /// Per-endpoint tracing span. Every adapter method instruments its async
     /// body with this span so events emitted directly by `OAuthAdapter` /
     /// `OAuthAdapterInner` (state transitions, refresh, heartbeat) carry
@@ -1572,26 +1574,37 @@ impl OAuthAdapterInner {
                 // forwarder was aborted, see `swap_tools_forwarder`). Both
                 // are read at the replacement, before the forwarder swap
                 // rebaselines the acknowledgement to the new adapter.
-                // The old forwarder is aborted BEFORE that read: it is the
-                // only other observer of the old adapter's recoveries, so
-                // once it is gone the sample under the write lock is the
-                // final word on what the old adapter still owes, instead of
-                // racing a forwarder that may or may not poll a late tick
-                // before `swap_tools_forwarder` aborts it. Every other step
-                // keeps its order; the swap's own take then finds the slot
-                // empty.
+                // The old adapter is fully quiesced BEFORE that read. Its
+                // forwarder — the only other observer of its recoveries — is
+                // aborted and joined first, so no tick is polled after this
+                // point; the replacement is published under the write lock
+                // exactly as before; then, with the guard released, the old
+                // adapter is shut down, which aborts and joins its reconnect
+                // supervisor and GET listener (the producers of its
+                // recoveries) and reports `Stopped`. `HttpAdapter::shutdown`
+                // does no network I/O and awaits nothing that is not
+                // cancellation-safe (two task joins and one health write),
+                // so it cannot stall the apply. Only once nothing can commit
+                // on the old adapter any more is its recovery generation
+                // sampled: that sample is the final word on what it still
+                // owes. Every later step keeps its order; the swap's own
+                // take then finds the forwarder slot empty.
                 let source = InnerTickSource::bind(&adapter);
                 let new_fingerprint = Self::probe_tools_fingerprint(&adapter).await;
                 if let Some(h) = self.inner_forwarder_handle.lock().await.take() {
                     h.abort();
+                    let _ = h.await;
                 }
-                let (was_listable, unacked_old_recovery) = {
-                    let mut guard = self.inner_adapter.write().await;
-                    let old = guard.replace(adapter);
-                    let unacked = old.as_ref().is_some_and(|old| {
+                let old = self.inner_adapter.write().await.replace(adapter);
+                let was_listable = old.is_some();
+                let unacked_old_recovery = match old {
+                    Some(mut old) => {
+                        if let Err(e) = old.shutdown().await {
+                            debug!(error = %e, "superseded inner adapter shutdown reported an error");
+                        }
                         old.recovery_generation() > self.lock_recovery_tick().acked_generation
-                    });
-                    (old.is_some(), unacked)
+                    }
+                    None => false,
                 };
                 let was_healthy = matches!(
                     std::mem::replace(&mut *self.inner_health.write().await, HealthStatus::Healthy),
@@ -1842,6 +1855,7 @@ impl OAuthAdapterInner {
         let mut handle_guard = self.inner_forwarder_handle.lock().await;
         if let Some(h) = handle_guard.take() {
             h.abort();
+            let _ = h.await;
         }
         let Some(InnerTickSource {
             mut rx,
@@ -1871,7 +1885,7 @@ impl OAuthAdapterInner {
                 }
             }
         });
-        *handle_guard = Some(join.abort_handle());
+        *handle_guard = Some(join);
     }
 
     /// Handle one inner tick on behalf of the forwarder. A recovery tick is
@@ -5467,7 +5481,9 @@ mod tests {
     /// the `inner_adapter` write lock (the test holds a read guard) right
     /// after `Refreshing`: the forwarder slot must already be empty there,
     /// and an old-adapter recovery landing at that point yields exactly one
-    /// tick at the `Authenticated` commit.
+    /// tick at the `Authenticated` commit. (Round 6g moved the sample
+    /// itself past `old.shutdown()`, see the next test; the forwarder
+    /// ordering pinned here is unchanged.)
     #[tokio::test]
     async fn apply_aborts_old_forwarder_before_sampling_its_recovery() {
         let (mut adapter, _fx, server) = armed_probe_adapter(3).await;
@@ -5514,6 +5530,92 @@ mod tests {
             !recv_tick(&mut rx, Duration::from_millis(400)).await,
             "one recovery publishes one tick"
         );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 6g, Copilot, R — residual): aborting the old
+    /// forwarder alone does not close the gap, because the old adapter's own
+    /// supervisor / reactive recovery can still commit AFTER the sample and
+    /// before the old adapter is dropped. The apply therefore quiesces the
+    /// old adapter — replacement published, guard dropped, then
+    /// `old.shutdown().await` (supervisor and listener joined, health
+    /// `Stopped`) — and only THEN samples its recovery generation. The test
+    /// holds a read guard on the old adapter's health, which parks the
+    /// shutdown right before it reports `Stopped` (after the joins): the
+    /// replacement is already published there, nothing is rebaselined yet,
+    /// and a late commit emulated on the old counter at that point is seen
+    /// by the sample and published exactly once at the `Authenticated`
+    /// commit, with the old adapter `Stopped` by the time the apply returns.
+    #[tokio::test]
+    async fn apply_samples_old_recovery_only_after_old_adapter_is_stopped() {
+        let (mut adapter, _fx, server) = armed_probe_adapter(3).await;
+        let mut rx = adapter.subscribe_tools_changed().unwrap();
+        drain(&mut rx).await;
+
+        let (old_generation, old_health) = {
+            let guard = adapter.inner.inner_adapter.read().await;
+            let old = guard.as_ref().expect("inner adapter published");
+            (old.recovery_generation_handle(), old.health_handle())
+        };
+        let acked = adapter.inner.lock_recovery_tick().acked_generation;
+        assert_eq!(old_generation.load(Ordering::SeqCst), acked);
+
+        // Parks `old.shutdown()` at its `Stopped` write, after its joins.
+        let park = old_health.read().await;
+        assert_eq!(*park, HealthStatus::Healthy);
+
+        let inner = adapter.inner.clone();
+        let apply = tokio::spawn(async move { inner.apply_tokens(make_token_set("second")).await });
+        assert!(
+            wait_until(Duration::from_secs(2), || adapter
+                .inner
+                .inner_adapter
+                .try_read()
+                .is_ok_and(|slot| slot.as_ref().is_some_and(|new| !Arc::ptr_eq(
+                    &new.recovery_generation_handle(),
+                    &old_generation
+                ))))
+            .await,
+            "the replacement is published before the old adapter is quiesced"
+        );
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Refreshing);
+        assert_eq!(adapter.health(), HealthStatus::Starting);
+        assert!(
+            adapter.inner.inner_forwarder_handle.lock().await.is_none(),
+            "the old forwarder is joined before the old adapter is shut down"
+        );
+        assert_eq!(
+            adapter.inner.lock_recovery_tick().acked_generation,
+            acked,
+            "the apply is parked inside the old adapter's shutdown: the sample has not been taken yet"
+        );
+        assert!(!adapter.inner.recovery_tick_pending());
+
+        // A recovery committing on the old adapter before its shutdown
+        // completes — the residual the bare forwarder reorder left open.
+        old_generation.fetch_add(1, Ordering::SeqCst);
+        assert!(!recv_tick(&mut rx, Duration::from_millis(200)).await);
+
+        drop(park);
+        apply.await.unwrap();
+        assert_eq!(
+            *old_health.read().await,
+            HealthStatus::Stopped,
+            "the old adapter reported Stopped before the apply sampled it"
+        );
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Authenticated);
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert!(
+            recv_tick(&mut rx, Duration::from_secs(2)).await,
+            "a recovery committed on the old adapter before its shutdown completed is seen by the post-shutdown sample and published at the commit"
+        );
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "that late recovery is counted exactly once"
+        );
+        assert!(!adapter.inner.recovery_tick_pending());
 
         adapter.shutdown().await.unwrap();
         server.abort();

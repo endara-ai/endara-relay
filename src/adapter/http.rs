@@ -593,6 +593,13 @@ impl HttpAdapter {
         self.recovery_generation.clone()
     }
 
+    /// Shared handle onto this adapter's health, so a test can observe (or
+    /// hold back) the `Stopped` report of an adapter it no longer owns.
+    #[cfg(test)]
+    pub(crate) fn health_handle(&self) -> Arc<RwLock<HealthStatus>> {
+        self.health.clone()
+    }
+
     /// Apply the JIT 401 interception policy to a tool-call outcome.
     ///
     /// When a JIT interceptor is attached and the upstream returned a hard
