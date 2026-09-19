@@ -58,18 +58,20 @@ impl SseConfig {
     }
 }
 
-/// Crash tracking for exponential backoff.
+/// Crash tracking for exponential backoff. Shared with the plain HTTP
+/// adapter's reconnect supervisor (`super::http`), which reuses the same
+/// 1 s → 60 s escalation.
 #[derive(Debug)]
-struct CrashTracker {
+pub(super) struct CrashTracker {
     timestamps: Vec<Instant>,
-    consecutive_failures: u32,
+    pub(super) consecutive_failures: u32,
     failure_window: Duration,
     max_failures_in_window: usize,
     base_backoff: Duration,
 }
 
 impl CrashTracker {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             timestamps: Vec::new(),
             consecutive_failures: 0,
@@ -80,7 +82,7 @@ impl CrashTracker {
     }
 
     /// Record a failure and return true when the window cap is reached.
-    fn record_failure(&mut self) -> bool {
+    pub(super) fn record_failure(&mut self) -> bool {
         let now = Instant::now();
         self.consecutive_failures += 1;
         self.timestamps.push(now);
@@ -89,7 +91,7 @@ impl CrashTracker {
         self.timestamps.len() >= self.max_failures_in_window
     }
 
-    fn backoff_duration(&self) -> Duration {
+    pub(super) fn backoff_duration(&self) -> Duration {
         let multiplier = match self.consecutive_failures {
             0 | 1 => 1,
             2 => 2,
@@ -100,14 +102,14 @@ impl CrashTracker {
         self.base_backoff.saturating_mul(multiplier)
     }
 
-    fn reset(&mut self) {
+    pub(super) fn reset(&mut self) {
         self.consecutive_failures = 0;
         self.timestamps.clear();
     }
 
     /// Build a tracker with custom timing knobs (for fast unit tests).
     #[cfg(test)]
-    fn new_test(base_backoff: Duration, max_failures: usize, window: Duration) -> Self {
+    pub(super) fn new_test(base_backoff: Duration, max_failures: usize, window: Duration) -> Self {
         Self {
             timestamps: Vec::new(),
             consecutive_failures: 0,
