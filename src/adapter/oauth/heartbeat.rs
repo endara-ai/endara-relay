@@ -240,10 +240,20 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
         };
         match classify_tick_action(&oauth_state) {
             TickAction::Skip => {
-                // No probe will commit anything: do not hold a recovery's
-                // invalidation hostage to a state whose health does not
-                // depend on `inner_health` anyway.
-                publish_recovery_tick_if_due(&adapter, false);
+                // No probe will commit anything. In a genuine-auth terminal
+                // state, do not hold a recovery's invalidation hostage to a
+                // state whose health does not depend on `inner_health`
+                // anyway. `Refreshing` is different: health derives to
+                // `Starting` while the replacement inner adapter is being
+                // rebuilt, so publishing now would let the registry cache the
+                // tools as unavailable with no corrective tick guaranteed
+                // (the apply path stays silent when its fingerprint probe
+                // fails). Keep the recovery pending; `apply_tokens` publishes
+                // it once the state is back to `Authenticated`, or the next
+                // tick does.
+                if oauth_state != OAuthState::Refreshing {
+                    publish_recovery_tick_if_due(&adapter, false);
+                }
             }
             TickAction::Probe => {
                 let result = probe_inner(&adapter).await;

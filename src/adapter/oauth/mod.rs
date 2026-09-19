@@ -1538,9 +1538,10 @@ impl OAuthAdapterInner {
                 // registry rebuild can't read pre-transition health (e.g.
                 // Refreshing→Starting) and cache the new tools with a stale
                 // UNAVAILABLE label; inner+health are already published.
-                if should_tick {
-                    let _ = self.outer_tools_changed_tx.send(());
-                }
+                // A recovery of the OLD inner adapter that the heartbeat
+                // deferred through `Refreshing` (`recovery_tick_pending`) is
+                // published here as well, folded into the same single tick.
+                heartbeat::publish_recovery_tick_if_due(self, should_tick);
             }
             Err(e) => {
                 // Capture inner adapter's health before clearing it
@@ -4590,6 +4591,60 @@ mod tests {
         assert!(
             !recv_tick(&mut rx, Duration::from_millis(400)).await,
             "one recovery performed by the heartbeat must not publish two outer ticks"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 6, Copilot): a recovery poke that arrives while
+    /// a token apply is in flight (`Refreshing`) must not be published by
+    /// the heartbeat's skip path — OAuth health derives to `Starting` there,
+    /// so the registry could cache the tools as unavailable with no
+    /// corrective tick guaranteed. The pending recovery survives
+    /// `Refreshing` and is published, exactly once, when the apply commits
+    /// `Authenticated`.
+    #[tokio::test]
+    async fn recovery_tick_pending_survives_refreshing_skip() {
+        let (mut adapter, _fx, server) = armed_probe_adapter(1).await;
+        let mut rx = adapter.subscribe_tools_changed().unwrap();
+        drain(&mut rx).await;
+
+        adapter
+            .inner
+            .transition_to(OAuthState::Refreshing, "test: apply in flight")
+            .await;
+        // The old inner adapter's recovery reaches the forwarder mid-apply.
+        adapter
+            .inner
+            .recovery_tick_pending
+            .store(true, Ordering::SeqCst);
+        adapter.inner.probe_now.notify_one();
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "a pending recovery must not be published while Refreshing (health derives to Starting)"
+        );
+        assert!(
+            adapter.inner.recovery_tick_pending.load(Ordering::SeqCst),
+            "the pending recovery is preserved through Refreshing"
+        );
+
+        // The apply commits: same tool set, so the apply itself owes no
+        // tick — the deferred recovery still must reach the registry.
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Authenticated);
+        assert!(
+            recv_tick(&mut rx, Duration::from_secs(2)).await,
+            "the deferred recovery is published once the state is Authenticated"
+        );
+        assert!(
+            !adapter.inner.recovery_tick_pending.load(Ordering::SeqCst),
+            "publishing consumes the pending recovery"
+        );
+        adapter.inner.probe_now.notify_one();
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "the deferred recovery is published exactly once"
         );
 
         adapter.shutdown().await.unwrap();

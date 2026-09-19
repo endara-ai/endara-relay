@@ -170,8 +170,11 @@ pub struct HttpAdapter {
     /// (matching a `FailedAdapter`, so a dead upstream adds no connect
     /// latency or error traffic to every catalog rebuild) and
     /// [`Self::note_request_success`] never flips health to `Healthy` — only
-    /// a real handshake may do that. Never reset: after the first success the
-    /// pre-existing reactive recovery semantics apply unchanged.
+    /// a real handshake may do that. Cleared again by `shutdown()`, which
+    /// tears the session listener down: until the next handshake respawns
+    /// it, a stray success on the old session must not promote the adapter
+    /// (the endpoint would miss server-initiated tool changes). Otherwise
+    /// the pre-existing reactive recovery semantics apply unchanged.
     handshake_completed: Arc<AtomicBool>,
     /// Exponential-backoff state for the reconnect supervisor (1 s base, ×2,
     /// 60 s cap — same escalation as the SSE adapter). Reset on every
@@ -202,22 +205,47 @@ pub struct HttpAdapter {
     /// concurrent `initialize` exchanges whose responses complete out of
     /// order would leave the OLDER session id in [`Self::session_id`] while
     /// the upstream honours the newer one. Both paths hold this across
-    /// [`Self::complete_handshake`], so the committed session is always the
-    /// one from the last-completed handshake. An aborted supervisor (shutdown)
-    /// drops its guard with its future, so `shutdown()` → `initialize()`
-    /// never waits on a dead holder.
+    /// the dialect probe AND [`Self::complete_handshake`], so the committed
+    /// session is always the one from the last-completed handshake and a
+    /// probe result is never committed after another handshake changed the
+    /// state it was taken against. An aborted supervisor (shutdown) drops
+    /// its guard with its future, so `shutdown()` → `initialize()` never
+    /// waits on a dead holder.
     handshake_lock: Arc<Mutex<()>>,
     /// Set by `shutdown()` / [`Drop`] before the background tasks are torn
     /// down. [`Self::spawn_get_listener`] checks it under the listener slot
     /// lock so a handshake racing shutdown never installs a fresh listener
     /// that nobody will abort.
     shutting_down: Arc<AtomicBool>,
+    /// Test-only barrier at the last cancellation point of a handshake: after
+    /// the JIT credential lookup, before the `initialize` POST. Lets a test
+    /// order a reactive recovery deterministically into that await window.
+    #[cfg(test)]
+    handshake_send_gate: Option<Arc<TestGate>>,
     /// `true` on the adapter the caller owns, `false` on the
     /// [`Self::task_clone`] handed to the supervisor task. Only the owning
     /// instance tears down background tasks in [`Drop`]; otherwise the
     /// supervisor's own clone would abort the GET listener (and itself) the
     /// moment it exited.
     owns_background_tasks: bool,
+}
+
+/// Outcome of [`HttpAdapter::complete_handshake`].
+#[derive(Debug, PartialEq, Eq)]
+enum HandshakeOutcome {
+    /// The handshake ran to completion and committed `Healthy`.
+    Completed,
+    /// A supervisor attempt found the adapter already recovered at its last
+    /// cancellation point and sent nothing; the shared state is untouched.
+    Obsolete,
+}
+
+/// Two-sided test barrier (see [`HttpAdapter::handshake_send_gate`]): the
+/// adapter signals `reached` and parks on `release`.
+#[cfg(test)]
+struct TestGate {
+    reached: Notify,
+    release: Notify,
 }
 
 /// Lock a background-task handle slot ([`HttpAdapter::listener_handle`] /
@@ -369,6 +397,8 @@ impl HttpAdapter {
             reconnect_notify: Arc::new(Notify::new()),
             handshake_lock: Arc::new(Mutex::new(())),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            handshake_send_gate: None,
             owns_background_tasks: true,
         }
     }
@@ -408,6 +438,8 @@ impl HttpAdapter {
             reconnect_notify: self.reconnect_notify.clone(),
             handshake_lock: self.handshake_lock.clone(),
             shutting_down: self.shutting_down.clone(),
+            #[cfg(test)]
+            handshake_send_gate: self.handshake_send_gate.clone(),
             owns_background_tasks: false,
         }
     }
@@ -1496,6 +1528,23 @@ impl HttpAdapter {
                 }
 
                 info!(url = %self.config.url, "HTTP reconnect: attempting");
+                // Serialize with a caller-owned `initialize()` (see
+                // `handshake_lock`) BEFORE probing: a probe result taken
+                // outside the lock could be committed after the handshake
+                // that made this attempt wait already re-demoted the adapter
+                // (or the upstream died), and a stateless 2026 result sends
+                // nothing fresh in `complete_handshake` to notice. Re-check
+                // health once the lock is held: the handshake that made this
+                // attempt wait may have recovered the adapter, in which case
+                // a second `initialize` would only churn the upstream's
+                // session. The probe is bounded by `DISCOVER_PROBE_TIMEOUT`,
+                // so a caller waits on the lock for at most that long.
+                let handshake = self.handshake_lock.lock().await;
+                if !matches!(*self.health.read().await, HealthStatus::Unhealthy(_)) {
+                    debug!(url = %self.config.url, "HTTP reconnect: recovered while waiting for the handshake lock, abandoning attempt");
+                    self.crash_tracker.lock().await.reset();
+                    break;
+                }
                 // The dialect probe is stateless, so abandoning it mid-flight
                 // has no upstream side effect — the last point at which a
                 // reactive recovery can retire this attempt. A stale hint
@@ -1514,14 +1563,8 @@ impl HttpAdapter {
                         result = &mut probe => break result,
                     }
                 };
-                // Serialize with a caller-owned `initialize()` (see
-                // `handshake_lock`). Re-check health once the lock is held:
-                // the handshake that made this attempt wait may have
-                // recovered the adapter, in which case a second `initialize`
-                // would only churn the upstream's session.
-                let handshake = self.handshake_lock.lock().await;
                 if !matches!(*self.health.read().await, HealthStatus::Unhealthy(_)) {
-                    debug!(url = %self.config.url, "HTTP reconnect: recovered during dialect probe or while waiting for the handshake lock, abandoning attempt");
+                    debug!(url = %self.config.url, "HTTP reconnect: recovered during dialect probe, abandoning attempt");
                     self.crash_tracker.lock().await.reset();
                     break;
                 }
@@ -1529,8 +1572,13 @@ impl HttpAdapter {
                 let outcome = self.complete_handshake(discover_result, true).await;
                 drop(handshake);
                 match outcome {
-                    Ok(()) => {
+                    Ok(HandshakeOutcome::Completed) => {
                         info!(url = %self.config.url, "HTTP reconnect succeeded");
+                        break;
+                    }
+                    Ok(HandshakeOutcome::Obsolete) => {
+                        debug!(url = %self.config.url, "HTTP reconnect: recovered during credential loading, abandoning attempt");
+                        self.crash_tracker.lock().await.reset();
                         break;
                     }
                     Err(e) => {
@@ -1683,22 +1731,27 @@ impl HttpAdapter {
         // Any other outcome (legacy result, JSON-RPC error, transport
         // failure) falls through to the unchanged legacy handshake.
         let discover_result = self.try_discover_probe().await;
-        self.complete_handshake(discover_result, false).await
+        // The caller-owned path never reports `Obsolete` (it always writes).
+        self.complete_handshake(discover_result, false)
+            .await
+            .map(|_| ())
     }
 
     /// Everything after the dialect probe: the 2026 stateless path or the
     /// legacy `initialize` exchange, then `notifications/initialized`, the
     /// `GET` listener and the `Healthy` flip. `supervisor_attempt` marks a
     /// reconnect-supervisor attempt, whose failure writes are conditional
-    /// (see [`Self::set_handshake_unhealthy`]). From the `initialize` POST on
-    /// this runs to completion so the session the upstream hands back is
-    /// always the one the adapter keeps. Takes `&self` so the supervisor's
-    /// [`Self::task_clone`] can drive it.
+    /// (see [`Self::set_handshake_unhealthy`]) and which stands down with
+    /// [`HandshakeOutcome::Obsolete`] if a reactive recovery lands during
+    /// the JIT credential lookup — the last await before the `initialize`
+    /// POST. From that POST on this runs to completion so the session the
+    /// upstream hands back is always the one the adapter keeps. Takes
+    /// `&self` so the supervisor's [`Self::task_clone`] can drive it.
     async fn complete_handshake(
         &self,
         discover_result: Option<Value>,
         supervisor_attempt: bool,
-    ) -> Result<(), AdapterError> {
+    ) -> Result<HandshakeOutcome, AdapterError> {
         {
             if detect_upstream_dialect(discover_result.as_ref(), None).is_2026() {
                 let result = discover_result.as_ref().expect(
@@ -1722,7 +1775,7 @@ impl HttpAdapter {
                 self.spawn_get_listener().await;
                 self.mark_handshake_healthy().await;
                 info!(url = %self.config.url, "HTTP MCP adapter initialized (2026 stateless path)");
-                return Ok(());
+                return Ok(HandshakeOutcome::Completed);
             }
 
             let params = json!({
@@ -1749,26 +1802,37 @@ impl HttpAdapter {
                 let request = jsonrpc::new_request("initialize", Some(params), id);
                 trace!(method = "initialize", id = id, url = %self.config.url, "sending HTTP JSON-RPC request");
                 let builder = self.client.post(&self.config.url).json(&request);
-                let send_result = self
-                    .apply_jit_bearer(builder)
-                    .await
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        if e.is_timeout() {
-                            AdapterError::Timeout(self.config.timeout_secs)
-                        } else if e.is_connect() {
-                            AdapterError::ConnectionFailed(with_local_network_hint(
-                                &self.config.url,
-                                connect_error_message(&self.config.url, &e),
-                            ))
-                        } else {
-                            AdapterError::HttpError {
-                                status: 0,
-                                body: format_error_chain(&e),
-                            }
+                let builder = self.apply_jit_bearer(builder).await;
+                #[cfg(test)]
+                if let Some(gate) = &self.handshake_send_gate {
+                    gate.reached.notify_one();
+                    gate.release.notified().await;
+                }
+                // The credential lookup above is asynchronous (it may load
+                // the token manager): caller traffic can recover the adapter
+                // while it yields. A supervisor attempt is still cancellable
+                // here — nothing has reached the upstream — so re-check once
+                // more before the POST rather than rotate a recovered session.
+                if supervisor_attempt
+                    && !matches!(*self.health.read().await, HealthStatus::Unhealthy(_))
+                {
+                    return Ok(HandshakeOutcome::Obsolete);
+                }
+                let send_result = builder.send().await.map_err(|e| {
+                    if e.is_timeout() {
+                        AdapterError::Timeout(self.config.timeout_secs)
+                    } else if e.is_connect() {
+                        AdapterError::ConnectionFailed(with_local_network_hint(
+                            &self.config.url,
+                            connect_error_message(&self.config.url, &e),
+                        ))
+                    } else {
+                        AdapterError::HttpError {
+                            status: 0,
+                            body: format_error_chain(&e),
                         }
-                    });
+                    }
+                });
                 let resp = match send_result {
                     Ok(r) => r,
                     Err(e) => {
@@ -1923,7 +1987,7 @@ impl HttpAdapter {
 
             self.mark_handshake_healthy().await;
             info!(url = %self.config.url, "HTTP MCP adapter initialized");
-            Ok(())
+            Ok(HandshakeOutcome::Completed)
         }
     }
 }
@@ -2285,6 +2349,13 @@ impl McpAdapter for HttpAdapter {
                 handle.abort();
                 let _ = handle.await;
             }
+            // The session listener is gone: until a handshake respawns it,
+            // the adapter is back to the never-initialized contract (see
+            // `handshake_completed`). Otherwise a re-`initialize()` that
+            // fails, followed by a stray success on the old session during
+            // the supervisor's backoff, would promote to `Healthy` and stop
+            // the retries with no listener to carry tool changes.
+            self.handshake_completed.store(false, Ordering::SeqCst);
             *self.health.write().await = HealthStatus::Stopped;
             info!(url = %self.config.url, "HTTP MCP adapter shut down");
             Ok(())
@@ -3812,6 +3883,9 @@ mod tests {
     ///
     /// `issue_session` off simulates an upstream that came back stateless
     /// (no `Mcp-Session-Id` on `initialize`, and requests must NOT carry one).
+    /// `discover_2026` makes `server/discover` answer as a 2026 stateless
+    /// upstream (the adapter then skips `initialize` entirely) instead of the
+    /// default legacy method-not-found.
     /// `init_delay_ms` holds every `initialize` response for that long so a
     /// test can act while a handshake is in flight; `init_count` is bumped
     /// when the handshake STARTS so the test can detect that window.
@@ -3833,6 +3907,7 @@ mod tests {
         accepting: Arc<AtomicBool>,
         issue_session: Arc<AtomicBool>,
         session_on_arrival: Arc<AtomicBool>,
+        discover_2026: Arc<AtomicBool>,
         init_delay_ms: Arc<AtomicU64>,
         init_count: Arc<AtomicU64>,
         get_count: Arc<AtomicU64>,
@@ -3884,6 +3959,7 @@ mod tests {
             accepting: Arc::new(AtomicBool::new(true)),
             issue_session: Arc::new(AtomicBool::new(true)),
             session_on_arrival: Arc::new(AtomicBool::new(false)),
+            discover_2026: Arc::new(AtomicBool::new(false)),
             init_delay_ms: Arc::new(AtomicU64::new(0)),
             init_count: Arc::new(AtomicU64::new(0)),
             get_count: Arc::new(AtomicU64::new(0)),
@@ -3943,6 +4019,19 @@ mod tests {
             if fx.hold_discover.swap(false, Ordering::SeqCst) {
                 fx.started.notify_one();
                 fx.release.notified().await;
+            }
+            if fx.discover_2026.load(Ordering::SeqCst) {
+                return Json(json!({
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "protocolVersion": "2026-07-28",
+                        "capabilities": {"tools": {"listChanged": true}},
+                        "serverInfo": {"name": "fake-http-2026", "version": "0.0.0"},
+                        "tools": []
+                    },
+                    "id": id,
+                }))
+                .into_response();
             }
             // Legacy upstream: the probe is unknown.
             return Json(json!({
@@ -5321,6 +5410,187 @@ mod tests {
         assert_eq!(fx.discover_count.load(Ordering::SeqCst), 2);
         assert_eq!(drain_ticks(&mut rx), 1, "exactly one tick per recovery");
         assert_eq!(adapter.crash_tracker.lock().await.consecutive_failures, 0);
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 6, Copilot): the supervisor must not carry a
+    /// dialect-probe result across its `handshake_lock` wait. A 2026 result
+    /// selects the stateless path, which sends nothing fresh to the upstream
+    /// in `complete_handshake`: if the upstream went away (or another
+    /// handshake re-demoted the adapter) while the attempt waited for the
+    /// lock, the stale probe would still commit `Healthy` and consume the
+    /// reconnect permit. The probe now runs under the lock, so it observes
+    /// the upstream as it is when the attempt actually proceeds.
+    #[tokio::test]
+    async fn dialect_probe_runs_under_handshake_lock() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initial handshake");
+        use_fast_backoff(&adapter).await;
+        assert_eq!(fx.discover_count.load(Ordering::SeqCst), 1);
+
+        // From now on the upstream answers the probe as a 2026 server.
+        fx.discover_2026.store(true, Ordering::SeqCst);
+        // Hold the handshake lock exactly as a caller-owned `initialize()`
+        // would, then demote: the attempt backs off and queues on the lock.
+        let held = adapter.handshake_lock.lock().await;
+        demote_via_transport_failures(&adapter).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+
+        // The upstream dies while the attempt is waiting for the lock.
+        fx.accepting.store(false, Ordering::SeqCst);
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            matches!(adapter.health(), HealthStatus::Unhealthy(_)),
+            "a probe result from before the handshake-lock wait must not be committed once the upstream is unreachable"
+        );
+        assert_eq!(
+            *adapter.upstream_dialect.read().await,
+            ProtocolVersion::V2025_03_26,
+            "no stale 2026 dialect may be published either"
+        );
+        assert!(
+            lock_slot(&adapter.reconnect_handle)
+                .as_ref()
+                .is_some_and(|h| !h.is_finished()),
+            "supervisor keeps retrying against the dead upstream"
+        );
+
+        // The upstream returns: the attempt probes it fresh and recovers.
+        fx.accepting.store(true, Ordering::SeqCst);
+        let recovered = wait_until(Duration::from_secs(5), || {
+            adapter.health() == HealthStatus::Healthy
+        })
+        .await;
+        assert!(recovered, "supervisor recovers once the upstream is back");
+        assert!(
+            adapter.upstream_dialect.read().await.is_2026(),
+            "the recovery used a probe taken under the lock"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 6, Copilot): the JIT credential lookup before
+    /// the `initialize` POST is an await window in which caller traffic can
+    /// recover the adapter. The attempt is still cancellable there (nothing
+    /// has reached the upstream), so it must re-check health after the
+    /// lookup instead of sending a redundant `initialize` that rotates the
+    /// recovered session. Deterministic via the test-only gate at that point.
+    #[tokio::test]
+    async fn recovery_during_credential_loading_sends_no_initialize() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        let gate = Arc::new(TestGate {
+            reached: Notify::new(),
+            release: Notify::new(),
+        });
+        adapter.handshake_send_gate = Some(gate.clone());
+        // Pre-arm one pass for the caller-owned handshake, then consume the
+        // `reached` permit it leaves behind so the supervisor's is distinct.
+        gate.release.notify_one();
+        adapter.initialize().await.expect("initial handshake");
+        gate.reached.notified().await;
+        use_fast_backoff(&adapter).await;
+        let mut rx = adapter.subscribe_tools_changed().unwrap();
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 1);
+
+        demote_via_transport_failures(&adapter).await;
+        tokio::time::timeout(Duration::from_secs(5), gate.reached.notified())
+            .await
+            .expect("supervisor attempt should reach the initialize send point");
+
+        // Caller traffic recovers the adapter while the attempt is parked
+        // right after its credential lookup.
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("live server answers");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        rx.try_recv().expect("one reactive recovery tick");
+
+        gate.release.notify_one();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            1,
+            "an attempt obsoleted during credential loading must not send initialize"
+        );
+        assert_eq!(
+            adapter.session_id.read().await.as_deref(),
+            Some("sess-1"),
+            "the recovered session must not be rotated"
+        );
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert!(rx.try_recv().is_err(), "exactly one tick per recovery");
+        assert!(
+            lock_slot(&adapter.reconnect_handle)
+                .as_ref()
+                .is_some_and(|h| !h.is_finished()),
+            "supervisor keeps waiting for the next demotion"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 6, Copilot): `shutdown()` tears the session
+    /// listener down, so it must also clear `handshake_completed`. Otherwise
+    /// a re-`initialize()` that fails (upstream down) leaves the supervisor
+    /// retrying while a stray success on the OLD session — which the
+    /// upstream may still honour — would promote the adapter to `Healthy`
+    /// through `note_request_success` and stop the retries, with no listener
+    /// to carry server-initiated tool changes until another restart.
+    #[tokio::test]
+    async fn stale_success_after_shutdown_does_not_promote_without_handshake() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initial handshake");
+        adapter.shutdown().await.unwrap();
+        use_fast_backoff(&adapter).await;
+
+        fx.accepting.store(false, Ordering::SeqCst);
+        adapter
+            .initialize()
+            .await
+            .expect_err("re-initialize fails while the upstream is down");
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+        let gets_before = fx.get_count.load(Ordering::SeqCst);
+
+        // A request on the old session succeeds during the supervisor's
+        // backoff (the reactive path such a success drives).
+        adapter.note_request_success().await;
+        assert!(
+            matches!(adapter.health(), HealthStatus::Unhealthy(_)),
+            "a request success after shutdown must not promote an adapter whose handshake never respawned the listener"
+        );
+        assert!(
+            !adapter.handshake_completed.load(Ordering::SeqCst),
+            "shutdown returns the adapter to the never-initialized contract"
+        );
+
+        // Recovery still comes from a real handshake, which respawns the
+        // GET listener.
+        fx.accepting.store(true, Ordering::SeqCst);
+        let recovered = wait_until(Duration::from_secs(5), || {
+            adapter.health() == HealthStatus::Healthy
+        })
+        .await;
+        assert!(recovered, "supervisor recovers once the upstream is back");
+        let listener_respawned = wait_until(Duration::from_secs(5), || {
+            fx.get_count.load(Ordering::SeqCst) > gets_before
+        })
+        .await;
+        assert!(
+            listener_respawned,
+            "the supervisor's handshake respawned the GET listener"
+        );
+        assert!(adapter.handshake_completed.load(Ordering::SeqCst));
 
         adapter.shutdown().await.unwrap();
         server.abort();
