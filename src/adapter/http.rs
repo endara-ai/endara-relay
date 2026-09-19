@@ -1200,6 +1200,11 @@ impl HttpAdapter {
     /// upstreams). Shared by the legacy and 2026 initialize paths. Any
     /// previous listener (from a connection that has since died) is aborted
     /// first so a reconnect never leaves two streams open.
+    ///
+    /// The listener authenticates from `HttpConfig::headers`, not from
+    /// `self.client`: the request client's per-request timeout would tear the
+    /// long-lived stream down, so the listener builds its own client and the
+    /// OAuth wrapper mirrors its bearer into the config headers.
     async fn spawn_get_listener(&self) {
         let url = self.config.url.clone();
         let headers = self.config.headers.clone();
@@ -1313,7 +1318,20 @@ impl HttpAdapter {
     ///   session, so the attempt runs to completion: on success the returned
     ///   session replaces the stored one; on failure
     ///   [`Self::set_handshake_unhealthy`] refuses to overwrite a health
-    ///   state that is no longer `Unhealthy`.
+    ///   state that is no longer `Unhealthy`. The last health check sits
+    ///   directly before the `initialize` POST with no await between them;
+    ///   the residual window (a caller's success on another worker) is
+    ///   inherent unless the `health` lock were held across network I/O, and
+    ///   it is harmless because the attempt commits exactly the session the
+    ///   upstream handed it.
+    /// * A NEWER demotion that lands while `initialize` is in flight is not
+    ///   tracked by a generation: a handshake that then succeeds is the most
+    ///   recent evidence and promotes to `Healthy`. Its reconnect permit is
+    ///   consumed by a pass that finds the adapter `Healthy` and stands
+    ///   down, and since health IS `Healthy` again the next threshold
+    ///   crossing demotes and re-arms — no interleaving leaves the adapter
+    ///   `Unhealthy` with nothing retrying (pinned by
+    ///   `demotion_during_inflight_handshake_promotes_and_keeps_retrying`).
     ///
     /// The `tools_changed` tick is owned by whichever path performs the
     /// actual `Unhealthy → Healthy` flip (the handshake does it under the
@@ -4343,6 +4361,118 @@ mod tests {
             .call_tool("x", json!({}))
             .await
             .expect("post-handshake request carries the current session id");
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 4, Copilot): a NEW demotion lands while the
+    /// supervisor's `initialize` is already on the wire (the adapter had
+    /// recovered reactively in between, so the attempt is obsolete but must
+    /// run to completion). There is no generation to compare: the handshake
+    /// that then succeeds is the newest evidence about the upstream, and it
+    /// promotes to `Healthy` on the session the upstream just issued. The
+    /// newer demotion's reconnect permit is not lost — it is consumed by a
+    /// supervisor pass that finds the adapter `Healthy` and stands down — and
+    /// because health is `Healthy` again the next threshold crossing demotes
+    /// and re-arms as usual, so no outage can leave the adapter `Unhealthy`
+    /// with nothing retrying. Pins that contract deterministically.
+    #[tokio::test]
+    async fn demotion_during_inflight_handshake_promotes_and_keeps_retrying() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        use_fast_backoff(&adapter).await;
+        let mut rx = adapter.subscribe_tools_changed().expect("Some receiver");
+
+        fx.hold_init.store(true, Ordering::SeqCst);
+        demote_via_transport_failures(&adapter).await;
+        tokio::time::timeout(Duration::from_secs(5), fx.started.notified())
+            .await
+            .expect("supervisor handshake should have started");
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 2);
+
+        // Reactive recovery on the still-honoured `sess-1` makes the parked
+        // attempt obsolete ...
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("live upstream answers on the old session");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert_eq!(drain_ticks(&mut rx), 1, "reactive recovery ticks once");
+
+        // ... and a NEWER outage demotes again while that attempt is still
+        // parked at the upstream. Its permit is stored on `reconnect_notify`.
+        demote_via_transport_failures(&adapter).await;
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            2,
+            "the supervisor is inside the parked attempt; no second handshake starts"
+        );
+
+        // The parked handshake completes: it promotes on the session the
+        // upstream just issued (one flip, one tick) and resets the backoff.
+        fx.release.notify_one();
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                adapter.health() == HealthStatus::Healthy
+                    && adapter
+                        .crash_tracker
+                        .try_lock()
+                        .map(|t| t.consecutive_failures == 0)
+                        .unwrap_or(false)
+            })
+            .await,
+            "the in-flight handshake promotes to Healthy"
+        );
+        assert_eq!(
+            adapter.session_id.read().await.as_deref(),
+            Some("sess-2"),
+            "the promoted state is the session the upstream actually issued"
+        );
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("post-handshake request carries the current session id");
+        assert_eq!(adapter.transport_failures.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            drain_ticks(&mut rx),
+            1,
+            "the handshake's flip ticks exactly once"
+        );
+
+        // The stored permit only makes the supervisor look, see `Healthy`,
+        // and go back to waiting — it never handshakes on a Healthy adapter.
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                lock_slot(&adapter.reconnect_handle)
+                    .as_ref()
+                    .is_some_and(|h| !h.is_finished())
+            })
+            .await,
+            "supervisor keeps running"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            2,
+            "no redundant handshake after the stale permit"
+        );
+
+        // A later outage is not silently swallowed: the threshold crossing
+        // demotes (health was Healthy) and re-arms the supervisor, which
+        // recovers on its own.
+        demote_via_transport_failures(&adapter).await;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                adapter.health() == HealthStatus::Healthy
+                    && fx.init_count.load(Ordering::SeqCst) == 3
+            })
+            .await,
+            "the next demotion still drives a supervisor recovery"
+        );
+        assert_eq!(drain_ticks(&mut rx), 1, "that recovery ticks once");
+        assert_eq!(adapter.session_id.read().await.as_deref(), Some("sess-3"));
 
         adapter.shutdown().await.unwrap();
         server.abort();

@@ -359,6 +359,15 @@ impl OAuthAdapterInner {
     /// (tool-call completed/failed, handshake logging) carry the
     /// `endpoint`/`transport="oauth"` fields and reach the per-server Logs
     /// tab. Every rebuild (token swap) shares the same span.
+    ///
+    /// The bearer is ALSO placed in `HttpConfig::headers`: the inner
+    /// adapter's long-lived `GET` listener (server-initiated
+    /// `tools/list_changed`) builds its own client from those headers — it
+    /// cannot share the request client, whose per-request timeout would
+    /// tear the stream down — so an authenticated upstream would otherwise
+    /// answer the listener 401 and notifications would never arrive
+    /// (PR #163 review). The inner adapter is rebuilt on every token swap,
+    /// so the two copies never diverge.
     fn build_inner_adapter(
         url: &str,
         access_token: &str,
@@ -366,6 +375,7 @@ impl OAuthAdapterInner {
         endpoint_name: String,
         span: tracing::Span,
     ) -> HttpAdapter {
+        let bearer = format!("Bearer {}", access_token);
         let client = Client::builder()
             .timeout(Duration::from_secs(30))
             .default_headers({
@@ -376,9 +386,7 @@ impl OAuthAdapterInner {
                         "application/json, text/event-stream",
                     ),
                 );
-                if let Ok(val) =
-                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", access_token))
-                {
+                if let Ok(val) = reqwest::header::HeaderValue::from_str(&bearer) {
                     headers.insert(reqwest::header::AUTHORIZATION, val);
                 }
                 headers
@@ -388,6 +396,9 @@ impl OAuthAdapterInner {
         let mut http_config = HttpConfig::new(url);
         http_config.server_type_override = server_type_override;
         http_config.endpoint_name = endpoint_name;
+        http_config
+            .headers
+            .insert(reqwest::header::AUTHORIZATION.as_str().to_string(), bearer);
         HttpAdapter::new_with_client_inner(http_config, client, span)
     }
 
@@ -4270,6 +4281,128 @@ mod tests {
             ),
             "no inner adapter: nothing to mirror, the verdict stands"
         );
+    }
+
+    /// PR #163 review (round 4, Copilot): the inner adapter's `GET` listener
+    /// builds its own client from `HttpConfig::headers`, so the bearer that
+    /// only lived in the prebuilt request client never reached the stream —
+    /// an authenticated upstream answered it 401 and server-initiated
+    /// `tools/list_changed` never arrived. The wrapper now mirrors the bearer
+    /// into the config headers; the fixture's `GET` rejects anything but
+    /// `Bearer first` and the notification must reach the outer subscriber.
+    #[tokio::test]
+    async fn get_listener_carries_bearer_and_delivers_list_changed() {
+        use axum::http::{header, StatusCode};
+        use axum::response::sse::{Event, KeepAlive, Sse};
+        use axum::{response::IntoResponse, routing::any, Json, Router};
+        use serde_json::{json, Value};
+        use std::convert::Infallible;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::{mpsc, Notify};
+
+        #[derive(Clone)]
+        struct Fx {
+            authorized_gets: Arc<AtomicUsize>,
+            unauthorized_gets: Arc<AtomicUsize>,
+            emit: Arc<Notify>,
+        }
+
+        async fn handle(
+            axum::extract::State(fx): axum::extract::State<Fx>,
+            req: axum::extract::Request,
+        ) -> axum::response::Response {
+            if req.method() == axum::http::Method::GET {
+                let bearer = req
+                    .headers()
+                    .get(header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok());
+                if bearer != Some("Bearer first") {
+                    fx.unauthorized_gets.fetch_add(1, Ordering::SeqCst);
+                    return (StatusCode::UNAUTHORIZED, "no bearer on GET").into_response();
+                }
+                fx.authorized_gets.fetch_add(1, Ordering::SeqCst);
+                let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(8);
+                let emit = fx.emit.clone();
+                tokio::spawn(async move {
+                    emit.notified().await;
+                    let _ = tx
+                        .send(Ok(Event::default().data(
+                            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}",
+                        )))
+                        .await;
+                    tx.closed().await;
+                });
+                return Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+                    .keep_alive(KeepAlive::default())
+                    .into_response();
+            }
+            let bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                .await
+                .unwrap_or_default();
+            let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            if body["method"] == "initialize" {
+                return Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {"tools": {"listChanged": true}},
+                        "serverInfo": {"name": "test-server", "version": "0.0.1"},
+                    },
+                }))
+                .into_response();
+            }
+            Json(json!({"jsonrpc": "2.0", "id": id, "result": {}})).into_response()
+        }
+
+        let fx = Fx {
+            authorized_gets: Arc::new(AtomicUsize::new(0)),
+            unauthorized_gets: Arc::new(AtomicUsize::new(0)),
+            emit: Arc::new(Notify::new()),
+        };
+        let router = Router::new()
+            .route("/mcp", any(handle))
+            .with_state(fx.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+
+        let mut config = make_config();
+        config.url = format!("http://127.0.0.1:{}/mcp", addr.port());
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+        adapter.inner.apply_tokens(make_token_set("first")).await;
+        assert!(adapter.inner.inner_adapter.read().await.is_some());
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while fx.authorized_gets.load(Ordering::SeqCst) == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            fx.unauthorized_gets.load(Ordering::SeqCst),
+            0,
+            "the GET listener must present the bearer"
+        );
+        assert_eq!(
+            fx.authorized_gets.load(Ordering::SeqCst),
+            1,
+            "the authenticated GET stream is open"
+        );
+
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+        drain(&mut outer_rx).await;
+        fx.emit.notify_one();
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_secs(2)).await,
+            "list_changed from the authenticated GET stream reaches the outer subscriber"
+        );
+
+        server.abort();
     }
 
     #[tokio::test]
