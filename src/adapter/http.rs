@@ -904,7 +904,8 @@ impl HttpAdapter {
     /// supervisor would never respawn it — server-initiated
     /// `notifications/tools/list_changed` would then be missed until the
     /// next handshake. So a listener that is no longer alive is respawned
-    /// here, BEFORE the recovery tick (a live one is left alone, see
+    /// here, BEFORE the recovery tick (a live one is left alone, and a
+    /// handshake in flight owns the repair instead, see
     /// [`Self::respawn_get_listener_if_dead`]).
     ///
     /// A never-initialized adapter (see [`Self::handshake_completed`]) is not
@@ -935,12 +936,32 @@ impl HttpAdapter {
     /// one has exited (or none is installed). A listener that is still
     /// streaming is left untouched — [`Self::spawn_get_listener`] would abort
     /// it, and a healthy stream must not be cut just because a POST
-    /// recovered health. Liveness is read from the stored `JoinHandle`
-    /// under the slot lock; the spawn itself re-reads the current session
-    /// and JIT bearer, exactly like a handshake's spawn. Upstreams without a
-    /// server-initiated stream (404/405) get one extra `GET` per recovery,
-    /// which exits quietly as it did at handshake time.
+    /// recovered health. Upstreams without a server-initiated stream
+    /// (404/405) get one extra `GET` per recovery, which exits quietly as it
+    /// did at handshake time.
+    ///
+    /// The repair is serialized with the handshakes through
+    /// [`Self::handshake_lock`], held from the liveness read through the
+    /// spawn: otherwise a supervisor attempt already past its point of no
+    /// return could commit a newer session and its own listener between this
+    /// path's session snapshot and its install, and the install would
+    /// replace that valid listener with one on the stale session while
+    /// health stays `Healthy`. The lock is only tried, never awaited — this
+    /// runs on the request path, and a handshake that holds the lock makes
+    /// the repair redundant either way: one that commits installs a fresh
+    /// listener at its commit, and a supervisor attempt that stands down
+    /// instead repairs the listener itself once it has released the lock
+    /// (see [`Self::run_supervisor`]). Liveness is read from the stored
+    /// `JoinHandle` under the slot lock; the spawn itself re-reads the
+    /// current session and JIT bearer, exactly like a handshake's spawn.
     async fn respawn_get_listener_if_dead(&self) {
+        let Ok(_handshake) = self.handshake_lock.try_lock() else {
+            debug!(
+                url = %self.config.url,
+                "reactive recovery: a handshake is in flight; leaving the GET listener to it"
+            );
+            return;
+        };
         let dead = lock_slot(&self.listener_handle)
             .as_ref()
             .is_none_or(JoinHandle::is_finished);
@@ -1567,6 +1588,16 @@ impl HttpAdapter {
                 _ = self.reconnect_notify.notified() => {}
             }
 
+            // Every exit of the attempt loop other than a completed
+            // handshake is a stand-down: a caller's request recovered the
+            // adapter reactively. That flip repairs an exited GET listener
+            // itself unless a handshake held `handshake_lock` at the time,
+            // in which case it deferred the repair to the lock holder (see
+            // `respawn_get_listener_if_dead`). A completed handshake installs
+            // a fresh listener at its commit; an attempt that stood down
+            // installed nothing, so the repair runs here once the lock is
+            // released — a no-op if the flip already did it.
+            let mut handshake_completed = false;
             'attempt: loop {
                 // `notify_waiters` only reaches `Notified` futures that
                 // already exist, so register before checking health.
@@ -1671,6 +1702,7 @@ impl HttpAdapter {
                 match outcome {
                     Ok(HandshakeOutcome::Completed) => {
                         info!(url = %self.config.url, "HTTP reconnect succeeded");
+                        handshake_completed = true;
                         break;
                     }
                     Ok(HandshakeOutcome::Obsolete) => {
@@ -1682,6 +1714,9 @@ impl HttpAdapter {
                         warn!(url = %self.config.url, error = %e, "HTTP reconnect attempt failed");
                     }
                 }
+            }
+            if !handshake_completed {
+                self.respawn_get_listener_if_dead().await;
             }
         }
     }
@@ -4092,6 +4127,8 @@ mod tests {
         init_delay_ms: Arc<AtomicU64>,
         init_count: Arc<AtomicU64>,
         get_count: Arc<AtomicU64>,
+        /// The `Mcp-Session-Id` each `GET` listener connected with, in order.
+        get_sessions: Arc<std::sync::Mutex<Vec<Option<String>>>>,
         get_stream: Arc<std::sync::atomic::AtomicU8>,
         tools_list_count: Arc<AtomicU64>,
         discover_count: Arc<AtomicU64>,
@@ -4174,6 +4211,7 @@ mod tests {
             init_delay_ms: Arc::new(AtomicU64::new(0)),
             init_count: Arc::new(AtomicU64::new(0)),
             get_count: Arc::new(AtomicU64::new(0)),
+            get_sessions: Arc::new(std::sync::Mutex::new(Vec::new())),
             get_stream: Arc::new(std::sync::atomic::AtomicU8::new(GET_STREAM_405)),
             tools_list_count: Arc::new(AtomicU64::new(0)),
             discover_count: Arc::new(AtomicU64::new(0)),
@@ -4209,6 +4247,12 @@ mod tests {
     ) -> axum::response::Response {
         if req.method() != axum::http::Method::POST {
             if req.method() == axum::http::Method::GET {
+                fx.get_sessions.lock().unwrap().push(
+                    req.headers()
+                        .get("mcp-session-id")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.to_string()),
+                );
                 fx.get_count.fetch_add(1, Ordering::SeqCst);
                 match fx.get_stream.load(Ordering::SeqCst) {
                     GET_STREAM_EMIT_THEN_END => return supervisor_fixture_get_stream(false),
@@ -5102,8 +5146,164 @@ mod tests {
         server.abort();
     }
 
-    /// Guard for the respawn above: a listener that is still streaming is
-    /// left alone — `spawn_get_listener` would abort it, and a POST that
+    /// Shared start of the two repair-vs-handshake regressions below: an
+    /// initialized adapter whose `GET` listener has connected on `sess-1`
+    /// and then exited (the upstream ended the stream), with the fast
+    /// backoff so the supervisor's next attempt is immediate.
+    async fn adapter_with_exited_get_listener(
+        url: String,
+        fx: &SupervisorFixture,
+    ) -> (HttpAdapter, broadcast::Receiver<()>) {
+        fx.serve_get_stream(GET_STREAM_EMIT_THEN_END);
+        let (adapter, rx) = adapter_with_connected_get_listener(url).await;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                lock_slot(&adapter.listener_handle)
+                    .as_ref()
+                    .is_some_and(JoinHandle::is_finished)
+            })
+            .await,
+            "the listener exits when the upstream stream ends"
+        );
+        assert_eq!(fx.get_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fx.get_sessions.lock().unwrap().as_slice(),
+            [Some("sess-1".to_string())]
+        );
+        use_fast_backoff(&adapter).await;
+        (adapter, rx)
+    }
+
+    /// PR #163 review (round 6d, Copilot): the reactive listener repair must
+    /// not race a handshake commit. A supervisor attempt past its point of
+    /// no return (its `initialize` POST is in flight) is about to commit a
+    /// newer session and its own listener; a repair that snapshots the old
+    /// session in that window and installs after the commit would replace
+    /// the valid listener with one on the stale session while health stays
+    /// `Healthy`. With the handshake holding `handshake_lock`, the flip
+    /// defers the repair: no listener is spawned on the old session, and the
+    /// one listener installed is the handshake's, on the newer session.
+    #[tokio::test]
+    async fn reactive_repair_defers_to_inflight_handshake_commit() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let (mut adapter, mut rx) = adapter_with_exited_get_listener(url, &fx).await;
+
+        // Park the reconnect's `initialize` at the upstream: the attempt
+        // holds `handshake_lock` and will commit `sess-2` once released.
+        fx.hold_init.store(true, Ordering::SeqCst);
+        demote_via_transport_failures(&adapter).await;
+        tokio::time::timeout(Duration::from_secs(5), fx.started.notified())
+            .await
+            .expect("supervisor handshake should have started");
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 2);
+        drain_ticks(&mut rx);
+
+        // The upstream still honours `sess-1` until the held initialize
+        // completes: a caller's request recovers the adapter reactively.
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("live upstream answers on the old session");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert_eq!(drain_ticks(&mut rx), 1, "reactive recovery ticks once");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            fx.get_count.load(Ordering::SeqCst),
+            1,
+            "a repair racing an in-flight handshake commit must be deferred to the handshake"
+        );
+
+        fx.release.notify_one();
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                fx.get_count.load(Ordering::SeqCst) == 2
+            })
+            .await,
+            "the handshake installs the listener at its commit"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            adapter.session_id.read().await.as_deref(),
+            Some("sess-2"),
+            "the handshake committed the newer session"
+        );
+        assert_eq!(
+            fx.get_sessions.lock().unwrap().as_slice(),
+            [Some("sess-1".to_string()), Some("sess-2".to_string())],
+            "exactly one listener is installed after the recovery, on the newer session"
+        );
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert_eq!(
+            drain_ticks(&mut rx),
+            1,
+            "the newer listener relays the push"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// Guard for the deferral above: a handshake that holds the lock but
+    /// then STANDS DOWN (the reactive recovery obsoleted it before its point
+    /// of no return) installs no listener, so the supervisor must run the
+    /// repair the flip deferred to it — otherwise the listener stays dead
+    /// until the next outage, the exact gap the reactive repair closes.
+    #[tokio::test]
+    async fn stood_down_supervisor_runs_the_deferred_listener_repair() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let (mut adapter, mut rx) = adapter_with_exited_get_listener(url, &fx).await;
+
+        // Park the reconnect's dialect probe: the attempt holds
+        // `handshake_lock` while still cancellable.
+        fx.hold_discover.store(true, Ordering::SeqCst);
+        demote_via_transport_failures(&adapter).await;
+        tokio::time::timeout(Duration::from_secs(5), fx.started.notified())
+            .await
+            .expect("supervisor probe should have started");
+        drain_ticks(&mut rx);
+
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("live upstream answers");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert_eq!(drain_ticks(&mut rx), 1, "reactive recovery ticks once");
+
+        // The attempt stands down on the recovery signal and, once it has
+        // released the lock, repairs the listener it was left in charge of.
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                fx.get_count.load(Ordering::SeqCst) == 2
+            })
+            .await,
+            "a stood-down supervisor must respawn the exited listener the flip deferred to it"
+        );
+        fx.release.notify_one();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            1,
+            "the listener is repaired without a handshake"
+        );
+        assert_eq!(
+            fx.get_sessions.lock().unwrap().as_slice(),
+            [Some("sess-1".to_string()), Some("sess-1".to_string())],
+            "the repaired listener is on the session the adapter recovered on"
+        );
+        assert_eq!(adapter.session_id.read().await.as_deref(), Some("sess-1"));
+        assert_eq!(
+            drain_ticks(&mut rx),
+            1,
+            "the repaired listener relays the push"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// Guard for `reactive_recovery_respawns_exited_get_listener`: a
+    /// listener that is still streaming is left alone —
+    /// `spawn_get_listener` would abort it, and a POST that
     /// recovers health is no reason to cut a healthy server-push stream.
     #[tokio::test]
     async fn reactive_recovery_keeps_live_get_listener() {
