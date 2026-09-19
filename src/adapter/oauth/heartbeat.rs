@@ -261,11 +261,33 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
                 let healthy_verdict = matches!(action, ProbeAction::MarkHealthy);
                 let became_healthy =
                     apply_probe_action(&adapter, action, threshold, &oauth_state, generation).await;
-                // A healthy commit acknowledges the inner recovery counter
-                // (the probe itself may have recovered the inner adapter);
-                // an advance it finds is a recovery whose tick is owed here.
-                let recovery_acked = healthy_verdict && adapter.ack_inner_recovery().await;
-                publish_recovery_tick_if_due(&adapter, became_healthy || recovery_acked);
+                // Only a CURRENT healthy commit publishes: it acknowledges
+                // the inner recovery counter (the probe itself may have
+                // recovered the inner adapter — an advance it finds is a
+                // recovery whose tick is owed here) and consumes a pending
+                // forwarder recovery. A failed verdict leaves the pending
+                // flag for the fresh probe behind it, and a verdict the
+                // lifecycle moved past mid-probe publishes nothing (see
+                // `settle_recovery_after_healthy_verdict`).
+                if !healthy_verdict {
+                    continue;
+                }
+                match adapter
+                    .settle_recovery_after_healthy_verdict(generation)
+                    .await
+                {
+                    Some(recovery_owed) => {
+                        if became_healthy || recovery_owed {
+                            let _ = adapter.outer_tools_changed_tx.send(());
+                        }
+                    }
+                    None => debug!(
+                        dispatched_generation = generation,
+                        result = "stale",
+                        "heartbeat probe succeeded but the lifecycle moved on \
+                         mid-probe; leaving any pending recovery for the apply"
+                    ),
+                }
             }
             TickAction::Recover => {
                 attempt_recovery(&adapter).await;
@@ -275,20 +297,19 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
     }
 }
 
-/// Publish the outer tools-changed invalidation the wrapper owes AFTER a
-/// probe verdict has been committed to `inner_health`. Fires at most once
-/// per call when either an inner recovery poke is pending
-/// (`RecoveryTickState::tick_pending`, raised by the forwarder instead of ticking
-/// itself) or the caller established that this commit owes a tick
-/// (`owed`: the probe flipped `inner_health` from `Unhealthy` to `Healthy`,
-/// or its healthy commit acknowledged an inner recovery the forwarder had
-/// not poked for — see [`OAuthAdapterInner::ack_inner_recovery`]). The
-/// flip condition covers a probe dispatched before the recovery that lands
-/// first with a stale failure: the pending flag is consumed by that stale
-/// commit, and the fresh probe right behind it still ticks when it clears
-/// the verdict. Ticking only here means the registry always rebuilds the
-/// catalog against the committed verdict, never against the one the probe
-/// is about to replace.
+/// Publish the outer tools-changed invalidation the wrapper owes on the
+/// paths that commit no probe verdict: a token apply that just returned to
+/// `Authenticated`, a heartbeat tick skipped in a genuine-auth terminal
+/// state, or a recovery attempt. Fires at most once per call when either an
+/// inner recovery poke is pending (`RecoveryTickState::tick_pending`,
+/// raised by the forwarder instead of ticking itself) or the caller
+/// established that it owes a tick anyway (`owed`). A probe verdict takes
+/// the pending flag through
+/// [`OAuthAdapterInner::settle_recovery_after_healthy_verdict`] instead,
+/// which only a current healthy commit may do — so the registry always
+/// rebuilds the catalog against a healthy committed verdict, never against
+/// a stale failure the fresh probe behind it is about to overturn, and
+/// never while the lifecycle is mid-apply.
 pub(super) fn publish_recovery_tick_if_due(adapter: &OAuthAdapterInner, owed: bool) {
     let pending = adapter.take_recovery_tick_pending();
     if pending || owed {

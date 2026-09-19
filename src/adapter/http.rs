@@ -176,9 +176,9 @@ pub struct HttpAdapter {
     /// (the endpoint would miss server-initiated tool changes). Otherwise
     /// the pre-existing reactive recovery semantics apply unchanged.
     handshake_completed: Arc<AtomicBool>,
-    /// Exponential-backoff state for the reconnect supervisor (1 s base, ×2,
-    /// 60 s cap — same escalation as the SSE adapter). Reset on every
-    /// successful handshake.
+    /// Exponential-backoff state for the reconnect supervisor (1 s base, ×2
+    /// per consecutive failure, 60 s cap — same escalation as the SSE
+    /// adapter). Reset on every successful handshake.
     crash_tracker: Arc<Mutex<CrashTracker>>,
     /// Handle for the background reconnect supervisor task spawned by
     /// [`Self::ensure_supervisor_running`]. Aborted on shutdown / drop.
@@ -878,7 +878,15 @@ impl HttpAdapter {
     ///
     /// The flip also fires [`Self::recovered_notify`] so a reconnect attempt
     /// the supervisor has in flight (but that has not yet sent `initialize`)
-    /// stands down instead of handshaking redundantly.
+    /// stands down instead of handshaking redundantly. Because the
+    /// supervisor stands down without a handshake, the flip must also repair
+    /// what an outage breaks besides health: the outage that demoted the
+    /// adapter usually ended the `GET` listener too, and a stood-down
+    /// supervisor would never respawn it — server-initiated
+    /// `notifications/tools/list_changed` would then be missed until the
+    /// next handshake. So a listener that is no longer alive is respawned
+    /// here, BEFORE the recovery tick (a live one is left alone, see
+    /// [`Self::respawn_get_listener_if_dead`]).
     ///
     /// A never-initialized adapter (see [`Self::handshake_completed`]) is not
     /// recovered here: a stray successful request proves the upstream is up,
@@ -898,8 +906,31 @@ impl HttpAdapter {
             }
         };
         if flipped {
+            self.respawn_get_listener_if_dead().await;
             self.recovered_notify.notify_waiters();
             let _ = self.tools_changed_tx.send(());
+        }
+    }
+
+    /// Respawn the `GET` listener after a reactive recovery iff the current
+    /// one has exited (or none is installed). A listener that is still
+    /// streaming is left untouched — [`Self::spawn_get_listener`] would abort
+    /// it, and a healthy stream must not be cut just because a POST
+    /// recovered health. Liveness is read from the stored `JoinHandle`
+    /// under the slot lock; the spawn itself re-reads the current session
+    /// and JIT bearer, exactly like a handshake's spawn. Upstreams without a
+    /// server-initiated stream (404/405) get one extra `GET` per recovery,
+    /// which exits quietly as it did at handshake time.
+    async fn respawn_get_listener_if_dead(&self) {
+        let dead = lock_slot(&self.listener_handle)
+            .as_ref()
+            .is_none_or(JoinHandle::is_finished);
+        if dead {
+            debug!(
+                url = %self.config.url,
+                "reactive recovery: GET listener is not alive; respawning it"
+            );
+            self.spawn_get_listener().await;
         }
     }
 
@@ -4004,7 +4035,11 @@ mod tests {
     /// when the request arrives, as a real server does) instead of the most
     /// recently answered one, so overlapping handshakes whose responses
     /// complete out of order leave the adapter on a session the upstream
-    /// has already replaced.
+    /// has already replaced. `get_stream` selects how `GET` is answered:
+    /// 405 (default), or an SSE stream that emits one
+    /// `notifications/tools/list_changed` and then either ends
+    /// ([`GET_STREAM_EMIT_THEN_END`], the listener sees the stream close as
+    /// it would in an outage) or stays open ([`GET_STREAM_EMIT_THEN_HOLD`]).
     #[derive(Clone)]
     struct SupervisorFixture {
         accepting: Arc<AtomicBool>,
@@ -4014,6 +4049,7 @@ mod tests {
         init_delay_ms: Arc<AtomicU64>,
         init_count: Arc<AtomicU64>,
         get_count: Arc<AtomicU64>,
+        get_stream: Arc<std::sync::atomic::AtomicU8>,
         tools_list_count: Arc<AtomicU64>,
         discover_count: Arc<AtomicU64>,
         current_session: Arc<std::sync::Mutex<Option<String>>>,
@@ -4041,10 +4077,39 @@ mod tests {
         MalformedBody,
     }
 
+    const GET_STREAM_405: u8 = 0;
+    const GET_STREAM_EMIT_THEN_END: u8 = 1;
+    const GET_STREAM_EMIT_THEN_HOLD: u8 = 2;
+
     impl SupervisorFixture {
         fn fail_init_with(&self, failure: Option<HeldInitFailure>) {
             *self.fail_init.lock().unwrap() = failure;
         }
+
+        fn serve_get_stream(&self, mode: u8) {
+            self.get_stream.store(mode, Ordering::SeqCst);
+        }
+    }
+
+    /// `GET` body for the non-405 `get_stream` modes: one
+    /// `notifications/tools/list_changed` event after a short delay, then
+    /// the stream ends or is held open until the client disconnects.
+    fn supervisor_fixture_get_stream(hold_open: bool) -> axum::response::Response {
+        let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(8);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx
+                .send(Ok(Event::default().data(
+                    "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}",
+                )))
+                .await;
+            if hold_open {
+                tx.closed().await;
+            }
+        });
+        Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+            .keep_alive(KeepAlive::default())
+            .into_response()
     }
 
     async fn start_supervisor_fixture() -> (String, SupervisorFixture, JoinHandle<()>) {
@@ -4066,6 +4131,7 @@ mod tests {
             init_delay_ms: Arc::new(AtomicU64::new(0)),
             init_count: Arc::new(AtomicU64::new(0)),
             get_count: Arc::new(AtomicU64::new(0)),
+            get_stream: Arc::new(std::sync::atomic::AtomicU8::new(GET_STREAM_405)),
             tools_list_count: Arc::new(AtomicU64::new(0)),
             discover_count: Arc::new(AtomicU64::new(0)),
             current_session: Arc::new(std::sync::Mutex::new(None)),
@@ -4101,6 +4167,11 @@ mod tests {
         if req.method() != axum::http::Method::POST {
             if req.method() == axum::http::Method::GET {
                 fx.get_count.fetch_add(1, Ordering::SeqCst);
+                match fx.get_stream.load(Ordering::SeqCst) {
+                    GET_STREAM_EMIT_THEN_END => return supervisor_fixture_get_stream(false),
+                    GET_STREAM_EMIT_THEN_HOLD => return supervisor_fixture_get_stream(true),
+                    _ => {}
+                }
             }
             return (StatusCode::METHOD_NOT_ALLOWED, "").into_response();
         }
@@ -4895,6 +4966,137 @@ mod tests {
                 .as_ref()
                 .is_some_and(|h| !h.is_finished()),
             "supervisor keeps waiting for the next demotion"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// Wait for at least one tick, then absorb any that arrive right behind
+    /// it. Returns how many were seen in total (0 when none arrived in time).
+    async fn recv_ticks(rx: &mut broadcast::Receiver<()>, timeout: Duration) -> usize {
+        let first = matches!(
+            tokio::time::timeout(timeout, rx.recv()).await,
+            Ok(Ok(())) | Ok(Err(broadcast::error::RecvError::Lagged(_)))
+        );
+        if !first {
+            return 0;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        1 + drain_ticks(rx)
+    }
+
+    /// Initialize against an upstream that serves a `GET` stream and wait for
+    /// the handshake's listener to relay the stream's first push, proving
+    /// the listener is connected. Returns the adapter and its subscriber.
+    async fn adapter_with_connected_get_listener(
+        url: String,
+    ) -> (HttpAdapter, broadcast::Receiver<()>) {
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        let mut rx = adapter.subscribe_tools_changed().expect("Some receiver");
+        adapter.initialize().await.expect("initialize succeeds");
+        assert!(
+            recv_ticks(&mut rx, Duration::from_secs(5)).await >= 1,
+            "the handshake's GET listener relays the upstream's push"
+        );
+        // Backoff long enough that the supervisor cannot handshake (and so
+        // respawn the listener itself) before the reactive recovery lands.
+        *adapter.crash_tracker.lock().await =
+            CrashTracker::new_test(Duration::from_secs(30), usize::MAX, Duration::from_secs(60));
+        (adapter, rx)
+    }
+
+    /// PR #163 review (round 6c, Copilot): the outage that demotes the
+    /// adapter usually ends the `GET` listener too. A reactive recovery
+    /// flips health and stands the supervisor down without a handshake, so
+    /// nothing would respawn the listener — later server-initiated
+    /// `tools/list_changed` pushes would be missed until the next handshake.
+    /// The flip must respawn an exited listener (before its recovery tick).
+    #[tokio::test]
+    async fn reactive_recovery_respawns_exited_get_listener() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        fx.serve_get_stream(GET_STREAM_EMIT_THEN_END);
+        let (mut adapter, mut rx) = adapter_with_connected_get_listener(url).await;
+        // The upstream ends the stream right after its push: the listener
+        // exits exactly as it does when the upstream goes away.
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                lock_slot(&adapter.listener_handle)
+                    .as_ref()
+                    .is_some_and(JoinHandle::is_finished)
+            })
+            .await,
+            "the listener exits when the upstream stream ends"
+        );
+        assert_eq!(fx.get_count.load(Ordering::SeqCst), 1);
+
+        demote_via_transport_failures(&adapter).await;
+        drain_ticks(&mut rx);
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("live upstream answers");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                fx.get_count.load(Ordering::SeqCst) == 2
+            })
+            .await,
+            "a reactive recovery must respawn the exited GET listener"
+        );
+        assert!(
+            recv_ticks(&mut rx, Duration::from_secs(5)).await >= 2,
+            "both the recovery tick and the respawned listener's relayed push are observed"
+        );
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            1,
+            "the listener is respawned without a redundant handshake"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// Guard for the respawn above: a listener that is still streaming is
+    /// left alone — `spawn_get_listener` would abort it, and a POST that
+    /// recovers health is no reason to cut a healthy server-push stream.
+    #[tokio::test]
+    async fn reactive_recovery_keeps_live_get_listener() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        fx.serve_get_stream(GET_STREAM_EMIT_THEN_HOLD);
+        let (mut adapter, mut rx) = adapter_with_connected_get_listener(url).await;
+        assert!(
+            lock_slot(&adapter.listener_handle)
+                .as_ref()
+                .is_some_and(|h| !h.is_finished()),
+            "the listener is streaming"
+        );
+
+        demote_via_transport_failures(&adapter).await;
+        drain_ticks(&mut rx);
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("live upstream answers");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert_eq!(
+            recv_ticks(&mut rx, Duration::from_secs(2)).await,
+            1,
+            "only the recovery tick: no replacement stream pushes again"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            fx.get_count.load(Ordering::SeqCst),
+            1,
+            "a streaming GET listener must not be replaced by a reactive recovery"
+        );
+        assert!(
+            lock_slot(&adapter.listener_handle)
+                .as_ref()
+                .is_some_and(|h| !h.is_finished()),
+            "the original listener is still streaming"
         );
 
         adapter.shutdown().await.unwrap();

@@ -226,7 +226,8 @@ impl TokenPostOutcome {
 ///
 /// `acked_generation` is the inner [`HttpAdapter::recovery_generation`]
 /// whose invalidation the heartbeat has already published (with a
-/// `MarkHealthy` commit, see [`OAuthAdapterInner::ack_inner_recovery`]).
+/// current `MarkHealthy` commit, see
+/// [`OAuthAdapterInner::settle_recovery_after_healthy_verdict`]).
 /// `tick_pending` is raised by the forwarder, together with a probe poke,
 /// for a recovery the heartbeat has NOT acknowledged yet
 /// ([`OAuthAdapterInner::note_unacked_recovery`]); the heartbeat publishes
@@ -1811,7 +1812,7 @@ impl OAuthAdapterInner {
     /// heartbeat finds it set when the probe it triggers is applied, and
     /// publishes the invalidation after that commit. When it already has
     /// (its own probe performed the recovery and its `MarkHealthy` commit
-    /// ticked, see [`Self::ack_inner_recovery`]), the tick is simply
+    /// ticked, see [`Self::settle_recovery_after_healthy_verdict`]), the tick is simply
     /// dropped: a second probe would only publish the same recovery again.
     async fn poke_heartbeat_on_inner_recovery(&self, seen_recovery: &mut u64) -> bool {
         let current = self.inner_recovery_generation().await;
@@ -1870,22 +1871,49 @@ impl OAuthAdapterInner {
         self.lock_recovery_tick().tick_pending = pending;
     }
 
-    /// Acknowledge the inner adapter's current recovery generation on behalf
-    /// of a heartbeat `MarkHealthy` commit. Returns `true` when it advanced
-    /// past the last acknowledged one — the heartbeat then owes the outer
-    /// tick for that recovery (it may have performed it itself, with no
-    /// `inner_health` flip and no forwarder poke to publish it otherwise).
-    /// Failed verdicts never acknowledge, so a stale failure landing after
-    /// a recovery leaves it for the forwarder's corrective poke.
-    pub(super) async fn ack_inner_recovery(&self) -> bool {
+    /// Settle the recovery-tick accounting on behalf of a heartbeat
+    /// `MarkHealthy` commit: acknowledge the inner adapter's current recovery
+    /// generation and take the pending recovery tick, if any. Returns
+    /// `Some(true)` when the commit owes an outer tick — the generation
+    /// advanced past the last acknowledged one (the probe may have performed
+    /// the recovery itself, with no `inner_health` flip and no forwarder
+    /// poke to publish it otherwise) or a forwarder had raised the pending
+    /// flag — `Some(false)` when it owes nothing, and `None` when the verdict
+    /// is STALE: the lifecycle is no longer `Authenticated` or its generation
+    /// moved since the probe was dispatched (a token apply began or ran
+    /// mid-probe). A stale verdict neither acknowledges nor consumes
+    /// anything: outer health derives to `Starting` while `Refreshing`, so
+    /// publishing now would let the registry cache the tools as unavailable,
+    /// and the apply — which stays silent when its fingerprint probe is
+    /// unchanged or fails — could never correct it; the pending recovery is
+    /// left for `apply_tokens` to publish once the state is back to
+    /// `Authenticated`, or for the next current healthy verdict. Failed
+    /// verdicts never come here at all, so a stale failure landing after a
+    /// recovery leaves the pending flag for the fresh probe right behind it.
+    ///
+    /// The currency check and the accounting share one `state` read
+    /// critical section (the accounting lock is taken inside it, with no
+    /// await in between): every apply transitions under the `state` write
+    /// lock before it touches the accounting, so a verdict found current
+    /// here cannot be overtaken by an apply between its check and its take.
+    pub(super) async fn settle_recovery_after_healthy_verdict(
+        &self,
+        dispatched_generation: u64,
+    ) -> Option<bool> {
         let current = self.inner_recovery_generation().await;
-        let mut state = self.lock_recovery_tick();
-        if current > state.acked_generation {
-            state.acked_generation = current;
-            true
-        } else {
-            false
+        let state = self.state.read().await;
+        if *state != OAuthState::Authenticated
+            || self.lifecycle_generation.load(Ordering::Relaxed) != dispatched_generation
+        {
+            return None;
         }
+        let mut tick = self.lock_recovery_tick();
+        let acked = current > tick.acked_generation;
+        if acked {
+            tick.acked_generation = current;
+        }
+        let pending = std::mem::take(&mut tick.tick_pending);
+        Some(acked || pending)
     }
 
     /// Disconnect: abort refresh task, clear tokens, delete from disk, set
@@ -4712,6 +4740,136 @@ mod tests {
         assert!(
             !recv_tick(&mut rx, Duration::from_millis(400)).await,
             "a heartbeat ack racing the forwarder's check must not yield a second tick for one recovery"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 6c, Copilot): a probe dispatched BEFORE the
+    /// inner recovers lands after it with a failure verdict from the outage.
+    /// That stale failure must not consume the pending recovery: it would
+    /// publish an invalidation against the `Unhealthy` verdict it just
+    /// committed (the registry caches the tools as unavailable) and the
+    /// fresh probe right behind it would publish a second one. The pending
+    /// flag survives the stale failure and exactly one tick follows the
+    /// fresh healthy commit. Deterministic: the fixture parks both probes.
+    #[tokio::test]
+    async fn stale_failed_probe_does_not_consume_pending_recovery() {
+        let (mut adapter, fx, server) = armed_probe_adapter(1).await;
+        let mut rx = adapter.subscribe_tools_changed().unwrap();
+        drain(&mut rx).await;
+
+        // Dispatch a probe that parks at the upstream and will fail.
+        fx.hold_probe.store(true, Ordering::SeqCst);
+        fx.fail_probe.store(true, Ordering::SeqCst);
+        adapter.inner.probe_now.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), fx.probe_started.notified())
+            .await
+            .expect("the stale probe reaches the upstream");
+        fx.fail_probe.store(false, Ordering::SeqCst);
+
+        // The inner recovers while that probe is parked: the forwarder
+        // raises the pending recovery and its poke is stored.
+        recover_inner_for_real(&adapter).await;
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                adapter.inner.recovery_tick_pending()
+            })
+            .await,
+            "the forwarder raises the pending recovery"
+        );
+
+        // The stale failure lands (threshold 1 → Unhealthy); the stored poke
+        // dispatches the fresh probe, which parks in turn.
+        fx.probe_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), fx.probe_started.notified())
+            .await
+            .expect("the fresh probe reaches the upstream");
+        assert!(
+            matches!(adapter.health(), HealthStatus::Unhealthy(_)),
+            "the stale failure was committed"
+        );
+        assert!(
+            adapter.inner.recovery_tick_pending(),
+            "a stale failed probe must not consume the pending recovery"
+        );
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(200)).await,
+            "nothing is published against the stale unhealthy verdict"
+        );
+
+        // The fresh probe's healthy commit publishes the recovery — once.
+        fx.hold_probe.store(false, Ordering::SeqCst);
+        fx.probe_release.notify_one();
+        assert!(
+            recv_tick(&mut rx, Duration::from_secs(2)).await,
+            "the fresh healthy commit publishes the recovery"
+        );
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert!(!adapter.inner.recovery_tick_pending());
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "one recovery publishes one tick"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 6c, Copilot): a probe dispatched while
+    /// `Authenticated` finishes after a token apply moved the lifecycle to
+    /// `Refreshing`. Its healthy verdict is stale — outer health derives to
+    /// `Starting` mid-apply, and the apply stays silent when its fingerprint
+    /// probe is unchanged — so it must not consume the pending recovery and
+    /// publish it there. The flag survives and the apply's own
+    /// post-`Authenticated` tick publishes it. Deterministic: the fixture
+    /// parks the probe across the transition.
+    #[tokio::test]
+    async fn stale_healthy_probe_after_refreshing_does_not_consume_pending_recovery() {
+        let (mut adapter, fx, server) = armed_probe_adapter(1).await;
+        let mut rx = adapter.subscribe_tools_changed().unwrap();
+        drain(&mut rx).await;
+
+        // A probe dispatched in `Authenticated` parks at the upstream.
+        fx.hold_probe.store(true, Ordering::SeqCst);
+        adapter.inner.probe_now.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), fx.probe_started.notified())
+            .await
+            .expect("the probe reaches the upstream");
+        fx.hold_probe.store(false, Ordering::SeqCst);
+
+        // A token apply begins, and the old inner adapter's recovery reaches
+        // the forwarder while it is in flight.
+        adapter
+            .inner
+            .transition_to(OAuthState::Refreshing, "test: apply in flight")
+            .await;
+        adapter.inner.set_recovery_tick_pending(true);
+
+        // The parked probe lands with a healthy verdict — stale by lifecycle.
+        fx.probe_release.notify_one();
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "a stale healthy verdict must not publish while Refreshing (health derives to Starting)"
+        );
+        assert!(
+            adapter.inner.recovery_tick_pending(),
+            "a stale healthy verdict must not consume the pending recovery"
+        );
+
+        // The apply commits with the same tool set (no tick of its own): the
+        // deferred recovery still reaches the registry, once.
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Authenticated);
+        assert!(
+            recv_tick(&mut rx, Duration::from_secs(2)).await,
+            "the deferred recovery is published once the state is Authenticated"
+        );
+        assert!(!adapter.inner.recovery_tick_pending());
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "one deferred recovery publishes one tick"
         );
 
         adapter.shutdown().await.unwrap();

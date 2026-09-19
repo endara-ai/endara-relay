@@ -60,7 +60,7 @@ impl SseConfig {
 
 /// Crash tracking for exponential backoff. Shared with the plain HTTP
 /// adapter's reconnect supervisor (`super::http`), which reuses the same
-/// 1 s → 60 s escalation.
+/// escalation: 1, 1, 2, 4, 8, 16, 32 s, then held at the 60 s cap.
 #[derive(Debug)]
 pub(super) struct CrashTracker {
     timestamps: Vec<Instant>,
@@ -91,12 +91,17 @@ impl CrashTracker {
         self.timestamps.len() >= self.max_failures_in_window
     }
 
+    /// Capped exponential backoff for the current failure streak: the base
+    /// unit doubles from the second consecutive failure on (1, 1, 2, 4, 8,
+    /// 16, 32) and holds at 60× the base from the eighth failure onwards.
     pub(super) fn backoff_duration(&self) -> Duration {
         let multiplier = match self.consecutive_failures {
             0 | 1 => 1,
             2 => 2,
             3 => 4,
             4 => 8,
+            5 => 16,
+            6 => 32,
             _ => 60,
         };
         self.base_backoff.saturating_mul(multiplier)
@@ -1325,6 +1330,21 @@ mod tests {
         assert_eq!(tracker.backoff_duration(), Duration::from_secs(1));
         tracker.record_failure();
         assert_eq!(tracker.backoff_duration(), Duration::from_secs(2));
+    }
+
+    /// PR #163 review (round 6c, Copilot): the escalation is a capped
+    /// exponential — every step doubles until the 60 s cap, with no jump
+    /// from 8 s straight to the cap. Pins the full sequence the plain HTTP
+    /// supervisor (which has no attempt cap) walks through.
+    #[test]
+    fn test_crash_tracker_backoff_doubles_until_the_cap() {
+        let mut tracker = CrashTracker::new();
+        let mut observed = Vec::new();
+        for _ in 0..9 {
+            tracker.record_failure();
+            observed.push(tracker.backoff_duration().as_secs());
+        }
+        assert_eq!(observed, [1, 2, 4, 8, 16, 32, 60, 60, 60]);
     }
 
     #[test]
