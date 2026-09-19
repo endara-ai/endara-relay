@@ -163,6 +163,16 @@ pub struct HttpAdapter {
     /// [`Self::note_request_success`]) or proactively via the reconnect
     /// supervisor (see [`Self::run_supervisor`]).
     transport_failures: Arc<AtomicU64>,
+    /// Latched `true` by [`Self::mark_handshake_healthy`] the first time a
+    /// handshake (caller-owned or supervisor) commits. While it is still
+    /// `false` and health is `Unhealthy`, the adapter has never had a
+    /// session: [`Self::list_tools`] answers `Ok([])` without network I/O
+    /// (matching a `FailedAdapter`, so a dead upstream adds no connect
+    /// latency or error traffic to every catalog rebuild) and
+    /// [`Self::note_request_success`] never flips health to `Healthy` — only
+    /// a real handshake may do that. Never reset: after the first success the
+    /// pre-existing reactive recovery semantics apply unchanged.
+    handshake_completed: Arc<AtomicBool>,
     /// Exponential-backoff state for the reconnect supervisor (1 s base, ×2,
     /// 60 s cap — same escalation as the SSE adapter). Reset on every
     /// successful handshake.
@@ -331,6 +341,7 @@ impl HttpAdapter {
             upstream_dialect: Arc::new(RwLock::new(ProtocolVersion::V2025_03_26)),
             list_ttl_ms: Arc::new(RwLock::new(None)),
             transport_failures: Arc::new(AtomicU64::new(0)),
+            handshake_completed: Arc::new(AtomicBool::new(false)),
             crash_tracker: Arc::new(Mutex::new(CrashTracker::new())),
             reconnect_handle: Arc::new(StdMutex::new(None)),
             recovered_notify: Arc::new(Notify::new()),
@@ -367,6 +378,7 @@ impl HttpAdapter {
             upstream_dialect: self.upstream_dialect.clone(),
             list_ttl_ms: self.list_ttl_ms.clone(),
             transport_failures: self.transport_failures.clone(),
+            handshake_completed: self.handshake_completed.clone(),
             crash_tracker: self.crash_tracker.clone(),
             reconnect_handle: self.reconnect_handle.clone(),
             recovered_notify: self.recovered_notify.clone(),
@@ -735,11 +747,17 @@ impl HttpAdapter {
     /// The flip also fires [`Self::recovered_notify`] so a reconnect attempt
     /// the supervisor has in flight (but that has not yet sent `initialize`)
     /// stands down instead of handshaking redundantly.
+    ///
+    /// A never-initialized adapter (see [`Self::handshake_completed`]) is not
+    /// recovered here: a stray successful request proves the upstream is up,
+    /// but the adapter still has no session, so only a handshake may flip it.
     async fn note_request_success(&self) {
         let flipped = {
             let mut health = self.health.write().await;
             self.transport_failures.store(0, Ordering::SeqCst);
-            if matches!(*health, HealthStatus::Unhealthy(_)) {
+            if self.handshake_completed.load(Ordering::SeqCst)
+                && matches!(*health, HealthStatus::Unhealthy(_))
+            {
                 *health = HealthStatus::Healthy;
                 true
             } else {
@@ -1373,6 +1391,7 @@ impl HttpAdapter {
         let flipped = {
             let mut health = self.health.write().await;
             self.transport_failures.store(0, Ordering::SeqCst);
+            self.handshake_completed.store(true, Ordering::SeqCst);
             let was_unhealthy = matches!(*health, HealthStatus::Unhealthy(_));
             *health = HealthStatus::Healthy;
             was_unhealthy
@@ -1716,6 +1735,14 @@ impl McpAdapter for HttpAdapter {
 
     async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
         async {
+            // Never-initialized and down: answer like a `FailedAdapter` so a
+            // catalog rebuild neither waits on a dead upstream nor recovers
+            // the adapter without a session. The supervisor owns recovery.
+            if !self.handshake_completed.load(Ordering::SeqCst)
+                && matches!(*self.health.read().await, HealthStatus::Unhealthy(_))
+            {
+                return Ok(vec![]);
+            }
             let result = self.send_request("tools/list", None).await?;
             let tools_value = result
                 .get("tools")
@@ -3215,7 +3242,9 @@ mod tests {
         // GET 405 so the test doesn't depend on the SSE channel; POST returns ok.
         let (url, server) = start_fake_http_server(true).await;
         let adapter = HttpAdapter::new(HttpConfig::new(url));
-        // Simulate a prior run of transport failures that demoted the adapter.
+        // Simulate a prior handshake followed by a run of transport failures
+        // that demoted the adapter.
+        adapter.handshake_completed.store(true, Ordering::SeqCst);
         *adapter.health.write().await = HealthStatus::Unhealthy("upstream unreachable".into());
         adapter.transport_failures.store(5, Ordering::SeqCst);
 
@@ -3249,7 +3278,9 @@ mod tests {
         let (url, server) = start_fake_http_server(true).await;
         let adapter = HttpAdapter::new(HttpConfig::new(url));
         let mut rx = adapter.subscribe_tools_changed().expect("Some receiver");
-        // Simulate a prior run of transport failures that demoted the adapter.
+        // Simulate a prior handshake followed by a run of transport failures
+        // that demoted the adapter.
+        adapter.handshake_completed.store(true, Ordering::SeqCst);
         *adapter.health.write().await = HealthStatus::Unhealthy("upstream unreachable".into());
         adapter.transport_failures.store(5, Ordering::SeqCst);
 
@@ -3305,6 +3336,7 @@ mod tests {
         init_delay_ms: Arc<AtomicU64>,
         init_count: Arc<AtomicU64>,
         get_count: Arc<AtomicU64>,
+        tools_list_count: Arc<AtomicU64>,
         current_session: Arc<std::sync::Mutex<Option<String>>>,
         hold_discover: Arc<AtomicBool>,
         fail_init: Arc<AtomicBool>,
@@ -3329,6 +3361,7 @@ mod tests {
             init_delay_ms: Arc::new(AtomicU64::new(0)),
             init_count: Arc::new(AtomicU64::new(0)),
             get_count: Arc::new(AtomicU64::new(0)),
+            tools_list_count: Arc::new(AtomicU64::new(0)),
             current_session: Arc::new(std::sync::Mutex::new(None)),
             hold_discover: Arc::new(AtomicBool::new(false)),
             fail_init: Arc::new(AtomicBool::new(false)),
@@ -3431,6 +3464,17 @@ mod tests {
         }
         if value.get("id").is_none() {
             return (StatusCode::ACCEPTED, "").into_response();
+        }
+        if value["method"] == "tools/list" {
+            fx.tools_list_count.fetch_add(1, Ordering::SeqCst);
+            return Json(json!({
+                "jsonrpc": "2.0",
+                "result": {"tools": [
+                    {"name": "ping", "description": "p", "inputSchema": {"type": "object"}}
+                ]},
+                "id": id,
+            }))
+            .into_response();
         }
         Json(json!({"jsonrpc": "2.0", "result": {"ok": true}, "id": id})).into_response()
     }
@@ -3831,6 +3875,133 @@ mod tests {
         assert_eq!(adapter.health(), HealthStatus::Stopped);
         assert_eq!(fx.init_count.load(Ordering::SeqCst), 1);
 
+        server.abort();
+    }
+
+    /// While `Unhealthy` and never initialized, `list_tools` must answer
+    /// `Ok([])` like a `FailedAdapter` — no upstream `tools/list`, and no
+    /// false `Healthy` from a stray successful request — so a catalog rebuild
+    /// neither pays connect latency nor "recovers" an adapter that has no
+    /// session. Only the supervisor's handshake may bring it back.
+    #[tokio::test]
+    async fn never_initialized_list_tools_is_empty_without_upstream_traffic() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        fx.accepting.store(false, Ordering::SeqCst);
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter
+            .initialize()
+            .await
+            .expect_err("503 handshake fails initialize");
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 0);
+        let mut rx = adapter.subscribe_tools_changed().expect("Some receiver");
+
+        // Worst case: the upstream is now alive and would happily answer
+        // `tools/list` — the never-initialized adapter must still not ask.
+        fx.accepting.store(true, Ordering::SeqCst);
+        let tools = adapter
+            .list_tools()
+            .await
+            .expect("never-initialized list_tools is Ok");
+        assert!(tools.is_empty(), "no tools before a handshake: {tools:?}");
+        assert_eq!(
+            fx.tools_list_count.load(Ordering::SeqCst),
+            0,
+            "no upstream tools/list while never initialized"
+        );
+        assert!(
+            matches!(adapter.health(), HealthStatus::Unhealthy(_)),
+            "catalog read must not flip health without a handshake"
+        );
+        // A successful request on another path must not fake a recovery
+        // either: there is still no session.
+        let _ = adapter.call_tool("ping", json!({})).await;
+        assert!(
+            matches!(adapter.health(), HealthStatus::Unhealthy(_)),
+            "note_request_success must not flip Healthy before a handshake"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no tools_changed without a recovery"
+        );
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 0);
+
+        // The supervisor's handshake is the only way back.
+        use_fast_backoff(&adapter).await;
+        adapter.retry_initialize_in_background().await;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                adapter.health() == HealthStatus::Healthy
+            })
+            .await,
+            "supervisor recovers once the handshake succeeds"
+        );
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 1);
+        assert!(rx.try_recv().is_ok(), "recovery ticks tools_changed");
+        let tools = adapter.list_tools().await.expect("tools after handshake");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(fx.tools_list_count.load(Ordering::SeqCst), 1);
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// Same contract when the upstream is not even listening: `Ok([])`
+    /// immediately, without a connect attempt.
+    #[tokio::test]
+    async fn never_initialized_list_tools_is_empty_when_upstream_dead() {
+        let (_addr, url) = reserve_dead_upstream().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter
+            .initialize()
+            .await
+            .expect_err("connection refused fails initialize");
+        let tools = adapter
+            .list_tools()
+            .await
+            .expect("never-initialized list_tools is Ok");
+        assert!(tools.is_empty());
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+        assert_eq!(
+            adapter.transport_failures.load(Ordering::SeqCst),
+            0,
+            "no request was issued, so nothing was counted"
+        );
+        adapter.shutdown().await.unwrap();
+    }
+
+    /// Non-regression: after the FIRST successful handshake the guard is
+    /// latched, so an adapter demoted to `Unhealthy` later keeps the
+    /// pre-existing behaviour — `list_tools` reaches the upstream and a
+    /// success recovers health reactively (with its `tools_changed` tick).
+    #[tokio::test]
+    async fn list_tools_after_first_handshake_still_recovers_reactively() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 1);
+        let mut rx = adapter.subscribe_tools_changed().expect("Some receiver");
+
+        demote_via_transport_failures(&adapter).await;
+
+        let tools = adapter.list_tools().await.expect("upstream is reachable");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(
+            fx.tools_list_count.load(Ordering::SeqCst),
+            1,
+            "list_tools must still reach the upstream once a session existed"
+        );
+        assert_eq!(
+            adapter.health(),
+            HealthStatus::Healthy,
+            "a successful request recovers health reactively"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "reactive recovery ticks tools_changed"
+        );
+
+        adapter.shutdown().await.unwrap();
         server.abort();
     }
 
@@ -4258,6 +4429,7 @@ mod tests {
     async fn concurrent_success_and_failure_never_stick_unhealthy() {
         for _ in 0..1000 {
             let adapter = Arc::new(HttpAdapter::new(HttpConfig::new("http://127.0.0.1:1/mcp")));
+            adapter.handshake_completed.store(true, Ordering::SeqCst);
             *adapter.health.write().await = HealthStatus::Healthy;
             // Prime the counter one below the threshold so the racing failure
             // would cross it and demote health.

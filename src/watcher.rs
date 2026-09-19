@@ -1698,15 +1698,22 @@ mod tests {
             }
             other => panic!("expected Unhealthy while upstream is down, got {:?}", other),
         }
-        // A FailedAdapter answers `list_tools` with `Ok([])`; the real HTTP
-        // adapter still talks to the (dead) upstream and fails.
+        // While down and never initialized the adapter answers catalog reads
+        // like a `FailedAdapter` (`Ok([])`, no upstream traffic)...
         assert!(
-            adapter.list_tools().await.is_err(),
-            "the real HttpAdapter must be registered, not a FailedAdapter"
+            adapter
+                .list_tools()
+                .await
+                .expect("never-initialized list_tools is Ok([])")
+                .is_empty(),
+            "no tools while the upstream is down"
         );
+        // ...but unlike a `FailedAdapter` (whose `subscribe_tools_changed`
+        // is `None`) it is the real `HttpAdapter`: it exposes a
+        // `tools_changed` receiver and recovers on its own below.
         let mut rx = adapter
             .subscribe_tools_changed()
-            .expect("HttpAdapter exposes a tools_changed receiver");
+            .expect("the real HttpAdapter must be registered, not a FailedAdapter");
 
         // Upstream comes up at the configured address; the supervisor's
         // production backoff (1 s base) drives the retry.
