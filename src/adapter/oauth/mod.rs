@@ -22,7 +22,7 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, Notify, RwLock};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio::time::Instant;
 use tracing::{error, info, warn, Instrument};
@@ -258,6 +258,13 @@ pub struct OAuthAdapterInner {
     pub inner_health: RwLock<HealthStatus>,
     /// Handle to the heartbeat background task.
     heartbeat_task_handle: Mutex<Option<JoinHandle<()>>>,
+    /// Wakes the heartbeat loop for an out-of-cycle probe. Fired by the
+    /// tools-changed forwarder when the inner `HttpAdapter` reports a
+    /// genuine `Unhealthy → Healthy` recovery (its
+    /// [`HttpAdapter::recovery_generation`] advanced), so `inner_health`
+    /// catches up after one probe instead of after the next interval tick.
+    /// The heartbeat stays the only post-apply writer of `inner_health`.
+    probe_now: Arc<Notify>,
     /// Ring buffer of recent state transitions (max TRANSITION_RING_BUFFER_CAPACITY).
     pub transition_history: RwLock<VecDeque<TransitionRecord>>,
     /// In-process metric counters.
@@ -1691,10 +1698,13 @@ impl OAuthAdapterInner {
     /// next swap tick unconditionally — safe, at worst one extra tick.
     ///
     /// An inner tick is also how the inner adapter announces its own
-    /// `Unhealthy → Healthy` recovery (reconnect supervisor or reactive), so
-    /// each forwarded tick refreshes the cached `inner_health` first (see
-    /// [`Self::refresh_inner_health_on_tick`]) — without it `health()` would
-    /// keep reporting the heartbeat's stale `Unhealthy` until the next probe.
+    /// `Unhealthy → Healthy` recovery (reconnect supervisor or reactive). The
+    /// same channel carries ordinary `tools/list_changed` invalidations, so a
+    /// tick alone proves nothing about health: the forwarder snapshots the
+    /// inner's [`HttpAdapter::recovery_generation`] when it binds and, on
+    /// each tick, asks the heartbeat for an immediate probe only when that
+    /// counter advanced (see [`Self::poke_heartbeat_on_inner_recovery`]).
+    /// The forwarder never writes `inner_health` itself.
     async fn swap_tools_forwarder(self: &Arc<Self>, rx: Option<broadcast::Receiver<()>>) {
         let mut handle_guard = self.inner_forwarder_handle.lock().await;
         if let Some(h) = handle_guard.take() {
@@ -1703,13 +1713,16 @@ impl OAuthAdapterInner {
         let Some(mut rx) = rx else { return };
         let outer_tx = self.outer_tools_changed_tx.clone();
         let fingerprint = self.last_tools_fingerprint.clone();
+        let mut seen_recovery = self.inner_recovery_generation().await;
         let weak = Arc::downgrade(self);
         let join = tokio::spawn(async move {
             // `Ok` and `Lagged` both forward a tick; `Closed` ends the task.
             while let Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
                 *fingerprint.write().await = None;
                 if let Some(inner) = weak.upgrade() {
-                    inner.refresh_inner_health_on_tick().await;
+                    inner
+                        .poke_heartbeat_on_inner_recovery(&mut seen_recovery)
+                        .await;
                 }
                 let _ = outer_tx.send(());
             }
@@ -1717,24 +1730,35 @@ impl OAuthAdapterInner {
         *handle_guard = Some(join.abort_handle());
     }
 
-    /// Mirror an inner recovery into `inner_health` when forwarding a tick.
+    /// The published inner adapter's recovery counter (`0` with none
+    /// installed — a fresh adapter starts there too).
+    async fn inner_recovery_generation(&self) -> u64 {
+        self.inner_adapter
+            .read()
+            .await
+            .as_ref()
+            .map_or(0, HttpAdapter::recovery_generation)
+    }
+
+    /// On a forwarded inner tick, wake the heartbeat for an out-of-cycle
+    /// probe iff the inner `HttpAdapter` recovered since the last look.
+    ///
     /// The heartbeat can have marked the wrapper `Unhealthy` during the same
-    /// outage that demoted the inner `HttpAdapter`; once the inner recovers
-    /// (its tick is the observable signal) the wrapper must report `Healthy`
-    /// immediately rather than after the next heartbeat. Only a `Healthy`
-    /// inner is mirrored — the `Unhealthy` verdict stays with the heartbeat's
-    /// hysteresis — and no extra invalidation tick is emitted: the forwarded
-    /// tick already is one.
-    async fn refresh_inner_health_on_tick(&self) {
-        let inner_health = {
-            let guard = self.inner_adapter.read().await;
-            match guard.as_ref() {
-                Some(adapter) => adapter.current_health().await,
-                None => return,
-            }
-        };
-        if matches!(inner_health, HealthStatus::Healthy) {
-            *self.inner_health.write().await = HealthStatus::Healthy;
+    /// outage that demoted the inner adapter; once the inner recovers the
+    /// wrapper must not stay reported unavailable until the next interval
+    /// tick. Writing `Healthy` here would be wrong twice over: an ordinary
+    /// `list_changed` tick would clear a heartbeat verdict earned by an
+    /// HTTP/JSON-RPC failure the inner adapter never counts, and a probe
+    /// already in flight could land afterwards and overwrite the write with
+    /// a stale `Unhealthy`. So the heartbeat keeps sole ownership of
+    /// `inner_health` and is asked to re-probe now: a probe that was in
+    /// flight when the recovery happened is followed by this fresh one
+    /// (`Notify` stores the permit), and whichever result is newest wins.
+    async fn poke_heartbeat_on_inner_recovery(&self, seen_recovery: &mut u64) {
+        let current = self.inner_recovery_generation().await;
+        if current > *seen_recovery {
+            *seen_recovery = current;
+            self.probe_now.notify_one();
         }
     }
 
@@ -1854,6 +1878,7 @@ impl OAuthAdapter {
                 refresh_task_handle: Mutex::new(None),
                 inner_health: RwLock::new(HealthStatus::Starting),
                 heartbeat_task_handle: Mutex::new(None),
+                probe_now: Arc::new(Notify::new()),
                 transition_history: RwLock::new(VecDeque::new()),
                 metrics: OAuthMetrics::new(),
                 refresh_mutex: Mutex::new(()),
@@ -4208,79 +4233,265 @@ mod tests {
         );
     }
 
-    /// PR #163 review (round 4, Copilot): the heartbeat can mark the wrapper
-    /// `Unhealthy` during the same outage that demotes the inner
-    /// `HttpAdapter`. The inner's recovery arrives here as a forwarded tick;
-    /// `health()` reads the cached `inner_health`, so the forwarder must
-    /// refresh it — otherwise the endpoint stays reported unavailable until
-    /// the next heartbeat. Exactly one outer tick is emitted (no additional
-    /// invalidation).
-    #[tokio::test]
-    async fn forwarded_recovery_tick_refreshes_inner_health() {
-        let (url, server) = spawn_minimal_mcp_server().await;
+    /// Upstream fixture for the heartbeat/forwarder coordination tests:
+    /// counts `tools/list` probes and can park the next probe (`hold_probe`
+    /// → `probe_started` fires, the response waits for `probe_release`) or
+    /// fail it with a 503 (`fail_probe`, sampled when the request ARRIVES so
+    /// a parked probe keeps the verdict it was dispatched with).
+    #[derive(Clone)]
+    struct ProbeFx {
+        tools_list_count: Arc<std::sync::atomic::AtomicUsize>,
+        hold_probe: Arc<AtomicBool>,
+        fail_probe: Arc<AtomicBool>,
+        probe_started: Arc<Notify>,
+        probe_release: Arc<Notify>,
+    }
+
+    async fn spawn_probe_fixture() -> (String, ProbeFx, tokio::task::JoinHandle<()>) {
+        use axum::http::StatusCode;
+        use axum::{response::IntoResponse, routing::post, Json, Router};
+        use serde_json::{json, Value};
+
+        async fn handle(
+            axum::extract::State(fx): axum::extract::State<ProbeFx>,
+            Json(body): Json<Value>,
+        ) -> axum::response::Response {
+            let id = body.get("id").cloned().unwrap_or(Value::Null);
+            match body.get("method").and_then(|m| m.as_str()).unwrap_or("") {
+                "initialize" => Json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "test-server", "version": "0.0.1"},
+                    },
+                }))
+                .into_response(),
+                "tools/list" => {
+                    fx.tools_list_count.fetch_add(1, Ordering::SeqCst);
+                    let fail = fx.fail_probe.load(Ordering::SeqCst);
+                    if fx.hold_probe.load(Ordering::SeqCst) {
+                        fx.probe_started.notify_one();
+                        fx.probe_release.notified().await;
+                    }
+                    if fail {
+                        return (StatusCode::SERVICE_UNAVAILABLE, "probe failed").into_response();
+                    }
+                    Json(json!({"jsonrpc": "2.0", "id": id, "result": {"tools": []}}))
+                        .into_response()
+                }
+                _ => Json(json!({"jsonrpc": "2.0", "id": id, "result": {}})).into_response(),
+            }
+        }
+
+        let fx = ProbeFx {
+            tools_list_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hold_probe: Arc::new(AtomicBool::new(false)),
+            fail_probe: Arc::new(AtomicBool::new(false)),
+            probe_started: Arc::new(Notify::new()),
+            probe_release: Arc::new(Notify::new()),
+        };
+        let router = Router::new()
+            .route("/mcp", post(handle))
+            .with_state(fx.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+        (format!("http://127.0.0.1:{}/mcp", addr.port()), fx, server)
+    }
+
+    /// Authenticated OAuth adapter over [`spawn_probe_fixture`] with the real
+    /// heartbeat loop running (30 s interval, so only pokes probe) and the
+    /// forwarder bound to the real inner adapter's broadcast.
+    async fn armed_probe_adapter(
+        threshold: u32,
+    ) -> (OAuthAdapter, ProbeFx, tokio::task::JoinHandle<()>) {
+        let (url, fx, server) = spawn_probe_fixture().await;
         let mut config = make_config();
         config.url = url;
+        config.probe_failure_threshold = threshold;
         let mut adapter = make_adapter(config);
         adapter.initialize().await.unwrap();
         adapter.inner.apply_tokens(make_token_set("first")).await;
         assert!(adapter.inner.inner_adapter.read().await.is_some());
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Authenticated);
         assert_eq!(adapter.health(), HealthStatus::Healthy);
+        (adapter, fx, server)
+    }
 
-        // Heartbeat verdict from the outage; the inner has since recovered.
+    /// Wait until `pred` holds or the timeout elapses.
+    async fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while !pred() {
+            if Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
+    }
+
+    /// Cross the inner adapter's transport-failure threshold and recover it
+    /// reactively through a real call, so its `recovery_generation` advances
+    /// and its recovery tick reaches the forwarder.
+    async fn recover_inner_for_real(adapter: &OAuthAdapter) {
+        {
+            let guard = adapter.inner.inner_adapter.read().await;
+            let inner = guard.as_ref().expect("inner adapter installed");
+            inner.demote_via_transport_failures_for_test().await;
+            assert!(matches!(inner.health(), HealthStatus::Unhealthy(_)));
+        }
+        adapter
+            .call_tool("x", serde_json::json!({}))
+            .await
+            .expect("live upstream answers");
+        let guard = adapter.inner.inner_adapter.read().await;
+        assert_eq!(guard.as_ref().unwrap().health(), HealthStatus::Healthy);
+    }
+
+    /// PR #163 review (round 4, Copilot): the inner broadcast also carries
+    /// ordinary `tools/list_changed` invalidations. A heartbeat verdict earned
+    /// by an HTTP/JSON-RPC failure — one the inner `HttpAdapter` never counts,
+    /// so it stayed `Healthy` — must not be cleared by such a tick without a
+    /// successful probe. The tick is still forwarded; `inner_health` stands
+    /// and no probe is triggered.
+    #[tokio::test]
+    async fn list_changed_tick_keeps_heartbeat_verdict_without_probe() {
+        let (adapter, fx, server) = armed_probe_adapter(3).await;
+        let probes_before = fx.tools_list_count.load(Ordering::SeqCst);
+
         *adapter.inner.inner_health.write().await =
-            HealthStatus::Unhealthy("upstream unreachable".into());
-        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
-
+            HealthStatus::Unhealthy("upstream returned 503".into());
         let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
         drain(&mut outer_rx).await;
+
+        // A plain invalidation on the inner channel (recovery generation
+        // unchanged: the inner adapter is Healthy and never flipped).
         let (inner_tx, inner_rx) = broadcast::channel::<()>(16);
         adapter.inner.swap_tools_forwarder(Some(inner_rx)).await;
-
-        // The inner's recovery tick.
         inner_tx.send(()).expect("inner send");
         assert!(
             recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
-            "the recovery tick is forwarded"
+            "the invalidation is forwarded"
         );
+        tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             *adapter.inner.inner_health.read().await,
-            HealthStatus::Healthy,
-            "forwarding a recovery tick refreshes inner_health"
+            HealthStatus::Unhealthy("upstream returned 503".into()),
+            "a list_changed tick must not clear the heartbeat's verdict"
         );
         assert_eq!(
-            adapter.health(),
-            HealthStatus::Healthy,
-            "health() reports the recovery without waiting for a heartbeat"
+            fx.tools_list_count.load(Ordering::SeqCst),
+            probes_before,
+            "a list_changed tick must not trigger a probe"
+        );
+
+        server.abort();
+    }
+
+    /// PR #163 review (round 4, Copilot): the heartbeat can mark the wrapper
+    /// `Unhealthy` during the same outage that demotes the inner
+    /// `HttpAdapter`. The inner's genuine recovery (its recovery generation
+    /// advanced with the tick) makes the heartbeat probe immediately rather
+    /// than at the next interval, and THAT probe clears the verdict — the
+    /// forwarder itself never writes `inner_health`. Exactly one outer tick.
+    #[tokio::test]
+    async fn inner_recovery_triggers_immediate_probe_that_clears_verdict() {
+        let (mut adapter, fx, server) = armed_probe_adapter(3).await;
+        let probes_before = fx.tools_list_count.load(Ordering::SeqCst);
+
+        *adapter.inner.inner_health.write().await =
+            HealthStatus::Unhealthy("upstream unreachable".into());
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+        drain(&mut outer_rx).await;
+
+        recover_inner_for_real(&adapter).await;
+
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "the inner recovery tick is forwarded"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                adapter.health() == HealthStatus::Healthy
+            })
+            .await,
+            "the recovery-triggered probe clears the heartbeat verdict"
+        );
+        assert_eq!(
+            fx.tools_list_count.load(Ordering::SeqCst),
+            probes_before + 1,
+            "exactly one out-of-cycle probe ran"
         );
         assert!(
             !recv_tick(&mut outer_rx, Duration::from_millis(100)).await,
             "no additional invalidation tick"
         );
 
+        adapter.shutdown().await.unwrap();
         server.abort();
     }
 
-    /// The refresh mirrors the inner adapter rather than blindly flipping
-    /// `Healthy`: with no inner adapter installed a forwarded tick leaves the
-    /// heartbeat's verdict alone.
+    /// PR #163 review (round 4, Copilot): a probe dispatched BEFORE the inner
+    /// recovers finishes after it, with a failure verdict from the outage.
+    /// Because the recovery only asks the heartbeat to re-probe (a stored
+    /// permit), the stale verdict is written and then immediately superseded
+    /// by the fresh probe — the adapter never sits `Unhealthy` until the next
+    /// interval tick. Deterministic: the fixture parks the stale probe.
     #[tokio::test]
-    async fn forwarded_tick_without_inner_adapter_keeps_inner_health() {
-        let adapter = make_adapter(make_config());
-        *adapter.inner.inner_health.write().await =
-            HealthStatus::Unhealthy("upstream unreachable".into());
-        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+    async fn stale_probe_finishing_after_recovery_is_superseded_by_a_fresh_probe() {
+        let (mut adapter, fx, server) = armed_probe_adapter(1).await;
+        let probes_before = fx.tools_list_count.load(Ordering::SeqCst);
 
-        let (inner_tx, inner_rx) = broadcast::channel::<()>(16);
-        adapter.inner.swap_tools_forwarder(Some(inner_rx)).await;
-        inner_tx.send(()).expect("inner send");
-        assert!(recv_tick(&mut outer_rx, Duration::from_millis(500)).await);
-        assert!(
-            matches!(
-                *adapter.inner.inner_health.read().await,
-                HealthStatus::Unhealthy(_)
-            ),
-            "no inner adapter: nothing to mirror, the verdict stands"
+        // Dispatch a probe that will park at the upstream and fail.
+        fx.hold_probe.store(true, Ordering::SeqCst);
+        fx.fail_probe.store(true, Ordering::SeqCst);
+        adapter.inner.probe_now.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), fx.probe_started.notified())
+            .await
+            .expect("the stale probe reaches the upstream");
+        fx.hold_probe.store(false, Ordering::SeqCst);
+        fx.fail_probe.store(false, Ordering::SeqCst);
+
+        // The inner recovers while that probe is parked; its poke is stored.
+        recover_inner_for_real(&adapter).await;
+        assert_eq!(
+            fx.tools_list_count.load(Ordering::SeqCst),
+            probes_before + 1,
+            "the heartbeat is busy with the parked probe; nothing else probes"
         );
+
+        // The stale probe lands as a failure (threshold 1 → Unhealthy) ...
+        fx.probe_release.notify_one();
+        // ... and the stored poke runs a fresh probe right behind it.
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                fx.tools_list_count.load(Ordering::SeqCst) == probes_before + 2
+            })
+            .await,
+            "the fresh probe follows the stale one immediately"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                adapter.health() == HealthStatus::Healthy
+            })
+            .await,
+            "the fresh probe's verdict wins"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert_eq!(
+            fx.tools_list_count.load(Ordering::SeqCst),
+            probes_before + 2,
+            "no probe storm: one stale, one fresh"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
     }
 
     /// PR #163 review (round 4, Copilot): the inner adapter's `GET` listener

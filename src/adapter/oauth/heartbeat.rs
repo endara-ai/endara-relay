@@ -196,12 +196,18 @@ async fn probe_inner(inner: &OAuthAdapterInner) -> Result<(), ProbeError> {
 /// Background heartbeat loop that periodically probes the inner adapter.
 ///
 /// Uses a `Weak` reference so the loop exits automatically when the
-/// adapter is dropped.
+/// adapter is dropped. Besides the interval, an iteration also runs when
+/// `probe_now` fires — the tools-changed forwarder pokes it when the inner
+/// `HttpAdapter` reports a genuine recovery, so `inner_health` catches up
+/// after one probe instead of waiting out the interval. The poke is a
+/// stored permit: one arriving while a probe is in flight starts the next
+/// probe as soon as that one is applied, so the fresher result lands last.
 pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
-    let (interval_secs, threshold) = match inner.upgrade() {
+    let (interval_secs, threshold, probe_now) = match inner.upgrade() {
         Some(arc) => (
             arc.config.heartbeat_interval_secs,
             arc.config.probe_failure_threshold,
+            arc.probe_now.clone(),
         ),
         None => return,
     };
@@ -211,7 +217,10 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
     let mut consecutive_failures: u32 = 0;
 
     loop {
-        ticker.tick().await;
+        tokio::select! {
+            _ = ticker.tick() => {}
+            _ = probe_now.notified() => {}
+        }
         let Some(adapter) = inner.upgrade() else {
             return;
         };

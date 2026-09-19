@@ -184,6 +184,13 @@ pub struct HttpAdapter {
     /// so an in-flight supervisor attempt that has not yet sent `initialize`
     /// can stand down instead of running a redundant handshake.
     recovered_notify: Arc<Notify>,
+    /// Incremented (under the `health` write lock) on every actual
+    /// `Unhealthy → Healthy` flip, reactive or handshake. Lets a wrapper that
+    /// caches its own verdict (the OAuth heartbeat) tell a genuine recovery
+    /// apart from an ordinary `tools/list_changed` tick on the same
+    /// broadcast: both arrive as a tick, only the former advances this
+    /// counter. See [`Self::recovery_generation`].
+    recovery_generation: Arc<AtomicU64>,
     /// Notified by [`Self::note_transport_failure`] when reactive health flips
     /// the adapter to `Unhealthy`, waking the supervisor to start reconnecting.
     reconnect_notify: Arc<Notify>,
@@ -345,6 +352,7 @@ impl HttpAdapter {
             crash_tracker: Arc::new(Mutex::new(CrashTracker::new())),
             reconnect_handle: Arc::new(StdMutex::new(None)),
             recovered_notify: Arc::new(Notify::new()),
+            recovery_generation: Arc::new(AtomicU64::new(0)),
             reconnect_notify: Arc::new(Notify::new()),
             shutting_down: Arc::new(AtomicBool::new(false)),
             owns_background_tasks: true,
@@ -382,6 +390,7 @@ impl HttpAdapter {
             crash_tracker: self.crash_tracker.clone(),
             reconnect_handle: self.reconnect_handle.clone(),
             recovered_notify: self.recovered_notify.clone(),
+            recovery_generation: self.recovery_generation.clone(),
             reconnect_notify: self.reconnect_notify.clone(),
             shutting_down: self.shutting_down.clone(),
             owns_background_tasks: false,
@@ -404,6 +413,17 @@ impl HttpAdapter {
     #[cfg(test)]
     pub(crate) fn server_type_recorded_flag(&self) -> bool {
         self.server_type_recorded.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: cross the transport-failure threshold exactly as a run of
+    /// dead requests would, demoting the adapter and arming its supervisor.
+    /// Lets wrapper tests (OAuth) drive a real `Unhealthy → Healthy` flip
+    /// through the production recovery paths.
+    #[cfg(test)]
+    pub(crate) async fn demote_via_transport_failures_for_test(&self) {
+        for _ in 0..TRANSPORT_FAILURE_THRESHOLD {
+            self.note_transport_failure().await;
+        }
     }
 
     /// Install the given event-bus handle (Arc-cloned) on this adapter,
@@ -435,11 +455,13 @@ impl HttpAdapter {
         *self.upstream_dialect.read().await
     }
 
-    /// Current health, read under the lock (unlike the non-blocking
-    /// [`McpAdapter::health`], which answers `Starting` when the lock is
-    /// contended). For wrappers that mirror this adapter's health.
-    pub(crate) async fn current_health(&self) -> HealthStatus {
-        self.health.read().await.clone()
+    /// Number of `Unhealthy → Healthy` flips so far. A wrapper snapshots it
+    /// and treats a later, larger value as proof that a genuine recovery
+    /// happened in between (an ordinary `tools/list_changed` tick leaves it
+    /// unchanged). Bumped before the flip's tick is sent, so a subscriber
+    /// that reads it on receipt of the tick sees the new value.
+    pub(crate) fn recovery_generation(&self) -> u64 {
+        self.recovery_generation.load(Ordering::SeqCst)
     }
 
     /// Apply the JIT 401 interception policy to a tool-call outcome.
@@ -766,6 +788,7 @@ impl HttpAdapter {
                 && matches!(*health, HealthStatus::Unhealthy(_))
             {
                 *health = HealthStatus::Healthy;
+                self.recovery_generation.fetch_add(1, Ordering::SeqCst);
                 true
             } else {
                 false
@@ -1465,6 +1488,9 @@ impl HttpAdapter {
             self.handshake_completed.store(true, Ordering::SeqCst);
             let was_unhealthy = matches!(*health, HealthStatus::Unhealthy(_));
             *health = HealthStatus::Healthy;
+            if was_unhealthy {
+                self.recovery_generation.fetch_add(1, Ordering::SeqCst);
+            }
             was_unhealthy
         };
         self.crash_tracker.lock().await.reset();
