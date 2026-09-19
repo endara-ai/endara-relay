@@ -1678,7 +1678,13 @@ impl OAuthAdapterInner {
     /// that happens to reproduce the original set must still tick (the
     /// registry's caches followed the drift). An unknown baseline makes the
     /// next swap tick unconditionally — safe, at worst one extra tick.
-    async fn swap_tools_forwarder(&self, rx: Option<broadcast::Receiver<()>>) {
+    ///
+    /// An inner tick is also how the inner adapter announces its own
+    /// `Unhealthy → Healthy` recovery (reconnect supervisor or reactive), so
+    /// each forwarded tick refreshes the cached `inner_health` first (see
+    /// [`Self::refresh_inner_health_on_tick`]) — without it `health()` would
+    /// keep reporting the heartbeat's stale `Unhealthy` until the next probe.
+    async fn swap_tools_forwarder(self: &Arc<Self>, rx: Option<broadcast::Receiver<()>>) {
         let mut handle_guard = self.inner_forwarder_handle.lock().await;
         if let Some(h) = handle_guard.take() {
             h.abort();
@@ -1686,22 +1692,39 @@ impl OAuthAdapterInner {
         let Some(mut rx) = rx else { return };
         let outer_tx = self.outer_tools_changed_tx.clone();
         let fingerprint = self.last_tools_fingerprint.clone();
+        let weak = Arc::downgrade(self);
         let join = tokio::spawn(async move {
-            loop {
-                match rx.recv().await {
-                    Ok(()) => {
-                        *fingerprint.write().await = None;
-                        let _ = outer_tx.send(());
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        *fingerprint.write().await = None;
-                        let _ = outer_tx.send(());
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
+            // `Ok` and `Lagged` both forward a tick; `Closed` ends the task.
+            while let Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
+                *fingerprint.write().await = None;
+                if let Some(inner) = weak.upgrade() {
+                    inner.refresh_inner_health_on_tick().await;
                 }
+                let _ = outer_tx.send(());
             }
         });
         *handle_guard = Some(join.abort_handle());
+    }
+
+    /// Mirror an inner recovery into `inner_health` when forwarding a tick.
+    /// The heartbeat can have marked the wrapper `Unhealthy` during the same
+    /// outage that demoted the inner `HttpAdapter`; once the inner recovers
+    /// (its tick is the observable signal) the wrapper must report `Healthy`
+    /// immediately rather than after the next heartbeat. Only a `Healthy`
+    /// inner is mirrored — the `Unhealthy` verdict stays with the heartbeat's
+    /// hysteresis — and no extra invalidation tick is emitted: the forwarded
+    /// tick already is one.
+    async fn refresh_inner_health_on_tick(&self) {
+        let inner_health = {
+            let guard = self.inner_adapter.read().await;
+            match guard.as_ref() {
+                Some(adapter) => adapter.current_health().await,
+                None => return,
+            }
+        };
+        if matches!(inner_health, HealthStatus::Healthy) {
+            *self.inner_health.write().await = HealthStatus::Healthy;
+        }
     }
 
     /// Disconnect: abort refresh task, clear tokens, delete from disk, set
@@ -4171,6 +4194,81 @@ mod tests {
         assert!(
             recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
             "outer subscriber should receive tick forwarded from inner"
+        );
+    }
+
+    /// PR #163 review (round 4, Copilot): the heartbeat can mark the wrapper
+    /// `Unhealthy` during the same outage that demotes the inner
+    /// `HttpAdapter`. The inner's recovery arrives here as a forwarded tick;
+    /// `health()` reads the cached `inner_health`, so the forwarder must
+    /// refresh it — otherwise the endpoint stays reported unavailable until
+    /// the next heartbeat. Exactly one outer tick is emitted (no additional
+    /// invalidation).
+    #[tokio::test]
+    async fn forwarded_recovery_tick_refreshes_inner_health() {
+        let (url, server) = spawn_minimal_mcp_server().await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+        adapter.inner.apply_tokens(make_token_set("first")).await;
+        assert!(adapter.inner.inner_adapter.read().await.is_some());
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+        // Heartbeat verdict from the outage; the inner has since recovered.
+        *adapter.inner.inner_health.write().await =
+            HealthStatus::Unhealthy("upstream unreachable".into());
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+        drain(&mut outer_rx).await;
+        let (inner_tx, inner_rx) = broadcast::channel::<()>(16);
+        adapter.inner.swap_tools_forwarder(Some(inner_rx)).await;
+
+        // The inner's recovery tick.
+        inner_tx.send(()).expect("inner send");
+        assert!(
+            recv_tick(&mut outer_rx, Duration::from_millis(500)).await,
+            "the recovery tick is forwarded"
+        );
+        assert_eq!(
+            *adapter.inner.inner_health.read().await,
+            HealthStatus::Healthy,
+            "forwarding a recovery tick refreshes inner_health"
+        );
+        assert_eq!(
+            adapter.health(),
+            HealthStatus::Healthy,
+            "health() reports the recovery without waiting for a heartbeat"
+        );
+        assert!(
+            !recv_tick(&mut outer_rx, Duration::from_millis(100)).await,
+            "no additional invalidation tick"
+        );
+
+        server.abort();
+    }
+
+    /// The refresh mirrors the inner adapter rather than blindly flipping
+    /// `Healthy`: with no inner adapter installed a forwarded tick leaves the
+    /// heartbeat's verdict alone.
+    #[tokio::test]
+    async fn forwarded_tick_without_inner_adapter_keeps_inner_health() {
+        let adapter = make_adapter(make_config());
+        *adapter.inner.inner_health.write().await =
+            HealthStatus::Unhealthy("upstream unreachable".into());
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+
+        let (inner_tx, inner_rx) = broadcast::channel::<()>(16);
+        adapter.inner.swap_tools_forwarder(Some(inner_rx)).await;
+        inner_tx.send(()).expect("inner send");
+        assert!(recv_tick(&mut outer_rx, Duration::from_millis(500)).await);
+        assert!(
+            matches!(
+                *adapter.inner.inner_health.read().await,
+                HealthStatus::Unhealthy(_)
+            ),
+            "no inner adapter: nothing to mirror, the verdict stands"
         );
     }
 

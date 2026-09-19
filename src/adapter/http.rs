@@ -435,6 +435,13 @@ impl HttpAdapter {
         *self.upstream_dialect.read().await
     }
 
+    /// Current health, read under the lock (unlike the non-blocking
+    /// [`McpAdapter::health`], which answers `Starting` when the lock is
+    /// contended). For wrappers that mirror this adapter's health.
+    pub(crate) async fn current_health(&self) -> HealthStatus {
+        self.health.read().await.clone()
+    }
+
     /// Apply the JIT 401 interception policy to a tool-call outcome.
     ///
     /// When a JIT interceptor is attached and the upstream returned a hard
@@ -1229,8 +1236,20 @@ impl HttpAdapter {
     }
 
     /// Spawn the background reconnect supervisor task if it isn't running.
+    ///
+    /// Never installs one once shutdown has begun: `shutdown()`/`Drop` set
+    /// `shutting_down` BEFORE they drain this slot, and the check here shares
+    /// the slot lock with that drain, so a transport failure (or startup
+    /// retry) racing shutdown either stores its handle before the drain
+    /// (which then aborts it) or observes the flag and installs nothing. A
+    /// supervisor spawned after the drain would have missed the non-latched
+    /// `shutdown_notify` and stayed parked forever.
     async fn ensure_supervisor_running(&self) {
         let mut guard = lock_slot(&self.reconnect_handle);
+        if self.shutting_down.load(Ordering::SeqCst) {
+            debug!(url = %self.config.url, "shutdown in progress; not spawning reconnect supervisor");
+            return;
+        }
         if guard.as_ref().is_some_and(|h| !h.is_finished()) {
             return;
         }
@@ -1248,11 +1267,12 @@ impl HttpAdapter {
     /// Arm the reconnect supervisor after a failed [`McpAdapter::initialize`]
     /// so the adapter recovers on its own once the upstream is reachable,
     /// instead of staying frozen in the `Unhealthy(<init error>)` state the
-    /// handshake left it in. `initialize()` only arms the supervisor on
-    /// success; the registration path ([`crate::watcher::create_adapter`])
-    /// calls this on failure so a plain `http` upstream that is down at relay
-    /// startup or on a config add/reload is registered as the real adapter
-    /// and retried with the standard backoff — no caller traffic required.
+    /// handshake left it in. `initialize()` calls this itself on failure, so
+    /// every caller of it — the registration path
+    /// ([`crate::watcher::create_adapter`]) at relay startup or on a config
+    /// add/reload, and the management enable/restart paths that
+    /// re-initialize after a `shutdown()` — gets a plain `http` upstream that
+    /// is down retried with the standard backoff, no caller traffic required.
     /// The eventual recovery flips `Unhealthy → Healthy` through
     /// [`Self::mark_handshake_healthy`], which emits the `tools_changed` tick
     /// the registry uses to re-fetch the catalog.
@@ -1540,10 +1560,17 @@ impl HttpAdapter {
                 let result = discover_result.as_ref().expect(
                     "detect_upstream_dialect reports 2026 only when a discover result is present",
                 );
-                self.set_upstream_dialect(ProtocolVersion::V2026_07_28)
-                    .await;
+                // Validate the discovery result BEFORE publishing the
+                // dialect: like the session commit below, a dialect this
+                // attempt did not successfully negotiate must never reach the
+                // shared state. Otherwise an obsolete supervisor attempt that
+                // rejects an invalid 2026 response would leave a `Healthy`
+                // adapter (recovered reactively on its legacy session)
+                // formatting every later request as sessionless 2026 traffic.
                 self.apply_server_identity(result, supervisor_attempt)
                     .await?;
+                self.set_upstream_dialect(ProtocolVersion::V2026_07_28)
+                    .await;
                 // 2026 is stateless: no notifications/initialized, no session
                 // id. Discard any session left over from a previous (legacy)
                 // connection so it is never echoed at the new upstream.
@@ -1768,7 +1795,18 @@ impl McpAdapter for HttpAdapter {
             // listener, so clearing the latch here cannot race either of them.
             self.shutting_down.store(false, Ordering::SeqCst);
             *self.health.write().await = HealthStatus::Starting;
-            self.connect_and_handshake().await?;
+            if let Err(e) = self.connect_and_handshake().await {
+                // Same retry contract as a successful start: the adapter is
+                // `Unhealthy(<init error>)` and the supervisor brings it back
+                // once the upstream is reachable. Every `initialize()` caller
+                // gets this — including the management enable path, which
+                // re-initializes after `shutdown()` and propagates the error
+                // with `?`. The OAuth wrapper drops a failed inner adapter,
+                // whose `Drop` aborts the supervisor again, so its behaviour
+                // is unchanged.
+                self.retry_initialize_in_background().await;
+                return Err(e);
+            }
             // Arm the reconnect supervisor now so a later transport-dead
             // demotion recovers without waiting for caller traffic.
             self.ensure_supervisor_running().await;
@@ -3847,8 +3885,10 @@ mod tests {
             ),
         }
         assert!(
-            lock_slot(&adapter.reconnect_handle).is_none(),
-            "a failed initialize alone does not arm the supervisor"
+            lock_slot(&adapter.reconnect_handle)
+                .as_ref()
+                .is_some_and(|h| !h.is_finished()),
+            "a failed initialize arms the supervisor itself"
         );
         assert_eq!(
             adapter.stderr_lines().await,
@@ -3858,12 +3898,14 @@ mod tests {
 
         use_fast_backoff(&adapter).await;
         let mut rx = adapter.subscribe_tools_changed().expect("Some receiver");
+        // Idempotent: a second arm (the registration path used to call this)
+        // neither duplicates the supervisor nor disturbs it.
         adapter.retry_initialize_in_background().await;
         assert!(
             lock_slot(&adapter.reconnect_handle)
                 .as_ref()
                 .is_some_and(|h| !h.is_finished()),
-            "retry_initialize_in_background arms the supervisor"
+            "retry_initialize_in_background keeps the supervisor armed"
         );
 
         // Still down: the supervisor keeps retrying and the adapter stays
@@ -4680,6 +4722,158 @@ mod tests {
         assert!(recovered, "the retried attempt must recover the adapter");
         assert_eq!(fx.init_count.load(Ordering::SeqCst), 2);
         assert_eq!(drain_ticks(&mut rx), 1, "exactly one tick per recovery");
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 4, Copilot): the dialect is subject to the same
+    /// rule as the session — publish only what this attempt successfully
+    /// negotiated. A supervisor attempt whose `server/discover` answered 2026
+    /// but without a valid `serverInfo.name` fails at identity validation;
+    /// if a caller's request recovered the legacy session just before, the
+    /// conditional failure write leaves `Healthy`, and a dialect already
+    /// switched to 2026 would format every later request as sessionless 2026
+    /// traffic against the legacy session (400 from the upstream). Drives
+    /// `complete_handshake` directly with the adapter already recovered —
+    /// the deterministic equivalent of the recovery landing between the
+    /// supervisor's post-probe health check and the identity failure.
+    #[tokio::test]
+    async fn obsolete_invalid_2026_discovery_keeps_legacy_dialect() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        assert!(!adapter.upstream_dialect().await.is_2026());
+        assert_eq!(adapter.session_id.read().await.as_deref(), Some("sess-1"));
+
+        // The adapter is Healthy on its legacy session when the obsolete
+        // supervisor attempt processes an invalid 2026 discovery result.
+        let invalid_2026 = json!({
+            "protocolVersion": "2026-07-28",
+            "capabilities": {"tools": {"listChanged": true}},
+        });
+        let err = adapter
+            .complete_handshake(Some(invalid_2026), true)
+            .await
+            .expect_err("a 2026 discovery result without serverInfo.name is rejected");
+        assert!(matches!(err, AdapterError::ProtocolError(_)), "{err:?}");
+
+        assert_eq!(
+            adapter.health(),
+            HealthStatus::Healthy,
+            "an obsolete attempt's failure never overwrites recovered health"
+        );
+        assert!(
+            !adapter.upstream_dialect().await.is_2026(),
+            "a rejected 2026 discovery must not publish the 2026 dialect"
+        );
+        assert_eq!(
+            adapter.session_id.read().await.as_deref(),
+            Some("sess-1"),
+            "the working legacy session is untouched"
+        );
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("later requests still run as legacy traffic on the working session");
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 1);
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 4, Copilot): `shutdown()` latches `shutting_down`
+    /// and drains the supervisor slot, but a transport-failure demotion can
+    /// enter `ensure_supervisor_running` after that drain. It must not
+    /// install a new supervisor: that task would have missed the non-latched
+    /// `shutdown_notify` and stayed parked after shutdown returned. Replays
+    /// the interleaving: shutdown has set the flag and taken the handle, then
+    /// the demotion lands.
+    #[tokio::test]
+    async fn transport_failure_racing_shutdown_installs_no_supervisor() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        assert!(lock_slot(&adapter.reconnect_handle).is_some());
+
+        // shutdown() so far: flag latched, supervisor handle drained.
+        adapter.shutting_down.store(true, Ordering::SeqCst);
+        adapter.shutdown_notify.notify_waiters();
+        let drained = lock_slot(&adapter.reconnect_handle).take();
+        let drained = drained.expect("initialize armed a supervisor");
+        drained.abort();
+        let _ = drained.await;
+
+        // The racing demotion (health is still Healthy at this point).
+        demote_via_transport_failures(&adapter).await;
+        assert!(
+            lock_slot(&adapter.reconnect_handle).is_none(),
+            "no supervisor may be installed once shutdown has begun"
+        );
+
+        // shutdown() completes normally and nothing is left behind.
+        adapter.shutdown().await.expect("shutdown succeeds");
+        assert_eq!(adapter.health(), HealthStatus::Stopped);
+        assert!(lock_slot(&adapter.reconnect_handle).is_none());
+        assert!(lock_slot(&adapter.listener_handle).is_none());
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            1,
+            "no parked supervisor reconnects after shutdown"
+        );
+
+        server.abort();
+    }
+
+    /// PR #163 review (round 4, Copilot): the management enable path calls
+    /// `initialize()` directly after `disable()`/`shutdown()` and propagates
+    /// its error with `?`. Enabling a plain HTTP endpoint while its upstream
+    /// is down must still leave a retrying adapter — `initialize()` arms the
+    /// background retry on failure, the same contract as the startup path —
+    /// so the endpoint recovers on its own when the upstream returns.
+    #[tokio::test]
+    async fn reinitialize_failure_after_shutdown_arms_recovery() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        adapter.shutdown().await.expect("shutdown succeeds");
+        assert!(lock_slot(&adapter.reconnect_handle).is_none());
+
+        // Enable while the upstream is down.
+        fx.accepting.store(false, Ordering::SeqCst);
+        adapter
+            .initialize()
+            .await
+            .expect_err("re-initialize against a down upstream fails");
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+        assert!(
+            lock_slot(&adapter.reconnect_handle)
+                .as_ref()
+                .is_some_and(|h| !h.is_finished()),
+            "a failed re-initialize must arm the reconnect supervisor"
+        );
+
+        use_fast_backoff(&adapter).await;
+        let mut rx = adapter.subscribe_tools_changed().expect("Some receiver");
+        fx.accepting.store(true, Ordering::SeqCst);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                adapter.health() == HealthStatus::Healthy
+            })
+            .await,
+            "the endpoint enabled while down must recover once the upstream returns"
+        );
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            2,
+            "recovery comes from the supervisor's handshake"
+        );
+        assert!(rx.try_recv().is_ok(), "recovery ticks tools_changed");
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("the recovered endpoint is usable");
 
         adapter.shutdown().await.unwrap();
         server.abort();

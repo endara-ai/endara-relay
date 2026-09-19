@@ -1246,8 +1246,9 @@ pub(crate) async fn create_adapter(
             match adapter.initialize().await {
                 Ok(()) => Box::new(adapter),
                 Err(e) => {
+                    // A failed `initialize()` has already armed the adapter's
+                    // background retry; register it as the real adapter.
                     warn!(endpoint = %ep.name, error = %e, "Failed to initialize HTTP adapter, registering unhealthy and retrying in background");
-                    adapter.retry_initialize_in_background().await;
                     Box::new(adapter)
                 }
             }
