@@ -248,9 +248,14 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
             TickAction::Probe => {
                 let result = probe_inner(&adapter).await;
                 let action = classify_probe_result(result, &mut consecutive_failures, threshold);
+                let healthy_verdict = matches!(action, ProbeAction::MarkHealthy);
                 let became_healthy =
                     apply_probe_action(&adapter, action, threshold, &oauth_state, generation).await;
-                publish_recovery_tick_if_due(&adapter, became_healthy);
+                // A healthy commit acknowledges the inner recovery counter
+                // (the probe itself may have recovered the inner adapter);
+                // an advance it finds is a recovery whose tick is owed here.
+                let recovery_acked = healthy_verdict && adapter.ack_inner_recovery().await;
+                publish_recovery_tick_if_due(&adapter, became_healthy || recovery_acked);
             }
             TickAction::Recover => {
                 attempt_recovery(&adapter).await;
@@ -264,18 +269,21 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
 /// probe verdict has been committed to `inner_health`. Fires at most once
 /// per call when either an inner recovery poke is pending
 /// (`recovery_tick_pending`, raised by the forwarder instead of ticking
-/// itself) or this probe actually flipped `inner_health` from `Unhealthy`
-/// to `Healthy` (`became_healthy`). The second condition covers a probe
-/// dispatched before the recovery that lands first with a stale failure:
-/// the pending flag is consumed by that stale commit, and the fresh probe
-/// right behind it still ticks when it clears the verdict. Ticking only
-/// here means the registry always rebuilds the catalog against the
-/// committed verdict, never against the one the probe is about to replace.
-pub(super) fn publish_recovery_tick_if_due(adapter: &OAuthAdapterInner, became_healthy: bool) {
+/// itself) or the caller established that this commit owes a tick
+/// (`owed`: the probe flipped `inner_health` from `Unhealthy` to `Healthy`,
+/// or its healthy commit acknowledged an inner recovery the forwarder had
+/// not poked for — see [`OAuthAdapterInner::ack_inner_recovery`]). The
+/// flip condition covers a probe dispatched before the recovery that lands
+/// first with a stale failure: the pending flag is consumed by that stale
+/// commit, and the fresh probe right behind it still ticks when it clears
+/// the verdict. Ticking only here means the registry always rebuilds the
+/// catalog against the committed verdict, never against the one the probe
+/// is about to replace.
+pub(super) fn publish_recovery_tick_if_due(adapter: &OAuthAdapterInner, owed: bool) {
     let pending = adapter
         .recovery_tick_pending
         .swap(false, std::sync::atomic::Ordering::SeqCst);
-    if pending || became_healthy {
+    if pending || owed {
         let _ = adapter.outer_tools_changed_tx.send(());
     }
 }

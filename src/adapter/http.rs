@@ -1477,10 +1477,13 @@ impl HttpAdapter {
                     tokio::select! {
                         _ = self.shutdown_notify.notified() => return,
                         _ = &mut recovered => {
+                            // Re-arm BEFORE the health re-read: a genuine flip
+                            // landing between the two would otherwise notify
+                            // no one and leave this sleep to run out.
+                            recovered.set(self.recovered_notify.notified());
                             if self.stood_down_after_recovery_signal("backoff").await {
                                 break 'attempt;
                             }
-                            recovered.set(self.recovered_notify.notified());
                         }
                         _ = &mut sleep => break,
                     }
@@ -1503,10 +1506,10 @@ impl HttpAdapter {
                     tokio::select! {
                         _ = self.shutdown_notify.notified() => return,
                         _ = &mut recovered => {
+                            recovered.set(self.recovered_notify.notified());
                             if self.stood_down_after_recovery_signal("dialect probe").await {
                                 break 'attempt;
                             }
-                            recovered.set(self.recovered_notify.notified());
                         }
                         result = &mut probe => break result,
                     }
@@ -1547,8 +1550,11 @@ impl HttpAdapter {
     /// further permit ever coming (repeat failures while `Unhealthy` don't
     /// notify). So re-read health: `true` (adapter is no longer `Unhealthy`)
     /// means stand down — the backoff is reset for the caller to `break`;
-    /// `false` means the signal was stale and the caller re-arms the hint
-    /// and resumes the SAME pending phase (no attempt is recorded).
+    /// `false` means the signal was stale and the caller resumes the SAME
+    /// pending phase (no attempt is recorded). The caller re-arms the hint
+    /// BEFORE calling this, so a genuine flip that lands between the stale
+    /// read and the re-arm is still delivered (pinned by
+    /// `genuine_recovery_in_stale_signal_gap_short_circuits_backoff`).
     async fn stood_down_after_recovery_signal(&self, phase: &str) -> bool {
         if matches!(*self.health.read().await, HealthStatus::Unhealthy(_)) {
             debug!(
@@ -5395,6 +5401,127 @@ mod tests {
 
         adapter.shutdown().await.unwrap();
         server.abort();
+    }
+
+    /// PR #163 review (round 5): a stale hint is handled by re-reading health
+    /// and re-arming the `Notified`. When the re-arm came AFTER the re-read, a
+    /// genuine `Unhealthy → Healthy` flip landing between the two notified no
+    /// registered waiter, so the supervisor slept its full backoff (5 s here)
+    /// before noticing. The flip is injected deterministically from a tracing
+    /// layer on the "stale recovery notification" event, i.e. exactly in that
+    /// gap; the supervisor must stand down promptly, with no second handshake.
+    #[test]
+    fn genuine_recovery_in_stale_signal_gap_short_circuits_backoff() {
+        use futures_util::FutureExt;
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::prelude::*;
+
+        struct RecoverOnStale {
+            adapter: HttpAdapter,
+            fired: Arc<AtomicBool>,
+        }
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for RecoverOnStale {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut msg = Message(String::new());
+                event.record(&mut msg);
+                if msg
+                    .0
+                    .contains("stale recovery notification while still Unhealthy")
+                {
+                    // The `health` read guard of the stale check is already
+                    // released (the `if` temporary), so the write lock is
+                    // uncontended here.
+                    self.adapter
+                        .note_request_success()
+                        .now_or_never()
+                        .expect("recovery locks are uncontended");
+                    self.fired.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (url, fx, server) = start_supervisor_fixture().await;
+            let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+            adapter.initialize().await.expect("initialize succeeds");
+            // Replace the supervisor with one running under the injecting
+            // subscriber.
+            if let Some(handle) = lock_slot(&adapter.reconnect_handle).take() {
+                handle.abort();
+            }
+            *adapter.crash_tracker.lock().await =
+                CrashTracker::new_test(Duration::from_secs(5), usize::MAX, Duration::from_secs(60));
+            let fired = Arc::new(AtomicBool::new(false));
+            let subscriber = tracing_subscriber::registry().with(RecoverOnStale {
+                adapter: adapter.task_clone(),
+                fired: fired.clone(),
+            });
+            let supervisor = adapter.task_clone();
+            let supervisor_task = tokio::spawn(
+                async move { supervisor.run_supervisor().await }.with_subscriber(subscriber),
+            );
+            let abort_handle = supervisor_task.abort_handle();
+            *lock_slot(&adapter.reconnect_handle) = Some(supervisor_task);
+
+            demote_via_transport_failures(&adapter).await;
+            assert!(
+                wait_until(Duration::from_secs(2), || {
+                    adapter
+                        .crash_tracker
+                        .try_lock()
+                        .map(|t| t.consecutive_failures == 1)
+                        .unwrap_or(false)
+                })
+                .await,
+                "supervisor should have entered its backoff"
+            );
+
+            // Stale hint (adapter still Unhealthy) → the layer recovers the
+            // adapter for real inside the stale-check gap.
+            adapter.recovered_notify.notify_waiters();
+            assert!(
+                wait_until(Duration::from_secs(2), || fired.load(Ordering::SeqCst)).await,
+                "the stale hint must be observed"
+            );
+            assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+            let stood_down = wait_until(Duration::from_millis(300), || {
+                adapter
+                    .crash_tracker
+                    .try_lock()
+                    .map(|t| t.consecutive_failures == 0)
+                    .unwrap_or(false)
+            })
+            .await;
+            abort_handle.abort();
+            assert_eq!(
+                fx.init_count.load(Ordering::SeqCst),
+                1,
+                "a recovered adapter needs no supervisor handshake"
+            );
+            adapter.shutdown().await.unwrap();
+            server.abort();
+            assert!(
+                stood_down,
+                "genuine recovery in stale-check/rearm gap must short-circuit the pending sleep"
+            );
+        });
     }
 
     /// PR #163 review (round 4, Copilot): the dialect is subject to the same

@@ -273,6 +273,15 @@ pub struct OAuthAdapterInner {
     /// `Unhealthy` and cache the `[⚠️ UNAVAILABLE]` labels with no later
     /// tick to correct them.
     recovery_tick_pending: AtomicBool,
+    /// The inner [`HttpAdapter::recovery_generation`] whose outer invalidation
+    /// the heartbeat has already published (with a `MarkHealthy` commit).
+    /// Shared between heartbeat and forwarder so one inner recovery yields
+    /// exactly one outer tick whichever of them observes it first: a
+    /// recovery performed BY a heartbeat probe is acknowledged when that
+    /// probe commits, and the forwarder then drops the matching inner tick
+    /// instead of poking for a second probe that would tick again. Re-seeded
+    /// to the inner's current counter whenever the forwarder is re-bound.
+    acked_recovery_generation: AtomicU64,
     /// Ring buffer of recent state transitions (max TRANSITION_RING_BUFFER_CAPACITY).
     pub transition_history: RwLock<VecDeque<TransitionRecord>>,
     /// In-process metric counters.
@@ -1714,9 +1723,11 @@ impl OAuthAdapterInner {
     /// counter advanced (see [`Self::poke_heartbeat_on_inner_recovery`]).
     /// The forwarder never writes `inner_health` itself. A recovery tick is
     /// NOT relayed here either: the heartbeat publishes it after the probe
-    /// commits (`recovery_tick_pending`), so the registry never rebuilds its
-    /// catalog against a verdict the probe is about to overturn. Ordinary
-    /// invalidations are relayed immediately as before.
+    /// commits (`recovery_tick_pending`, or `acked_recovery_generation` when
+    /// the heartbeat's own probe performed the recovery), so the registry
+    /// never rebuilds its catalog against a verdict the probe is about to
+    /// overturn and one recovery never ticks twice. Ordinary invalidations
+    /// are relayed immediately as before.
     async fn swap_tools_forwarder(self: &Arc<Self>, rx: Option<broadcast::Receiver<()>>) {
         let mut handle_guard = self.inner_forwarder_handle.lock().await;
         if let Some(h) = handle_guard.take() {
@@ -1726,12 +1737,14 @@ impl OAuthAdapterInner {
         let outer_tx = self.outer_tools_changed_tx.clone();
         let fingerprint = self.last_tools_fingerprint.clone();
         let mut seen_recovery = self.inner_recovery_generation().await;
+        self.acked_recovery_generation
+            .store(seen_recovery, Ordering::SeqCst);
         let weak = Arc::downgrade(self);
         let join = tokio::spawn(async move {
             // `Ok` and `Lagged` both forward a tick; `Closed` ends the task.
             while let Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
                 *fingerprint.write().await = None;
-                let recovery_poked = match weak.upgrade() {
+                let recovery_tick = match weak.upgrade() {
                     Some(inner) => {
                         inner
                             .poke_heartbeat_on_inner_recovery(&mut seen_recovery)
@@ -1739,7 +1752,7 @@ impl OAuthAdapterInner {
                     }
                     None => false,
                 };
-                if !recovery_poked {
+                if !recovery_tick {
                     let _ = outer_tx.send(());
                 }
             }
@@ -1772,19 +1785,40 @@ impl OAuthAdapterInner {
     /// flight when the recovery happened is followed by this fresh one
     /// (`Notify` stores the permit), and whichever result is newest wins.
     ///
-    /// Returns `true` when a recovery was noted. The caller then owes no
-    /// outer tick: `recovery_tick_pending` is raised BEFORE the poke so the
-    /// heartbeat finds it set when the probe it triggers is applied, and
-    /// publishes the invalidation after that commit.
+    /// Returns `true` when the tick announced a recovery; the caller then
+    /// owes no outer tick. When the heartbeat has not acknowledged that
+    /// generation yet, `recovery_tick_pending` is raised BEFORE the poke so
+    /// the heartbeat finds it set when the probe it triggers is applied,
+    /// and publishes the invalidation after that commit. When it already
+    /// has (its own probe performed the recovery and its `MarkHealthy`
+    /// commit ticked, see [`Self::ack_inner_recovery`]), the tick is simply
+    /// dropped: a second probe would only publish the same recovery again.
     async fn poke_heartbeat_on_inner_recovery(&self, seen_recovery: &mut u64) -> bool {
         let current = self.inner_recovery_generation().await;
-        if current > *seen_recovery {
-            *seen_recovery = current;
+        if current <= *seen_recovery {
+            return false;
+        }
+        *seen_recovery = current;
+        if current > self.acked_recovery_generation.load(Ordering::SeqCst) {
             self.recovery_tick_pending.store(true, Ordering::SeqCst);
             self.probe_now.notify_one();
-            return true;
         }
-        false
+        true
+    }
+
+    /// Acknowledge the inner adapter's current recovery generation on behalf
+    /// of a heartbeat `MarkHealthy` commit. Returns `true` when it advanced
+    /// past the last acknowledged one — the heartbeat then owes the outer
+    /// tick for that recovery (it may have performed it itself, with no
+    /// `inner_health` flip and no forwarder poke to publish it otherwise).
+    /// Failed verdicts never acknowledge, so a stale failure landing after
+    /// a recovery leaves it for the forwarder's corrective poke.
+    pub(super) async fn ack_inner_recovery(&self) -> bool {
+        let current = self.inner_recovery_generation().await;
+        current
+            > self
+                .acked_recovery_generation
+                .swap(current, Ordering::SeqCst)
     }
 
     /// Disconnect: abort refresh task, clear tokens, delete from disk, set
@@ -1905,6 +1939,7 @@ impl OAuthAdapter {
                 heartbeat_task_handle: Mutex::new(None),
                 probe_now: Arc::new(Notify::new()),
                 recovery_tick_pending: AtomicBool::new(false),
+                acked_recovery_generation: AtomicU64::new(0),
                 transition_history: RwLock::new(VecDeque::new()),
                 metrics: OAuthMetrics::new(),
                 refresh_mutex: Mutex::new(()),
@@ -4519,6 +4554,42 @@ mod tests {
             fx.tools_list_count.load(Ordering::SeqCst),
             probes_before + 2,
             "no probe storm: one stale, one fresh"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 5): when the heartbeat's own `tools/list` probe
+    /// is what recovers the demoted inner adapter, its `MarkHealthy` commit
+    /// flips `inner_health` and ticks; the inner recovery tick then reaches
+    /// the forwarder, which (before the fix) saw the generation advance,
+    /// raised `recovery_tick_pending` and poked — so the next probe
+    /// published the same recovery a second time. The healthy commit now
+    /// acknowledges the generation and the forwarder drops the tick.
+    #[tokio::test]
+    async fn heartbeat_led_recovery_emits_one_tick() {
+        let (mut adapter, _fx, server) = armed_probe_adapter(1).await;
+        *adapter.inner.inner_health.write().await =
+            HealthStatus::Unhealthy("upstream unreachable".into());
+        let mut rx = adapter.subscribe_tools_changed().unwrap();
+        drain(&mut rx).await;
+        {
+            let guard = adapter.inner.inner_adapter.read().await;
+            guard
+                .as_ref()
+                .unwrap()
+                .demote_via_transport_failures_for_test()
+                .await;
+        }
+
+        // The heartbeat probe recovers the inner adapter itself.
+        adapter.inner.probe_now.notify_one();
+        assert!(recv_tick(&mut rx, Duration::from_secs(2)).await);
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "one recovery performed by the heartbeat must not publish two outer ticks"
         );
 
         adapter.shutdown().await.unwrap();
