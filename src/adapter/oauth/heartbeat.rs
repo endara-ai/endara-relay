@@ -239,22 +239,52 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
             (state.clone(), generation)
         };
         match classify_tick_action(&oauth_state) {
-            TickAction::Skip => continue,
+            TickAction::Skip => {
+                // No probe will commit anything: do not hold a recovery's
+                // invalidation hostage to a state whose health does not
+                // depend on `inner_health` anyway.
+                publish_recovery_tick_if_due(&adapter, false);
+            }
             TickAction::Probe => {
                 let result = probe_inner(&adapter).await;
                 let action = classify_probe_result(result, &mut consecutive_failures, threshold);
-                apply_probe_action(&adapter, action, threshold, &oauth_state, generation).await;
+                let became_healthy =
+                    apply_probe_action(&adapter, action, threshold, &oauth_state, generation).await;
+                publish_recovery_tick_if_due(&adapter, became_healthy);
             }
             TickAction::Recover => {
                 attempt_recovery(&adapter).await;
+                publish_recovery_tick_if_due(&adapter, false);
             }
         }
     }
 }
 
+/// Publish the outer tools-changed invalidation the wrapper owes AFTER a
+/// probe verdict has been committed to `inner_health`. Fires at most once
+/// per call when either an inner recovery poke is pending
+/// (`recovery_tick_pending`, raised by the forwarder instead of ticking
+/// itself) or this probe actually flipped `inner_health` from `Unhealthy`
+/// to `Healthy` (`became_healthy`). The second condition covers a probe
+/// dispatched before the recovery that lands first with a stale failure:
+/// the pending flag is consumed by that stale commit, and the fresh probe
+/// right behind it still ticks when it clears the verdict. Ticking only
+/// here means the registry always rebuilds the catalog against the
+/// committed verdict, never against the one the probe is about to replace.
+pub(super) fn publish_recovery_tick_if_due(adapter: &OAuthAdapterInner, became_healthy: bool) {
+    let pending = adapter
+        .recovery_tick_pending
+        .swap(false, std::sync::atomic::Ordering::SeqCst);
+    if pending || became_healthy {
+        let _ = adapter.outer_tools_changed_tx.send(());
+    }
+}
+
 /// Apply the `ProbeAction` dispatched from `classify_probe_result` to the
 /// shared adapter state (writes `inner_health`, increments metrics, may
-/// transition `OAuthState`).
+/// transition `OAuthState`). Returns `true` when this call flipped
+/// `inner_health` from `Unhealthy` to `Healthy` (the outer invalidation for
+/// that transition is published by the caller once the write is done).
 ///
 /// Extracted from `heartbeat_loop` so the side-effect dispatch can be
 /// driven directly by tests without spinning a real timer or probe.
@@ -264,16 +294,20 @@ async fn apply_probe_action(
     threshold: u32,
     oauth_state: &OAuthState,
     dispatched_generation: u64,
-) {
+) -> bool {
     match action {
         ProbeAction::MarkHealthy => {
-            *adapter.inner_health.write().await = HealthStatus::Healthy;
+            let previous = std::mem::replace(
+                &mut *adapter.inner_health.write().await,
+                HealthStatus::Healthy,
+            );
             adapter.metrics.inc_heartbeat_healthy();
             trace!(
                 oauth_state = ?oauth_state,
                 result = "healthy",
                 "heartbeat probe succeeded"
             );
+            return matches!(previous, HealthStatus::Unhealthy(_));
         }
         ProbeAction::BelowThreshold { failures, reason } => {
             debug!(
@@ -340,7 +374,7 @@ async fn apply_probe_action(
                      mid-probe (state changed or an apply ran); dropping \
                      stale result"
                 );
-                return;
+                return false;
             }
             adapter.metrics.inc_heartbeat_unhealthy();
             warn!(
@@ -367,6 +401,7 @@ async fn apply_probe_action(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
+    false
 }
 
 #[cfg(test)]

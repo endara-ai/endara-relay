@@ -265,6 +265,14 @@ pub struct OAuthAdapterInner {
     /// catches up after one probe instead of after the next interval tick.
     /// The heartbeat stays the only post-apply writer of `inner_health`.
     probe_now: Arc<Notify>,
+    /// Set together with a recovery poke: the outer invalidation for that
+    /// recovery is owed and the heartbeat publishes it once the probe's
+    /// verdict has been committed to `inner_health` (see
+    /// [`heartbeat::publish_recovery_tick_if_due`]). Ticking before the
+    /// commit would let the registry rebuild its catalog against the stale
+    /// `Unhealthy` and cache the `[⚠️ UNAVAILABLE]` labels with no later
+    /// tick to correct them.
+    recovery_tick_pending: AtomicBool,
     /// Ring buffer of recent state transitions (max TRANSITION_RING_BUFFER_CAPACITY).
     pub transition_history: RwLock<VecDeque<TransitionRecord>>,
     /// In-process metric counters.
@@ -1704,7 +1712,11 @@ impl OAuthAdapterInner {
     /// inner's [`HttpAdapter::recovery_generation`] when it binds and, on
     /// each tick, asks the heartbeat for an immediate probe only when that
     /// counter advanced (see [`Self::poke_heartbeat_on_inner_recovery`]).
-    /// The forwarder never writes `inner_health` itself.
+    /// The forwarder never writes `inner_health` itself. A recovery tick is
+    /// NOT relayed here either: the heartbeat publishes it after the probe
+    /// commits (`recovery_tick_pending`), so the registry never rebuilds its
+    /// catalog against a verdict the probe is about to overturn. Ordinary
+    /// invalidations are relayed immediately as before.
     async fn swap_tools_forwarder(self: &Arc<Self>, rx: Option<broadcast::Receiver<()>>) {
         let mut handle_guard = self.inner_forwarder_handle.lock().await;
         if let Some(h) = handle_guard.take() {
@@ -1719,12 +1731,17 @@ impl OAuthAdapterInner {
             // `Ok` and `Lagged` both forward a tick; `Closed` ends the task.
             while let Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
                 *fingerprint.write().await = None;
-                if let Some(inner) = weak.upgrade() {
-                    inner
-                        .poke_heartbeat_on_inner_recovery(&mut seen_recovery)
-                        .await;
+                let recovery_poked = match weak.upgrade() {
+                    Some(inner) => {
+                        inner
+                            .poke_heartbeat_on_inner_recovery(&mut seen_recovery)
+                            .await
+                    }
+                    None => false,
+                };
+                if !recovery_poked {
+                    let _ = outer_tx.send(());
                 }
-                let _ = outer_tx.send(());
             }
         });
         *handle_guard = Some(join.abort_handle());
@@ -1754,12 +1771,20 @@ impl OAuthAdapterInner {
     /// `inner_health` and is asked to re-probe now: a probe that was in
     /// flight when the recovery happened is followed by this fresh one
     /// (`Notify` stores the permit), and whichever result is newest wins.
-    async fn poke_heartbeat_on_inner_recovery(&self, seen_recovery: &mut u64) {
+    ///
+    /// Returns `true` when a recovery was noted. The caller then owes no
+    /// outer tick: `recovery_tick_pending` is raised BEFORE the poke so the
+    /// heartbeat finds it set when the probe it triggers is applied, and
+    /// publishes the invalidation after that commit.
+    async fn poke_heartbeat_on_inner_recovery(&self, seen_recovery: &mut u64) -> bool {
         let current = self.inner_recovery_generation().await;
         if current > *seen_recovery {
             *seen_recovery = current;
+            self.recovery_tick_pending.store(true, Ordering::SeqCst);
             self.probe_now.notify_one();
+            return true;
         }
+        false
     }
 
     /// Disconnect: abort refresh task, clear tokens, delete from disk, set
@@ -1879,6 +1904,7 @@ impl OAuthAdapter {
                 inner_health: RwLock::new(HealthStatus::Starting),
                 heartbeat_task_handle: Mutex::new(None),
                 probe_now: Arc::new(Notify::new()),
+                recovery_tick_pending: AtomicBool::new(false),
                 transition_history: RwLock::new(VecDeque::new()),
                 metrics: OAuthMetrics::new(),
                 refresh_mutex: Mutex::new(()),
@@ -4278,8 +4304,13 @@ mod tests {
                     if fail {
                         return (StatusCode::SERVICE_UNAVAILABLE, "probe failed").into_response();
                     }
-                    Json(json!({"jsonrpc": "2.0", "id": id, "result": {"tools": []}}))
-                        .into_response()
+                    // One tool so a registry catalog built over this fixture
+                    // has an entry whose health label can be observed.
+                    Json(json!({"jsonrpc": "2.0", "id": id, "result": {"tools": [
+                        {"name": "probe_tool", "description": "probe tool",
+                         "inputSchema": {"type": "object"}}
+                    ]}}))
+                    .into_response()
                 }
                 _ => Json(json!({"jsonrpc": "2.0", "id": id, "result": {}})).into_response(),
             }
@@ -4491,6 +4522,115 @@ mod tests {
         );
 
         adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 5): the inner adapter's recovery tick reaches
+    /// the registry only AFTER the heartbeat has committed the probe's
+    /// verdict. Before the fix the forwarder relayed the tick at once, so
+    /// the registry rebuilt the merged catalog while the wrapper still read
+    /// `Unhealthy`, cached the `[⚠️ UNAVAILABLE]` labels, and no later tick
+    /// corrected them once the probe flipped `inner_health`. Deterministic:
+    /// the fixture parks the recovery-triggered probe, and the catalog is
+    /// built through a real registry while it is parked.
+    #[tokio::test]
+    async fn recovery_invalidation_reaches_registry_only_after_probe_commits() {
+        use crate::registry::AdapterRegistry;
+
+        let (adapter, fx, server) = armed_probe_adapter(1).await;
+        let inner = adapter.inner.clone();
+        *inner.inner_health.write().await = HealthStatus::Unhealthy("upstream unreachable".into());
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+
+        let registry = AdapterRegistry::new();
+        registry
+            .register(
+                "oauth-ep".into(),
+                Box::new(adapter),
+                "oauth".into(),
+                None,
+                None,
+            )
+            .await;
+        let mut relay_rx = registry.subscribe_tools_changed();
+        let unavailable = registry
+            .merged_catalog()
+            .await
+            .into_iter()
+            .find(|t| t.name == "probe_tool")
+            .and_then(|t| t.description)
+            .expect("the fixture's tool is in the catalog");
+        assert!(
+            unavailable.starts_with("[⚠️ UNAVAILABLE]"),
+            "baseline: wrapper is Unhealthy, got {unavailable:?}"
+        );
+        while relay_rx.try_recv().is_ok() {}
+
+        // Park the probe the inner recovery is about to trigger, then
+        // recover the inner adapter for real (its recovery generation
+        // advances and its tick reaches the forwarder).
+        fx.hold_probe.store(true, Ordering::SeqCst);
+        {
+            let guard = inner.inner_adapter.read().await;
+            let http = guard.as_ref().expect("inner adapter installed");
+            http.demote_via_transport_failures_for_test().await;
+            http.call_tool("x", serde_json::json!({}))
+                .await
+                .expect("live upstream answers");
+            assert_eq!(http.health(), HealthStatus::Healthy);
+        }
+        tokio::time::timeout(Duration::from_secs(5), fx.probe_started.notified())
+            .await
+            .expect("the recovery-triggered probe reaches the upstream");
+        fx.hold_probe.store(false, Ordering::SeqCst);
+
+        // Barrier: while the probe is parked the verdict is uncommitted, so
+        // no invalidation may have reached the registry — a rebuild now
+        // would cache the stale label.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), relay_rx.recv())
+                .await
+                .is_err(),
+            "no invalidation may be published before the probe commits"
+        );
+        let mid = registry
+            .merged_catalog()
+            .await
+            .into_iter()
+            .find(|t| t.name == "probe_tool")
+            .and_then(|t| t.description)
+            .unwrap();
+        assert!(
+            mid.starts_with("[⚠️ UNAVAILABLE]"),
+            "still uncommitted: {mid:?}"
+        );
+
+        // Release: the probe commits Healthy, THEN the invalidation lands.
+        fx.probe_release.notify_one();
+        let endpoint = tokio::time::timeout(Duration::from_secs(5), relay_rx.recv())
+            .await
+            .expect("the recovery invalidation is published after the commit")
+            .expect("relay channel open");
+        assert_eq!(endpoint, "oauth-ep");
+        assert_eq!(*inner.inner_health.read().await, HealthStatus::Healthy);
+        let healthy = registry
+            .merged_catalog()
+            .await
+            .into_iter()
+            .find(|t| t.name == "probe_tool")
+            .and_then(|t| t.description)
+            .unwrap();
+        assert_eq!(
+            healthy, "[oauth-ep] probe tool",
+            "the rebuilt catalog must drop the UNAVAILABLE label"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), relay_rx.recv())
+                .await
+                .is_err(),
+            "exactly one invalidation per recovery"
+        );
+
         server.abort();
     }
 

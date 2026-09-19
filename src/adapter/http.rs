@@ -456,6 +456,42 @@ impl HttpAdapter {
         self.jit_interceptor = Some(interceptor);
     }
 
+    /// The persisted JIT bearer for `endpoint_name` as an `Authorization`
+    /// header value, or `None` when no interceptor is attached, no token is
+    /// stored, or the stored token has expired
+    /// ([`JitInterceptor::current_bearer`]). Read live on every request so a
+    /// token refreshed after the loopback `/oauth/callback` is picked up
+    /// without rebuilding the adapter. The value is marked sensitive so
+    /// request/header debug output redacts it; the token is never logged.
+    ///
+    /// Static so the GET listener task (which owns no `&self`) can use the
+    /// same code path as the adapter's own request sites.
+    async fn jit_bearer_header(
+        interceptor: Option<&Arc<JitInterceptor>>,
+        endpoint_name: &str,
+    ) -> Option<reqwest::header::HeaderValue> {
+        let token = interceptor?.current_bearer(endpoint_name).await?;
+        let mut val = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token)).ok()?;
+        val.set_sensitive(true);
+        Some(val)
+    }
+
+    /// Single seam through which every request this adapter puts on the
+    /// wire — tool calls, `server/discover`, `initialize`,
+    /// `notifications/initialized` and other notifications — receives the
+    /// current JIT bearer (see [`Self::jit_bearer_header`]). No-op without an
+    /// interceptor or a valid stored token, leaving the default request path
+    /// unchanged. The GET listener applies the same header per request via
+    /// [`Self::jit_bearer_header`] directly.
+    async fn apply_jit_bearer(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match Self::jit_bearer_header(self.jit_interceptor.as_ref(), &self.config.endpoint_name)
+            .await
+        {
+            Some(val) => builder.header(reqwest::header::AUTHORIZATION, val),
+            None => builder,
+        }
+    }
+
     /// Record the upstream server's negotiated [`ProtocolVersion`]. Populated
     /// during the connection-open handshake (T7); consumed by the 2026 outbound
     /// code paths (T8).
@@ -716,6 +752,7 @@ impl HttpAdapter {
                 builder = builder.header(MCP_SESSION_ID_HEADER.clone(), val);
             }
         }
+        let builder = self.apply_jit_bearer(builder).await;
         let resp = builder.send().await.map_err(|e| {
             if e.is_timeout() {
                 AdapterError::Timeout(self.config.timeout_secs)
@@ -902,21 +939,7 @@ impl HttpAdapter {
                 builder = builder.header(MCP_SESSION_ID_HEADER.clone(), val);
             }
         }
-        // JIT retry-after-sign-in seam: when a JIT interceptor is attached and a
-        // valid bearer has been persisted for this endpoint (after the human
-        // completed the loopback `/oauth/callback`), inject it so a re-issued
-        // tool call uses the held token and succeeds instead of re-triggering
-        // the JIT flow. No-op when no interceptor is attached or no valid token
-        // is stored, leaving the default request path unchanged.
-        if let Some(ref interceptor) = self.jit_interceptor {
-            if let Some(token) = interceptor.current_bearer(&self.config.endpoint_name).await {
-                if let Ok(val) =
-                    reqwest::header::HeaderValue::from_str(&format!("Bearer {}", token))
-                {
-                    builder = builder.header(reqwest::header::AUTHORIZATION, val);
-                }
-            }
-        }
+        let builder = self.apply_jit_bearer(builder).await;
         let resp = builder.send().await.map_err(|e| {
             if e.is_timeout() {
                 AdapterError::Timeout(self.config.timeout_secs)
@@ -1006,6 +1029,8 @@ impl HttpAdapter {
         url: String,
         headers: HashMap<String, String>,
         session_id: Option<String>,
+        jit_interceptor: Option<Arc<JitInterceptor>>,
+        endpoint_name: String,
         tools_changed_tx: broadcast::Sender<()>,
         shutdown: Arc<Notify>,
     ) {
@@ -1040,9 +1065,17 @@ impl HttpAdapter {
             }
         };
 
+        // Same JIT bearer seam as the adapter's POST sites, read live at
+        // connect time so every (re)spawned stream carries the current token.
+        let mut get = client
+            .get(&url)
+            .header(reqwest::header::ACCEPT, "text/event-stream");
+        if let Some(val) = Self::jit_bearer_header(jit_interceptor.as_ref(), &endpoint_name).await {
+            get = get.header(reqwest::header::AUTHORIZATION, val);
+        }
         let resp = tokio::select! {
             _ = shutdown.notified() => return,
-            r = client.get(&url).header(reqwest::header::ACCEPT, "text/event-stream").send() => match r {
+            r = get.send() => match r {
                 Ok(r) => r,
                 Err(e) => {
                     debug!(error = %e, "GET listener: connect/send failed; exiting");
@@ -1138,6 +1171,7 @@ impl HttpAdapter {
             let builder = self.client.post(&self.config.url).json(&request);
             let builder =
                 Self::apply_2026_headers(builder, "server/discover", request.params.as_ref());
+            let builder = self.apply_jit_bearer(builder).await;
             let resp = builder.send().await.ok()?;
             if !resp.status().is_success() {
                 return None;
@@ -1242,13 +1276,17 @@ impl HttpAdapter {
     /// The listener authenticates from `HttpConfig::headers`, not from
     /// `self.client`: the request client's per-request timeout would tear the
     /// long-lived stream down, so the listener builds its own client and the
-    /// OAuth wrapper mirrors its bearer into the config headers.
+    /// OAuth wrapper mirrors its bearer into the config headers. A JIT bearer
+    /// is applied per connect via [`Self::jit_bearer_header`], the same seam
+    /// as every POST.
     async fn spawn_get_listener(&self) {
         let url = self.config.url.clone();
         let headers = self.config.headers.clone();
         // Snapshot the session ID at spawn time so the listener doesn't
         // need to re-read adapter state. Matches how `headers` is passed.
         let session_id = self.session_id.read().await.clone();
+        let jit_interceptor = self.jit_interceptor.clone();
+        let endpoint_name = self.config.endpoint_name.clone();
         let tx = self.tools_changed_tx.clone();
         let shutdown = self.shutdown_notify.clone();
         let listener_span = self.span.clone();
@@ -1269,7 +1307,16 @@ impl HttpAdapter {
         }
         let handle = tokio::spawn(
             async move {
-                Self::run_get_listener(url, headers, session_id, tx, shutdown).await;
+                Self::run_get_listener(
+                    url,
+                    headers,
+                    session_id,
+                    jit_interceptor,
+                    endpoint_name,
+                    tx,
+                    shutdown,
+                )
+                .await;
             }
             .instrument(listener_span),
         );
@@ -1351,7 +1398,11 @@ impl HttpAdapter {
     ///   each phase. The signal itself is only a hint: a delayed one from an
     ///   earlier flip must not stand the supervisor down while a later
     ///   demotion has it `Unhealthy` again
-    ///   (see [`Self::stood_down_after_recovery_signal`]).
+    ///   (see [`Self::stood_down_after_recovery_signal`]), and it must not
+    ///   restart the attempt either — the pending backoff keeps its original
+    ///   deadline and an in-flight dialect probe keeps running, so one
+    ///   attempt costs at most one (capped) backoff sleep (pinned by
+    ///   `stale_recovery_signal_during_backoff_keeps_the_deadline`).
     /// * Once `initialize` is on the wire the upstream may have rotated the
     ///   session, so the attempt runs to completion: on success the returned
     ///   session replaces the stored one; on failure
@@ -1387,7 +1438,7 @@ impl HttpAdapter {
                 _ = self.reconnect_notify.notified() => {}
             }
 
-            loop {
+            'attempt: loop {
                 // `notify_waiters` only reaches `Notified` futures that
                 // already exist, so register before checking health.
                 let recovered = self.recovered_notify.notified();
@@ -1415,15 +1466,24 @@ impl HttpAdapter {
                     "HTTP reconnect: backing off before next attempt"
                 );
 
-                tokio::select! {
-                    _ = self.shutdown_notify.notified() => return,
-                    _ = &mut recovered => {
-                        if self.stood_down_after_recovery_signal("backoff").await {
-                            break;
+                // The deadline is pinned once: a stale recovery hint (see
+                // `stood_down_after_recovery_signal`) re-enters the wait for
+                // the REMAINING time instead of recording another attempt and
+                // starting a fresh — possibly capped — backoff, so one
+                // outage costs at most one backoff sleep per attempt.
+                let sleep = tokio::time::sleep_until(tokio::time::Instant::now() + backoff);
+                tokio::pin!(sleep);
+                loop {
+                    tokio::select! {
+                        _ = self.shutdown_notify.notified() => return,
+                        _ = &mut recovered => {
+                            if self.stood_down_after_recovery_signal("backoff").await {
+                                break 'attempt;
+                            }
+                            recovered.set(self.recovered_notify.notified());
                         }
-                        continue;
+                        _ = &mut sleep => break,
                     }
-                    _ = tokio::time::sleep(backoff) => {}
                 }
 
                 if !matches!(*self.health.read().await, HealthStatus::Unhealthy(_)) {
@@ -1435,16 +1495,21 @@ impl HttpAdapter {
                 info!(url = %self.config.url, "HTTP reconnect: attempting");
                 // The dialect probe is stateless, so abandoning it mid-flight
                 // has no upstream side effect — the last point at which a
-                // reactive recovery can retire this attempt.
-                let discover_result = tokio::select! {
-                    _ = self.shutdown_notify.notified() => return,
-                    _ = &mut recovered => {
-                        if self.stood_down_after_recovery_signal("dialect probe").await {
-                            break;
+                // reactive recovery can retire this attempt. A stale hint
+                // leaves the in-flight probe alone.
+                let probe = self.try_discover_probe();
+                tokio::pin!(probe);
+                let discover_result = loop {
+                    tokio::select! {
+                        _ = self.shutdown_notify.notified() => return,
+                        _ = &mut recovered => {
+                            if self.stood_down_after_recovery_signal("dialect probe").await {
+                                break 'attempt;
+                            }
+                            recovered.set(self.recovered_notify.notified());
                         }
-                        continue;
+                        result = &mut probe => break result,
                     }
-                    result = self.try_discover_probe() => result,
                 };
                 // Serialize with a caller-owned `initialize()` (see
                 // `handshake_lock`). Re-check health once the lock is held:
@@ -1482,7 +1547,8 @@ impl HttpAdapter {
     /// further permit ever coming (repeat failures while `Unhealthy` don't
     /// notify). So re-read health: `true` (adapter is no longer `Unhealthy`)
     /// means stand down — the backoff is reset for the caller to `break`;
-    /// `false` means the signal was stale and the caller must keep retrying.
+    /// `false` means the signal was stale and the caller re-arms the hint
+    /// and resumes the SAME pending phase (no attempt is recorded).
     async fn stood_down_after_recovery_signal(&self, phase: &str) -> bool {
         if matches!(*self.health.read().await, HealthStatus::Unhealthy(_)) {
             debug!(
@@ -1676,10 +1742,10 @@ impl HttpAdapter {
                 let id = self.next_id();
                 let request = jsonrpc::new_request("initialize", Some(params), id);
                 trace!(method = "initialize", id = id, url = %self.config.url, "sending HTTP JSON-RPC request");
+                let builder = self.client.post(&self.config.url).json(&request);
                 let send_result = self
-                    .client
-                    .post(&self.config.url)
-                    .json(&request)
+                    .apply_jit_bearer(builder)
+                    .await
                     .send()
                     .await
                     .map_err(|e| {
@@ -3178,6 +3244,260 @@ mod tests {
         server.abort();
     }
 
+    /// Fixture that gates EVERY path on `Authorization: Bearer <expected>`:
+    /// `server/discover` (answered as legacy), `initialize` (issues a
+    /// session), notifications (202), `tools/list`, and the `GET` SSE stream
+    /// (which emits one `tools/list_changed` per accepted connection). Any
+    /// request without the current bearer gets a 401 and is counted in
+    /// `unauthenticated`, so a test can prove the token reached every wire
+    /// path. `expected` is swappable so token rotation can be exercised.
+    #[derive(Clone)]
+    struct BearerEverywhereFixture {
+        expected: Arc<std::sync::Mutex<String>>,
+        unauthenticated: Arc<AtomicU64>,
+        discover_authed: Arc<AtomicU64>,
+        init_authed: Arc<AtomicU64>,
+        notification_authed: Arc<AtomicU64>,
+        get_authed: Arc<AtomicU64>,
+        session: Arc<std::sync::Mutex<Option<String>>>,
+    }
+
+    impl BearerEverywhereFixture {
+        fn rotate_expected(&self, token: &str) {
+            *self.expected.lock().unwrap() = token.to_string();
+        }
+    }
+
+    async fn bearer_everywhere_handler(
+        State(fx): State<BearerEverywhereFixture>,
+        req: axum::extract::Request,
+    ) -> axum::response::Response {
+        let expected = format!("Bearer {}", fx.expected.lock().unwrap());
+        let authed = req
+            .headers()
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == expected)
+            .unwrap_or(false);
+        if !authed {
+            fx.unauthenticated.fetch_add(1, Ordering::SeqCst);
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(
+                    axum::http::header::WWW_AUTHENTICATE,
+                    "Bearer realm=\"Test\"",
+                )],
+                "unauthorized",
+            )
+                .into_response();
+        }
+        if req.method() == axum::http::Method::GET {
+            fx.get_authed.fetch_add(1, Ordering::SeqCst);
+            let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(8);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Ok(Event::default().data(
+                        "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}",
+                    )))
+                    .await;
+                tx.closed().await;
+            });
+            return Sse::new(tokio_stream::wrappers::ReceiverStream::new(rx))
+                .keep_alive(KeepAlive::default())
+                .into_response();
+        }
+        let session_header = req
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        let body_bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+            .await
+            .unwrap_or_default();
+        let value: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
+        let id = value["id"].as_u64().unwrap_or(0);
+        if value["method"] == "server/discover" {
+            fx.discover_authed.fetch_add(1, Ordering::SeqCst);
+            return Json(json!({
+                "jsonrpc": "2.0",
+                "error": {"code": -32601, "message": "method not found"},
+                "id": id,
+            }))
+            .into_response();
+        }
+        if value["method"] == "initialize" {
+            let n = fx.init_authed.fetch_add(1, Ordering::SeqCst) + 1;
+            let sid = format!("bearer-sess-{}", n);
+            *fx.session.lock().unwrap() = Some(sid.clone());
+            let mut resp = Json(json!({
+                "jsonrpc": "2.0",
+                "result": {
+                    "protocolVersion": "2025-03-26",
+                    "capabilities": {"tools": {"listChanged": true}},
+                    "serverInfo": {"name": "bearer-http", "version": "0.0.0"}
+                },
+                "id": id,
+            }))
+            .into_response();
+            resp.headers_mut().insert(
+                MCP_SESSION_ID_HEADER.clone(),
+                reqwest::header::HeaderValue::from_str(&sid).unwrap(),
+            );
+            return resp;
+        }
+        if session_header != *fx.session.lock().unwrap() {
+            return (StatusCode::BAD_REQUEST, "stale or missing session").into_response();
+        }
+        if value.get("id").is_none() {
+            fx.notification_authed.fetch_add(1, Ordering::SeqCst);
+            return (StatusCode::ACCEPTED, "").into_response();
+        }
+        if value["method"] == "tools/list" {
+            return Json(json!({
+                "jsonrpc": "2.0",
+                "result": {"tools": [
+                    {"name": "ping", "description": "p", "inputSchema": {"type": "object"}}
+                ]},
+                "id": id,
+            }))
+            .into_response();
+        }
+        Json(json!({"jsonrpc": "2.0", "result": {"ok": true}, "id": id})).into_response()
+    }
+
+    async fn start_bearer_everywhere_fixture(
+        token: &str,
+    ) -> (String, BearerEverywhereFixture, JoinHandle<()>) {
+        let fx = BearerEverywhereFixture {
+            expected: Arc::new(std::sync::Mutex::new(token.to_string())),
+            unauthenticated: Arc::new(AtomicU64::new(0)),
+            discover_authed: Arc::new(AtomicU64::new(0)),
+            init_authed: Arc::new(AtomicU64::new(0)),
+            notification_authed: Arc::new(AtomicU64::new(0)),
+            get_authed: Arc::new(AtomicU64::new(0)),
+            session: Arc::new(std::sync::Mutex::new(None)),
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route("/mcp", any(bearer_everywhere_handler))
+            .with_state(fx.clone());
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        (format!("http://{}/mcp", addr), fx, handle)
+    }
+
+    async fn persist_bearer(tm: &crate::token_manager::TokenManager, endpoint: &str, token: &str) {
+        use crate::token_manager::TokenSet;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        tm.save(
+            endpoint,
+            &TokenSet {
+                access_token: token.to_string(),
+                refresh_token: None,
+                expires_at: Some(now + 3600),
+                token_type: "Bearer".to_string(),
+                scope: None,
+                issued_at: Some(now),
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// PR #163 review (round 5): the persisted JIT bearer must reach EVERY
+    /// request the adapter puts on the wire — the `server/discover` probe,
+    /// the `initialize` POST, `notifications/initialized`, tool requests and
+    /// the `GET` SSE listener — on the initial handshake AND on every
+    /// supervisor reconnect, read live so a rotated token is picked up by
+    /// the respawned handshake and listener. Before the fix only
+    /// `send_request_inner` injected it: against a fully gated upstream the
+    /// handshake and listener went out unauthenticated.
+    #[tokio::test]
+    async fn jit_bearer_reaches_handshake_notifications_and_get_listener() {
+        use crate::adapter::oauth::jit::JitInterceptor;
+        use crate::oauth::OAuthFlowManager;
+        use crate::token_manager::TokenManager;
+
+        let (url, fx, server) = start_bearer_everywhere_fixture("token-v1").await;
+        let tmp = tempfile::tempdir().unwrap();
+        let tm = Arc::new(TokenManager::new(tmp.path().to_path_buf()));
+        persist_bearer(&tm, "ep-everywhere", "token-v1").await;
+        let flow_mgr = Arc::new(OAuthFlowManager::new());
+        let interceptor = Arc::new(JitInterceptor::new(9400, flow_mgr, Some(tm.clone()), true));
+
+        let mut config = HttpConfig::new(url);
+        config.endpoint_name = "ep-everywhere".to_string();
+        let mut adapter = HttpAdapter::new(config);
+        adapter.set_jit_interceptor(interceptor.clone());
+        let mut rx = adapter.subscribe_tools_changed().expect("Some receiver");
+
+        adapter
+            .initialize()
+            .await
+            .expect("fully gated upstream must accept the authenticated handshake");
+        use_fast_backoff(&adapter).await;
+        assert_eq!(fx.discover_authed.load(Ordering::SeqCst), 1);
+        assert_eq!(fx.init_authed.load(Ordering::SeqCst), 1);
+        assert!(fx.notification_authed.load(Ordering::SeqCst) >= 1);
+        // The listener's stream was accepted and delivered its notification.
+        tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("authenticated GET listener must deliver list_changed")
+            .unwrap();
+        assert_eq!(fx.get_authed.load(Ordering::SeqCst), 1);
+        adapter
+            .list_tools()
+            .await
+            .expect("tools/list authenticated");
+
+        // Rotate the token: the reconnect must read the NEW bearer live on
+        // every path, not a value captured when the adapter was built.
+        fx.rotate_expected("token-v2");
+        persist_bearer(&tm, "ep-everywhere", "token-v2").await;
+        demote_via_transport_failures(&adapter).await;
+        let recovered = wait_until(Duration::from_secs(5), || {
+            adapter.health() == HealthStatus::Healthy
+        })
+        .await;
+        assert!(
+            recovered,
+            "supervisor must reconnect with the rotated bearer"
+        );
+        assert_eq!(fx.discover_authed.load(Ordering::SeqCst), 2);
+        assert_eq!(fx.init_authed.load(Ordering::SeqCst), 2);
+        assert!(fx.notification_authed.load(Ordering::SeqCst) >= 2);
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                fx.get_authed.load(Ordering::SeqCst) == 2
+            })
+            .await,
+            "the respawned GET listener must carry the rotated bearer"
+        );
+        adapter
+            .list_tools()
+            .await
+            .expect("tools/list with rotated bearer");
+
+        assert_eq!(
+            fx.unauthenticated.load(Ordering::SeqCst),
+            0,
+            "no request on any path may reach the upstream without the current bearer"
+        );
+        assert_ne!(
+            interceptor.state().await,
+            crate::adapter::oauth::OAuthState::NeedsLogin,
+            "an authenticated adapter never re-triggers the JIT flow"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
     /// Without an interceptor (the default for every adapter today), a 401 is
     /// forwarded unchanged — confirming the wiring is dormant by default.
     #[tokio::test]
@@ -3511,6 +3831,7 @@ mod tests {
         init_count: Arc<AtomicU64>,
         get_count: Arc<AtomicU64>,
         tools_list_count: Arc<AtomicU64>,
+        discover_count: Arc<AtomicU64>,
         current_session: Arc<std::sync::Mutex<Option<String>>>,
         hold_discover: Arc<AtomicBool>,
         hold_init: Arc<AtomicBool>,
@@ -3561,6 +3882,7 @@ mod tests {
             init_count: Arc::new(AtomicU64::new(0)),
             get_count: Arc::new(AtomicU64::new(0)),
             tools_list_count: Arc::new(AtomicU64::new(0)),
+            discover_count: Arc::new(AtomicU64::new(0)),
             current_session: Arc::new(std::sync::Mutex::new(None)),
             hold_discover: Arc::new(AtomicBool::new(false)),
             hold_init: Arc::new(AtomicBool::new(false)),
@@ -3611,6 +3933,7 @@ mod tests {
         let value: Value = serde_json::from_slice(&body_bytes).unwrap_or(Value::Null);
         let id = value["id"].as_u64().unwrap_or(0);
         if value["method"] == "server/discover" {
+            fx.discover_count.fetch_add(1, Ordering::SeqCst);
             if fx.hold_discover.swap(false, Ordering::SeqCst) {
                 fx.started.notify_one();
                 fx.release.notified().await;
@@ -4936,7 +5259,10 @@ mod tests {
     /// stale signal must not stand the supervisor down while the adapter is
     /// `Unhealthy` — nothing would ever restart it. Fired here directly while
     /// the attempt is parked in the (stateless) dialect probe, which is the
-    /// deterministic equivalent of the race.
+    /// deterministic equivalent of the race. Round 5: the stale hint must
+    /// also leave the in-flight probe alone rather than cancel it and start
+    /// a new attempt — the parked probe is released afterwards and is the
+    /// only one the upstream ever sees.
     #[tokio::test]
     async fn stale_recovery_signal_during_dialect_probe_keeps_retrying() {
         let (url, fx, server) = start_supervisor_fixture().await;
@@ -4951,10 +5277,28 @@ mod tests {
             .await
             .expect("supervisor attempt should reach the dialect probe");
         assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+        // One probe from the caller's initial handshake, one from this attempt.
+        assert_eq!(fx.discover_count.load(Ordering::SeqCst), 2);
 
         // The stale signal: nothing recovered the adapter.
         adapter.recovered_notify.notify_waiters();
 
+        // The probe is still parked at the upstream; the attempt waits on
+        // it instead of abandoning it for a fresh one.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+        assert_eq!(
+            fx.discover_count.load(Ordering::SeqCst),
+            2,
+            "a stale hint must not cancel and re-issue the in-flight dialect probe"
+        );
+        assert_eq!(
+            adapter.crash_tracker.lock().await.consecutive_failures,
+            1,
+            "a stale hint must not record another attempt"
+        );
+
+        fx.release.notify_one();
         let recovered = wait_until(Duration::from_secs(5), || {
             adapter.health() == HealthStatus::Healthy
         })
@@ -4968,30 +5312,36 @@ mod tests {
             2,
             "recovery must come from the supervisor's retried handshake"
         );
+        assert_eq!(fx.discover_count.load(Ordering::SeqCst), 2);
         assert_eq!(drain_ticks(&mut rx), 1, "exactly one tick per recovery");
         assert_eq!(adapter.crash_tracker.lock().await.consecutive_failures, 0);
 
-        fx.release.notify_one();
         adapter.shutdown().await.unwrap();
         server.abort();
     }
 
     /// Same stale signal, other cancellable phase: delivered while the
-    /// attempt is sleeping out its backoff. The supervisor must treat it as
-    /// a hint, re-check health, and go round again (a further attempt is
-    /// recorded) instead of resetting and exiting.
+    /// attempt is sleeping out its backoff. PR #163 review (round 5): the
+    /// supervisor must re-check health and, finding the hint stale, resume
+    /// the SAME wait — the original deadline is kept and no further attempt
+    /// is recorded. Restarting the attempt would add a whole new backoff
+    /// (60 s at the cap) on top of the one already mostly slept, against the
+    /// "at most one capped backoff per attempt" requirement. With a 600 ms
+    /// base the retained deadline lands at ~600 ms; a restarted attempt
+    /// would land no earlier than 300 + 1200 ms.
     #[tokio::test]
-    async fn stale_recovery_signal_during_backoff_keeps_retrying() {
+    async fn stale_recovery_signal_during_backoff_keeps_the_deadline() {
         let (url, fx, server) = start_supervisor_fixture().await;
         let mut adapter = HttpAdapter::new(HttpConfig::new(url));
         adapter.initialize().await.expect("initialize succeeds");
         *adapter.crash_tracker.lock().await = CrashTracker::new_test(
-            Duration::from_millis(200),
+            Duration::from_millis(600),
             usize::MAX,
             Duration::from_secs(60),
         );
         let mut rx = adapter.subscribe_tools_changed().unwrap();
 
+        let demoted_at = std::time::Instant::now();
         demote_via_transport_failures(&adapter).await;
         // Counter == 1: the attempt is recorded and its `recovered` future
         // (registered before the record) is live, so the signal reaches it.
@@ -5008,27 +5358,39 @@ mod tests {
         );
         assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
 
+        // Halfway through the sleep: a stale hint.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 1);
         adapter.recovered_notify.notify_waiters();
-
-        // Going round again records a second attempt; standing down would
-        // have reset the counter to 0 instead.
-        assert!(
-            wait_until(Duration::from_secs(5), || {
-                adapter
-                    .crash_tracker
-                    .try_lock()
-                    .map(|t| t.consecutive_failures == 2)
-                    .unwrap_or(false)
-            })
-            .await,
-            "a stale signal while Unhealthy must lead to another attempt, not a stand-down"
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            adapter.crash_tracker.lock().await.consecutive_failures,
+            1,
+            "a stale hint mid-sleep must not record another attempt"
         );
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+
         let recovered = wait_until(Duration::from_secs(5), || {
             adapter.health() == HealthStatus::Healthy
         })
         .await;
-        assert!(recovered, "the retried attempt must recover the adapter");
-        assert_eq!(fx.init_count.load(Ordering::SeqCst), 2);
+        let recovered_after = demoted_at.elapsed();
+        assert!(recovered, "the pending attempt must recover the adapter");
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            2,
+            "one handshake, from the attempt that was already pending"
+        );
+        assert!(
+            recovered_after < Duration::from_millis(1200),
+            "a stale hint must not push the attempt past its original deadline \
+             (recovered after {recovered_after:?}; a restarted backoff would need >= 1500 ms)"
+        );
+        assert_eq!(
+            adapter.crash_tracker.lock().await.consecutive_failures,
+            0,
+            "the successful attempt resets the counter"
+        );
         assert_eq!(drain_ticks(&mut rx), 1, "exactly one tick per recovery");
 
         adapter.shutdown().await.unwrap();
