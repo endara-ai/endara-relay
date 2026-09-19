@@ -176,6 +176,12 @@ pub struct HttpAdapter {
     /// (the endpoint would miss server-initiated tool changes). Otherwise
     /// the pre-existing reactive recovery semantics apply unchanged.
     handshake_completed: Arc<AtomicBool>,
+    /// A reactive recovery found a handshake holding [`Self::handshake_lock`]
+    /// and left the `GET` listener replacement to it (see
+    /// [`Self::replace_get_listener_after_recovery`]). Cleared by every
+    /// listener install; consumed by a supervisor attempt that stands down
+    /// without installing one (see [`Self::run_supervisor`]).
+    listener_replacement_deferred: Arc<AtomicBool>,
     /// Exponential-backoff state for the reconnect supervisor (1 s base, ×2
     /// per consecutive failure, 60 s cap — same escalation as the SSE
     /// adapter). Reset on every successful handshake.
@@ -417,6 +423,7 @@ impl HttpAdapter {
             list_ttl_ms: Arc::new(RwLock::new(None)),
             transport_failures: Arc::new(AtomicU64::new(0)),
             handshake_completed: Arc::new(AtomicBool::new(false)),
+            listener_replacement_deferred: Arc::new(AtomicBool::new(false)),
             crash_tracker: Arc::new(Mutex::new(CrashTracker::new())),
             reconnect_handle: Arc::new(StdMutex::new(None)),
             recovered_notify: Arc::new(Notify::new()),
@@ -459,6 +466,7 @@ impl HttpAdapter {
             list_ttl_ms: self.list_ttl_ms.clone(),
             transport_failures: self.transport_failures.clone(),
             handshake_completed: self.handshake_completed.clone(),
+            listener_replacement_deferred: self.listener_replacement_deferred.clone(),
             crash_tracker: self.crash_tracker.clone(),
             reconnect_handle: self.reconnect_handle.clone(),
             recovered_notify: self.recovered_notify.clone(),
@@ -903,10 +911,9 @@ impl HttpAdapter {
     /// adapter usually ended the `GET` listener too, and a stood-down
     /// supervisor would never respawn it — server-initiated
     /// `notifications/tools/list_changed` would then be missed until the
-    /// next handshake. So a listener that is no longer alive is respawned
-    /// here, BEFORE the recovery tick (a live one is left alone, and a
-    /// handshake in flight owns the repair instead, see
-    /// [`Self::respawn_get_listener_if_dead`]).
+    /// next handshake. So the listener is replaced here, BEFORE the recovery
+    /// tick (a handshake in flight owns the replacement instead, see
+    /// [`Self::replace_get_listener_after_recovery`]).
     ///
     /// A never-initialized adapter (see [`Self::handshake_completed`]) is not
     /// recovered here: a stray successful request proves the upstream is up,
@@ -926,52 +933,56 @@ impl HttpAdapter {
             }
         };
         if flipped {
-            self.respawn_get_listener_if_dead().await;
+            self.replace_get_listener_after_recovery().await;
             self.recovered_notify.notify_waiters();
             let _ = self.tools_changed_tx.send(());
         }
     }
 
-    /// Respawn the `GET` listener after a reactive recovery iff the current
-    /// one has exited (or none is installed). A listener that is still
-    /// streaming is left untouched — [`Self::spawn_get_listener`] would abort
-    /// it, and a healthy stream must not be cut just because a POST
-    /// recovered health. Upstreams without a server-initiated stream
-    /// (404/405) get one extra `GET` per recovery, which exits quietly as it
-    /// did at handshake time.
+    /// Replace the `GET` listener after a genuine reactive
+    /// `Unhealthy → Healthy` flip — unconditionally, not only when the
+    /// current one has already exited. The recovery follows an outage that
+    /// very likely broke the stream, and a liveness snapshot races the
+    /// listener's own exit: the recovering POST can land while the old
+    /// stream task is still running but about to observe the outage and
+    /// end, so an "is it finished?" check would skip the replacement, the
+    /// supervisor would already have stood down, and the adapter would stay
+    /// `Healthy` with no listener — permanently missing server-initiated
+    /// `notifications/tools/list_changed`. Cutting a stream that happened to
+    /// survive costs one reconnect; upstreams without a server-initiated
+    /// stream (404/405) get one extra `GET` per recovery, which exits
+    /// quietly as it did at handshake time. A success that does not flip
+    /// health never comes here.
     ///
-    /// The repair is serialized with the handshakes through
-    /// [`Self::handshake_lock`], held from the liveness read through the
-    /// spawn: otherwise a supervisor attempt already past its point of no
-    /// return could commit a newer session and its own listener between this
-    /// path's session snapshot and its install, and the install would
-    /// replace that valid listener with one on the stale session while
-    /// health stays `Healthy`. The lock is only tried, never awaited — this
-    /// runs on the request path, and a handshake that holds the lock makes
-    /// the repair redundant either way: one that commits installs a fresh
-    /// listener at its commit, and a supervisor attempt that stands down
-    /// instead repairs the listener itself once it has released the lock
-    /// (see [`Self::run_supervisor`]). Liveness is read from the stored
-    /// `JoinHandle` under the slot lock; the spawn itself re-reads the
-    /// current session and JIT bearer, exactly like a handshake's spawn.
-    async fn respawn_get_listener_if_dead(&self) {
+    /// The replacement is serialized with the handshakes through
+    /// [`Self::handshake_lock`], held across the spawn: otherwise a
+    /// supervisor attempt already past its point of no return could commit
+    /// a newer session and its own listener between this path's session
+    /// snapshot and its install, and the install would replace that valid
+    /// listener with one on the stale session while health stays `Healthy`.
+    /// The lock is only tried, never awaited — this runs on the request
+    /// path, and a handshake that holds the lock owns the replacement: one
+    /// that commits installs a fresh listener at its commit (which clears
+    /// [`Self::listener_replacement_deferred`]), and a supervisor attempt
+    /// that stands down instead consumes the flag and installs the
+    /// replacement itself once it has released the lock (see
+    /// [`Self::run_supervisor`]). The spawn re-reads the current session and
+    /// JIT bearer, exactly like a handshake's spawn.
+    async fn replace_get_listener_after_recovery(&self) {
         let Ok(_handshake) = self.handshake_lock.try_lock() else {
+            self.listener_replacement_deferred
+                .store(true, Ordering::SeqCst);
             debug!(
                 url = %self.config.url,
                 "reactive recovery: a handshake is in flight; leaving the GET listener to it"
             );
             return;
         };
-        let dead = lock_slot(&self.listener_handle)
-            .as_ref()
-            .is_none_or(JoinHandle::is_finished);
-        if dead {
-            debug!(
-                url = %self.config.url,
-                "reactive recovery: GET listener is not alive; respawning it"
-            );
-            self.spawn_get_listener().await;
-        }
+        debug!(
+            url = %self.config.url,
+            "reactive recovery: replacing the GET listener"
+        );
+        self.spawn_get_listener().await;
     }
 
     /// Record a transport-dead failure: increment the consecutive-failure
@@ -1450,6 +1461,10 @@ impl HttpAdapter {
             debug!(url = %self.config.url, "shutdown in progress; not spawning GET listener");
             return;
         }
+        // Every install pays off a replacement a reactive recovery deferred
+        // to the handshake that held the lock at the time.
+        self.listener_replacement_deferred
+            .store(false, Ordering::SeqCst);
         let handle = tokio::spawn(
             async move {
                 Self::run_get_listener(
@@ -1590,13 +1605,13 @@ impl HttpAdapter {
 
             // Every exit of the attempt loop other than a completed
             // handshake is a stand-down: a caller's request recovered the
-            // adapter reactively. That flip repairs an exited GET listener
-            // itself unless a handshake held `handshake_lock` at the time,
-            // in which case it deferred the repair to the lock holder (see
-            // `respawn_get_listener_if_dead`). A completed handshake installs
-            // a fresh listener at its commit; an attempt that stood down
-            // installed nothing, so the repair runs here once the lock is
-            // released — a no-op if the flip already did it.
+            // adapter reactively. That flip replaces the GET listener itself
+            // unless a handshake held `handshake_lock` at the time, in which
+            // case it deferred the replacement to the lock holder (see
+            // `replace_get_listener_after_recovery`). A completed handshake
+            // installs a fresh listener at its commit; an attempt that stood
+            // down installed nothing, so it consumes the deferral here once
+            // the lock is released and installs the replacement itself.
             let mut handshake_completed = false;
             'attempt: loop {
                 // `notify_waiters` only reaches `Notified` futures that
@@ -1715,8 +1730,12 @@ impl HttpAdapter {
                     }
                 }
             }
-            if !handshake_completed {
-                self.respawn_get_listener_if_dead().await;
+            if !handshake_completed
+                && self
+                    .listener_replacement_deferred
+                    .swap(false, Ordering::SeqCst)
+            {
+                self.replace_get_listener_after_recovery().await;
             }
         }
     }
@@ -5301,12 +5320,17 @@ mod tests {
         server.abort();
     }
 
-    /// Guard for `reactive_recovery_respawns_exited_get_listener`: a
-    /// listener that is still streaming is left alone —
-    /// `spawn_get_listener` would abort it, and a POST that
-    /// recovers health is no reason to cut a healthy server-push stream.
+    /// PR #163 review (round 6e, Copilot): the replacement must not depend
+    /// on a liveness snapshot of the old listener. The recovering POST can
+    /// land while the old stream task is still running but about to observe
+    /// the outage and exit; an "is it finished?" check taken then skips the
+    /// replacement, the supervisor has already stood down, and the adapter
+    /// stays `Healthy` with no listener. So a genuine flip replaces the
+    /// listener even while the old one is still streaming: the fixture holds
+    /// the stream open, and the flip still installs a second `GET` (on the
+    /// same session, with no handshake) that relays the upstream's push.
     #[tokio::test]
-    async fn reactive_recovery_keeps_live_get_listener() {
+    async fn reactive_recovery_replaces_still_streaming_get_listener() {
         let (url, fx, server) = start_supervisor_fixture().await;
         fx.serve_get_stream(GET_STREAM_EMIT_THEN_HOLD);
         let (mut adapter, mut rx) = adapter_with_connected_get_listener(url).await;
@@ -5316,6 +5340,7 @@ mod tests {
                 .is_some_and(|h| !h.is_finished()),
             "the listener is streaming"
         );
+        assert_eq!(fx.get_count.load(Ordering::SeqCst), 1);
 
         demote_via_transport_failures(&adapter).await;
         drain_ticks(&mut rx);
@@ -5324,16 +5349,76 @@ mod tests {
             .await
             .expect("live upstream answers");
         assert_eq!(adapter.health(), HealthStatus::Healthy);
-        assert_eq!(
-            recv_ticks(&mut rx, Duration::from_secs(2)).await,
-            1,
-            "only the recovery tick: no replacement stream pushes again"
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                fx.get_count.load(Ordering::SeqCst) == 2
+            })
+            .await,
+            "a genuine reactive recovery must replace the GET listener even while the old one is still streaming"
         );
+        assert!(
+            recv_ticks(&mut rx, Duration::from_secs(5)).await >= 2,
+            "both the recovery tick and the replacement listener's relayed push are observed"
+        );
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            1,
+            "the listener is replaced without a redundant handshake"
+        );
+        assert_eq!(
+            fx.get_sessions.lock().unwrap().as_slice(),
+            [Some("sess-1".to_string()), Some("sess-1".to_string())],
+            "the replacement is on the session the adapter recovered on"
+        );
+        assert!(
+            lock_slot(&adapter.listener_handle)
+                .as_ref()
+                .is_some_and(|h| !h.is_finished()),
+            "the replacement listener is streaming"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// Guard for the replacement above: only a genuine `Unhealthy → Healthy`
+    /// flip replaces the listener. A successful request on an adapter that
+    /// is already `Healthy` — the steady state, every request — must leave a
+    /// streaming listener alone: `spawn_get_listener` would abort it, and
+    /// there is no recovery to repair.
+    #[tokio::test]
+    async fn healthy_request_without_flip_keeps_live_get_listener() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        fx.serve_get_stream(GET_STREAM_EMIT_THEN_HOLD);
+        let (mut adapter, mut rx) = adapter_with_connected_get_listener(url).await;
+        assert!(
+            lock_slot(&adapter.listener_handle)
+                .as_ref()
+                .is_some_and(|h| !h.is_finished()),
+            "the listener is streaming"
+        );
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        drain_ticks(&mut rx);
+
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("live upstream answers");
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("live upstream answers");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
         tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            drain_ticks(&mut rx),
+            0,
+            "no flip, no recovery tick, no replacement stream pushing again"
+        );
         assert_eq!(
             fx.get_count.load(Ordering::SeqCst),
             1,
-            "a streaming GET listener must not be replaced by a reactive recovery"
+            "a request that does not flip health must not replace a streaming GET listener"
         );
         assert!(
             lock_slot(&adapter.listener_handle)

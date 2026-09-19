@@ -258,34 +258,27 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
             TickAction::Probe => {
                 let result = probe_inner(&adapter).await;
                 let action = classify_probe_result(result, &mut consecutive_failures, threshold);
-                let healthy_verdict = matches!(action, ProbeAction::MarkHealthy);
-                let became_healthy =
-                    apply_probe_action(&adapter, action, threshold, &oauth_state, generation).await;
-                // Only a CURRENT healthy commit publishes: it acknowledges
-                // the inner recovery counter (the probe itself may have
-                // recovered the inner adapter — an advance it finds is a
-                // recovery whose tick is owed here) and consumes a pending
-                // forwarder recovery. A failed verdict leaves the pending
-                // flag for the fresh probe behind it, and a verdict the
-                // lifecycle moved past mid-probe publishes nothing (see
-                // `settle_recovery_after_healthy_verdict`).
-                if !healthy_verdict {
-                    continue;
-                }
-                match adapter
-                    .settle_recovery_after_healthy_verdict(generation)
+                // Only a CURRENT healthy commit publishes: it flips
+                // `inner_health` (a transition of the derived health into
+                // `Healthy`), acknowledges the inner recovery counter (the
+                // probe itself may have recovered the inner adapter — an
+                // advance it finds is a recovery whose tick is owed here)
+                // and consumes a deferred tick. A failed verdict leaves the
+                // pending flag for the fresh probe behind it, and a verdict
+                // the lifecycle moved past mid-probe commits and publishes
+                // nothing (see `OAuthAdapterInner::commit_healthy_verdict`).
+                match apply_probe_action(&adapter, action, threshold, &oauth_state, generation)
                     .await
                 {
-                    Some(recovery_owed) => {
-                        if became_healthy || recovery_owed {
-                            let _ = adapter.outer_tools_changed_tx.send(());
-                        }
+                    Some(true) => {
+                        let _ = adapter.outer_tools_changed_tx.send(());
                     }
+                    Some(false) => {}
                     None => debug!(
                         dispatched_generation = generation,
                         result = "stale",
                         "heartbeat probe succeeded but the lifecycle moved on \
-                         mid-probe; leaving any pending recovery for the apply"
+                         mid-probe; leaving inner_health and any deferred tick to the apply"
                     ),
                 }
             }
@@ -298,18 +291,19 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
 }
 
 /// Publish the outer tools-changed invalidation the wrapper owes on the
-/// paths that commit no probe verdict: a token apply that just returned to
-/// `Authenticated`, a heartbeat tick skipped in a genuine-auth terminal
-/// state, or a recovery attempt. Fires at most once per call when either an
-/// inner recovery poke is pending (`RecoveryTickState::tick_pending`,
-/// raised by the forwarder instead of ticking itself) or the caller
-/// established that it owes a tick anyway (`owed`). A probe verdict takes
-/// the pending flag through
-/// [`OAuthAdapterInner::settle_recovery_after_healthy_verdict`] instead,
-/// which only a current healthy commit may do — so the registry always
-/// rebuilds the catalog against a healthy committed verdict, never against
-/// a stale failure the fresh probe behind it is about to overturn, and
-/// never while the lifecycle is mid-apply.
+/// paths that commit no probe verdict: a token apply that just left
+/// `Refreshing` (for `Authenticated` or `ConnectionFailed`), a heartbeat
+/// tick skipped in a genuine-auth terminal state, or a recovery attempt.
+/// Fires at most once per call when either a tick is deferred
+/// (`RecoveryTickState::tick_pending`: an inner recovery poke, or an
+/// ordinary inner `list_changed` that arrived while `Refreshing`) or the
+/// caller established that it owes a tick anyway (`owed`). A probe verdict
+/// takes the pending flag through
+/// [`OAuthAdapterInner::commit_healthy_verdict`] instead, which only a
+/// current healthy commit may do — so the registry always rebuilds the
+/// catalog against a healthy committed verdict, never against a stale
+/// failure the fresh probe behind it is about to overturn, and never while
+/// the lifecycle is mid-apply.
 pub(super) fn publish_recovery_tick_if_due(adapter: &OAuthAdapterInner, owed: bool) {
     let pending = adapter.take_recovery_tick_pending();
     if pending || owed {
@@ -319,9 +313,13 @@ pub(super) fn publish_recovery_tick_if_due(adapter: &OAuthAdapterInner, owed: bo
 
 /// Apply the `ProbeAction` dispatched from `classify_probe_result` to the
 /// shared adapter state (writes `inner_health`, increments metrics, may
-/// transition `OAuthState`). Returns `true` when this call flipped
-/// `inner_health` from `Unhealthy` to `Healthy` (the outer invalidation for
-/// that transition is published by the caller once the write is done).
+/// transition `OAuthState`). Returns `Some(true)` when this call owes the
+/// outer invalidation — a current `MarkHealthy` commit that flipped
+/// `inner_health` from `Unhealthy`, acknowledged an inner recovery, or
+/// found a deferred tick (published by the caller once the write is done)
+/// — `Some(false)` when nothing is owed, and `None` for a `MarkHealthy`
+/// verdict the lifecycle moved past mid-probe (nothing written, see
+/// [`OAuthAdapterInner::commit_healthy_verdict`]).
 ///
 /// Extracted from `heartbeat_loop` so the side-effect dispatch can be
 /// driven directly by tests without spinning a real timer or probe.
@@ -331,20 +329,19 @@ async fn apply_probe_action(
     threshold: u32,
     oauth_state: &OAuthState,
     dispatched_generation: u64,
-) -> bool {
+) -> Option<bool> {
     match action {
         ProbeAction::MarkHealthy => {
-            let previous = std::mem::replace(
-                &mut *adapter.inner_health.write().await,
-                HealthStatus::Healthy,
-            );
-            adapter.metrics.inc_heartbeat_healthy();
-            trace!(
-                oauth_state = ?oauth_state,
-                result = "healthy",
-                "heartbeat probe succeeded"
-            );
-            return matches!(previous, HealthStatus::Unhealthy(_));
+            let owed = adapter.commit_healthy_verdict(dispatched_generation).await;
+            if owed.is_some() {
+                adapter.metrics.inc_heartbeat_healthy();
+                trace!(
+                    oauth_state = ?oauth_state,
+                    result = "healthy",
+                    "heartbeat probe succeeded"
+                );
+            }
+            return owed;
         }
         ProbeAction::BelowThreshold { failures, reason } => {
             debug!(
@@ -411,7 +408,7 @@ async fn apply_probe_action(
                      mid-probe (state changed or an apply ran); dropping \
                      stale result"
                 );
-                return false;
+                return Some(false);
             }
             adapter.metrics.inc_heartbeat_unhealthy();
             warn!(
@@ -438,7 +435,7 @@ async fn apply_probe_action(
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    false
+    Some(false)
 }
 
 #[cfg(test)]
