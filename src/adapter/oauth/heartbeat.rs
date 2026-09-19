@@ -248,12 +248,13 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
                 // rebuilt, so publishing now would let the registry cache the
                 // tools as unavailable with no corrective tick guaranteed
                 // (the apply path stays silent when its fingerprint probe
-                // fails). Keep the recovery pending; `apply_tokens` publishes
-                // it once the state is back to `Authenticated`, or the next
-                // tick does.
-                if oauth_state != OAuthState::Refreshing {
-                    publish_recovery_tick_if_due(&adapter, false);
-                }
+                // fails). `oauth_state` is only a snapshot — a token apply
+                // may have entered `Refreshing` since — so the decision is
+                // re-made under the state lock, together with the take:
+                // while `Refreshing` the recovery stays pending and
+                // `apply_tokens` publishes it once the state is back to
+                // `Authenticated`, or the next tick does.
+                adapter.publish_or_retain_tick(false).await;
             }
             TickAction::Probe => {
                 let result = probe_inner(&adapter).await;
@@ -263,61 +264,39 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
                 // `Healthy`), acknowledges the inner recovery counter (the
                 // probe itself may have recovered the inner adapter — an
                 // advance it finds is a recovery whose tick is owed here)
-                // and consumes a deferred tick. A failed verdict leaves the
-                // pending flag for the fresh probe behind it, and a verdict
-                // the lifecycle moved past mid-probe commits and publishes
-                // nothing (see `OAuthAdapterInner::commit_healthy_verdict`).
-                match apply_probe_action(&adapter, action, threshold, &oauth_state, generation)
+                // and consumes a deferred tick — and sends the tick inside
+                // the same lifecycle-fenced critical section. A failed
+                // verdict leaves the pending flag for the fresh probe
+                // behind it, and a verdict the lifecycle moved past
+                // mid-probe commits and publishes nothing (see
+                // `OAuthAdapterInner::commit_healthy_verdict`).
+                if apply_probe_action(&adapter, action, threshold, &oauth_state, generation)
                     .await
+                    .is_none()
                 {
-                    Some(true) => {
-                        let _ = adapter.outer_tools_changed_tx.send(());
-                    }
-                    Some(false) => {}
-                    None => debug!(
+                    debug!(
                         dispatched_generation = generation,
                         result = "stale",
                         "heartbeat probe succeeded but the lifecycle moved on \
                          mid-probe; leaving inner_health and any deferred tick to the apply"
-                    ),
+                    );
                 }
             }
             TickAction::Recover => {
                 attempt_recovery(&adapter).await;
-                publish_recovery_tick_if_due(&adapter, false);
+                adapter.publish_or_retain_tick(false).await;
             }
         }
     }
 }
 
-/// Publish the outer tools-changed invalidation the wrapper owes on the
-/// paths that commit no probe verdict: a token apply that just left
-/// `Refreshing` (for `Authenticated` or `ConnectionFailed`), a heartbeat
-/// tick skipped in a genuine-auth terminal state, or a recovery attempt.
-/// Fires at most once per call when either a tick is deferred
-/// (`RecoveryTickState::tick_pending`: an inner recovery poke, or an
-/// ordinary inner `list_changed` that arrived while `Refreshing`) or the
-/// caller established that it owes a tick anyway (`owed`). A probe verdict
-/// takes the pending flag through
-/// [`OAuthAdapterInner::commit_healthy_verdict`] instead, which only a
-/// current healthy commit may do — so the registry always rebuilds the
-/// catalog against a healthy committed verdict, never against a stale
-/// failure the fresh probe behind it is about to overturn, and never while
-/// the lifecycle is mid-apply.
-pub(super) fn publish_recovery_tick_if_due(adapter: &OAuthAdapterInner, owed: bool) {
-    let pending = adapter.take_recovery_tick_pending();
-    if pending || owed {
-        let _ = adapter.outer_tools_changed_tx.send(());
-    }
-}
-
 /// Apply the `ProbeAction` dispatched from `classify_probe_result` to the
 /// shared adapter state (writes `inner_health`, increments metrics, may
-/// transition `OAuthState`). Returns `Some(true)` when this call owes the
-/// outer invalidation — a current `MarkHealthy` commit that flipped
+/// transition `OAuthState`). Returns `Some(true)` when this call published
+/// the outer invalidation — a current `MarkHealthy` commit that flipped
 /// `inner_health` from `Unhealthy`, acknowledged an inner recovery, or
-/// found a deferred tick (published by the caller once the write is done)
-/// — `Some(false)` when nothing is owed, and `None` for a `MarkHealthy`
+/// found a deferred tick (sent inside the commit's own critical section)
+/// — `Some(false)` when nothing was owed, and `None` for a `MarkHealthy`
 /// verdict the lifecycle moved past mid-probe (nothing written, see
 /// [`OAuthAdapterInner::commit_healthy_verdict`]).
 ///
