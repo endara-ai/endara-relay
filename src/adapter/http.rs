@@ -1227,6 +1227,29 @@ impl HttpAdapter {
         *guard = Some(handle);
     }
 
+    /// Arm the reconnect supervisor after a failed [`McpAdapter::initialize`]
+    /// so the adapter recovers on its own once the upstream is reachable,
+    /// instead of staying frozen in the `Unhealthy(<init error>)` state the
+    /// handshake left it in. `initialize()` only arms the supervisor on
+    /// success; the registration path ([`crate::watcher::create_adapter`])
+    /// calls this on failure so a plain `http` upstream that is down at relay
+    /// startup or on a config add/reload is registered as the real adapter
+    /// and retried with the standard backoff — no caller traffic required.
+    /// The eventual recovery flips `Unhealthy → Healthy` through
+    /// [`Self::mark_handshake_healthy`], which emits the `tools_changed` tick
+    /// the registry uses to re-fetch the catalog.
+    ///
+    /// No-op unless health is `Unhealthy`: a `Stopped` (or already recovered)
+    /// adapter must never spawn a supervisor, the same rule
+    /// [`Self::note_transport_failure`] follows.
+    pub(crate) async fn retry_initialize_in_background(&self) {
+        if !matches!(*self.health.read().await, HealthStatus::Unhealthy(_)) {
+            return;
+        }
+        self.ensure_supervisor_running().await;
+        self.reconnect_notify.notify_one();
+    }
+
     /// Reconnect supervisor loop — wait for a "went unhealthy" notification
     /// from [`Self::note_transport_failure`], then re-run the handshake
     /// ([`Self::try_discover_probe`] + [`Self::complete_handshake`]) with
@@ -2004,6 +2027,16 @@ impl McpAdapter for HttpAdapter {
         }
         .instrument(self.span.clone())
         .await
+    }
+
+    /// Surface the current `Unhealthy` reason as an `[ERROR]` log line, the
+    /// same shape a `FailedAdapter` reports, so the endpoint logs view keeps
+    /// showing why the upstream is down while the supervisor retries.
+    async fn stderr_lines(&self) -> Vec<String> {
+        match &*self.health.read().await {
+            HealthStatus::Unhealthy(reason) => vec![format!("[ERROR] {}", reason)],
+            _ => vec![],
+        }
     }
 
     async fn activity_log(&self) -> Vec<String> {
@@ -3280,6 +3313,16 @@ mod tests {
     }
 
     async fn start_supervisor_fixture() -> (String, SupervisorFixture, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        start_supervisor_fixture_on(listener).await
+    }
+
+    /// Serve the supervisor fixture on an already-bound listener so a test
+    /// can reserve a port, keep it dead for a while, then bring the upstream
+    /// up at the very address the adapter was configured with.
+    async fn start_supervisor_fixture_on(
+        listener: TcpListener,
+    ) -> (String, SupervisorFixture, JoinHandle<()>) {
         let fx = SupervisorFixture {
             accepting: Arc::new(AtomicBool::new(true)),
             issue_session: Arc::new(AtomicBool::new(true)),
@@ -3295,12 +3338,20 @@ mod tests {
         let app = Router::new()
             .route("/mcp", any(supervisor_fixture_handler))
             .with_state(fx.clone());
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let handle = tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
         (format!("http://{}/mcp", addr), fx, handle)
+    }
+
+    /// Reserve a loopback port and release it, returning the address as an
+    /// `/mcp` URL that refuses connections until a test binds it again.
+    async fn reserve_dead_upstream() -> (std::net::SocketAddr, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        (addr, format!("http://{}/mcp", addr))
     }
 
     async fn supervisor_fixture_handler(
@@ -3623,6 +3674,163 @@ mod tests {
         );
 
         adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// Startup against a dead upstream (connection refused): `initialize()`
+    /// fails and leaves the adapter `Unhealthy(<reason>)` with NO supervisor.
+    /// `retry_initialize_in_background` must arm one so that, once the
+    /// upstream comes up at the same address, the adapter handshakes and
+    /// flips `Healthy` on its own — no caller traffic, and one
+    /// `tools_changed` tick so the registry re-fetches the catalog.
+    #[tokio::test]
+    async fn retry_in_background_recovers_from_dead_upstream_at_startup() {
+        let (addr, url) = reserve_dead_upstream().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        let err = adapter
+            .initialize()
+            .await
+            .expect_err("initialize against a dead upstream fails");
+        match adapter.health() {
+            HealthStatus::Unhealthy(reason) => {
+                assert_eq!(reason, err.to_string(), "health carries the init error")
+            }
+            other => panic!(
+                "expected Unhealthy after failed initialize, got {:?}",
+                other
+            ),
+        }
+        assert!(
+            lock_slot(&adapter.reconnect_handle).is_none(),
+            "a failed initialize alone does not arm the supervisor"
+        );
+        assert_eq!(
+            adapter.stderr_lines().await,
+            vec![format!("[ERROR] {}", err)],
+            "logs view surfaces the init error like a FailedAdapter did"
+        );
+
+        use_fast_backoff(&adapter).await;
+        let mut rx = adapter.subscribe_tools_changed().expect("Some receiver");
+        adapter.retry_initialize_in_background().await;
+        assert!(
+            lock_slot(&adapter.reconnect_handle)
+                .as_ref()
+                .is_some_and(|h| !h.is_finished()),
+            "retry_initialize_in_background arms the supervisor"
+        );
+
+        // Still down: the supervisor keeps retrying and the adapter stays
+        // Unhealthy (with a meaningful reason) the whole time.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        match adapter.health() {
+            HealthStatus::Unhealthy(reason) => assert!(!reason.is_empty()),
+            other => panic!("expected Unhealthy while upstream is down, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err(), "no tick while still down");
+
+        // Upstream comes up at the configured address.
+        let listener = TcpListener::bind(addr)
+            .await
+            .expect("rebind the reserved upstream port");
+        let (_url, fx, server) = start_supervisor_fixture_on(listener).await;
+
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                adapter.health() == HealthStatus::Healthy
+            })
+            .await,
+            "supervisor must bring a startup-dead upstream to Healthy with no caller traffic"
+        );
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            1,
+            "exactly one handshake reaches the upstream once it is up"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "the recovery must tick tools_changed so the catalog is re-fetched"
+        );
+        assert!(
+            adapter.stderr_lines().await.is_empty(),
+            "no stale [ERROR] line once healthy"
+        );
+        assert_eq!(adapter.transport_failures.load(Ordering::SeqCst), 0);
+
+        // The armed lifecycle is the standard one: a later demotion still
+        // self-heals via the same supervisor.
+        demote_via_transport_failures(&adapter).await;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                adapter.health() == HealthStatus::Healthy
+            })
+            .await,
+            "supervisor armed at startup must recover a later demotion too"
+        );
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 2);
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// Same recovery when the upstream is reachable but failing the
+    /// handshake (503 on `initialize`) at startup — the alive-but-erroring
+    /// case the reactive path never demotes on.
+    #[tokio::test]
+    async fn retry_in_background_recovers_from_failing_handshake_at_startup() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        fx.accepting.store(false, Ordering::SeqCst);
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter
+            .initialize()
+            .await
+            .expect_err("503 handshake fails initialize");
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 0);
+
+        use_fast_backoff(&adapter).await;
+        adapter.retry_initialize_in_background().await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            matches!(adapter.health(), HealthStatus::Unhealthy(_)),
+            "still Unhealthy while the upstream keeps failing the handshake"
+        );
+
+        fx.accepting.store(true, Ordering::SeqCst);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                adapter.health() == HealthStatus::Healthy
+            })
+            .await,
+            "supervisor must recover once the handshake succeeds"
+        );
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 1);
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// `retry_initialize_in_background` follows the same rule as the
+    /// reactive demotion: never spawn a supervisor for a `Stopped` adapter
+    /// (or one that is not `Unhealthy`), so a shutdown adapter stays down.
+    #[tokio::test]
+    async fn retry_in_background_is_noop_unless_unhealthy() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        adapter.shutdown().await.expect("shutdown succeeds");
+        assert_eq!(adapter.health(), HealthStatus::Stopped);
+
+        use_fast_backoff(&adapter).await;
+        adapter.retry_initialize_in_background().await;
+        assert!(
+            lock_slot(&adapter.reconnect_handle).is_none(),
+            "no supervisor for a Stopped adapter"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(adapter.health(), HealthStatus::Stopped);
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 1);
+
         server.abort();
     }
 
