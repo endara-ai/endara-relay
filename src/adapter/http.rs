@@ -167,6 +167,11 @@ pub struct HttpAdapter {
     /// Notified by [`Self::note_transport_failure`] when reactive health flips
     /// the adapter to `Unhealthy`, waking the supervisor to start reconnecting.
     reconnect_notify: Arc<Notify>,
+    /// Set by `shutdown()` / [`Drop`] before the background tasks are torn
+    /// down. [`Self::spawn_get_listener`] checks it under the listener slot
+    /// lock so a handshake racing shutdown never installs a fresh listener
+    /// that nobody will abort.
+    shutting_down: Arc<AtomicBool>,
     /// `true` on the adapter the caller owns, `false` on the
     /// [`Self::task_clone`] handed to the supervisor task. Only the owning
     /// instance tears down background tasks in [`Drop`]; otherwise the
@@ -310,6 +315,7 @@ impl HttpAdapter {
             crash_tracker: Arc::new(Mutex::new(CrashTracker::new())),
             reconnect_handle: Arc::new(Mutex::new(None)),
             reconnect_notify: Arc::new(Notify::new()),
+            shutting_down: Arc::new(AtomicBool::new(false)),
             owns_background_tasks: true,
         }
     }
@@ -344,6 +350,7 @@ impl HttpAdapter {
             crash_tracker: self.crash_tracker.clone(),
             reconnect_handle: self.reconnect_handle.clone(),
             reconnect_notify: self.reconnect_notify.clone(),
+            shutting_down: self.shutting_down.clone(),
             owns_background_tasks: false,
         }
     }
@@ -1144,13 +1151,25 @@ impl HttpAdapter {
         let tx = self.tools_changed_tx.clone();
         let shutdown = self.shutdown_notify.clone();
         let listener_span = self.span.clone();
+        // Take the slot lock BEFORE spawning and store the handle with no
+        // await point in between: if the calling task (the reconnect
+        // supervisor) is aborted mid-way, it is either before the spawn (no
+        // listener exists) or after the handle is stored (shutdown/drop can
+        // find and abort it). Spawning first and then awaiting the lock could
+        // orphan a live listener. Once shutdown has been signalled, the slot
+        // is (or is about to be) drained for good — do not repopulate it.
+        let mut slot = self.listener_handle.lock().await;
+        if self.shutting_down.load(Ordering::SeqCst) {
+            debug!(url = %self.config.url, "shutdown in progress; not spawning GET listener");
+            return;
+        }
         let handle = tokio::spawn(
             async move {
                 Self::run_get_listener(url, headers, session_id, tx, shutdown).await;
             }
             .instrument(listener_span),
         );
-        if let Some(previous) = self.listener_handle.lock().await.replace(handle) {
+        if let Some(previous) = slot.replace(handle) {
             previous.abort();
         }
     }
@@ -1180,10 +1199,15 @@ impl HttpAdapter {
     /// once reachable, so the loop keeps retrying at the 60 s ceiling. Exits
     /// only on shutdown.
     ///
-    /// On success the handshake itself sets `Healthy` and resets the
-    /// transport-failure counter; the supervisor then emits one
-    /// `tools_changed` tick so the registry re-fetches this endpoint's tools
-    /// into the merged catalog.
+    /// Reactive recovery (a caller's request succeeding, see
+    /// [`Self::note_request_success`]) can beat the supervisor at any point.
+    /// The loop therefore re-checks health after every backoff sleep and
+    /// abandons the attempt once the adapter is no longer `Unhealthy`, so a
+    /// caller-driven recovery is never followed by a redundant handshake.
+    /// The `tools_changed` tick is owned by whichever path performs the
+    /// actual `Unhealthy → Healthy` flip (the handshake does it under the
+    /// same `health` write lock, see [`Self::connect_and_handshake`]), so
+    /// exactly one tick is emitted per recovery.
     async fn run_supervisor(&self) {
         loop {
             tokio::select! {
@@ -1191,13 +1215,16 @@ impl HttpAdapter {
                 _ = self.reconnect_notify.notified() => {}
             }
 
-            // A stale permit (e.g. a caller's success already recovered the
-            // adapter while the notification was pending) is a no-op.
-            if !matches!(*self.health.read().await, HealthStatus::Unhealthy(_)) {
-                continue;
-            }
-
             loop {
+                // A stale permit (e.g. a caller's success already recovered
+                // the adapter while the notification was pending) or a
+                // recovery that happened during the previous backoff sleep
+                // makes the attempt obsolete.
+                if !matches!(*self.health.read().await, HealthStatus::Unhealthy(_)) {
+                    self.crash_tracker.lock().await.reset();
+                    break;
+                }
+
                 let backoff = {
                     let mut tracker = self.crash_tracker.lock().await;
                     // The window cap is an SSE concern; HTTP retries forever.
@@ -1216,11 +1243,16 @@ impl HttpAdapter {
                     _ = tokio::time::sleep(backoff) => {}
                 }
 
+                if !matches!(*self.health.read().await, HealthStatus::Unhealthy(_)) {
+                    debug!(url = %self.config.url, "HTTP reconnect: recovered reactively during backoff, skipping");
+                    self.crash_tracker.lock().await.reset();
+                    break;
+                }
+
                 info!(url = %self.config.url, "HTTP reconnect: attempting");
                 match self.connect_and_handshake().await {
                     Ok(()) => {
                         info!(url = %self.config.url, "HTTP reconnect succeeded");
-                        let _ = self.tools_changed_tx.send(());
                         break;
                     }
                     Err(e) => {
@@ -1228,6 +1260,27 @@ impl HttpAdapter {
                     }
                 }
             }
+        }
+    }
+
+    /// Final step of a successful handshake: clear the transport-failure
+    /// counter and set `Healthy` under one `health` write lock (the same
+    /// discipline as [`Self::note_request_success`]), emitting one
+    /// `tools_changed` tick only when this write performed the actual
+    /// `Unhealthy → Healthy` flip. If a caller's request already recovered the
+    /// adapter while the handshake was in flight, that path owns the tick and
+    /// this one stays silent.
+    async fn mark_handshake_healthy(&self) {
+        let flipped = {
+            let mut health = self.health.write().await;
+            self.transport_failures.store(0, Ordering::SeqCst);
+            let was_unhealthy = matches!(*health, HealthStatus::Unhealthy(_));
+            *health = HealthStatus::Healthy;
+            was_unhealthy
+        };
+        self.crash_tracker.lock().await.reset();
+        if flipped {
+            let _ = self.tools_changed_tx.send(());
         }
     }
 }
@@ -1244,13 +1297,16 @@ impl Drop for HttpAdapter {
         // tick. Drop is synchronous, so we can't `.await` the handles; a
         // best-effort `try_lock` lets us abort the join handles immediately
         // when uncontended, otherwise we rely on the notification alone.
+        // The supervisor (the only producer of new listeners) goes first so
+        // it cannot install a fresh listener after the slot has been drained.
+        self.shutting_down.store(true, Ordering::SeqCst);
         self.shutdown_notify.notify_waiters();
-        if let Ok(mut guard) = self.listener_handle.try_lock() {
+        if let Ok(mut guard) = self.reconnect_handle.try_lock() {
             if let Some(handle) = guard.take() {
                 handle.abort();
             }
         }
-        if let Ok(mut guard) = self.reconnect_handle.try_lock() {
+        if let Ok(mut guard) = self.listener_handle.try_lock() {
             if let Some(handle) = guard.take() {
                 handle.abort();
             }
@@ -1286,13 +1342,12 @@ impl HttpAdapter {
                 self.set_upstream_dialect(ProtocolVersion::V2026_07_28)
                     .await;
                 self.apply_server_identity(result).await?;
-                // 2026 is stateless: no notifications/initialized, no session id.
+                // 2026 is stateless: no notifications/initialized, no session
+                // id. Discard any session left over from a previous (legacy)
+                // connection so it is never echoed at the new upstream.
+                *self.session_id.write().await = None;
                 self.spawn_get_listener().await;
-                // Fresh start after (re)connect: clear any stale transport-dead
-                // count so reactive health begins from a clean slate.
-                self.transport_failures.store(0, Ordering::SeqCst);
-                *self.health.write().await = HealthStatus::Healthy;
-                self.crash_tracker.lock().await.reset();
+                self.mark_handshake_healthy().await;
                 info!(url = %self.config.url, "HTTP MCP adapter initialized (2026 stateless path)");
                 return Ok(());
             }
@@ -1367,18 +1422,28 @@ impl HttpAdapter {
                 // we consume the body. Reqwest's `HeaderMap` lookups are
                 // case-insensitive, so this matches whatever spelling the
                 // upstream sends (Mcp-Session-Id, mcp-session-id, etc.).
-                if let Some(sid_val) = resp.headers().get(&MCP_SESSION_ID_HEADER) {
-                    if let Ok(sid_str) = sid_val.to_str() {
-                        let sid_str = sid_str.trim();
-                        if !sid_str.is_empty() {
-                            debug!(
-                                session_id = %sid_str,
-                                "captured Mcp-Session-Id from initialize response"
-                            );
-                            *self.session_id.write().await = Some(sid_str.to_string());
-                        }
-                    }
+                //
+                // Every successful `initialize` REPLACES the stored session
+                // state: an upstream that restarted between connections issues
+                // a new id (or none at all if it came back stateless), and
+                // echoing the old one would get every later request rejected.
+                let new_session_id = resp
+                    .headers()
+                    .get(&MCP_SESSION_ID_HEADER)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                match &new_session_id {
+                    Some(sid) => debug!(
+                        session_id = %sid,
+                        "captured Mcp-Session-Id from initialize response"
+                    ),
+                    None => debug!(
+                        "initialize response carried no Mcp-Session-Id; session is stateless"
+                    ),
                 }
+                *self.session_id.write().await = new_session_id;
 
                 let content_type = resp
                     .headers()
@@ -1484,11 +1549,7 @@ impl HttpAdapter {
             // via `parse_sse_response`.
             self.spawn_get_listener().await;
 
-            // Fresh start after (re)connect: clear any stale transport-dead
-            // count so reactive health begins from a clean slate.
-            self.transport_failures.store(0, Ordering::SeqCst);
-            *self.health.write().await = HealthStatus::Healthy;
-            self.crash_tracker.lock().await.reset();
+            self.mark_handshake_healthy().await;
             info!(url = %self.config.url, "HTTP MCP adapter initialized");
             Ok(())
         }
@@ -1799,13 +1860,17 @@ impl McpAdapter for HttpAdapter {
         async {
             // Signal the GET listener and the reconnect supervisor to exit at
             // the next select tick, then await their handles so they tear
-            // down before the adapter does.
+            // down before the adapter does. The supervisor is the only thing
+            // that can install a NEW listener (via a reconnect handshake), so
+            // it is stopped and joined first; only then is the listener slot
+            // drained, guaranteeing no listener is spawned after the drain.
+            self.shutting_down.store(true, Ordering::SeqCst);
             self.shutdown_notify.notify_waiters();
-            if let Some(handle) = self.listener_handle.lock().await.take() {
+            if let Some(handle) = self.reconnect_handle.lock().await.take() {
                 handle.abort();
                 let _ = handle.await;
             }
-            if let Some(handle) = self.reconnect_handle.lock().await.take() {
+            if let Some(handle) = self.listener_handle.lock().await.take() {
                 handle.abort();
                 let _ = handle.await;
             }
@@ -3065,9 +3130,17 @@ mod tests {
     /// request must echo the most recently issued id or gets 400, mirroring
     /// a real upstream that forgot the old session across a restart. GET is
     /// always 405 so the tests don't depend on the SSE channel.
+    ///
+    /// `issue_session` off simulates an upstream that came back stateless
+    /// (no `Mcp-Session-Id` on `initialize`, and requests must NOT carry one).
+    /// `init_delay_ms` holds every `initialize` response for that long so a
+    /// test can act while a handshake is in flight; `init_count` is bumped
+    /// when the handshake STARTS so the test can detect that window.
     #[derive(Clone)]
     struct SupervisorFixture {
         accepting: Arc<AtomicBool>,
+        issue_session: Arc<AtomicBool>,
+        init_delay_ms: Arc<AtomicU64>,
         init_count: Arc<AtomicU64>,
         current_session: Arc<std::sync::Mutex<Option<String>>>,
     }
@@ -3075,6 +3148,8 @@ mod tests {
     async fn start_supervisor_fixture() -> (String, SupervisorFixture, JoinHandle<()>) {
         let fx = SupervisorFixture {
             accepting: Arc::new(AtomicBool::new(true)),
+            issue_session: Arc::new(AtomicBool::new(true)),
+            init_delay_ms: Arc::new(AtomicU64::new(0)),
             init_count: Arc::new(AtomicU64::new(0)),
             current_session: Arc::new(std::sync::Mutex::new(None)),
         };
@@ -3111,8 +3186,15 @@ mod tests {
         let id = value["id"].as_u64().unwrap_or(0);
         if value["method"] == "initialize" {
             let n = fx.init_count.fetch_add(1, Ordering::SeqCst) + 1;
-            let sid = format!("sess-{}", n);
-            *fx.current_session.lock().unwrap() = Some(sid.clone());
+            let delay = fx.init_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
+            let sid = fx
+                .issue_session
+                .load(Ordering::SeqCst)
+                .then(|| format!("sess-{}", n));
+            *fx.current_session.lock().unwrap() = sid.clone();
             let mut resp = Json(json!({
                 "jsonrpc": "2.0",
                 "result": {
@@ -3123,10 +3205,12 @@ mod tests {
                 "id": id,
             }))
             .into_response();
-            resp.headers_mut().insert(
-                MCP_SESSION_ID_HEADER.clone(),
-                reqwest::header::HeaderValue::from_str(&sid).unwrap(),
-            );
+            if let Some(sid) = sid {
+                resp.headers_mut().insert(
+                    MCP_SESSION_ID_HEADER.clone(),
+                    reqwest::header::HeaderValue::from_str(&sid).unwrap(),
+                );
+            }
             return resp;
         }
         let expected = fx.current_session.lock().unwrap().clone();
@@ -3377,6 +3461,222 @@ mod tests {
         assert_eq!(result["ok"], true);
 
         adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    fn drain_ticks(rx: &mut broadcast::Receiver<()>) -> usize {
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        n
+    }
+
+    /// A caller's request that succeeds while the supervisor is sleeping out
+    /// its backoff recovers the adapter reactively (and ticks). The supervisor
+    /// must then stand down: no redundant handshake, no second tick.
+    #[tokio::test]
+    async fn reactive_recovery_during_backoff_emits_only_one_tick() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        // Backoff long enough that the caller's request lands mid-sleep.
+        *adapter.crash_tracker.lock().await = CrashTracker::new_test(
+            Duration::from_millis(300),
+            usize::MAX,
+            Duration::from_secs(60),
+        );
+        let mut rx = adapter.subscribe_tools_changed().expect("Some receiver");
+
+        demote_via_transport_failures(&adapter).await;
+        // Let the supervisor observe the notification and enter its backoff.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+
+        // Reactive recovery: a plain request succeeds against the live upstream.
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("live upstream answers");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert_eq!(drain_ticks(&mut rx), 1, "reactive recovery ticks once");
+
+        // Outlive the backoff by a wide margin; the supervisor must not
+        // re-handshake or tick again.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            1,
+            "no redundant handshake after a reactive recovery"
+        );
+        assert_eq!(drain_ticks(&mut rx), 0, "no second tick");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert_eq!(
+            adapter.crash_tracker.lock().await.consecutive_failures,
+            0,
+            "standing down resets the backoff"
+        );
+        assert!(
+            adapter
+                .reconnect_handle
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|h| !h.is_finished()),
+            "supervisor keeps waiting for the next demotion"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// Same race, later window: the caller's request succeeds while the
+    /// supervisor's handshake is already in flight. The handshake completes
+    /// (adopting the upstream's newest session) but the tick is owned by the
+    /// path that performed the actual `Unhealthy → Healthy` flip, so exactly
+    /// one tick is observed and the adapter ends up on a working session.
+    #[tokio::test]
+    async fn reactive_recovery_during_inflight_handshake_emits_only_one_tick() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        use_fast_backoff(&adapter).await;
+        let mut rx = adapter.subscribe_tools_changed().expect("Some receiver");
+
+        // Hold the reconnect's `initialize` open long enough to race it.
+        fx.init_delay_ms.store(400, Ordering::SeqCst);
+        demote_via_transport_failures(&adapter).await;
+        let in_flight = wait_until(Duration::from_secs(5), || {
+            fx.init_count.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        assert!(in_flight, "supervisor handshake should have started");
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+
+        // The upstream still honours `sess-1` until the delayed initialize
+        // completes, so a caller's request succeeds and recovers reactively.
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("live upstream answers on the old session");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert_eq!(drain_ticks(&mut rx), 1, "reactive recovery ticks once");
+
+        // Let the in-flight handshake finish.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(drain_ticks(&mut rx), 0, "handshake must not tick again");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert_eq!(
+            adapter.session_id.read().await.as_deref(),
+            Some("sess-2"),
+            "handshake adopts the upstream's newest session"
+        );
+        fx.init_delay_ms.store(0, Ordering::SeqCst);
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("post-handshake request carries the current session id");
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// An upstream that restarted and came back sessionless omits
+    /// `Mcp-Session-Id` from `initialize`. The reconnect must DISCARD the
+    /// previous id rather than keep echoing it (which the fixture, like a real
+    /// upstream, rejects with 400).
+    #[tokio::test]
+    async fn reconnect_without_session_header_discards_old_session() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        use_fast_backoff(&adapter).await;
+        assert_eq!(adapter.session_id.read().await.as_deref(), Some("sess-1"));
+
+        fx.issue_session.store(false, Ordering::SeqCst);
+        demote_via_transport_failures(&adapter).await;
+        let recovered = wait_until(Duration::from_secs(5), || {
+            adapter.health() == HealthStatus::Healthy
+        })
+        .await;
+        assert!(
+            recovered,
+            "supervisor must recover against the sessionless upstream"
+        );
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            adapter.session_id.read().await.as_deref(),
+            None,
+            "a sessionless initialize must clear the stale session id"
+        );
+
+        let result = adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("post-reconnect request must not carry the old session id");
+        assert_eq!(result["ok"], true);
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// `shutdown()` while the supervisor's handshake is in flight: the
+    /// supervisor is stopped BEFORE the listener slot is drained, so the
+    /// interrupted handshake can neither leave a live listener behind nor
+    /// flip health back after shutdown.
+    #[tokio::test]
+    async fn shutdown_during_inflight_handshake_leaves_no_listener() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        use_fast_backoff(&adapter).await;
+
+        fx.init_delay_ms.store(400, Ordering::SeqCst);
+        demote_via_transport_failures(&adapter).await;
+        let in_flight = wait_until(Duration::from_secs(5), || {
+            fx.init_count.load(Ordering::SeqCst) == 2
+        })
+        .await;
+        assert!(in_flight, "supervisor handshake should have started");
+
+        adapter.shutdown().await.expect("shutdown succeeds");
+        assert_eq!(adapter.health(), HealthStatus::Stopped);
+        assert!(adapter.reconnect_handle.lock().await.is_none());
+        assert!(adapter.listener_handle.lock().await.is_none());
+
+        // Outlive the delayed initialize: nothing may be installed or flipped.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            adapter.listener_handle.lock().await.is_none(),
+            "an interrupted handshake must not install a listener after shutdown"
+        );
+        assert_eq!(adapter.health(), HealthStatus::Stopped);
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            2,
+            "no further handshake attempts after shutdown"
+        );
+
+        server.abort();
+    }
+
+    /// Belt and braces for the same race when the handshake cannot be
+    /// aborted (e.g. `Drop`, which can only `try_lock`): once shutdown has
+    /// been signalled, `spawn_get_listener` refuses to repopulate the slot.
+    #[tokio::test]
+    async fn spawn_get_listener_is_a_no_op_after_shutdown_signalled() {
+        let (url, _fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        adapter.shutdown().await.expect("shutdown succeeds");
+        assert!(adapter.listener_handle.lock().await.is_none());
+
+        adapter.spawn_get_listener().await;
+        assert!(
+            adapter.listener_handle.lock().await.is_none(),
+            "no listener may be installed once shutdown has begun"
+        );
+
         server.abort();
     }
 
