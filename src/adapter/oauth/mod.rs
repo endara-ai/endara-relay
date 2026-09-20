@@ -296,6 +296,18 @@ struct RecoveryTickState {
     baseline_invalidated: bool,
 }
 
+/// What a successful heartbeat probe saw: the fingerprint of the tool set
+/// its `tools/list` returned (`None` when it could not be hashed) and the
+/// inner adapter's recovery generation read BEFORE the request was sent.
+/// A healthy commit that publishes a recovery re-baselines on the
+/// fingerprint only while that generation is still current (see
+/// [`OAuthAdapterInner::commit_healthy_verdict`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ProbedTools {
+    pub(super) fingerprint: Option<u64>,
+    pub(super) recovery_generation: u64,
+}
+
 impl RecoveryTickState {
     /// Take everything deferred for publication. A pending recovery is
     /// acknowledged by the take: its generation becomes `acked_generation`
@@ -2325,24 +2337,33 @@ impl OAuthAdapterInner {
     /// `Starting`, with the recovery consumed and nothing left for the
     /// apply to correct.
     ///
-    /// A publishing commit also moves `last_tools_fingerprint` to
-    /// `probed_fingerprint`, the set the verdict's own `tools/list` saw:
-    /// the registry rebuilds its catalog against that set on this tick, so
-    /// it is the baseline the next apply must compare against. The tool set
-    /// may have drifted during an outage without any `list_changed` (the
-    /// forwarder leaves the baseline alone for a recovery tick, see
+    /// A publishing commit also moves `last_tools_fingerprint` to the set
+    /// the verdict's own `tools/list` saw (`probed`): the registry rebuilds
+    /// its catalog against that set on this tick, so it is the baseline the
+    /// next apply must compare against. The tool set may have drifted
+    /// during an outage without any `list_changed` (the forwarder leaves
+    /// the baseline alone for a recovery tick, see
     /// [`Self::relay_inner_tick`]); keeping the pre-outage baseline would
     /// let a later apply that reproduces it stay silent with the catalog
-    /// still holding the post-outage set. An unknown probe fingerprint
-    /// clears the baseline, so that apply ticks unconditionally instead.
-    /// The write happens inside the critical section, ahead of the send,
-    /// so it is ordered before any apply's comparison. A commit that
+    /// still holding the post-outage set. The sample is trusted only while
+    /// the inner recovery generation it was taken at is still the one
+    /// sampled here: a recovery landing after the probe had its answer
+    /// (between the verdict and this commit, say, or during the request
+    /// from another caller) is acknowledged by this commit, yet the sample
+    /// describes the pre-recovery upstream — the fresh probe the forwarder
+    /// poked finds nothing owed and cannot correct it. Such a sample, like
+    /// an unknown fingerprint, clears the baseline so the next apply ticks
+    /// unconditionally instead (the recovery a probe performs itself moves
+    /// the generation too, so a heartbeat-led recovery pays that one tick;
+    /// a recovery a request performed and the poked probe confirmed does
+    /// not). The write happens inside the critical section, ahead of the
+    /// send, so it is ordered before any apply's comparison. A commit that
     /// publishes nothing leaves the baseline alone: no rebuild happened,
     /// so the catalog still reflects the baseline set.
     pub(super) async fn commit_healthy_verdict(
         &self,
         dispatched_generation: u64,
-        probed_fingerprint: Option<u64>,
+        probed: Option<ProbedTools>,
     ) -> Option<bool> {
         let generation = self.inner_recovery_generation_handle().await;
         let state = self.state.read().await;
@@ -2353,7 +2374,7 @@ impl OAuthAdapterInner {
         }
         let previous =
             std::mem::replace(&mut *self.inner_health.write().await, HealthStatus::Healthy);
-        let owed = {
+        let (owed, current) = {
             let mut tick = self.lock_recovery_tick();
             let current = generation.map_or(0, |g| g.load(Ordering::SeqCst));
             let acked = current > tick.acked_generation;
@@ -2361,10 +2382,16 @@ impl OAuthAdapterInner {
                 tick.acked_generation = current;
             }
             let pending = tick.take_deferred();
-            matches!(previous, HealthStatus::Unhealthy(_)) || acked || pending
+            (
+                matches!(previous, HealthStatus::Unhealthy(_)) || acked || pending,
+                current,
+            )
         };
         if owed {
-            *self.last_tools_fingerprint.write().await = probed_fingerprint;
+            let baseline = probed
+                .filter(|p| p.recovery_generation == current)
+                .and_then(|p| p.fingerprint);
+            *self.last_tools_fingerprint.write().await = baseline;
             let _ = self.outer_tools_changed_tx.send(());
         }
         Some(owed)
@@ -4864,7 +4891,9 @@ mod tests {
     /// a parked probe keeps the verdict it was dispatched with), or answer
     /// it as an SSE body that carries a `notifications/tools/list_changed`
     /// inline ahead of the result (`probe_sse_list_changed`, as the
-    /// Streamable HTTP transport allows).
+    /// Streamable HTTP transport allows). `tool_name` is the name of the
+    /// single tool served, read when the response is BUILT (after any
+    /// parking), so a test can drift the tool set under a parked probe.
     #[derive(Clone)]
     struct ProbeFx {
         tools_list_count: Arc<std::sync::atomic::AtomicUsize>,
@@ -4873,6 +4902,7 @@ mod tests {
         probe_sse_list_changed: Arc<AtomicBool>,
         probe_started: Arc<Notify>,
         probe_release: Arc<Notify>,
+        tool_name: Arc<std::sync::RwLock<String>>,
     }
 
     async fn spawn_probe_fixture() -> (String, ProbeFx, tokio::task::JoinHandle<()>) {
@@ -4908,8 +4938,9 @@ mod tests {
                     }
                     // One tool so a registry catalog built over this fixture
                     // has an entry whose health label can be observed.
+                    let tool_name = fx.tool_name.read().unwrap().clone();
                     let result = json!({"jsonrpc": "2.0", "id": id, "result": {"tools": [
-                        {"name": "probe_tool", "description": "probe tool",
+                        {"name": tool_name, "description": "probe tool",
                          "inputSchema": {"type": "object"}}
                     ]}});
                     if fx.probe_sse_list_changed.load(Ordering::SeqCst) {
@@ -4936,6 +4967,7 @@ mod tests {
             probe_sse_list_changed: Arc::new(AtomicBool::new(false)),
             probe_started: Arc::new(Notify::new()),
             probe_release: Arc::new(Notify::new()),
+            tool_name: Arc::new(std::sync::RwLock::new("probe_tool".to_string())),
         };
         let router = Router::new()
             .route("/mcp", post(handle))
@@ -6615,6 +6647,93 @@ mod tests {
             "the commit acknowledged the generation it published"
         );
         assert!(!adapter.inner.recovery_tick_pending());
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #164 review (round 2): the parked-verdict ordering above, with the
+    /// tool set drifting under it. The probe's `tools/list` answered with
+    /// set A; while the verdict waits at its currency check the upstream
+    /// moves to B and the inner recovers (generation 0 → 1). The commit
+    /// acknowledges that recovery and publishes it — the registry rebuilds
+    /// against B — but its sample describes A, and the poked probe behind
+    /// it (which sees B) owes nothing and must not touch the baseline. So
+    /// the commit must not baseline A: it clears the baseline (the sample's
+    /// recovery generation is no longer current), and a later apply that
+    /// finds A again ticks instead of staying silent with B cached.
+    #[tokio::test]
+    async fn recovery_after_a_parked_verdicts_sample_does_not_baseline_the_stale_sample() {
+        let (mut adapter, fx, server) = armed_probe_adapter(1).await;
+        let mut rx = adapter.subscribe_tools_changed().unwrap();
+        drain(&mut rx).await;
+        let baseline_a = *adapter.inner.last_tools_fingerprint.read().await;
+        assert!(baseline_a.is_some(), "the apply baselined on set A");
+
+        // A probe dispatched in `Authenticated` parks at the upstream, then
+        // is answered with set A.
+        fx.hold_probe.store(true, Ordering::SeqCst);
+        adapter.inner.probe_now.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), fx.probe_started.notified())
+            .await
+            .expect("the probe reaches the upstream");
+        fx.hold_probe.store(false, Ordering::SeqCst);
+
+        // Release the verdict while holding the state lock: it has its
+        // sample (A) and waits at its currency check.
+        let parked_verdict = adapter.inner.state.write().await;
+        fx.probe_release.notify_one();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The upstream drifts to B and the inner recovers now: its
+        // generation advances past the one the parked sample was taken at.
+        *fx.tool_name.write().unwrap() = "beta_tool".to_string();
+        {
+            let guard = adapter.inner.inner_adapter.read().await;
+            let http = guard.as_ref().expect("inner adapter installed");
+            http.demote_via_transport_failures_for_test().await;
+            http.call_tool("x", serde_json::json!({}))
+                .await
+                .expect("live upstream answers");
+            assert_eq!(http.recovery_generation(), 1);
+        }
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                adapter.inner.recovery_tick_pending()
+            })
+            .await,
+            "the forwarder raises the pending recovery while the verdict is parked"
+        );
+        drop(parked_verdict);
+
+        // The commit publishes and acknowledges the recovery once; the
+        // poked probe behind it owes nothing.
+        assert!(
+            recv_tick(&mut rx, Duration::from_secs(2)).await,
+            "the healthy commit publishes the recovery"
+        );
+        assert!(!recv_tick(&mut rx, Duration::from_millis(600)).await);
+        assert_eq!(adapter.inner.lock_recovery_tick().acked_generation, 1);
+        assert!(!adapter.inner.recovery_tick_pending());
+        assert_eq!(
+            *adapter.inner.last_tools_fingerprint.read().await,
+            None,
+            "a sample taken before the acknowledged recovery must not become the baseline"
+        );
+
+        // Silent drift back to A, then a routine apply: the catalog holds
+        // B, so the apply must tick.
+        *fx.tool_name.write().unwrap() = "probe_tool".to_string();
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Authenticated);
+        assert!(
+            recv_tick(&mut rx, Duration::from_secs(2)).await,
+            "an apply that finds the pre-recovery set again must tick: the recovery published B"
+        );
+        assert_eq!(
+            *adapter.inner.last_tools_fingerprint.read().await,
+            baseline_a
+        );
 
         adapter.shutdown().await.unwrap();
         server.abort();
