@@ -176,12 +176,15 @@ async fn attempt_recovery(adapter: &Arc<OAuthAdapterInner>) {
 /// Probe the inner adapter by sending a `tools/list` JSON-RPC request
 /// with a configurable timeout. A successful probe carries the fingerprint
 /// of the tool set it saw (`None` only when it could not be hashed) together
-/// with the inner recovery generation the sample belongs to: the generation
-/// the probe's own success flipped the adapter to when the probe was what
-/// recovered it (its answer is the first of that epoch), otherwise the one
-/// read before the request went out. A healthy commit that publishes a
+/// with the inner recovery generation the sample belongs to, as attributed
+/// by [`HttpAdapter::list_tools_tracked`]: the generation the probe's own
+/// success flipped the adapter to when the probe was dispatched into the
+/// outage it ended (its answer is the first of that epoch), otherwise the
+/// one read before the request went out. A healthy commit that publishes a
 /// recovery re-baselines on the sample iff that generation is still current
 /// (see [`OAuthAdapterInner::commit_healthy_verdict`]).
+///
+/// [`HttpAdapter::list_tools_tracked`]: crate::adapter::http::HttpAdapter::list_tools_tracked
 async fn probe_inner(inner: &OAuthAdapterInner) -> Result<ProbedTools, ProbeError> {
     let guard = inner.inner_adapter.read().await;
     let adapter = match guard.as_ref() {
@@ -189,7 +192,6 @@ async fn probe_inner(inner: &OAuthAdapterInner) -> Result<ProbedTools, ProbeErro
         None => return Err(ProbeError::Network("no inner adapter".into())),
     };
 
-    let generation_before = adapter.recovery_generation();
     let timeout_secs = inner.config.probe_timeout_secs;
     match tokio::time::timeout(
         Duration::from_secs(timeout_secs),
@@ -197,9 +199,9 @@ async fn probe_inner(inner: &OAuthAdapterInner) -> Result<ProbedTools, ProbeErro
     )
     .await
     {
-        Ok(Ok((tools, recovered_to))) => Ok(ProbedTools {
+        Ok(Ok((tools, recovery_generation))) => Ok(ProbedTools {
             fingerprint: OAuthAdapterInner::fingerprint_tools(tools),
-            recovery_generation: recovered_to.unwrap_or(generation_before),
+            recovery_generation,
         }),
         Ok(Err(e)) => Err(classify_adapter_error(e)),
         Err(_) => Err(ProbeError::Network(format!(

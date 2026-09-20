@@ -299,11 +299,14 @@ struct RecoveryTickState {
 /// What a successful heartbeat probe saw: the fingerprint of the tool set
 /// its `tools/list` returned (`None` when it could not be hashed) and the
 /// inner adapter's recovery generation the sample belongs to — the one the
-/// probe's own success flipped the adapter to when the probe recovered it,
-/// otherwise the one read BEFORE the request was sent. A healthy commit
-/// that publishes a recovery re-baselines on the fingerprint only while
-/// that generation is still current (see
-/// [`OAuthAdapterInner::commit_healthy_verdict`]).
+/// probe's own success flipped the adapter to when the probe was dispatched
+/// into the outage it ended, otherwise the one read BEFORE the request was
+/// sent (the attribution is the inner adapter's, see
+/// [`HttpAdapter::list_tools_tracked`]). A healthy commit that publishes a
+/// recovery re-baselines on the fingerprint only while that generation is
+/// still current (see [`OAuthAdapterInner::commit_healthy_verdict`]).
+///
+/// [`HttpAdapter::list_tools_tracked`]: crate::adapter::http::HttpAdapter::list_tools_tracked
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ProbedTools {
     pub(super) fingerprint: Option<u64>,
@@ -2355,10 +2358,11 @@ impl OAuthAdapterInner {
     /// describes the pre-recovery upstream — the fresh probe the forwarder
     /// poked finds nothing owed and cannot correct it. Such a sample, like
     /// an unknown fingerprint, clears the baseline so the next apply ticks
-    /// unconditionally instead. A recovery the probe's own request performed
-    /// is different: its answer is the first of the recovered epoch, so the
-    /// sample belongs to the new generation and a heartbeat-led recovery
-    /// re-baselines like any other (see [`ProbedTools`]). The write happens
+    /// unconditionally instead. A recovery performed by a probe dispatched
+    /// into the outage is different: its answer is the first of the
+    /// recovered epoch, so the sample belongs to the new generation and a
+    /// heartbeat-led recovery re-baselines like any other (see
+    /// [`ProbedTools`]). The write happens
     /// inside the critical section, ahead of the send, so it is ordered
     /// before any apply's comparison. A commit that publishes nothing leaves
     /// the baseline alone: no rebuild happened, so the catalog still
