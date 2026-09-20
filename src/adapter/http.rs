@@ -225,15 +225,20 @@ pub struct HttpAdapter {
     /// Notified by [`Self::note_transport_failure`] when reactive health flips
     /// the adapter to `Unhealthy`, waking the supervisor to start reconnecting.
     reconnect_notify: Arc<Notify>,
-    /// Latched when a handshake fails PERMANENTLY
+    /// Whether the most recent handshake failed PERMANENTLY
     /// ([`Self::is_permanent_init_failure`]) — by the supervisor's own attempt
     /// or by a caller-owned [`McpAdapter::initialize`] while the supervisor
     /// is armed. The supervisor checks it before every attempt and stands
     /// down: retrying a `401`/`403`/`404` or a malformed `initialize` answer
-    /// would only hammer the upstream. Cleared at the arming sites (a fresh
-    /// demotion or a retryable init failure), so the next genuine outage
-    /// retries as usual. Set under [`Self::handshake_lock`] so an attempt
-    /// queued behind the failing handshake observes it before probing.
+    /// would only hammer the upstream. Written for EVERY handshake outcome
+    /// while [`Self::handshake_lock`] is still held
+    /// ([`Self::record_handshake_outcome`]), so it is ordered with handshake
+    /// completion — a delayed arming from an older retryable handshake can
+    /// never erase a newer permanent result — and an attempt queued behind
+    /// the failing handshake observes it before probing. Also cleared at a
+    /// demotion from a live state ([`Self::note_transport_failure`]): a
+    /// reactive recovery does not handshake, so the next genuine outage
+    /// after one must retry as usual.
     permanent_handshake_failure: Arc<AtomicBool>,
     /// Serializes handshakes. The caller-owned [`McpAdapter::initialize`]
     /// (`&mut self`) and the supervisor's [`Self::task_clone`] share the
@@ -1149,12 +1154,22 @@ impl HttpAdapter {
     /// reported after it (a request that was in flight across the shutdown)
     /// must neither resurrect it as `Unhealthy` — nothing would be retrying
     /// — nor spawn a supervisor.
+    ///
+    /// The demotion is a genuinely new outage, so it clears
+    /// [`Self::permanent_handshake_failure`] at the same serialized state
+    /// transition: the adapter was live, which after a permanent failure
+    /// means a reactive recovery (no handshake) brought it back, and this
+    /// outage deserves the standard retry loop.
     async fn note_transport_failure(&self) {
         let demoted = {
             let mut health = self.health.write().await;
             let count = self.transport_failures.fetch_add(1, Ordering::SeqCst) + 1;
             if count >= TRANSPORT_FAILURE_THRESHOLD && *health != HealthStatus::Stopped {
                 let was_live = !matches!(*health, HealthStatus::Unhealthy(_));
+                if was_live {
+                    self.permanent_handshake_failure
+                        .store(false, Ordering::SeqCst);
+                }
                 *health = HealthStatus::Unhealthy("upstream unreachable".into());
                 was_live
             } else {
@@ -1716,26 +1731,29 @@ impl HttpAdapter {
         self.arm_supervisor().await;
     }
 
-    /// Spawn the supervisor if needed and hand it a reconnect permit. Every
-    /// arming is a fresh outage (a demotion or a retryable init failure), so
-    /// a permanent-failure latch from an earlier handshake is cleared first:
-    /// this new outage deserves the standard retry loop.
+    /// Spawn the supervisor if needed and hand it a reconnect permit. Does
+    /// NOT touch [`Self::permanent_handshake_failure`]: the arming that
+    /// follows a retryable init failure runs after `handshake_lock` was
+    /// released, so a clear here could erase a permanent result a newer
+    /// handshake recorded in between. The latch is written at the handshake
+    /// itself and at a demotion's health transition instead.
     async fn arm_supervisor(&self) {
-        self.permanent_handshake_failure
-            .store(false, Ordering::SeqCst);
         self.ensure_supervisor_running().await;
         self.reconnect_notify.notify_one();
     }
 
-    /// Latch [`Self::permanent_handshake_failure`] when `e` is permanent.
-    /// Returns whether it was. Called by both handshake owners with their
-    /// final error while they still hold [`Self::handshake_lock`].
-    fn latch_permanent_failure(&self, e: &AdapterError) -> bool {
-        let permanent = Self::is_permanent_init_failure(e);
-        if permanent {
-            self.permanent_handshake_failure
-                .store(true, Ordering::SeqCst);
-        }
+    /// Record a handshake's outcome in [`Self::permanent_handshake_failure`]
+    /// — `true` for a permanent failure, `false` for anything else — and
+    /// return whether it was permanent. Called by both handshake owners with
+    /// their final outcome while they still hold [`Self::handshake_lock`],
+    /// so the latch always reflects the most recent handshake.
+    fn record_handshake_outcome<T>(&self, outcome: &Result<T, AdapterError>) -> bool {
+        let permanent = match outcome {
+            Err(e) => Self::is_permanent_init_failure(e),
+            Ok(_) => false,
+        };
+        self.permanent_handshake_failure
+            .store(permanent, Ordering::SeqCst);
         permanent
     }
 
@@ -1817,10 +1835,14 @@ impl HttpAdapter {
     ///   did while the supervisor was armed
     ///   ([`Self::permanent_handshake_failure`], checked before the backoff
     ///   and again once the lock is held). The adapter stays
-    ///   `Unhealthy(<reason>)` until a manual re-initialize; the next
-    ///   arming clears the latch (pinned by
-    ///   `supervisor_stands_down_on_permanent_handshake_error` and
-    ///   `caller_permanent_failure_stands_armed_supervisor_down`).
+    ///   `Unhealthy(<reason>)` until a manual re-initialize. The latch is
+    ///   written for every handshake outcome under the lock (so it always
+    ///   names the MOST RECENT handshake, whichever owner ran it) and
+    ///   cleared by a demotion from a live state; an arming by itself never
+    ///   clears it (pinned by
+    ///   `supervisor_stands_down_on_permanent_handshake_error`,
+    ///   `caller_permanent_failure_stands_armed_supervisor_down` and
+    ///   `delayed_arming_does_not_clear_a_newer_permanent_failure`).
     ///
     /// The `tools_changed` tick is owned by whichever path performs the
     /// actual `Unhealthy → Healthy` flip (the handshake does it under the
@@ -1953,10 +1975,7 @@ impl HttpAdapter {
                 }
 
                 let outcome = self.complete_handshake(discover_result, true).await;
-                let permanent = match &outcome {
-                    Err(e) => self.latch_permanent_failure(e),
-                    Ok(_) => false,
-                };
+                let permanent = self.record_handshake_outcome(&outcome);
                 drop(handshake);
                 match outcome {
                     Ok(HandshakeOutcome::Completed) => {
@@ -2496,15 +2515,14 @@ impl McpAdapter for HttpAdapter {
                     *health = HealthStatus::Starting;
                 }
                 let outcome = self.connect_and_handshake().await;
-                // Latched while the lock is still held: a supervisor attempt
+                // Recorded while the lock is still held: a supervisor attempt
                 // that queued behind this handshake (the supervisor was armed
                 // by an earlier transient failure) re-checks the latch once it
                 // acquires the lock and stands down instead of re-sending the
-                // same doomed `initialize`.
-                let permanent = match &outcome {
-                    Err(e) => self.latch_permanent_failure(e),
-                    Ok(()) => false,
-                };
+                // same doomed `initialize`. A retryable or successful outcome
+                // stores `false` here, under the lock, rather than at the
+                // arming below, which runs after the lock is released.
+                let permanent = self.record_handshake_outcome(&outcome);
                 (outcome, permanent)
             };
             if let Err(e) = outcome {
@@ -6491,7 +6509,88 @@ mod tests {
                     && fx.init_count.load(Ordering::SeqCst) == 5
             })
             .await,
-            "the latch is cleared by the next arming: the supervisor recovers again"
+            "a demotion from a live state clears the latch: the supervisor recovers again"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// The latch is ordered with handshake completion, not with arming. An
+    /// older caller-owned handshake that failed retryably releases
+    /// `handshake_lock` and only THEN arms the supervisor
+    /// (`retry_initialize_in_background`); if the supervisor's own attempt
+    /// slipped in between and got the permanent answer, that delayed arming
+    /// must not erase the newer result and re-send the doomed `initialize`.
+    /// A later caller-owned handshake that fails retryably DOES re-arm: its
+    /// own outcome is recorded under the lock.
+    #[tokio::test]
+    async fn delayed_arming_does_not_clear_a_newer_permanent_failure() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        use_fast_backoff(&adapter).await;
+
+        // The supervisor's attempt gets the permanent answer and stands down.
+        *fx.fail_init.lock().unwrap() = Some(HeldInitFailure::Http401);
+        demote_via_transport_failures(&adapter).await;
+        tokio::time::timeout(Duration::from_secs(5), fx.started.notified())
+            .await
+            .expect("supervisor attempt should reach initialize");
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 2);
+        fx.release.notify_one();
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                matches!(adapter.health(), HealthStatus::Unhealthy(ref r) if r.contains("401"))
+            })
+            .await,
+            "the permanent answer is recorded: {:?}",
+            adapter.health()
+        );
+        let discovers_before = fx.discover_count.load(Ordering::SeqCst);
+
+        // The delayed arming of an older retryable handshake lands now.
+        adapter.retry_initialize_in_background().await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            2,
+            "a delayed arming must not clear the newer permanent failure"
+        );
+        assert_eq!(
+            fx.discover_count.load(Ordering::SeqCst),
+            discovers_before,
+            "the stood-down supervisor does not probe the upstream"
+        );
+
+        // A caller-owned handshake that itself fails retryably re-arms the
+        // supervisor: the upstream then accepts and the adapter recovers.
+        *fx.fail_init.lock().unwrap() = Some(HeldInitFailure::Http503);
+        let releaser = {
+            let fx = fx.clone();
+            tokio::spawn(async move {
+                fx.started.notified().await;
+                *fx.fail_init.lock().unwrap() = None;
+                fx.release.notify_one();
+            })
+        };
+        let err = adapter
+            .initialize()
+            .await
+            .expect_err("caller initialize fails with the retryable answer");
+        assert!(
+            matches!(err, AdapterError::HttpError { status: 503, .. }),
+            "unexpected error: {err:?}"
+        );
+        releaser.await.unwrap();
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 3);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                adapter.health() == HealthStatus::Healthy
+                    && fx.init_count.load(Ordering::SeqCst) == 4
+            })
+            .await,
+            "a retryable caller outcome records a fresh latch and re-arms recovery"
         );
 
         adapter.shutdown().await.unwrap();
@@ -6592,7 +6691,7 @@ mod tests {
                     && fx.init_count.load(Ordering::SeqCst) == 5
             })
             .await,
-            "the latch is cleared by the next arming: the supervisor recovers again"
+            "a demotion from a live state clears the latch: the supervisor recovers again"
         );
 
         adapter.shutdown().await.unwrap();
