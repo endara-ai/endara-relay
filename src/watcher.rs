@@ -1142,6 +1142,10 @@ async fn build_ema_adapter(
 ///
 /// Always returns an adapter. If initialization fails, returns a [`FailedAdapter`]
 /// so the endpoint still appears in the registry with an unhealthy status.
+/// Plain `http` endpoints are the exception: a failed handshake keeps the real
+/// [`HttpAdapter`] (reporting the same `Unhealthy(<error>)`) and arms its
+/// reconnect supervisor, so an upstream that is down at startup or on a
+/// config add/reload recovers on its own once reachable.
 pub(crate) async fn create_adapter(
     ep: &EndpointConfig,
     token_manager: &Arc<TokenManager>,
@@ -1241,12 +1245,24 @@ pub(crate) async fn create_adapter(
             }
             match adapter.initialize().await {
                 Ok(()) => Box::new(adapter),
-                Err(e) => {
-                    warn!(endpoint = %ep.name, error = %e, "Failed to initialize HTTP adapter, registering as failed");
+                Err(e) if HttpAdapter::is_permanent_init_failure(&e) => {
+                    // The upstream answered and the answer will not change on
+                    // its own (`401`/`403`/`404`, invalid handshake): no
+                    // background retry was armed, so freeze it as a
+                    // `FailedAdapter` like any other non-retryable init error.
+                    // A manual restart / re-enable tries again.
+                    let msg = format!("Failed to initialize HTTP adapter: {}", e);
+                    warn!(endpoint = %ep.name, error = %e, "Failed to initialize HTTP adapter permanently, registering as failed (no background retry)");
                     Box::new(
-                        FailedAdapter::new(e.to_string())
+                        FailedAdapter::new(msg)
                             .with_server_type_override(ep.server_type_override.clone()),
                     )
+                }
+                Err(e) => {
+                    // A failed `initialize()` has already armed the adapter's
+                    // background retry; register it as the real adapter.
+                    warn!(endpoint = %ep.name, error = %e, "Failed to initialize HTTP adapter, registering unhealthy and retrying in background");
+                    Box::new(adapter)
                 }
             }
         }
@@ -1618,6 +1634,253 @@ mod tests {
             other => panic!("expected forwarded HttpError 401, got {:?}", other),
         }
 
+        server.abort();
+    }
+
+    /// Reserve a loopback port and release it: the returned address refuses
+    /// connections until a test binds it again.
+    async fn reserve_dead_port() -> std::net::SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        addr
+    }
+
+    /// Serve a minimal streamable-HTTP MCP upstream (handshake + one tool)
+    /// on an already-bound listener.
+    fn spawn_minimal_mcp_fixture_on(
+        listener: tokio::net::TcpListener,
+    ) -> tokio::task::JoinHandle<()> {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        use axum::routing::post;
+        use axum::{Json, Router};
+
+        async fn mcp(Json(body): Json<serde_json::Value>) -> axum::response::Response {
+            let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            let id = body.get("id").cloned();
+            match method {
+                "initialize" => Json(json!({
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "protocolVersion": "2025-03-26",
+                        "capabilities": {},
+                        "serverInfo": {"name": "late-http", "version": "0.0.0"}
+                    },
+                    "id": id,
+                }))
+                .into_response(),
+                "tools/list" => Json(json!({
+                    "jsonrpc": "2.0",
+                    "result": {"tools": [
+                        {"name": "ping", "description": "p", "inputSchema": {"type": "object"}}
+                    ]},
+                    "id": id,
+                }))
+                .into_response(),
+                _ if id.is_none() => (StatusCode::ACCEPTED, "").into_response(),
+                _ => Json(json!({
+                    "jsonrpc": "2.0",
+                    "error": {"code": -32601, "message": "method not found"},
+                    "id": id,
+                }))
+                .into_response(),
+            }
+        }
+
+        let router = Router::new().route("/mcp", post(mcp));
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        })
+    }
+
+    /// Regression for the startup / config-reload path: a plain `http`
+    /// endpoint whose upstream is down when `create_adapter` runs must be
+    /// registered as the REAL `HttpAdapter` in an `Unhealthy(<error>)` state
+    /// (not frozen as a `FailedAdapter`), and must recover on its own once the
+    /// upstream comes up — no caller traffic, one `tools_changed` tick.
+    #[tokio::test]
+    async fn create_adapter_http_dead_upstream_registers_real_adapter_and_recovers() {
+        let addr = reserve_dead_port().await;
+        let (tm, inners) = test_oauth_infra();
+        let ep = http_endpoint("late_http", &format!("http://{}/mcp", addr));
+
+        let adapter = create_adapter(&ep, &tm, &inners, true, None, None, &[]).await;
+        match adapter.health() {
+            HealthStatus::Unhealthy(msg) => {
+                assert!(!msg.is_empty(), "Unhealthy must carry the init error")
+            }
+            other => panic!("expected Unhealthy while upstream is down, got {:?}", other),
+        }
+        // While down and never initialized the adapter answers catalog reads
+        // like a `FailedAdapter` (`Ok([])`, no upstream traffic)...
+        assert!(
+            adapter
+                .list_tools()
+                .await
+                .expect("never-initialized list_tools is Ok([])")
+                .is_empty(),
+            "no tools while the upstream is down"
+        );
+        // ...but unlike a `FailedAdapter` (whose `subscribe_tools_changed`
+        // is `None`) it is the real `HttpAdapter`: it exposes a
+        // `tools_changed` receiver and recovers on its own below.
+        let mut rx = adapter
+            .subscribe_tools_changed()
+            .expect("the real HttpAdapter must be registered, not a FailedAdapter");
+
+        // Upstream comes up at the configured address; the supervisor's
+        // production backoff (1 s base) drives the retry.
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .expect("rebind the reserved upstream port");
+        let server = spawn_minimal_mcp_fixture_on(listener);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while adapter.health() != HealthStatus::Healthy && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            adapter.health(),
+            HealthStatus::Healthy,
+            "adapter must recover once the upstream is reachable, with no caller traffic"
+        );
+        assert!(
+            rx.try_recv().is_ok(),
+            "recovery must tick tools_changed so the registry re-fetches the catalog"
+        );
+        let tools = adapter
+            .list_tools()
+            .await
+            .expect("tools listable after recovery");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "ping");
+
+        server.abort();
+    }
+
+    /// Control: a non-`http` transport that fails to initialize keeps the
+    /// pre-existing `FailedAdapter` behaviour (`list_tools` → `Ok([])`,
+    /// `call_tool` → "server failed to initialize").
+    #[tokio::test]
+    async fn create_adapter_sse_dead_upstream_still_registers_failed_adapter() {
+        let addr = reserve_dead_port().await;
+        let (tm, inners) = test_oauth_infra();
+        let mut ep = http_endpoint("dead_sse", &format!("http://{}/sse", addr));
+        ep.transport = Transport::Sse;
+
+        let adapter = create_adapter(&ep, &tm, &inners, true, None, None, &[]).await;
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+        assert!(adapter
+            .list_tools()
+            .await
+            .expect("FailedAdapter lists no tools")
+            .is_empty());
+        match adapter.call_tool("x", json!({})).await {
+            Err(AdapterError::ConnectionFailed(msg)) => {
+                assert!(msg.starts_with("server failed to initialize:"), "{}", msg)
+            }
+            other => panic!("expected FailedAdapter ConnectionFailed, got {:?}", other),
+        }
+    }
+
+    /// Serve an upstream that answers every POST with a fixed non-2xx status
+    /// and counts the requests it received.
+    fn spawn_status_fixture(
+        status: u16,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use axum::Router;
+
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_h = hits.clone();
+        let router = Router::new().route(
+            "/mcp",
+            post(move || {
+                let hits = hits_h.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    StatusCode::from_u16(status).unwrap()
+                }
+            }),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, router).await.ok();
+        });
+        (format!("http://{}/mcp", addr), hits, server)
+    }
+
+    /// Regression: a plain `http` endpoint whose upstream ANSWERS the
+    /// handshake with a permanent failure (`404` — wrong URL) must be
+    /// registered as a `FailedAdapter` with NO background retry: the
+    /// upstream sees exactly the initial handshake traffic, and nothing more
+    /// after the supervisor's 1 s base backoff would have fired. A transient
+    /// answer (`503`) keeps the real, retrying `HttpAdapter`.
+    #[tokio::test]
+    async fn create_adapter_http_permanent_init_failure_registers_failed_adapter_without_retry() {
+        let (url, hits, server) = spawn_status_fixture(404);
+        let (tm, inners) = test_oauth_infra();
+        let mut ep = http_endpoint("wrong_url", &url);
+        ep.server_type_override = Some("GitHub".to_string());
+
+        let adapter = create_adapter(&ep, &tm, &inners, true, None, None, &[]).await;
+        match adapter.health() {
+            HealthStatus::Unhealthy(msg) => assert!(msg.contains("404"), "{msg}"),
+            other => panic!("expected Unhealthy after a 404 handshake, got {:?}", other),
+        }
+        assert!(
+            adapter.subscribe_tools_changed().is_none(),
+            "a permanent init failure must register a FailedAdapter, not a retrying HttpAdapter"
+        );
+        // PR #163 review (round 9, Copilot r4056157699): the replacement
+        // `FailedAdapter` carries the endpoint's `server_type_override` like
+        // every other failed-registration path, so the endpoint keeps
+        // advertising its configured server type.
+        assert_eq!(
+            adapter.configured_server_type().as_deref(),
+            Some("github"),
+            "the permanent-failure FailedAdapter must keep the server_type_override"
+        );
+        let initial = hits.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(initial >= 1, "the handshake must have reached the upstream");
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            initial,
+            "no background retry may reach a permanently failed upstream"
+        );
+        server.abort();
+
+        // Control: a transient `503` keeps the real adapter and its retry.
+        let (url, hits, server) = spawn_status_fixture(503);
+        let ep = http_endpoint("busy_url", &url);
+        let adapter = create_adapter(&ep, &tm, &inners, true, None, None, &[]).await;
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+        assert!(
+            adapter.subscribe_tools_changed().is_some(),
+            "a transient init failure must keep the real HttpAdapter"
+        );
+        let initial = hits.load(std::sync::atomic::Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while hits.load(std::sync::atomic::Ordering::SeqCst) == initial
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            hits.load(std::sync::atomic::Ordering::SeqCst) > initial,
+            "a transient init failure must keep retrying in the background"
+        );
+        drop(adapter);
         server.abort();
     }
 
