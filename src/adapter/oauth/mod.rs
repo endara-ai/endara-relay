@@ -276,9 +276,11 @@ impl TokenPostOutcome {
 /// and a recovery published in a terminal state is acknowledged by that
 /// publication, so the next healthy commit does not publish it again.
 ///
-/// `baseline_invalidated` records that an inner tick cleared the tools
-/// fingerprint baseline since the last apply (as opposed to the baseline
-/// being unknown because a probe failed). A tick relayed while
+/// `baseline_invalidated` records that an ordinary inner `list_changed` tick
+/// cleared the tools fingerprint baseline since the last apply (as opposed
+/// to the baseline being unknown because a probe failed; a recovery tick is
+/// consumed through the accounting above and never raises it, so a routine
+/// apply after a published recovery stays silent). A tick relayed while
 /// `Authenticated` may be processed by the registry only after the next
 /// apply has entered `Refreshing`, so the rebuild caches the tools as
 /// unavailable; the apply that consumes the flag owes a corrective tick even
@@ -1949,12 +1951,14 @@ impl OAuthAdapterInner {
     /// into `outer_tools_changed_tx`. `Lagged` is forwarded as a tick
     /// (matching the registry listener); `Closed` ends the task.
     ///
-    /// Each relayed tick also clears `last_tools_fingerprint`: an inner
-    /// `tools_changed` notification means the upstream tool set drifted from
-    /// the baseline probed at `apply_tokens` time, so a later Some→Some swap
-    /// that happens to reproduce the original set must still tick (the
-    /// registry's caches followed the drift). An unknown baseline makes the
-    /// next swap tick unconditionally — safe, at worst one extra tick.
+    /// Each relayed ordinary tick also clears `last_tools_fingerprint`: an
+    /// inner `tools_changed` notification means the upstream tool set
+    /// drifted from the baseline probed at `apply_tokens` time, so a later
+    /// Some→Some swap that happens to reproduce the original set must still
+    /// tick (the registry's caches followed the drift). An unknown baseline
+    /// makes the next swap tick unconditionally — safe, at worst one extra
+    /// tick. A recovery tick announces no drift and leaves the baseline
+    /// alone (see [`Self::relay_inner_tick`]).
     ///
     /// An inner tick is also how the inner adapter announces its own
     /// `Unhealthy → Healthy` recovery (reconnect supervisor or reactive). The
@@ -2016,7 +2020,6 @@ impl OAuthAdapterInner {
             return false;
         };
         let outer_tx = self.outer_tools_changed_tx.clone();
-        let fingerprint = self.last_tools_fingerprint.clone();
         let mut seen_recovery = recovery_generation.load(Ordering::SeqCst);
         let backlog = drain_queued_ticks(&mut rx);
         {
@@ -2045,15 +2048,6 @@ impl OAuthAdapterInner {
                     let _ = outer_tx.send(());
                     continue;
                 };
-                // Recorded FIRST, with no await between the poll and the
-                // write: an inner tick invalidates the fingerprint baseline,
-                // and the flag tells the next apply the baseline is unknown
-                // BECAUSE of a tick (not a failed probe) — or that a tick
-                // was polled but never relayed, if an apply aborts this task
-                // at one of the awaits below — so the apply's commit corrects
-                // even when its own probe fails (see `RecoveryTickState`).
-                inner.lock_recovery_tick().baseline_invalidated = true;
-                *fingerprint.write().await = None;
                 inner
                     .relay_inner_tick(&recovery_generation, &mut seen_recovery, &outer_tx)
                     .await;
@@ -2083,10 +2077,21 @@ impl OAuthAdapterInner {
         }
     }
 
-    /// Handle one inner tick on behalf of the forwarder. A recovery tick is
-    /// accounted for by [`Self::poke_heartbeat_on_inner_recovery`] and never
-    /// relayed here. An ordinary `tools/list_changed` is relayed at once
-    /// while the lifecycle is anything but `Refreshing`; while `Refreshing`
+    /// Handle one inner tick on behalf of the forwarder. The tick is
+    /// classified FIRST: a recovery tick is accounted for by
+    /// [`Self::poke_heartbeat_on_inner_recovery`] and never relayed here —
+    /// it announces no tool-set change, so it leaves the fingerprint
+    /// baseline alone (the heartbeat publishes the recovery once; an
+    /// invalidation left behind would make the next apply tick again for an
+    /// unchanged tool set). Only an ordinary `tools/list_changed`
+    /// invalidates the baseline. The classification of an ordinary tick
+    /// awaits nothing, so the flag is still recorded with no yield between
+    /// the poll and the write: it tells the next apply the baseline is
+    /// unknown BECAUSE of a tick (not a failed probe) — or that a tick was
+    /// polled but never relayed, if an apply aborts the forwarder at one of
+    /// the awaits below — so the apply's commit corrects even when its own
+    /// probe fails (see [`RecoveryTickState`]). The tick is then relayed at
+    /// once while the lifecycle is anything but `Refreshing`; while `Refreshing`
     /// (derived health `Starting`) it is deferred into
     /// `RecoveryTickState::tick_pending` instead, coalesced with whatever
     /// else is deferred, and published by the apply once it has committed
@@ -2113,6 +2118,8 @@ impl OAuthAdapterInner {
         {
             return;
         }
+        self.lock_recovery_tick().baseline_invalidated = true;
+        *self.last_tools_fingerprint.write().await = None;
         let state = self.state.read().await;
         if *state == OAuthState::Refreshing {
             self.lock_recovery_tick().tick_pending = true;
@@ -6021,6 +6028,63 @@ mod tests {
             !recv_tick(&mut rx, Duration::from_millis(400)).await,
             "a failed probe with no outstanding invalidation stays silent"
         );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (Copilot r4056292905): a genuine HTTP recovery reaches
+    /// the forwarder as an inner tick too, but is consumed through recovery
+    /// accounting (the heartbeat's commit publishes it once). It must not
+    /// ALSO be treated as an ordinary invalidation: the forwarder used to
+    /// raise `baseline_invalidated` and clear the fingerprint before
+    /// classifying the tick, so the next token apply ticked again for an
+    /// unchanged tool set. One recovery with unchanged tools yields exactly
+    /// one outer tick across the recovery and the following apply.
+    #[tokio::test]
+    async fn recovery_tick_does_not_invalidate_baseline_so_next_apply_stays_silent() {
+        let (mut adapter, _fx, server) = armed_probe_adapter(3).await;
+        let mut rx = adapter.subscribe_tools_changed().unwrap();
+        drain(&mut rx).await;
+        let baseline = *adapter.inner.last_tools_fingerprint.read().await;
+        assert!(
+            baseline.is_some(),
+            "baseline: the apply's fingerprint probe succeeded"
+        );
+
+        // The inner adapter recovers reactively; the heartbeat publishes the
+        // recovery once.
+        recover_inner_for_real(&adapter).await;
+        assert!(
+            recv_tick(&mut rx, Duration::from_secs(2)).await,
+            "the recovery is published"
+        );
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                !adapter.inner.recovery_tick_pending()
+            })
+            .await,
+            "the recovery is consumed by the heartbeat's commit"
+        );
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "one recovery publishes one tick"
+        );
+        assert_eq!(
+            *adapter.inner.last_tools_fingerprint.read().await,
+            baseline,
+            "a recovery tick announces no tool-set change: the baseline stands"
+        );
+
+        // Routine token refresh, same tool set, Healthy throughout: silent.
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Authenticated);
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "a recovery already published must not make the next apply tick again for an unchanged tool set"
+        );
+        assert!(!adapter.inner.recovery_tick_pending());
 
         adapter.shutdown().await.unwrap();
         server.abort();
