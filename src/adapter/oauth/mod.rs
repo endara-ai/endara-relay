@@ -236,32 +236,74 @@ impl TokenPostOutcome {
 /// with no later tick guaranteed to correct them.
 ///
 /// `acked_generation` is the inner [`HttpAdapter::recovery_generation`]
-/// whose invalidation the heartbeat has already published (with a
-/// current healthy commit, see
-/// [`OAuthAdapterInner::commit_healthy_verdict`]). `tick_pending` is the
-/// deferred tick: raised by the forwarder, together with a probe poke, for
-/// a recovery the heartbeat has NOT acknowledged yet
-/// ([`OAuthAdapterInner::note_unacked_recovery`]), and for any ordinary
-/// inner `list_changed` that arrives while the lifecycle is `Refreshing`
-/// ([`OAuthAdapterInner::relay_inner_tick`]). It is published by the next
-/// healthy transition ([`OAuthAdapterInner::publish_or_retain_tick`] on the
-/// apply commit, the healthy verdict's commit) — never while `Refreshing`:
-/// both publishers decide, take and send under the `state` read lock, so a
-/// refresh entering `Refreshing` (under the write lock) either follows a
-/// completed publication or finds the tick retained for its own commit.
+/// whose invalidation has already been published — by a current heartbeat
+/// healthy commit ([`OAuthAdapterInner::commit_healthy_verdict`]) or by any
+/// publication of `pending_recovery`. The deferred tick comes in two kinds,
+/// kept apart so a recovery is acknowledged whichever path publishes it:
+/// `pending_recovery` is the recovery generation the forwarder raised a
+/// tick for, together with a probe poke, because the heartbeat had NOT
+/// acknowledged it yet ([`OAuthAdapterInner::note_unacked_recovery`]);
+/// `tick_pending` is an ordinary inner `list_changed` (or an apply's owed
+/// tick) that arrived while the lifecycle was `Refreshing`
+/// ([`OAuthAdapterInner::relay_inner_tick`]) or was queued on a replacement
+/// adapter's subscription before its forwarder started
+/// ([`OAuthAdapterInner::swap_tools_forwarder`]). Both are published by the
+/// next publication ([`OAuthAdapterInner::publish_or_retain_tick`] on the
+/// apply commit, a terminal-state heartbeat tick, the healthy verdict's
+/// commit), and taking `pending_recovery` advances `acked_generation` to it
+/// — never while `Refreshing`: every publisher decides, takes and sends
+/// under the `state` read lock, so a refresh entering `Refreshing` (under
+/// the write lock) either follows a completed publication or finds the tick
+/// retained for its own commit.
+///
+/// `restore_owed` is the wrapper-level counterpart of the inner recovery: it
+/// is raised when the lifecycle enters a degraded terminal state
+/// (`AuthRequired` / `ConnectionFailed` / `Disconnected`, whose derived
+/// health is not `Healthy`) and consumed by the apply that commits
+/// `Authenticated` again, which then owes a corrective tick regardless of
+/// its fingerprint probe: the registry may have rebuilt its catalog against
+/// the degraded view, and a recovery tick published meanwhile (in the
+/// terminal state) served that state, not this transition.
 ///
 /// Everything lives under one lock, and the heartbeat samples the inner
 /// recovery generation INSIDE its critical section, so one inner recovery
 /// yields exactly one outer tick whichever side observes it first: a
 /// recovery the heartbeat's commit acknowledges is dropped by the forwarder
-/// afterwards, a forwarder that got there first has raised `tick_pending`,
-/// which that same commit consumes together with the acknowledgement, and
-/// a recovery landing between the heartbeat's verdict and its commit is
-/// acknowledged by that commit rather than published twice.
+/// afterwards, a forwarder that got there first has raised
+/// `pending_recovery`, which that same commit consumes together with the
+/// acknowledgement, a recovery landing between the heartbeat's verdict and
+/// its commit is acknowledged by that commit rather than published twice,
+/// and a recovery published in a terminal state is acknowledged by that
+/// publication, so the next healthy commit does not publish it again.
 #[derive(Debug, Default)]
 struct RecoveryTickState {
     acked_generation: u64,
     tick_pending: bool,
+    pending_recovery: Option<u64>,
+    restore_owed: bool,
+}
+
+impl RecoveryTickState {
+    /// Take everything deferred for publication. A pending recovery is
+    /// acknowledged by the take: its generation becomes `acked_generation`
+    /// (never moving it backwards), so whichever path publishes the tick
+    /// leaves nothing for the heartbeat's next healthy commit to re-publish.
+    fn take_deferred(&mut self) -> bool {
+        let ordinary = std::mem::take(&mut self.tick_pending);
+        let recovery = match self.pending_recovery.take() {
+            Some(generation) => {
+                self.acked_generation = self.acked_generation.max(generation);
+                true
+            }
+            None => false,
+        };
+        ordinary || recovery
+    }
+
+    #[cfg(test)]
+    fn has_deferred(&self) -> bool {
+        self.tick_pending || self.pending_recovery.is_some()
+    }
 }
 
 /// What the inner→outer tools-changed forwarder binds to: an inner
@@ -509,6 +551,10 @@ impl OAuthAdapterInner {
     /// successful `apply_tokens` hit the `(None, Some(_))` branch and tick
     /// even when the tool set is unchanged. `Refreshing`/`Authenticated`
     /// keep the baseline so routine refreshes stay silent (PR #140 review).
+    /// The same entry raises `RecoveryTickState::restore_owed`, so that
+    /// apply ticks even when its fingerprint probe fails (no `(None,
+    /// Some(_))` branch to fall into): the transition back into `Healthy`
+    /// is what the registry must learn about, whatever the tool set.
     ///
     /// Called by both state writers ([`Self::transition_to`] and
     /// [`Self::transition_if_current`]) inside the `state` write critical
@@ -524,6 +570,7 @@ impl OAuthAdapterInner {
             OAuthState::AuthRequired | OAuthState::ConnectionFailed | OAuthState::Disconnected
         ) {
             *self.last_tools_fingerprint.write().await = None;
+            self.lock_recovery_tick().restore_owed = true;
         }
     }
 
@@ -1568,12 +1615,17 @@ impl OAuthAdapterInner {
                 // health into `Healthy`, and it owes the post-transition
                 // tick whenever the registry may hold a non-healthy view of
                 // this endpoint — the previous `inner_health` was not
-                // `Healthy` (a heartbeat verdict from the outage), or the
-                // old inner adapter recovered without that recovery ever
-                // being acknowledged (its tick was still queued when its
-                // forwarder was aborted, see `swap_tools_forwarder`). Both
-                // are read at the replacement, before the forwarder swap
-                // rebaselines the acknowledgement to the new adapter.
+                // `Healthy` (a heartbeat verdict from the outage), the
+                // lifecycle passed through a degraded terminal state since
+                // the last commit (`RecoveryTickState::restore_owed`: the
+                // derived health was not `Healthy` whatever `inner_health`
+                // said, and a recovery tick published in that state served
+                // that state, not this transition), or the old inner
+                // adapter recovered without that recovery ever being
+                // published or acknowledged (its tick was still queued when
+                // its forwarder was aborted, see `swap_tools_forwarder`).
+                // All are read at the replacement, before the forwarder
+                // swap rebaselines the acknowledgement to the new adapter.
                 // The old adapter is fully quiesced BEFORE that read. Its
                 // forwarder — the only other observer of its recoveries — is
                 // aborted and joined first, so no tick is polled after this
@@ -1606,28 +1658,38 @@ impl OAuthAdapterInner {
                     }
                     None => false,
                 };
+                let restoring = std::mem::take(&mut self.lock_recovery_tick().restore_owed);
                 let was_healthy = matches!(
                     std::mem::replace(&mut *self.inner_health.write().await, HealthStatus::Healthy),
                     HealthStatus::Healthy
                 );
-                self.swap_tools_forwarder(source).await;
-                let should_tick = if !was_listable || !was_healthy || unacked_old_recovery {
-                    true
-                } else {
-                    let old_fingerprint = *self.last_tools_fingerprint.read().await;
-                    match (old_fingerprint, new_fingerprint) {
-                        // Both probes succeeded: tick only on an actual change.
-                        (Some(old), Some(new)) => old != new,
-                        // Baseline unknown (previous probe failed): cached
-                        // tools may be stale — tick to be safe.
-                        (None, Some(_)) => true,
-                        // New probe failed: a change is undetectable, and the
-                        // registry's own refetch would fail too — stay silent
-                        // and keep the previous baseline.
-                        (_, None) => false,
-                    }
-                };
-                if new_fingerprint.is_some() {
+                // Ticks the replacement adapter queued between the bind and
+                // its forwarder's start (its own fingerprint probe can push
+                // a `list_changed` inline) are deferred by the swap into
+                // `tick_pending`, which the publish below folds into this
+                // commit's tick; they also leave the baseline unknown, since
+                // the sample may predate the change they announce.
+                let backlog = self.swap_tools_forwarder(source).await;
+                let should_tick =
+                    if !was_listable || !was_healthy || unacked_old_recovery || restoring {
+                        true
+                    } else {
+                        let old_fingerprint = *self.last_tools_fingerprint.read().await;
+                        match (old_fingerprint, new_fingerprint) {
+                            // Both probes succeeded: tick only on an actual change.
+                            (Some(old), Some(new)) => old != new,
+                            // Baseline unknown (previous probe failed): cached
+                            // tools may be stale — tick to be safe.
+                            (None, Some(_)) => true,
+                            // New probe failed: a change is undetectable, and the
+                            // registry's own refetch would fail too — stay silent
+                            // and keep the previous baseline.
+                            (_, None) => false,
+                        }
+                    };
+                if backlog {
+                    *self.last_tools_fingerprint.write().await = None;
+                } else if new_fingerprint.is_some() {
                     *self.last_tools_fingerprint.write().await = new_fingerprint;
                 }
                 self.transition_to(
@@ -1844,14 +1906,35 @@ impl OAuthAdapterInner {
     /// state is back to `Authenticated`.
     /// The forwarder never writes `inner_health` itself. A recovery tick is
     /// NOT relayed here either: the heartbeat publishes it after the probe
-    /// commits (`RecoveryTickState::tick_pending`, or its `acked_generation` when
-    /// the heartbeat's own probe performed the recovery), so the registry
-    /// never rebuilds its catalog against a verdict the probe is about to
-    /// overturn and one recovery never ticks twice. Ordinary invalidations
-    /// are relayed immediately — unless the lifecycle is `Refreshing`, in
-    /// which case they are deferred like a recovery (see
-    /// [`Self::relay_inner_tick`]).
-    async fn swap_tools_forwarder(self: &Arc<Self>, source: Option<InnerTickSource>) {
+    /// commits (`RecoveryTickState::pending_recovery`, or its
+    /// `acked_generation` when the heartbeat's own probe performed the
+    /// recovery), so the registry never rebuilds its catalog against a
+    /// verdict the probe is about to overturn and one recovery never ticks
+    /// twice. Ordinary invalidations are relayed immediately — unless the
+    /// lifecycle is `Refreshing`, in which case they are deferred like a
+    /// recovery (see [`Self::relay_inner_tick`]).
+    ///
+    /// Ticks already queued on `source` when the forwarder starts — the
+    /// apply binds the receiver BEFORE its fingerprint probe, and that probe
+    /// (or any request on the new adapter in between) can push a
+    /// `list_changed` inline — are not left to the forwarder task: it may
+    /// first run only after the apply has committed `Authenticated` and
+    /// published its tick, in which case it would relay them as a second
+    /// tick for a change the apply's own tick already covers. They are
+    /// drained here, without blocking, into `RecoveryTickState::tick_pending`
+    /// so the apply's fenced publish folds them into its single commit tick.
+    /// Returns whether any were drained (the caller then treats the
+    /// fingerprint baseline as unknown, as a relayed tick would). Anything
+    /// arriving after the drain is a change the sample cannot have included
+    /// and is relayed (or deferred) by the forwarder as usual.
+    ///
+    /// The acknowledgement is rebaselined to the new adapter's counter. A
+    /// pending recovery of the OLD adapter is not lost by that: the apply
+    /// read `unacked_old_recovery` before calling here and owes the tick
+    /// itself, so the old generation is dropped (it must not advance the
+    /// acknowledgement of the NEW adapter's counter) and the deferred tick
+    /// is kept as an ordinary one.
+    async fn swap_tools_forwarder(self: &Arc<Self>, source: Option<InnerTickSource>) -> bool {
         let mut handle_guard = self.inner_forwarder_handle.lock().await;
         if let Some(h) = handle_guard.take() {
             h.abort();
@@ -1862,12 +1945,25 @@ impl OAuthAdapterInner {
             recovery_generation,
         }) = source
         else {
-            return;
+            return false;
         };
         let outer_tx = self.outer_tools_changed_tx.clone();
         let fingerprint = self.last_tools_fingerprint.clone();
         let mut seen_recovery = recovery_generation.load(Ordering::SeqCst);
-        self.lock_recovery_tick().acked_generation = seen_recovery;
+        let mut backlog = false;
+        while let Ok(()) | Err(broadcast::error::TryRecvError::Lagged(_)) = rx.try_recv() {
+            backlog = true;
+        }
+        {
+            let mut tick = self.lock_recovery_tick();
+            tick.acked_generation = seen_recovery;
+            if tick.pending_recovery.take().is_some() || backlog {
+                tick.tick_pending = true;
+            }
+        }
+        if backlog {
+            debug!("inner tools_changed queued before the forwarder started: folded into the apply's commit tick");
+        }
         let weak = Arc::downgrade(self);
         let join = tokio::spawn(async move {
             // `Ok` and `Lagged` both forward a tick; `Closed` ends the task.
@@ -1886,6 +1982,7 @@ impl OAuthAdapterInner {
             }
         });
         *handle_guard = Some(join);
+        backlog
     }
 
     /// Handle one inner tick on behalf of the forwarder. A recovery tick is
@@ -1989,23 +2086,30 @@ impl OAuthAdapterInner {
     }
 
     /// Lock the recovery-tick accounting. Never held across an await; a
-    /// poisoned lock only ever holds two plain values, so it is recovered.
+    /// poisoned lock only ever holds plain values, so it is recovered.
     fn lock_recovery_tick(&self) -> std::sync::MutexGuard<'_, RecoveryTickState> {
         self.recovery_tick
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Forwarder side: if `generation` is not acknowledged yet, raise the
-    /// pending tick for it and return `true` (the caller then pokes a probe).
-    /// Check and set are one critical section with the heartbeat's
+    /// Forwarder side: if `generation` is not acknowledged yet, record it as
+    /// the pending recovery and return `true` (the caller then pokes a
+    /// probe). Check and set are one critical section with the heartbeat's
     /// acknowledgement, so an ack that lands first is seen and one that lands
-    /// after finds the pending flag and consumes it — never both a
-    /// heartbeat-owed tick and a pending one for the same recovery.
+    /// after finds the pending recovery and consumes it — never both a
+    /// heartbeat-owed tick and a pending one for the same recovery. Whichever
+    /// publication takes the pending recovery (a healthy commit, the apply's
+    /// commit, or a heartbeat tick in a terminal state) acknowledges its
+    /// generation (see [`RecoveryTickState::take_deferred`]).
     fn note_unacked_recovery(&self, generation: u64) -> bool {
         let mut state = self.lock_recovery_tick();
         if generation > state.acked_generation {
-            state.tick_pending = true;
+            state.pending_recovery = Some(
+                state
+                    .pending_recovery
+                    .map_or(generation, |pending| pending.max(generation)),
+            );
             true
         } else {
             false
@@ -2019,8 +2123,10 @@ impl OAuthAdapterInner {
     /// it, as one lifecycle-fenced decision. Returns whether a tick was sent.
     ///
     /// The lifecycle is read under the `state` read lock and the decision,
-    /// the take of `RecoveryTickState::tick_pending` and the send all happen
-    /// inside that critical section: every transition into `Refreshing`
+    /// the take of the deferred tick ([`RecoveryTickState::take_deferred`],
+    /// which also acknowledges a pending recovery's generation so a later
+    /// healthy commit does not publish that recovery a second time) and the
+    /// send all happen inside that critical section: every transition into `Refreshing`
     /// runs under the `state` write lock, so a tick is published strictly
     /// before a refresh begins or deferred strictly before the refresh's
     /// apply takes the flag at its own commit — never while the derived
@@ -2040,7 +2146,7 @@ impl OAuthAdapterInner {
             }
             return false;
         }
-        let due = std::mem::take(&mut tick.tick_pending) || owed;
+        let due = tick.take_deferred() || owed;
         drop(tick);
         if due {
             let _ = self.outer_tools_changed_tx.send(());
@@ -2050,12 +2156,16 @@ impl OAuthAdapterInner {
 
     #[cfg(test)]
     fn recovery_tick_pending(&self) -> bool {
-        self.lock_recovery_tick().tick_pending
+        self.lock_recovery_tick().has_deferred()
     }
 
     #[cfg(test)]
     fn set_recovery_tick_pending(&self, pending: bool) {
-        self.lock_recovery_tick().tick_pending = pending;
+        let mut tick = self.lock_recovery_tick();
+        tick.tick_pending = pending;
+        if !pending {
+            tick.pending_recovery = None;
+        }
     }
 
     /// Commit a heartbeat `MarkHealthy` verdict: write `inner_health =
@@ -2066,8 +2176,10 @@ impl OAuthAdapterInner {
     /// into `Healthy`), the inner recovery generation advanced past the
     /// last acknowledged one (the probe may have performed the recovery
     /// itself, with no `inner_health` flip and no forwarder poke to publish
-    /// it otherwise), or a tick was deferred (`tick_pending`) — `Some(false)`
-    /// when it owes nothing, and `None` when the verdict is STALE: the
+    /// it otherwise), or a tick was deferred (`tick_pending` /
+    /// `pending_recovery`) — `Some(false)` when it owes nothing (a recovery
+    /// already published in a terminal state was acknowledged by that
+    /// publication and is not published again here), and `None` when the verdict is STALE: the
     /// lifecycle is no longer `Authenticated` or its generation moved since
     /// the probe was dispatched (a token apply began or ran mid-probe). A
     /// stale verdict writes, acknowledges and consumes nothing: outer health
@@ -2078,7 +2190,9 @@ impl OAuthAdapterInner {
     /// deferred one. (Were the stale verdict to write `Healthy`, the apply
     /// would read a restored health it never published a tick for.) Failed
     /// verdicts never come here at all, so a stale failure landing after a
-    /// recovery leaves the pending flag for the fresh probe right behind it.
+    /// recovery leaves the pending recovery for the fresh probe right
+    /// behind it (and a failure the lifecycle moved past is discarded by
+    /// the heartbeat loop before it is even counted).
     ///
     /// The currency check, the health write, the accounting AND the send
     /// share one `state` read critical section (the accounting lock is
@@ -2111,7 +2225,7 @@ impl OAuthAdapterInner {
             if acked {
                 tick.acked_generation = current;
             }
-            let pending = std::mem::take(&mut tick.tick_pending);
+            let pending = tick.take_deferred();
             matches!(previous, HealthStatus::Unhealthy(_)) || acked || pending
         };
         if owed {
@@ -4611,12 +4725,16 @@ mod tests {
     /// counts `tools/list` probes and can park the next probe (`hold_probe`
     /// → `probe_started` fires, the response waits for `probe_release`) or
     /// fail it with a 503 (`fail_probe`, sampled when the request ARRIVES so
-    /// a parked probe keeps the verdict it was dispatched with).
+    /// a parked probe keeps the verdict it was dispatched with), or answer
+    /// it as an SSE body that carries a `notifications/tools/list_changed`
+    /// inline ahead of the result (`probe_sse_list_changed`, as the
+    /// Streamable HTTP transport allows).
     #[derive(Clone)]
     struct ProbeFx {
         tools_list_count: Arc<std::sync::atomic::AtomicUsize>,
         hold_probe: Arc<AtomicBool>,
         fail_probe: Arc<AtomicBool>,
+        probe_sse_list_changed: Arc<AtomicBool>,
         probe_started: Arc<Notify>,
         probe_release: Arc<Notify>,
     }
@@ -4654,11 +4772,22 @@ mod tests {
                     }
                     // One tool so a registry catalog built over this fixture
                     // has an entry whose health label can be observed.
-                    Json(json!({"jsonrpc": "2.0", "id": id, "result": {"tools": [
+                    let result = json!({"jsonrpc": "2.0", "id": id, "result": {"tools": [
                         {"name": "probe_tool", "description": "probe tool",
                          "inputSchema": {"type": "object"}}
-                    ]}}))
-                    .into_response()
+                    ]}});
+                    if fx.probe_sse_list_changed.load(Ordering::SeqCst) {
+                        let body = format!(
+                            "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}}\n\ndata: {}\n\n",
+                            result
+                        );
+                        return (
+                            [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+                            body,
+                        )
+                            .into_response();
+                    }
+                    Json(result).into_response()
                 }
                 _ => Json(json!({"jsonrpc": "2.0", "id": id, "result": {}})).into_response(),
             }
@@ -4668,6 +4797,7 @@ mod tests {
             tools_list_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             hold_probe: Arc::new(AtomicBool::new(false)),
             fail_probe: Arc::new(AtomicBool::new(false)),
+            probe_sse_list_changed: Arc::new(AtomicBool::new(false)),
             probe_started: Arc::new(Notify::new()),
             probe_release: Arc::new(Notify::new()),
         };
@@ -5388,6 +5518,254 @@ mod tests {
         assert!(!adapter.inner.recovery_tick_pending());
         assert!(!adapter.inner.publish_or_retain_tick(false).await);
         assert!(!recv_tick(&mut rx, Duration::from_millis(200)).await);
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 7, Copilot r4054934934 / r4054802097): a failed
+    /// probe verdict dispatched against an inner adapter a token apply has
+    /// since replaced must be discarded BEFORE the hysteresis accounting and
+    /// before any `inner_health` / metric write. With threshold 2, a stale
+    /// failure that were counted would let the very next genuine failure
+    /// mark the replacement `Unhealthy`; discarded, one genuine failure is
+    /// below threshold and only the second crosses it. Deterministic: the
+    /// fixture parks the stale probe while the apply runs.
+    #[tokio::test]
+    async fn stale_failed_probe_is_discarded_before_hysteresis_after_apply() {
+        let (mut adapter, fx, server) = armed_probe_adapter(2).await;
+        let unhealthy_before = adapter
+            .inner
+            .metrics
+            .heartbeat_unhealthy
+            .load(Ordering::SeqCst);
+
+        // Dispatch a probe that parks at the upstream and will fail.
+        fx.hold_probe.store(true, Ordering::SeqCst);
+        fx.fail_probe.store(true, Ordering::SeqCst);
+        adapter.inner.probe_now.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), fx.probe_started.notified())
+            .await
+            .expect("the stale probe reaches the upstream");
+        fx.hold_probe.store(false, Ordering::SeqCst);
+        fx.fail_probe.store(false, Ordering::SeqCst);
+
+        // A token apply replaces the probed inner adapter while the probe is
+        // parked: the lifecycle generation moves on.
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Authenticated);
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+        // The stale failure lands: it belongs to the replaced adapter and
+        // must neither be counted nor written.
+        let probes_before = fx.tools_list_count.load(Ordering::SeqCst);
+        fx.probe_release.notify_one();
+        assert!(
+            !wait_until(Duration::from_millis(500), || {
+                adapter
+                    .inner
+                    .metrics
+                    .heartbeat_unhealthy
+                    .load(Ordering::SeqCst)
+                    > unhealthy_before
+            })
+            .await,
+            "a stale failed verdict must not be committed"
+        );
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+        // One genuine failure of the replacement: below threshold iff the
+        // stale one was not counted.
+        fx.fail_probe.store(true, Ordering::SeqCst);
+        adapter.inner.probe_now.notify_one();
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                fx.tools_list_count.load(Ordering::SeqCst) > probes_before
+            })
+            .await,
+            "the genuine probe reaches the upstream"
+        );
+        assert!(
+            !wait_until(Duration::from_millis(500), || {
+                matches!(adapter.health(), HealthStatus::Unhealthy(_))
+            })
+            .await,
+            "one genuine failure is below threshold: the stale failure must not have been counted"
+        );
+
+        // The second genuine failure crosses it — the fresh count is live.
+        adapter.inner.probe_now.notify_one();
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                matches!(adapter.health(), HealthStatus::Unhealthy(_))
+            })
+            .await,
+            "two genuine failures reach the threshold"
+        );
+        assert_eq!(
+            adapter
+                .inner
+                .metrics
+                .heartbeat_unhealthy
+                .load(Ordering::SeqCst),
+            unhealthy_before + 1
+        );
+        fx.fail_probe.store(false, Ordering::SeqCst);
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 7, Copilot r4054934962): ticks already queued
+    /// on a replacement adapter's subscription when its forwarder starts
+    /// must not be relayed by the forwarder as outer ticks of their own —
+    /// the forwarder task may first run only after the apply has committed
+    /// and published — but folded into the deferred tick the apply's
+    /// commit publishes once. Ticks arriving after the start relay as usual.
+    #[tokio::test]
+    async fn forwarder_backlog_is_folded_into_the_deferred_tick_not_relayed() {
+        let adapter = make_adapter(make_config());
+        let mut outer_rx = adapter.subscribe_tools_changed().expect("outer rx");
+        assert_ne!(*adapter.inner.state.read().await, OAuthState::Refreshing);
+
+        let (inner_tx, inner_rx) = broadcast::channel::<()>(16);
+        inner_tx.send(()).expect("inner send");
+        inner_tx.send(()).expect("inner send");
+        let backlog = adapter
+            .inner
+            .swap_tools_forwarder(plain_tick_source(inner_rx))
+            .await;
+        assert!(backlog, "the swap reports the drained backlog");
+        assert!(
+            adapter.inner.recovery_tick_pending(),
+            "the backlog is deferred into the pending tick"
+        );
+        assert!(
+            !recv_tick(&mut outer_rx, Duration::from_millis(300)).await,
+            "queued ticks are not relayed as outer ticks of their own"
+        );
+
+        // The commit's publication folds them into one tick.
+        assert!(adapter.inner.publish_or_retain_tick(false).await);
+        assert!(recv_tick(&mut outer_rx, Duration::from_millis(300)).await);
+        assert!(!recv_tick(&mut outer_rx, Duration::from_millis(200)).await);
+        assert!(!adapter.inner.recovery_tick_pending());
+
+        // A tick after the forwarder started is an ordinary relay.
+        inner_tx.send(()).expect("inner send");
+        assert!(recv_tick(&mut outer_rx, Duration::from_millis(500)).await);
+    }
+
+    /// The apply-level shape of the backlog case: the new inner adapter's
+    /// own fingerprint probe pushes a `list_changed` inline (queued on the
+    /// subscription bound before the probe), and the apply — same tool set,
+    /// nothing else owed — must publish exactly one tick, with the baseline
+    /// left unknown since the sample may predate the announced change.
+    #[tokio::test]
+    async fn apply_folds_new_inner_probe_backlog_into_one_tick() {
+        let (mut adapter, fx, server) = armed_probe_adapter(1).await;
+        stop_heartbeat(&adapter).await;
+        let mut rx = adapter.subscribe_tools_changed().unwrap();
+        drain(&mut rx).await;
+
+        fx.probe_sse_list_changed.store(true, Ordering::SeqCst);
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        fx.probe_sse_list_changed.store(false, Ordering::SeqCst);
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Authenticated);
+        assert!(
+            recv_tick(&mut rx, Duration::from_secs(2)).await,
+            "the apply publishes its commit tick"
+        );
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(500)).await,
+            "the probe's inline list_changed is folded into the commit tick, not relayed as a second one"
+        );
+        assert!(!adapter.inner.recovery_tick_pending());
+        assert!(
+            adapter.inner.last_tools_fingerprint.read().await.is_none(),
+            "a change announced around the sample leaves the baseline unknown"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 7, Copilot r4054934973): a recovery tick
+    /// published while the lifecycle sits in a terminal state must
+    /// acknowledge the recovery generation, so the heartbeat's later healthy
+    /// commit does not publish the same recovery again. The transition back
+    /// into `Healthy` still publishes exactly one corrective tick — driven
+    /// by the transition itself (`restore_owed`), here with a failing
+    /// fingerprint probe so nothing else could account for it — and a
+    /// current healthy verdict afterwards publishes nothing.
+    #[tokio::test]
+    async fn terminal_tick_acks_recovery_and_healthy_transition_ticks_once() {
+        let (mut adapter, fx, server) = armed_probe_adapter(1).await;
+        let mut rx = adapter.subscribe_tools_changed().unwrap();
+        drain(&mut rx).await;
+
+        adapter
+            .inner
+            .transition_to(OAuthState::AuthRequired, "test: 401")
+            .await;
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+
+        // The published inner adapter recovers for real: the forwarder
+        // raises the pending recovery and pokes the heartbeat, whose tick in
+        // the terminal state publishes it.
+        recover_inner_for_real(&adapter).await;
+        let recovered_generation = adapter
+            .inner
+            .inner_adapter
+            .read()
+            .await
+            .as_ref()
+            .unwrap()
+            .recovery_generation();
+        assert!(recovered_generation > 0);
+        assert!(
+            recv_tick(&mut rx, Duration::from_secs(2)).await,
+            "the recovery is published in the terminal state"
+        );
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                adapter.inner.lock_recovery_tick().acked_generation == recovered_generation
+            })
+            .await,
+            "the terminal publication acknowledges the recovery generation"
+        );
+        assert!(!adapter.inner.recovery_tick_pending());
+        assert!(!recv_tick(&mut rx, Duration::from_millis(300)).await);
+
+        // The apply that restores health: its fingerprint probe fails, so
+        // only the transition itself can owe the corrective tick.
+        fx.fail_probe.store(true, Ordering::SeqCst);
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        fx.fail_probe.store(false, Ordering::SeqCst);
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Authenticated);
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert!(
+            recv_tick(&mut rx, Duration::from_secs(2)).await,
+            "the transition back into Healthy publishes one corrective tick"
+        );
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "one transition publishes one tick"
+        );
+
+        // A current healthy verdict afterwards owes nothing.
+        let probes_before = fx.tools_list_count.load(Ordering::SeqCst);
+        adapter.inner.probe_now.notify_one();
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                fx.tools_list_count.load(Ordering::SeqCst) > probes_before
+            })
+            .await
+        );
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "an unchanged healthy verdict stays silent"
+        );
 
         adapter.shutdown().await.unwrap();
         server.abort();

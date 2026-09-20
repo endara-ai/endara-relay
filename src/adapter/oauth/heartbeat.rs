@@ -258,6 +258,45 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
             }
             TickAction::Probe => {
                 let result = probe_inner(&adapter).await;
+                // A failed verdict (`Network` / `Upstream`) is fenced by the
+                // lifecycle generation BEFORE the hysteresis accounting and
+                // before its `inner_health` / metric write, exactly as the
+                // healthy and 401 verdicts are fenced at their commits: the
+                // probe ran without the state lock, so a token apply may
+                // have replaced the probed inner adapter mid-probe, and the
+                // failure belongs to the adapter that is gone — counting it
+                // would mark the replacement unhealthy (at threshold) or
+                // pre-charge its hysteresis (below threshold) with no probe
+                // of the replacement ever having failed. The fence is a
+                // `state` read guard held across the accounting and the
+                // commit: every apply transitions under the write lock, so
+                // a failure found current here is committed against the
+                // adapter it probed. Only `inner_health` and metrics are
+                // touched under the guard (no state write).
+                let fence = if matches!(
+                    result,
+                    Err(ProbeError::Network(_)) | Err(ProbeError::Upstream(_))
+                ) {
+                    let state = adapter.state.read().await;
+                    let current_generation = adapter
+                        .lifecycle_generation
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if *state != OAuthState::Authenticated || current_generation != generation {
+                        debug!(
+                            oauth_state = ?*state,
+                            dispatched_generation = generation,
+                            current_generation = current_generation,
+                            result = "stale",
+                            "heartbeat probe failed but the lifecycle moved on \
+                             mid-probe (state changed or an apply ran); dropping \
+                             stale result before hysteresis"
+                        );
+                        continue;
+                    }
+                    Some(state)
+                } else {
+                    None
+                };
                 let action = classify_probe_result(result, &mut consecutive_failures, threshold);
                 // Only a CURRENT healthy commit publishes: it flips
                 // `inner_health` (a transition of the derived health into
@@ -281,6 +320,7 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
                          mid-probe; leaving inner_health and any deferred tick to the apply"
                     );
                 }
+                drop(fence);
             }
             TickAction::Recover => {
                 attempt_recovery(&adapter).await;
@@ -339,6 +379,9 @@ async fn apply_probe_action(
             // "upstream unreachable" only when the upstream is genuinely
             // dead at the transport level; an alive-but-erroring upstream
             // (403/5xx/JSON-RPC/protocol) surfaces its actual error text.
+            // Currency was established by `heartbeat_loop` before the
+            // hysteresis accounting, under a `state` read guard it still
+            // holds here, so this write lands on the adapter that failed.
             let message = if transport_dead {
                 "upstream unreachable".to_string()
             } else {

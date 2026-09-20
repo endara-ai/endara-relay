@@ -182,6 +182,16 @@ pub struct HttpAdapter {
     /// listener install; consumed by a supervisor attempt that stands down
     /// without installing one (see [`Self::run_supervisor`]).
     listener_replacement_deferred: Arc<AtomicBool>,
+    /// `true` once the current `GET` listener's request was answered 2xx —
+    /// the upstream does serve a server-initiated stream — and `false`
+    /// when it was answered non-2xx (404/405: nothing to repair) or when a
+    /// new listener is installed (it reports for itself once it connects).
+    /// A successful request that does NOT flip health repairs the listener
+    /// only if this is set and the listener task has since finished (the
+    /// stream hit EOF or errored while health stayed `Healthy`), so an
+    /// upstream that rejected `GET` is never re-probed by ordinary traffic
+    /// (see [`Self::repair_get_listener_if_ended`]).
+    listener_streamed: Arc<AtomicBool>,
     /// Exponential-backoff state for the reconnect supervisor (1 s base, ×2
     /// per consecutive failure, 60 s cap — same escalation as the SSE
     /// adapter). Reset on every successful handshake.
@@ -424,6 +434,7 @@ impl HttpAdapter {
             transport_failures: Arc::new(AtomicU64::new(0)),
             handshake_completed: Arc::new(AtomicBool::new(false)),
             listener_replacement_deferred: Arc::new(AtomicBool::new(false)),
+            listener_streamed: Arc::new(AtomicBool::new(false)),
             crash_tracker: Arc::new(Mutex::new(CrashTracker::new())),
             reconnect_handle: Arc::new(StdMutex::new(None)),
             recovered_notify: Arc::new(Notify::new()),
@@ -467,6 +478,7 @@ impl HttpAdapter {
             transport_failures: self.transport_failures.clone(),
             handshake_completed: self.handshake_completed.clone(),
             listener_replacement_deferred: self.listener_replacement_deferred.clone(),
+            listener_streamed: self.listener_streamed.clone(),
             crash_tracker: self.crash_tracker.clone(),
             reconnect_handle: self.reconnect_handle.clone(),
             recovered_notify: self.recovered_notify.clone(),
@@ -925,25 +937,85 @@ impl HttpAdapter {
     /// A never-initialized adapter (see [`Self::handshake_completed`]) is not
     /// recovered here: a stray successful request proves the upstream is up,
     /// but the adapter still has no session, so only a handshake may flip it.
+    ///
+    /// A success that does not flip health — the adapter is `Healthy` with a
+    /// session — has one repair of its own: a `GET` stream that was
+    /// established and has since ended (EOF or stream error, no outage
+    /// demoted the adapter) is reconnected (see
+    /// [`Self::repair_get_listener_if_ended`]). Nothing else would: the
+    /// supervisor only runs while `Unhealthy`.
     async fn note_request_success(&self) {
-        let flipped = {
+        let (flipped, steady) = {
             let mut health = self.health.write().await;
             self.transport_failures.store(0, Ordering::SeqCst);
-            if self.handshake_completed.load(Ordering::SeqCst)
-                && matches!(*health, HealthStatus::Unhealthy(_))
-            {
+            let has_session = self.handshake_completed.load(Ordering::SeqCst);
+            if has_session && matches!(*health, HealthStatus::Unhealthy(_)) {
                 *health = HealthStatus::Healthy;
                 self.recovery_generation.fetch_add(1, Ordering::SeqCst);
-                true
+                (true, false)
             } else {
-                false
+                (false, has_session && *health == HealthStatus::Healthy)
             }
         };
         if flipped {
             self.replace_get_listener_after_recovery().await;
             self.recovered_notify.notify_waiters();
             let _ = self.tools_changed_tx.send(());
+        } else if steady {
+            self.repair_get_listener_if_ended().await;
         }
+    }
+
+    /// Reconnect the `GET` listener on the request path while health stays
+    /// `Healthy`, iff the upstream had established a server-initiated stream
+    /// ([`Self::listener_streamed`]) and that listener task has finished
+    /// since: the stream hit EOF or errored without an outage that would
+    /// have demoted the adapter, so no recovery flip and no supervisor
+    /// handshake will ever respawn it, and server-initiated
+    /// `notifications/tools/list_changed` would be missed for good. A
+    /// listener that exited on a non-2xx `GET` (404/405) cleared the flag,
+    /// so an upstream without a stream is never re-probed by ordinary
+    /// traffic; a listener that never connected (transport error at `GET`
+    /// time) is left to the next handshake.
+    ///
+    /// Serialized with the handshakes through the same `try_lock` on
+    /// [`Self::handshake_lock`] as [`Self::replace_get_listener_after_recovery`]
+    /// — a handshake in flight installs its own listener at its commit, or
+    /// a supervisor attempt that stands down instead pays the deferral off
+    /// — and the liveness check is repeated under the lock, so a listener a
+    /// handshake just installed is never replaced. The install goes through
+    /// [`Self::spawn_get_listener`], which aborts the previous task under
+    /// the slot lock: two listeners never coexist.
+    async fn repair_get_listener_if_ended(&self) {
+        if !self.listener_ended_after_streaming() {
+            return;
+        }
+        let Ok(_handshake) = self.handshake_lock.try_lock() else {
+            self.listener_replacement_deferred
+                .store(true, Ordering::SeqCst);
+            debug!(
+                url = %self.config.url,
+                "GET listener ended while Healthy: a handshake is in flight; leaving the repair to it"
+            );
+            return;
+        };
+        if !self.listener_ended_after_streaming() {
+            return;
+        }
+        debug!(
+            url = %self.config.url,
+            "GET listener ended while Healthy: reconnecting it"
+        );
+        self.spawn_get_listener().await;
+    }
+
+    /// Whether the current `GET` listener established a stream and has
+    /// since finished (see [`Self::listener_streamed`]).
+    fn listener_ended_after_streaming(&self) -> bool {
+        self.listener_streamed.load(Ordering::SeqCst)
+            && lock_slot(&self.listener_handle)
+                .as_ref()
+                .is_some_and(JoinHandle::is_finished)
     }
 
     /// Replace the `GET` listener after a genuine reactive
@@ -959,7 +1031,8 @@ impl HttpAdapter {
     /// survive costs one reconnect; upstreams without a server-initiated
     /// stream (404/405) get one extra `GET` per recovery, which exits
     /// quietly as it did at handshake time. A success that does not flip
-    /// health never comes here.
+    /// health never comes here (its own, conditional repair is
+    /// [`Self::repair_get_listener_if_ended`]).
     ///
     /// The replacement is serialized with the handshakes through
     /// [`Self::handshake_lock`], held across the spawn: otherwise a
@@ -1002,18 +1075,21 @@ impl HttpAdapter {
     /// interleaving that leaves `health == Unhealthy("upstream unreachable")`
     /// while the failure counter is below the threshold.
     ///
-    /// On the actual demotion (a non-`Unhealthy`, non-`Stopped` state crossing
-    /// the threshold) the reconnect supervisor is woken so recovery no longer
+    /// On the actual demotion (a non-`Unhealthy` state crossing the
+    /// threshold) the reconnect supervisor is woken so recovery no longer
     /// depends on a caller happening to issue another request. Repeated
     /// failures while already `Unhealthy` only refresh the reason; the
-    /// supervisor is already retrying. A `Stopped` adapter never spawns one.
+    /// supervisor is already retrying. A `Stopped` adapter stays `Stopped`:
+    /// `shutdown()` has torn its supervisor and listener down, so a failure
+    /// reported after it (a request that was in flight across the shutdown)
+    /// must neither resurrect it as `Unhealthy` — nothing would be retrying
+    /// — nor spawn a supervisor.
     async fn note_transport_failure(&self) {
         let demoted = {
             let mut health = self.health.write().await;
             let count = self.transport_failures.fetch_add(1, Ordering::SeqCst) + 1;
-            if count >= TRANSPORT_FAILURE_THRESHOLD {
-                let was_live =
-                    !matches!(*health, HealthStatus::Unhealthy(_) | HealthStatus::Stopped);
+            if count >= TRANSPORT_FAILURE_THRESHOLD && *health != HealthStatus::Stopped {
+                let was_live = !matches!(*health, HealthStatus::Unhealthy(_));
                 *health = HealthStatus::Unhealthy("upstream unreachable".into());
                 was_live
             } else {
@@ -1164,7 +1240,11 @@ impl HttpAdapter {
     /// On any of: transport error, non-2xx response (notably 404/405 from
     /// servers that don't implement the GET stream), or shutdown signal, the
     /// task exits quietly — inline POST notifications still reach the
-    /// broadcast via [`HttpAdapter::parse_sse_response`].
+    /// broadcast via [`HttpAdapter::parse_sse_response`]. `streamed` records
+    /// how the `GET` was answered (2xx → `true`, non-2xx → `false`) so the
+    /// request path can tell a stream that ended from an upstream that
+    /// never offered one (see [`HttpAdapter::listener_streamed`]).
+    #[allow(clippy::too_many_arguments)]
     async fn run_get_listener(
         url: String,
         headers: HashMap<String, String>,
@@ -1173,6 +1253,7 @@ impl HttpAdapter {
         endpoint_name: String,
         tools_changed_tx: broadcast::Sender<()>,
         shutdown: Arc<Notify>,
+        streamed: Arc<AtomicBool>,
     ) {
         // Separate client for the long-lived stream — the per-request timeout
         // on the main client (30s by default) would tear down the stream.
@@ -1226,12 +1307,14 @@ impl HttpAdapter {
 
         let status = resp.status();
         if !status.is_success() {
+            streamed.store(false, Ordering::SeqCst);
             debug!(
                 status = %status,
                 "GET listener: non-2xx response (upstream likely doesn't support server-initiated streams); exiting"
             );
             return;
         }
+        streamed.store(true, Ordering::SeqCst);
 
         use futures_util::StreamExt;
         let mut bytes_stream = resp.bytes_stream();
@@ -1452,6 +1535,7 @@ impl HttpAdapter {
         let endpoint_name = self.config.endpoint_name.clone();
         let tx = self.tools_changed_tx.clone();
         let shutdown = self.shutdown_notify.clone();
+        let streamed = self.listener_streamed.clone();
         let listener_span = self.span.clone();
         // Take the slot lock BEFORE spawning and store the handle with no
         // await point in between: if the calling task (the reconnect
@@ -1469,9 +1553,11 @@ impl HttpAdapter {
             return;
         }
         // Every install pays off a replacement a reactive recovery deferred
-        // to the handshake that held the lock at the time.
+        // to the handshake that held the lock at the time, and starts with
+        // no stream established: the new listener reports for itself.
         self.listener_replacement_deferred
             .store(false, Ordering::SeqCst);
+        self.listener_streamed.store(false, Ordering::SeqCst);
         let handle = tokio::spawn(
             async move {
                 Self::run_get_listener(
@@ -1482,6 +1568,7 @@ impl HttpAdapter {
                     endpoint_name,
                     tx,
                     shutdown,
+                    streamed,
                 )
                 .await;
             }
@@ -5169,6 +5256,118 @@ mod tests {
         );
 
         adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 7, Copilot r4054802081): a `GET` stream that
+    /// ends while the adapter stays `Healthy` (EOF, no outage demoted it) is
+    /// never replaced by the recovery flip or a supervisor handshake, so
+    /// server-initiated `tools/list_changed` would be missed for good. The
+    /// next successful request must reconnect it — without a handshake.
+    #[tokio::test]
+    async fn get_listener_ended_while_healthy_is_reconnected_by_next_success() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        fx.serve_get_stream(GET_STREAM_EMIT_THEN_END);
+        let (mut adapter, mut rx) = adapter_with_connected_get_listener(url).await;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                lock_slot(&adapter.listener_handle)
+                    .as_ref()
+                    .is_some_and(JoinHandle::is_finished)
+            })
+            .await,
+            "the listener exits when the upstream stream ends"
+        );
+        assert_eq!(fx.get_count.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        drain_ticks(&mut rx);
+
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("live upstream answers");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                fx.get_count.load(Ordering::SeqCst) == 2
+            })
+            .await,
+            "a successful request while Healthy must reconnect the ended GET listener"
+        );
+        assert!(
+            recv_ticks(&mut rx, Duration::from_secs(5)).await >= 1,
+            "the reconnected listener relays the upstream's push"
+        );
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            1,
+            "the listener is reconnected without a handshake"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// Companion of the healthy-state repair above: an upstream that
+    /// rejected `GET` (405 — no server-initiated stream) never had a stream
+    /// to repair, so ordinary successful traffic must not re-probe it.
+    #[tokio::test]
+    async fn upstream_rejecting_get_is_not_reprobed_by_successes() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                lock_slot(&adapter.listener_handle)
+                    .as_ref()
+                    .is_some_and(JoinHandle::is_finished)
+            })
+            .await,
+            "the listener exits on 405"
+        );
+        assert_eq!(fx.get_count.load(Ordering::SeqCst), 1);
+
+        for _ in 0..3 {
+            adapter
+                .call_tool("x", json!({}))
+                .await
+                .expect("live upstream answers");
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert_eq!(
+            fx.get_count.load(Ordering::SeqCst),
+            1,
+            "an upstream that rejected GET is not re-probed by successes while Healthy"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 7, Copilot r4054934911): a transport failure
+    /// reported after `shutdown()` (a request that was in flight across it)
+    /// must not resurrect a `Stopped` adapter as `Unhealthy` — nothing would
+    /// be retrying — nor arm a supervisor.
+    #[tokio::test]
+    async fn late_transport_failure_does_not_resurrect_a_stopped_adapter() {
+        let (url, _fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        adapter.shutdown().await.unwrap();
+        assert_eq!(adapter.health(), HealthStatus::Stopped);
+
+        adapter.demote_via_transport_failures_for_test().await;
+        assert_eq!(
+            adapter.health(),
+            HealthStatus::Stopped,
+            "a late transport failure must leave a Stopped adapter Stopped"
+        );
+        assert!(
+            lock_slot(&adapter.reconnect_handle).is_none(),
+            "no supervisor is armed on a Stopped adapter"
+        );
+
         server.abort();
     }
 
