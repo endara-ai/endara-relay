@@ -279,8 +279,9 @@ impl TokenPostOutcome {
 /// `baseline_invalidated` records that an ordinary inner `list_changed` tick
 /// cleared the tools fingerprint baseline since the last apply (as opposed
 /// to the baseline being unknown because a probe failed; a recovery tick is
-/// consumed through the accounting above and never raises it, so a routine
-/// apply after a published recovery stays silent). A tick relayed while
+/// consumed through the accounting above and never raises it — the commit
+/// that publishes the recovery re-baselines on its probe instead, so a
+/// routine apply after a published recovery stays silent). A tick relayed while
 /// `Authenticated` may be processed by the registry only after the next
 /// apply has entered `Refreshing`, so the rebuild caches the tools as
 /// unavailable; the apply that consumes the flag owes a corrective tick even
@@ -570,8 +571,15 @@ impl OAuthAdapterInner {
     /// Returns `None` when `tools/list` fails — callers treat an unknown
     /// probe conservatively (see `apply_tokens_inner`).
     async fn probe_tools_fingerprint(adapter: &HttpAdapter) -> Option<u64> {
+        let tools = adapter.list_tools().await.ok()?;
+        Self::fingerprint_tools(tools)
+    }
+
+    /// Hash a tool list into an order-insensitive fingerprint (`None` when
+    /// it cannot be serialized). Shared by the apply's probe and the
+    /// heartbeat's, so the two compare like for like.
+    pub(super) fn fingerprint_tools(mut tools: Vec<ToolInfo>) -> Option<u64> {
         use std::hash::{Hash, Hasher};
-        let mut tools = adapter.list_tools().await.ok()?;
         tools.sort_by(|a, b| a.name.cmp(&b.name));
         let serialized = serde_json::to_string(&tools).ok()?;
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -1957,8 +1965,9 @@ impl OAuthAdapterInner {
     /// Some→Some swap that happens to reproduce the original set must still
     /// tick (the registry's caches followed the drift). An unknown baseline
     /// makes the next swap tick unconditionally — safe, at worst one extra
-    /// tick. A recovery tick announces no drift and leaves the baseline
-    /// alone (see [`Self::relay_inner_tick`]).
+    /// tick. A recovery tick leaves the baseline alone here; the heartbeat
+    /// commit that publishes the recovery moves it to the set its probe saw
+    /// (see [`Self::relay_inner_tick`] and [`Self::commit_healthy_verdict`]).
     ///
     /// An inner tick is also how the inner adapter announces its own
     /// `Unhealthy → Healthy` recovery (reconnect supervisor or reactive). The
@@ -2080,10 +2089,12 @@ impl OAuthAdapterInner {
     /// Handle one inner tick on behalf of the forwarder. The tick is
     /// classified FIRST: a recovery tick is accounted for by
     /// [`Self::poke_heartbeat_on_inner_recovery`] and never relayed here —
-    /// it announces no tool-set change, so it leaves the fingerprint
-    /// baseline alone (the heartbeat publishes the recovery once; an
-    /// invalidation left behind would make the next apply tick again for an
-    /// unchanged tool set). Only an ordinary `tools/list_changed`
+    /// it does not touch the fingerprint baseline either. The heartbeat
+    /// commit that publishes the recovery moves the baseline to the tool
+    /// set its probe saw ([`Self::commit_healthy_verdict`]), which covers a
+    /// drift during the outage; an invalidation left behind here would
+    /// make the next apply tick again for an unchanged tool set (the
+    /// heartbeat publishes the recovery once). Only an ordinary `tools/list_changed`
     /// invalidates the baseline. The classification of an ordinary tick
     /// awaits nothing, so the flag is still recorded with no yield between
     /// the poll and the write: it tells the next apply the baseline is
@@ -2313,7 +2324,26 @@ impl OAuthAdapterInner {
     /// gap would publish it while the derived health already reads
     /// `Starting`, with the recovery consumed and nothing left for the
     /// apply to correct.
-    pub(super) async fn commit_healthy_verdict(&self, dispatched_generation: u64) -> Option<bool> {
+    ///
+    /// A publishing commit also moves `last_tools_fingerprint` to
+    /// `probed_fingerprint`, the set the verdict's own `tools/list` saw:
+    /// the registry rebuilds its catalog against that set on this tick, so
+    /// it is the baseline the next apply must compare against. The tool set
+    /// may have drifted during an outage without any `list_changed` (the
+    /// forwarder leaves the baseline alone for a recovery tick, see
+    /// [`Self::relay_inner_tick`]); keeping the pre-outage baseline would
+    /// let a later apply that reproduces it stay silent with the catalog
+    /// still holding the post-outage set. An unknown probe fingerprint
+    /// clears the baseline, so that apply ticks unconditionally instead.
+    /// The write happens inside the critical section, ahead of the send,
+    /// so it is ordered before any apply's comparison. A commit that
+    /// publishes nothing leaves the baseline alone: no rebuild happened,
+    /// so the catalog still reflects the baseline set.
+    pub(super) async fn commit_healthy_verdict(
+        &self,
+        dispatched_generation: u64,
+        probed_fingerprint: Option<u64>,
+    ) -> Option<bool> {
         let generation = self.inner_recovery_generation_handle().await;
         let state = self.state.read().await;
         if *state != OAuthState::Authenticated
@@ -2334,6 +2364,7 @@ impl OAuthAdapterInner {
             matches!(previous, HealthStatus::Unhealthy(_)) || acked || pending
         };
         if owed {
+            *self.last_tools_fingerprint.write().await = probed_fingerprint;
             let _ = self.outer_tools_changed_tx.send(());
         }
         Some(owed)
@@ -6085,6 +6116,73 @@ mod tests {
             "a recovery already published must not make the next apply tick again for an unchanged tool set"
         );
         assert!(!adapter.inner.recovery_tick_pending());
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #164 review: the tool set can drift DURING an outage without any
+    /// `list_changed`. The recovery tick makes the registry rebuild against
+    /// the post-outage set B, so the heartbeat commit that publishes it
+    /// must move the baseline from A to B as well: with A kept, a later
+    /// silent drift back to A followed by a routine apply would compare
+    /// A==A, stay silent, and leave B cached (before #164 the forwarder's
+    /// unconditional clear covered this at the price of an extra tick).
+    #[tokio::test]
+    async fn recovery_rebaselines_on_the_probed_tool_set_so_a_drift_back_still_ticks() {
+        let tool_name = Arc::new(std::sync::RwLock::new("alpha".to_string()));
+        let (url, server) = spawn_mcp_server_with_mutable_tools(tool_name.clone()).await;
+        let mut config = make_config();
+        config.url = url;
+        let mut adapter = make_adapter(config);
+        adapter.initialize().await.unwrap();
+        let mut rx = adapter.subscribe_tools_changed().unwrap();
+
+        // Baseline A.
+        adapter.inner.apply_tokens(make_token_set("first")).await;
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Authenticated);
+        assert!(recv_tick(&mut rx, Duration::from_secs(2)).await);
+        drain(&mut rx).await;
+        let baseline_a = *adapter.inner.last_tools_fingerprint.read().await;
+        assert!(baseline_a.is_some());
+
+        // The upstream drifts to B while the inner adapter is down; the
+        // recovery is published once and the baseline follows to B.
+        *tool_name.write().unwrap() = "beta".to_string();
+        recover_inner_for_real(&adapter).await;
+        assert!(
+            recv_tick(&mut rx, Duration::from_secs(2)).await,
+            "the recovery is published"
+        );
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                !adapter.inner.recovery_tick_pending()
+            })
+            .await
+        );
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "one recovery publishes one tick"
+        );
+        let baseline_b = *adapter.inner.last_tools_fingerprint.read().await;
+        assert!(
+            baseline_b.is_some() && baseline_b != baseline_a,
+            "the publishing commit re-baselines on the probed set: {baseline_a:?} -> {baseline_b:?}"
+        );
+
+        // Silent drift back to A (no list_changed), then a routine apply:
+        // the catalog holds B, so the apply must tick.
+        *tool_name.write().unwrap() = "alpha".to_string();
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Authenticated);
+        assert!(
+            recv_tick(&mut rx, Duration::from_secs(2)).await,
+            "an apply that finds a set different from the one the recovery published must tick"
+        );
+        assert_eq!(
+            *adapter.inner.last_tools_fingerprint.read().await,
+            baseline_a
+        );
 
         adapter.shutdown().await.unwrap();
         server.abort();

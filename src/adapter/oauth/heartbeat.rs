@@ -174,8 +174,11 @@ async fn attempt_recovery(adapter: &Arc<OAuthAdapterInner>) {
 }
 
 /// Probe the inner adapter by sending a `tools/list` JSON-RPC request
-/// with a configurable timeout.
-async fn probe_inner(inner: &OAuthAdapterInner) -> Result<(), ProbeError> {
+/// with a configurable timeout. A successful probe carries the fingerprint
+/// of the tool set it saw (`None` only when it could not be hashed), so a
+/// healthy commit that publishes a recovery can re-baseline on it (see
+/// [`OAuthAdapterInner::commit_healthy_verdict`]).
+async fn probe_inner(inner: &OAuthAdapterInner) -> Result<Option<u64>, ProbeError> {
     let guard = inner.inner_adapter.read().await;
     let adapter = match guard.as_ref() {
         Some(a) => a,
@@ -184,7 +187,7 @@ async fn probe_inner(inner: &OAuthAdapterInner) -> Result<(), ProbeError> {
 
     let timeout_secs = inner.config.probe_timeout_secs;
     match tokio::time::timeout(Duration::from_secs(timeout_secs), adapter.list_tools()).await {
-        Ok(Ok(_)) => Ok(()),
+        Ok(Ok(tools)) => Ok(OAuthAdapterInner::fingerprint_tools(tools)),
         Ok(Err(e)) => Err(classify_adapter_error(e)),
         Err(_) => Err(ProbeError::Network(format!(
             "probe timed out after {}s",
@@ -276,6 +279,8 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
             }
             TickAction::Probe => {
                 let result = probe_inner(&adapter).await;
+                let probed_fingerprint = result.as_ref().ok().copied().flatten();
+                let result = result.map(|_| ());
                 // EVERY verdict is fenced by the lifecycle generation BEFORE
                 // the hysteresis accounting: the probe ran without the state
                 // lock, so a token apply may have replaced the probed inner
@@ -329,9 +334,16 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
                 // behind it, and a verdict the lifecycle moved past
                 // mid-probe commits and publishes nothing (see
                 // `OAuthAdapterInner::commit_healthy_verdict`).
-                if apply_probe_action(&adapter, action, threshold, &oauth_state, generation)
-                    .await
-                    .is_none()
+                if apply_probe_action(
+                    &adapter,
+                    action,
+                    threshold,
+                    &oauth_state,
+                    generation,
+                    probed_fingerprint,
+                )
+                .await
+                .is_none()
                 {
                     debug!(
                         dispatched_generation = generation,
@@ -358,7 +370,9 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
 /// found a deferred tick (sent inside the commit's own critical section)
 /// — `Some(false)` when nothing was owed, and `None` for a `MarkHealthy`
 /// verdict the lifecycle moved past mid-probe (nothing written, see
-/// [`OAuthAdapterInner::commit_healthy_verdict`]).
+/// [`OAuthAdapterInner::commit_healthy_verdict`]). `probed_fingerprint` is
+/// the tool-set fingerprint the successful probe saw; a publishing
+/// `MarkHealthy` commit re-baselines on it.
 ///
 /// Extracted from `heartbeat_loop` so the side-effect dispatch can be
 /// driven directly by tests without spinning a real timer or probe.
@@ -368,10 +382,13 @@ async fn apply_probe_action(
     threshold: u32,
     oauth_state: &OAuthState,
     dispatched_generation: u64,
+    probed_fingerprint: Option<u64>,
 ) -> Option<bool> {
     match action {
         ProbeAction::MarkHealthy => {
-            let owed = adapter.commit_healthy_verdict(dispatched_generation).await;
+            let owed = adapter
+                .commit_healthy_verdict(dispatched_generation, probed_fingerprint)
+                .await;
             if owed.is_some() {
                 adapter.metrics.inc_heartbeat_healthy();
                 trace!(
@@ -763,7 +780,7 @@ mod tests {
             .lifecycle_generation
             .load(std::sync::atomic::Ordering::Relaxed);
         let action = classify_probe_result(result, failures, threshold);
-        apply_probe_action(adapter, action, threshold, &oauth_state, generation).await;
+        apply_probe_action(adapter, action, threshold, &oauth_state, generation, None).await;
     }
 
     /// Set the adapter into the `Authenticated` / `Healthy` baseline that
@@ -951,7 +968,15 @@ mod tests {
         let mut failures = 0u32;
         let action = classify_probe_result(auth(), &mut failures, threshold);
         assert_eq!(action, ProbeAction::AuthFailed);
-        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
+        apply_probe_action(
+            &inner,
+            action,
+            threshold,
+            &dispatched_state,
+            dispatched_gen,
+            None,
+        )
+        .await;
 
         assert_eq!(
             *inner.state.read().await,
@@ -966,7 +991,15 @@ mod tests {
         // unchanged, the 401 applies.
         *inner.state.write().await = OAuthState::Authenticated;
         let action = classify_probe_result(auth(), &mut failures, threshold);
-        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
+        apply_probe_action(
+            &inner,
+            action,
+            threshold,
+            &dispatched_state,
+            dispatched_gen,
+            None,
+        )
+        .await;
         assert_eq!(*inner.state.read().await, OAuthState::AuthRequired);
     }
 
@@ -1005,7 +1038,15 @@ mod tests {
         let mut failures = 0u32;
         let action = classify_probe_result(auth(), &mut failures, threshold);
         assert_eq!(action, ProbeAction::AuthFailed);
-        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
+        apply_probe_action(
+            &inner,
+            action,
+            threshold,
+            &dispatched_state,
+            dispatched_gen,
+            None,
+        )
+        .await;
 
         assert_eq!(
             *inner.state.read().await,
@@ -1049,7 +1090,15 @@ mod tests {
         let mut failures = 0u32;
         let action = classify_probe_result(auth(), &mut failures, threshold);
         assert_eq!(action, ProbeAction::AuthFailed);
-        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
+        apply_probe_action(
+            &inner,
+            action,
+            threshold,
+            &dispatched_state,
+            dispatched_gen,
+            None,
+        )
+        .await;
         assert_eq!(*inner.state.read().await, OAuthState::AuthRequired);
         assert_eq!(load(&inner), g0 + 3, "AuthFailed arm must bump");
     }
