@@ -996,26 +996,32 @@ impl HttpAdapter {
     /// demoted the adapter) is reconnected (see
     /// [`Self::repair_get_listener_if_ended`]). Nothing else would: the
     /// supervisor only runs while `Unhealthy`.
-    async fn note_request_success(&self) {
-        let (flipped, steady) = {
+    ///
+    /// Returns the recovery generation this success flipped the adapter
+    /// to, `None` when it flipped nothing — so a caller can tell that its
+    /// own response was the first of the recovered epoch (see
+    /// [`Self::list_tools_tracked`]).
+    async fn note_request_success(&self) -> Option<u64> {
+        let (flipped_to, steady) = {
             let mut health = self.health.write().await;
             self.transport_failures.store(0, Ordering::SeqCst);
             let has_session = self.handshake_completed.load(Ordering::SeqCst);
             if has_session && matches!(*health, HealthStatus::Unhealthy(_)) {
                 *health = HealthStatus::Healthy;
-                self.recovery_generation.fetch_add(1, Ordering::SeqCst);
-                (true, false)
+                let generation = self.recovery_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                (Some(generation), false)
             } else {
-                (false, has_session && *health == HealthStatus::Healthy)
+                (None, has_session && *health == HealthStatus::Healthy)
             }
         };
-        if flipped {
+        if flipped_to.is_some() {
             self.replace_get_listener_after_recovery().await;
             self.recovered_notify.notify_waiters();
             let _ = self.tools_changed_tx.send(());
         } else if steady {
             self.repair_get_listener_if_ended().await;
         }
+        flipped_to
     }
 
     /// Reconnect the `GET` listener on the request path while health stays
@@ -1165,15 +1171,77 @@ impl HttpAdapter {
         method: &str,
         params: Option<Value>,
     ) -> Result<Value, AdapterError> {
+        self.send_request_tracked(method, params).await.0
+    }
+
+    /// [`Self::send_request`] that also reports the recovery generation the
+    /// request's own success flipped the adapter to (`None` when the
+    /// success recovered nothing or the request failed), as returned by
+    /// [`Self::note_request_success`].
+    async fn send_request_tracked(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> (Result<Value, AdapterError>, Option<u64>) {
         let result = self.send_request_inner(method, params).await;
-        match &result {
+        let recovered_to = match &result {
             Ok(_) => self.note_request_success().await,
-            Err(e) if Self::is_transport_dead(e) => self.note_transport_failure().await,
+            Err(e) if Self::is_transport_dead(e) => {
+                self.note_transport_failure().await;
+                None
+            }
             // Alive-but-erroring (HTTP status>0, JSON-RPC, protocol): leave the
             // counter and health untouched so a 401/500/etc. never demotes.
-            Err(_) => {}
+            Err(_) => None,
+        };
+        (result, recovered_to)
+    }
+
+    /// `tools/list`, also reporting the recovery generation this very
+    /// request's success flipped the adapter to (`None` when it recovered
+    /// nothing). A `Some` means the returned tool set is the first answer
+    /// of that recovered epoch, so a caller keeping a fingerprint baseline
+    /// per generation may attribute it there (the OAuth heartbeat probe
+    /// does); without it a sample can only be trusted for the generation
+    /// read before the request went out.
+    pub(crate) async fn list_tools_tracked(
+        &self,
+    ) -> Result<(Vec<ToolInfo>, Option<u64>), AdapterError> {
+        async {
+            // Never-initialized and down: answer like a `FailedAdapter` so a
+            // catalog rebuild neither waits on a dead upstream nor recovers
+            // the adapter without a session. The supervisor owns recovery.
+            if !self.handshake_completed.load(Ordering::SeqCst)
+                && matches!(*self.health.read().await, HealthStatus::Unhealthy(_))
+            {
+                return Ok((vec![], None));
+            }
+            let (result, recovered_to) = self.send_request_tracked("tools/list", None).await;
+            let result = result?;
+            let tools_value = result
+                .get("tools")
+                .ok_or_else(|| AdapterError::ProtocolError("missing 'tools' field".into()))?;
+            let tools: Vec<ToolInfo> = serde_json::from_value(tools_value.clone())?;
+            // Capture the upstream `ttlMs` freshness hint (SEP-2549) only for
+            // 2026 upstreams; legacy upstreams never carry it and keep the
+            // existing event-driven cache behavior. Read by the registry cache.
+            let ttl = if self.upstream_dialect.read().await.is_2026() {
+                protocol::ttl_ms_from_result(&result)
+            } else {
+                None
+            };
+            *self.list_ttl_ms.write().await = ttl;
+            // Refresh the per-tool annotations cache for overlay events.
+            let mut cache = self.tool_annotations_cache.write().await;
+            cache.clear();
+            for tool in &tools {
+                cache.insert(tool.name.clone(), tool.annotations.clone());
+            }
+            drop(cache);
+            Ok((tools, recovered_to))
         }
-        result
+        .instrument(self.span.clone())
+        .await
     }
 
     /// Inner request implementation: builds and sends the HTTP POST and maps the
@@ -2449,40 +2517,7 @@ impl McpAdapter for HttpAdapter {
     }
 
     async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
-        async {
-            // Never-initialized and down: answer like a `FailedAdapter` so a
-            // catalog rebuild neither waits on a dead upstream nor recovers
-            // the adapter without a session. The supervisor owns recovery.
-            if !self.handshake_completed.load(Ordering::SeqCst)
-                && matches!(*self.health.read().await, HealthStatus::Unhealthy(_))
-            {
-                return Ok(vec![]);
-            }
-            let result = self.send_request("tools/list", None).await?;
-            let tools_value = result
-                .get("tools")
-                .ok_or_else(|| AdapterError::ProtocolError("missing 'tools' field".into()))?;
-            let tools: Vec<ToolInfo> = serde_json::from_value(tools_value.clone())?;
-            // Capture the upstream `ttlMs` freshness hint (SEP-2549) only for
-            // 2026 upstreams; legacy upstreams never carry it and keep the
-            // existing event-driven cache behavior. Read by the registry cache.
-            let ttl = if self.upstream_dialect.read().await.is_2026() {
-                protocol::ttl_ms_from_result(&result)
-            } else {
-                None
-            };
-            *self.list_ttl_ms.write().await = ttl;
-            // Refresh the per-tool annotations cache for overlay events.
-            let mut cache = self.tool_annotations_cache.write().await;
-            cache.clear();
-            for tool in &tools {
-                cache.insert(tool.name.clone(), tool.annotations.clone());
-            }
-            drop(cache);
-            Ok(tools)
-        }
-        .instrument(self.span.clone())
-        .await
+        self.list_tools_tracked().await.map(|(tools, _)| tools)
     }
 
     async fn list_tools_ttl_ms(&self) -> Option<u64> {

@@ -298,9 +298,11 @@ struct RecoveryTickState {
 
 /// What a successful heartbeat probe saw: the fingerprint of the tool set
 /// its `tools/list` returned (`None` when it could not be hashed) and the
-/// inner adapter's recovery generation read BEFORE the request was sent.
-/// A healthy commit that publishes a recovery re-baselines on the
-/// fingerprint only while that generation is still current (see
+/// inner adapter's recovery generation the sample belongs to — the one the
+/// probe's own success flipped the adapter to when the probe recovered it,
+/// otherwise the one read BEFORE the request was sent. A healthy commit
+/// that publishes a recovery re-baselines on the fingerprint only while
+/// that generation is still current (see
 /// [`OAuthAdapterInner::commit_healthy_verdict`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ProbedTools {
@@ -2346,20 +2348,21 @@ impl OAuthAdapterInner {
     /// [`Self::relay_inner_tick`]); keeping the pre-outage baseline would
     /// let a later apply that reproduces it stay silent with the catalog
     /// still holding the post-outage set. The sample is trusted only while
-    /// the inner recovery generation it was taken at is still the one
+    /// the inner recovery generation it belongs to is still the one
     /// sampled here: a recovery landing after the probe had its answer
     /// (between the verdict and this commit, say, or during the request
     /// from another caller) is acknowledged by this commit, yet the sample
     /// describes the pre-recovery upstream — the fresh probe the forwarder
     /// poked finds nothing owed and cannot correct it. Such a sample, like
     /// an unknown fingerprint, clears the baseline so the next apply ticks
-    /// unconditionally instead (the recovery a probe performs itself moves
-    /// the generation too, so a heartbeat-led recovery pays that one tick;
-    /// a recovery a request performed and the poked probe confirmed does
-    /// not). The write happens inside the critical section, ahead of the
-    /// send, so it is ordered before any apply's comparison. A commit that
-    /// publishes nothing leaves the baseline alone: no rebuild happened,
-    /// so the catalog still reflects the baseline set.
+    /// unconditionally instead. A recovery the probe's own request performed
+    /// is different: its answer is the first of the recovered epoch, so the
+    /// sample belongs to the new generation and a heartbeat-led recovery
+    /// re-baselines like any other (see [`ProbedTools`]). The write happens
+    /// inside the critical section, ahead of the send, so it is ordered
+    /// before any apply's comparison. A commit that publishes nothing leaves
+    /// the baseline alone: no rebuild happened, so the catalog still
+    /// reflects the baseline set.
     pub(super) async fn commit_healthy_verdict(
         &self,
         dispatched_generation: u64,
@@ -5181,9 +5184,16 @@ mod tests {
     /// raised `recovery_tick_pending` and poked — so the next probe
     /// published the same recovery a second time. The healthy commit now
     /// acknowledges the generation and the forwarder drops the tick.
+    ///
+    /// PR #164 review (Copilot): the probe's answer is the first of the
+    /// recovered epoch, so the commit re-baselines on it and the next
+    /// unchanged apply stays silent — the recovery costs one tick in total,
+    /// not a second rebuild on the apply.
     #[tokio::test]
     async fn heartbeat_led_recovery_emits_one_tick() {
         let (mut adapter, _fx, server) = armed_probe_adapter(1).await;
+        let baseline = *adapter.inner.last_tools_fingerprint.read().await;
+        assert!(baseline.is_some(), "the apply baselined on the tool set");
         *adapter.inner.inner_health.write().await =
             HealthStatus::Unhealthy("upstream unreachable".into());
         let mut rx = adapter.subscribe_tools_changed().unwrap();
@@ -5204,6 +5214,21 @@ mod tests {
         assert!(
             !recv_tick(&mut rx, Duration::from_millis(400)).await,
             "one recovery performed by the heartbeat must not publish two outer ticks"
+        );
+        assert_eq!(adapter.inner.lock_recovery_tick().acked_generation, 1);
+        assert_eq!(
+            *adapter.inner.last_tools_fingerprint.read().await,
+            baseline,
+            "the probe that recovered the inner adapter re-baselines on its own answer"
+        );
+
+        // An unchanged tool set on the next apply: the catalog already
+        // holds it, so the apply owes no tick.
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Authenticated);
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(600)).await,
+            "a heartbeat-led recovery must not cost a second rebuild on the next apply"
         );
 
         adapter.shutdown().await.unwrap();
