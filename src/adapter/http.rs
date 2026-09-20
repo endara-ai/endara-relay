@@ -1019,26 +1019,33 @@ impl HttpAdapter {
     /// demoted the adapter) is reconnected (see
     /// [`Self::repair_get_listener_if_ended`]). Nothing else would: the
     /// supervisor only runs while `Unhealthy`.
-    async fn note_request_success(&self) {
-        let (flipped, steady) = {
+    ///
+    /// Returns the recovery generation this success flipped the adapter
+    /// to, `None` when it flipped nothing. Owning the flip proves only that
+    /// this accounting ran after the demotion, not that the response did —
+    /// see [`Self::list_tools_tracked`] for the check that turns it into
+    /// an epoch attribution.
+    async fn note_request_success(&self) -> Option<u64> {
+        let (flipped_to, steady) = {
             let mut health = self.health.write().await;
             self.transport_failures.store(0, Ordering::SeqCst);
             let has_session = self.handshake_completed.load(Ordering::SeqCst);
             if has_session && matches!(*health, HealthStatus::Unhealthy(_)) {
                 *health = HealthStatus::Healthy;
-                self.recovery_generation.fetch_add(1, Ordering::SeqCst);
-                (true, false)
+                let generation = self.recovery_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                (Some(generation), false)
             } else {
-                (false, has_session && *health == HealthStatus::Healthy)
+                (None, has_session && *health == HealthStatus::Healthy)
             }
         };
-        if flipped {
+        if flipped_to.is_some() {
             self.replace_get_listener_after_recovery().await;
             self.recovered_notify.notify_waiters();
             let _ = self.tools_changed_tx.send(());
         } else if steady {
             self.repair_get_listener_if_ended().await;
         }
+        flipped_to
     }
 
     /// Reconnect the `GET` listener on the request path while health stays
@@ -1197,15 +1204,97 @@ impl HttpAdapter {
         method: &str,
         params: Option<Value>,
     ) -> Result<Value, AdapterError> {
+        self.send_request_tracked(method, params).await.0
+    }
+
+    /// [`Self::send_request`] that also reports the recovery generation the
+    /// request's own success flipped the adapter to (`None` when the
+    /// success recovered nothing or the request failed), as returned by
+    /// [`Self::note_request_success`].
+    async fn send_request_tracked(
+        &self,
+        method: &str,
+        params: Option<Value>,
+    ) -> (Result<Value, AdapterError>, Option<u64>) {
         let result = self.send_request_inner(method, params).await;
-        match &result {
+        let recovered_to = match &result {
             Ok(_) => self.note_request_success().await,
-            Err(e) if Self::is_transport_dead(e) => self.note_transport_failure().await,
+            Err(e) if Self::is_transport_dead(e) => {
+                self.note_transport_failure().await;
+                None
+            }
             // Alive-but-erroring (HTTP status>0, JSON-RPC, protocol): leave the
             // counter and health untouched so a 401/500/etc. never demotes.
-            Err(_) => {}
+            Err(_) => None,
+        };
+        (result, recovered_to)
+    }
+
+    /// `tools/list`, also reporting the recovery generation the returned
+    /// tool set belongs to, for a caller keeping a fingerprint baseline per
+    /// generation (the OAuth heartbeat probe does).
+    ///
+    /// Ordinarily that is the generation read before the request went out,
+    /// atomically with health (both change under the `health` write lock).
+    /// The one exception is a request dispatched while the adapter was
+    /// ALREADY `Unhealthy` whose own success then flipped it to exactly the
+    /// next generation: no other recovery happened between dispatch and
+    /// flip, so the request was answered by the upstream the outage ended
+    /// with and its answer is the first of the recovered epoch. Owning the
+    /// flip alone does not prove that — a request dispatched while `Healthy`
+    /// can obtain its answer, be delayed at the accounting's health lock
+    /// while transport failures demote the adapter and the upstream restarts
+    /// with a different tool set, and then be the success that flips health:
+    /// its answer predates the outage, so it stays attributed to the
+    /// pre-request generation and a baseline keyed on generations discards
+    /// it.
+    pub(crate) async fn list_tools_tracked(&self) -> Result<(Vec<ToolInfo>, u64), AdapterError> {
+        async {
+            let (generation_before, dispatched_unhealthy) = {
+                let health = self.health.read().await;
+                (
+                    self.recovery_generation.load(Ordering::SeqCst),
+                    matches!(*health, HealthStatus::Unhealthy(_)),
+                )
+            };
+            // Never-initialized and down: answer like a `FailedAdapter` so a
+            // catalog rebuild neither waits on a dead upstream nor recovers
+            // the adapter without a session. The supervisor owns recovery.
+            if dispatched_unhealthy && !self.handshake_completed.load(Ordering::SeqCst) {
+                return Ok((vec![], generation_before));
+            }
+            let (result, recovered_to) = self.send_request_tracked("tools/list", None).await;
+            let result = result?;
+            let generation = match recovered_to {
+                Some(flipped_to) if dispatched_unhealthy && flipped_to == generation_before + 1 => {
+                    flipped_to
+                }
+                _ => generation_before,
+            };
+            let tools_value = result
+                .get("tools")
+                .ok_or_else(|| AdapterError::ProtocolError("missing 'tools' field".into()))?;
+            let tools: Vec<ToolInfo> = serde_json::from_value(tools_value.clone())?;
+            // Capture the upstream `ttlMs` freshness hint (SEP-2549) only for
+            // 2026 upstreams; legacy upstreams never carry it and keep the
+            // existing event-driven cache behavior. Read by the registry cache.
+            let ttl = if self.upstream_dialect.read().await.is_2026() {
+                protocol::ttl_ms_from_result(&result)
+            } else {
+                None
+            };
+            *self.list_ttl_ms.write().await = ttl;
+            // Refresh the per-tool annotations cache for overlay events.
+            let mut cache = self.tool_annotations_cache.write().await;
+            cache.clear();
+            for tool in &tools {
+                cache.insert(tool.name.clone(), tool.annotations.clone());
+            }
+            drop(cache);
+            Ok((tools, generation))
         }
-        result
+        .instrument(self.span.clone())
+        .await
     }
 
     /// Inner request implementation: builds and sends the HTTP POST and maps the
@@ -2588,40 +2677,7 @@ impl McpAdapter for HttpAdapter {
     }
 
     async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
-        async {
-            // Never-initialized and down: answer like a `FailedAdapter` so a
-            // catalog rebuild neither waits on a dead upstream nor recovers
-            // the adapter without a session. The supervisor owns recovery.
-            if !self.handshake_completed.load(Ordering::SeqCst)
-                && matches!(*self.health.read().await, HealthStatus::Unhealthy(_))
-            {
-                return Ok(vec![]);
-            }
-            let result = self.send_request("tools/list", None).await?;
-            let tools_value = result
-                .get("tools")
-                .ok_or_else(|| AdapterError::ProtocolError("missing 'tools' field".into()))?;
-            let tools: Vec<ToolInfo> = serde_json::from_value(tools_value.clone())?;
-            // Capture the upstream `ttlMs` freshness hint (SEP-2549) only for
-            // 2026 upstreams; legacy upstreams never carry it and keep the
-            // existing event-driven cache behavior. Read by the registry cache.
-            let ttl = if self.upstream_dialect.read().await.is_2026() {
-                protocol::ttl_ms_from_result(&result)
-            } else {
-                None
-            };
-            *self.list_ttl_ms.write().await = ttl;
-            // Refresh the per-tool annotations cache for overlay events.
-            let mut cache = self.tool_annotations_cache.write().await;
-            cache.clear();
-            for tool in &tools {
-                cache.insert(tool.name.clone(), tool.annotations.clone());
-            }
-            drop(cache);
-            Ok(tools)
-        }
-        .instrument(self.span.clone())
-        .await
+        self.list_tools_tracked().await.map(|(tools, _)| tools)
     }
 
     async fn list_tools_ttl_ms(&self) -> Option<u64> {
@@ -4614,7 +4670,10 @@ mod tests {
     /// parks every `initialize` and then fails it with the configured
     /// [`HeldInitFailure`]. A parked request signals `started` and waits for
     /// `release`, so a test can order itself against an in-flight handshake
-    /// without wall-clock sleeps. `session_on_arrival` makes the upstream
+    /// without wall-clock sleeps. `hold_tools_list` (one-shot) parks the next
+    /// `tools/list` the same way, AFTER its answer has been built, so a test
+    /// can change the served tool set (`alt_tools`) while an answer that
+    /// predates the change is still in flight. `session_on_arrival` makes the upstream
     /// honour the session of the most recently RECEIVED `initialize` (issued
     /// when the request arrives, as a real server does) instead of the most
     /// recently answered one, so overlapping handshakes whose responses
@@ -4641,6 +4700,8 @@ mod tests {
         current_session: Arc<std::sync::Mutex<Option<String>>>,
         hold_discover: Arc<AtomicBool>,
         hold_init: Arc<AtomicBool>,
+        hold_tools_list: Arc<AtomicBool>,
+        alt_tools: Arc<AtomicBool>,
         fail_init: Arc<std::sync::Mutex<Option<HeldInitFailure>>>,
         started: Arc<Notify>,
         release: Arc<Notify>,
@@ -4730,6 +4791,8 @@ mod tests {
             current_session: Arc::new(std::sync::Mutex::new(None)),
             hold_discover: Arc::new(AtomicBool::new(false)),
             hold_init: Arc::new(AtomicBool::new(false)),
+            hold_tools_list: Arc::new(AtomicBool::new(false)),
+            alt_tools: Arc::new(AtomicBool::new(false)),
             fail_init: Arc::new(std::sync::Mutex::new(None)),
             started: Arc::new(Notify::new()),
             release: Arc::new(Notify::new()),
@@ -4899,14 +4962,23 @@ mod tests {
         }
         if value["method"] == "tools/list" {
             fx.tools_list_count.fetch_add(1, Ordering::SeqCst);
-            return Json(json!({
+            let name = if fx.alt_tools.load(Ordering::SeqCst) {
+                "pong"
+            } else {
+                "ping"
+            };
+            let answer = Json(json!({
                 "jsonrpc": "2.0",
                 "result": {"tools": [
-                    {"name": "ping", "description": "p", "inputSchema": {"type": "object"}}
+                    {"name": name, "description": "p", "inputSchema": {"type": "object"}}
                 ]},
                 "id": id,
-            }))
-            .into_response();
+            }));
+            if fx.hold_tools_list.swap(false, Ordering::SeqCst) {
+                fx.started.notify_one();
+                fx.release.notified().await;
+            }
+            return answer.into_response();
         }
         Json(json!({"jsonrpc": "2.0", "result": {"ok": true}, "id": id})).into_response()
     }
@@ -5501,6 +5573,104 @@ mod tests {
             n += 1;
         }
         n
+    }
+
+    /// `list_tools_tracked` attributes its answer to the generation its own
+    /// success flipped the adapter to when the request was dispatched into
+    /// the outage it ended: the answer is the first of the recovered epoch.
+    #[tokio::test]
+    async fn list_tools_tracked_attributes_a_recovery_owned_by_a_request_dispatched_into_the_outage(
+    ) {
+        let (url, _fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        // Keep the supervisor asleep so the request owns the recovery.
+        *adapter.crash_tracker.lock().await =
+            CrashTracker::new_test(Duration::from_secs(60), usize::MAX, Duration::from_secs(60));
+        demote_via_transport_failures(&adapter).await;
+        assert_eq!(adapter.recovery_generation(), 0);
+
+        let (tools, generation) = adapter
+            .list_tools_tracked()
+            .await
+            .expect("live upstream answers");
+        assert_eq!(
+            tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            ["ping"]
+        );
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert_eq!(adapter.recovery_generation(), 1);
+        assert_eq!(
+            generation, 1,
+            "a request dispatched while Unhealthy whose success flipped health owns the epoch"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #164 review: owning the `Unhealthy → Healthy` flip does not prove
+    /// the answer was sampled after the outage. A `tools/list` dispatched
+    /// while `Healthy` obtains tool set A, then waits at the accounting's
+    /// health lock while the adapter is demoted and the upstream restarts
+    /// with tool set B; its old success is what flips health. The answer
+    /// predates the outage, so it must stay attributed to the pre-request
+    /// generation — a baseline keyed on generations then discards it and a
+    /// fresh sample of the recovered epoch carries B.
+    #[tokio::test]
+    async fn list_tools_tracked_does_not_attribute_a_pre_outage_answer_to_the_recovery_it_flips() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert_eq!(adapter.recovery_generation(), 0);
+
+        // The upstream builds answer A, then parks it.
+        fx.hold_tools_list.store(true, Ordering::SeqCst);
+        let probe = adapter.task_clone();
+        let in_flight = tokio::spawn(async move { probe.list_tools_tracked().await });
+        fx.started.notified().await;
+
+        // The outage, accounted while the answer is on its way back: the
+        // health write guard holds the request's success accounting until
+        // the adapter is Unhealthy and the upstream serves B.
+        let mut health = adapter.health.write().await;
+        fx.alt_tools.store(true, Ordering::SeqCst);
+        fx.release.notify_one();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        *health = HealthStatus::Unhealthy("upstream restarted".into());
+        drop(health);
+
+        let (tools, generation) = in_flight
+            .await
+            .unwrap()
+            .expect("the pre-outage answer is still a success");
+        assert_eq!(
+            tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            ["ping"],
+            "the in-flight answer predates the restart"
+        );
+        assert_eq!(
+            adapter.health(),
+            HealthStatus::Healthy,
+            "the old success flips health"
+        );
+        assert_eq!(adapter.recovery_generation(), 1);
+        assert_eq!(
+            generation, 0,
+            "a request dispatched while Healthy never owns the epoch its late success flips to"
+        );
+
+        // A fresh sample belongs to the recovered epoch and sees B.
+        let (tools, generation) = adapter.list_tools_tracked().await.unwrap();
+        assert_eq!(
+            tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+            ["pong"]
+        );
+        assert_eq!(generation, 1);
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
     }
 
     /// A caller's request that succeeds while the supervisor is sleeping out

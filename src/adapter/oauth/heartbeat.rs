@@ -5,9 +5,9 @@
 //! single transient probe failure does not flip the endpoint to Offline
 //! in the desktop sidebar.
 
-use super::super::{AdapterError, HealthStatus, McpAdapter};
+use super::super::{AdapterError, HealthStatus};
 use super::state::OAuthState;
-use super::OAuthAdapterInner;
+use super::{OAuthAdapterInner, ProbedTools};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use tokio::time::MissedTickBehavior;
@@ -174,8 +174,18 @@ async fn attempt_recovery(adapter: &Arc<OAuthAdapterInner>) {
 }
 
 /// Probe the inner adapter by sending a `tools/list` JSON-RPC request
-/// with a configurable timeout.
-async fn probe_inner(inner: &OAuthAdapterInner) -> Result<(), ProbeError> {
+/// with a configurable timeout. A successful probe carries the fingerprint
+/// of the tool set it saw (`None` only when it could not be hashed) together
+/// with the inner recovery generation the sample belongs to, as attributed
+/// by [`HttpAdapter::list_tools_tracked`]: the generation the probe's own
+/// success flipped the adapter to when the probe was dispatched into the
+/// outage it ended (its answer is the first of that epoch), otherwise the
+/// one read before the request went out. A healthy commit that publishes a
+/// recovery re-baselines on the sample iff that generation is still current
+/// (see [`OAuthAdapterInner::commit_healthy_verdict`]).
+///
+/// [`HttpAdapter::list_tools_tracked`]: crate::adapter::http::HttpAdapter::list_tools_tracked
+async fn probe_inner(inner: &OAuthAdapterInner) -> Result<ProbedTools, ProbeError> {
     let guard = inner.inner_adapter.read().await;
     let adapter = match guard.as_ref() {
         Some(a) => a,
@@ -183,8 +193,16 @@ async fn probe_inner(inner: &OAuthAdapterInner) -> Result<(), ProbeError> {
     };
 
     let timeout_secs = inner.config.probe_timeout_secs;
-    match tokio::time::timeout(Duration::from_secs(timeout_secs), adapter.list_tools()).await {
-        Ok(Ok(_)) => Ok(()),
+    match tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        adapter.list_tools_tracked(),
+    )
+    .await
+    {
+        Ok(Ok((tools, recovery_generation))) => Ok(ProbedTools {
+            fingerprint: OAuthAdapterInner::fingerprint_tools(tools),
+            recovery_generation,
+        }),
         Ok(Err(e)) => Err(classify_adapter_error(e)),
         Err(_) => Err(ProbeError::Network(format!(
             "probe timed out after {}s",
@@ -276,6 +294,8 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
             }
             TickAction::Probe => {
                 let result = probe_inner(&adapter).await;
+                let probed = result.as_ref().ok().copied();
+                let result = result.map(|_| ());
                 // EVERY verdict is fenced by the lifecycle generation BEFORE
                 // the hysteresis accounting: the probe ran without the state
                 // lock, so a token apply may have replaced the probed inner
@@ -329,9 +349,16 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
                 // behind it, and a verdict the lifecycle moved past
                 // mid-probe commits and publishes nothing (see
                 // `OAuthAdapterInner::commit_healthy_verdict`).
-                if apply_probe_action(&adapter, action, threshold, &oauth_state, generation)
-                    .await
-                    .is_none()
+                if apply_probe_action(
+                    &adapter,
+                    action,
+                    threshold,
+                    &oauth_state,
+                    generation,
+                    probed,
+                )
+                .await
+                .is_none()
                 {
                     debug!(
                         dispatched_generation = generation,
@@ -358,7 +385,10 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
 /// found a deferred tick (sent inside the commit's own critical section)
 /// — `Some(false)` when nothing was owed, and `None` for a `MarkHealthy`
 /// verdict the lifecycle moved past mid-probe (nothing written, see
-/// [`OAuthAdapterInner::commit_healthy_verdict`]).
+/// [`OAuthAdapterInner::commit_healthy_verdict`]). `probed` is what the
+/// successful probe saw (tool-set fingerprint plus the inner recovery
+/// generation at dispatch); a publishing `MarkHealthy` commit re-baselines
+/// on it while that generation is still current.
 ///
 /// Extracted from `heartbeat_loop` so the side-effect dispatch can be
 /// driven directly by tests without spinning a real timer or probe.
@@ -368,10 +398,13 @@ async fn apply_probe_action(
     threshold: u32,
     oauth_state: &OAuthState,
     dispatched_generation: u64,
+    probed: Option<ProbedTools>,
 ) -> Option<bool> {
     match action {
         ProbeAction::MarkHealthy => {
-            let owed = adapter.commit_healthy_verdict(dispatched_generation).await;
+            let owed = adapter
+                .commit_healthy_verdict(dispatched_generation, probed)
+                .await;
             if owed.is_some() {
                 adapter.metrics.inc_heartbeat_healthy();
                 trace!(
@@ -763,7 +796,7 @@ mod tests {
             .lifecycle_generation
             .load(std::sync::atomic::Ordering::Relaxed);
         let action = classify_probe_result(result, failures, threshold);
-        apply_probe_action(adapter, action, threshold, &oauth_state, generation).await;
+        apply_probe_action(adapter, action, threshold, &oauth_state, generation, None).await;
     }
 
     /// Set the adapter into the `Authenticated` / `Healthy` baseline that
@@ -951,7 +984,15 @@ mod tests {
         let mut failures = 0u32;
         let action = classify_probe_result(auth(), &mut failures, threshold);
         assert_eq!(action, ProbeAction::AuthFailed);
-        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
+        apply_probe_action(
+            &inner,
+            action,
+            threshold,
+            &dispatched_state,
+            dispatched_gen,
+            None,
+        )
+        .await;
 
         assert_eq!(
             *inner.state.read().await,
@@ -966,7 +1007,15 @@ mod tests {
         // unchanged, the 401 applies.
         *inner.state.write().await = OAuthState::Authenticated;
         let action = classify_probe_result(auth(), &mut failures, threshold);
-        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
+        apply_probe_action(
+            &inner,
+            action,
+            threshold,
+            &dispatched_state,
+            dispatched_gen,
+            None,
+        )
+        .await;
         assert_eq!(*inner.state.read().await, OAuthState::AuthRequired);
     }
 
@@ -1005,7 +1054,15 @@ mod tests {
         let mut failures = 0u32;
         let action = classify_probe_result(auth(), &mut failures, threshold);
         assert_eq!(action, ProbeAction::AuthFailed);
-        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
+        apply_probe_action(
+            &inner,
+            action,
+            threshold,
+            &dispatched_state,
+            dispatched_gen,
+            None,
+        )
+        .await;
 
         assert_eq!(
             *inner.state.read().await,
@@ -1049,7 +1106,15 @@ mod tests {
         let mut failures = 0u32;
         let action = classify_probe_result(auth(), &mut failures, threshold);
         assert_eq!(action, ProbeAction::AuthFailed);
-        apply_probe_action(&inner, action, threshold, &dispatched_state, dispatched_gen).await;
+        apply_probe_action(
+            &inner,
+            action,
+            threshold,
+            &dispatched_state,
+            dispatched_gen,
+            None,
+        )
+        .await;
         assert_eq!(*inner.state.read().await, OAuthState::AuthRequired);
         assert_eq!(load(&inner), g0 + 3, "AuthFailed arm must bump");
     }
