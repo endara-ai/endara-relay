@@ -185,10 +185,11 @@ pub struct HttpAdapter {
     /// Known `GET`-stream capability of the upstream, independent of whether
     /// the current listener is connected: `true` once any listener's request
     /// was answered 2xx (the upstream does serve a server-initiated stream),
-    /// `false` once one was answered non-2xx (404/405: nothing to repair).
-    /// Installing a replacement listener does NOT reset it, and a listener
-    /// that fails at the transport layer before any response leaves it
-    /// untouched — only a definitive answer changes it. A successful
+    /// `false` once one was answered 404/405 (no GET stream: nothing to
+    /// repair). Installing a replacement listener does NOT reset it, and a
+    /// listener that fails at the transport layer before any response, or
+    /// on a retryable non-2xx (401/403/408/429/5xx), leaves it untouched —
+    /// only a definitive answer changes it. A successful
     /// request that does NOT flip health repairs the listener iff this is
     /// set and the listener task has finished (the stream hit EOF, errored,
     /// or a replacement never connected while health stayed `Healthy`), so
@@ -916,7 +917,9 @@ impl HttpAdapter {
     /// - Permanent: `HttpError` `401` / `403` / `404` on the handshake
     ///   (credentials or URL are wrong) and [`AdapterError::ProtocolError`]
     ///   (malformed JSON-RPC / `initialize` result, invalid
-    ///   `serverInfo.name`).
+    ///   `serverInfo.name`). `ProtocolError` is only ever produced from a
+    ///   body that was read in full: a 2xx whose body read fails maps to a
+    ///   transport error instead ([`Self::body_read_error`]).
     /// - Retryable: everything transport-dead (see [`Self::is_transport_dead`]),
     ///   `5xx`, `429`, `408`, any other status, and JSON-RPC errors — the
     ///   upstream may be starting up or shedding load.
@@ -928,6 +931,26 @@ impl HttpAdapter {
                 ..
             } | AdapterError::ProtocolError(_)
         )
+    }
+
+    /// Map a failure to read an accepted (2xx) handshake response body —
+    /// the upstream dropped the connection mid-body, or the read timed out —
+    /// onto the same transport-dead variants as a failed `send` (see
+    /// [`Self::is_transport_dead`]), never onto `ProtocolError`: the body
+    /// was never seen, so nothing proves it malformed and the failure must
+    /// stay retryable.
+    fn body_read_error(timeout_secs: u64, e: &reqwest::Error) -> AdapterError {
+        if e.is_timeout() {
+            AdapterError::Timeout(timeout_secs)
+        } else {
+            AdapterError::HttpError {
+                status: 0,
+                body: format!(
+                    "failed to read handshake response body: {}",
+                    format_error_chain(e)
+                ),
+            }
+        }
     }
 
     /// Record a successful request: reset the transport-failure counter and, if
@@ -1270,9 +1293,10 @@ impl HttpAdapter {
     /// servers that don't implement the GET stream), or shutdown signal, the
     /// task exits quietly — inline POST notifications still reach the
     /// broadcast via [`HttpAdapter::parse_sse_response`]. `capable` records
-    /// how the `GET` was answered (2xx → `true`, non-2xx → `false`) and is
-    /// left untouched when no response arrived, so the request path can
-    /// tell a stream that ended from an upstream that never offered one
+    /// how the `GET` was answered (2xx → `true`, 404/405 → `false`) and is
+    /// left untouched when no response arrived or the response was a
+    /// retryable non-2xx, so the request path can tell a stream that ended
+    /// from an upstream that never offered one
     /// (see [`HttpAdapter::get_stream_capable`]).
     #[allow(clippy::too_many_arguments)]
     async fn run_get_listener(
@@ -1337,11 +1361,29 @@ impl HttpAdapter {
 
         let status = resp.status();
         if !status.is_success() {
-            capable.store(false, Ordering::SeqCst);
-            debug!(
-                status = %status,
-                "GET listener: non-2xx response (upstream likely doesn't support server-initiated streams); exiting"
-            );
+            // Only a DEFINITIVE answer clears the known capability: 404/405
+            // say the endpoint has no GET stream, so ordinary traffic must
+            // not re-probe it. A 401/403 (token rotating), 408/429 or 5xx
+            // (upstream shedding load) is retryable and proves nothing about
+            // the endpoint; leaving the capability as it was keeps the
+            // listener repairable by the next successful POST — otherwise
+            // one such response would lose server-initiated
+            // `tools/list_changed` until the next handshake.
+            if matches!(
+                status,
+                reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            ) {
+                capable.store(false, Ordering::SeqCst);
+                debug!(
+                    status = %status,
+                    "GET listener: upstream doesn't support server-initiated streams; exiting"
+                );
+            } else {
+                debug!(
+                    status = %status,
+                    "GET listener: retryable non-2xx response; exiting without clearing the stream capability"
+                );
+            }
             return;
         }
         capable.store(true, Ordering::SeqCst);
@@ -2225,22 +2267,28 @@ impl HttpAdapter {
                     .unwrap_or("")
                     .to_string();
 
-                let response: JsonRpcResponse = if content_type.contains("text/event-stream") {
+                // Reading the 2xx body is a TRANSPORT step (the upstream can
+                // drop the connection mid-body) and is kept apart from
+                // parsing it, so the two failures classify differently for
+                // the init retry: a body read failure is retryable
+                // ([`Self::body_read_error`]), a malformed body is a
+                // permanent `ProtocolError` (see
+                // [`Self::is_permanent_init_failure`]).
+                let is_sse = content_type.contains("text/event-stream");
+                let body = match resp.bytes().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        let err = Self::body_read_error(self.config.timeout_secs, &e);
+                        self.fail_handshake(&err, supervisor_attempt).await;
+                        return Err(err);
+                    }
+                };
+                let response: JsonRpcResponse = if is_sse {
                     trace!(
                         id = id,
                         "response is SSE (text/event-stream), parsing events"
                     );
-                    let body = match resp.text().await {
-                        Ok(b) => b,
-                        Err(e) => {
-                            let err = AdapterError::ProtocolError(format!(
-                                "failed to read SSE body: {}",
-                                e
-                            ));
-                            self.fail_handshake(&err, supervisor_attempt).await;
-                            return Err(err);
-                        }
-                    };
+                    let body = String::from_utf8_lossy(&body);
                     match Self::parse_sse_response(&body, id, Some(&self.tools_changed_tx)) {
                         Ok(r) => r,
                         Err(e) => {
@@ -2249,7 +2297,7 @@ impl HttpAdapter {
                         }
                     }
                 } else {
-                    match resp.json().await {
+                    match serde_json::from_slice(&body) {
                         Ok(r) => r,
                         Err(e) => {
                             let err = AdapterError::ProtocolError(format!(
@@ -4196,6 +4244,74 @@ mod tests {
         server.abort();
     }
 
+    /// PR #163 review (round 9, Copilot r4056157625): an upstream that
+    /// accepts `initialize` (2xx) and then drops the connection mid-body is a
+    /// TRANSPORT failure, not a permanent one. The body read error used to be
+    /// mapped to `ProtocolError`, which `is_permanent_init_failure` treats as
+    /// permanent, so startup froze the endpoint as a `FailedAdapter` and never
+    /// retried. The failure must classify as retryable and arm the retry.
+    #[tokio::test]
+    async fn truncated_handshake_body_is_a_retryable_init_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        // Every request (discovery probe and legacy `initialize` alike) is
+        // answered 200 with a `Content-Length` the body never reaches; the
+        // socket is then closed.
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let mut read = 0;
+                    while read < buf.len() {
+                        let Ok(n) = sock.read(&mut buf[read..]).await else {
+                            return;
+                        };
+                        if n == 0 {
+                            return;
+                        }
+                        read += n;
+                        if buf[..read].windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    let _ = sock
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 4096\r\n\r\n{\"jsonrpc\":\"2.0\",",
+                        )
+                        .await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        let err = adapter
+            .initialize()
+            .await
+            .expect_err("a truncated handshake body fails initialize");
+        assert!(
+            !HttpAdapter::is_permanent_init_failure(&err),
+            "a body read failure must stay retryable, got {err:?}"
+        );
+        assert!(
+            HttpAdapter::is_transport_dead(&err),
+            "a body read failure is a transport failure, got {err:?}"
+        );
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+        assert!(
+            lock_slot(&adapter.reconnect_handle).is_some(),
+            "a retryable init failure arms the retry supervisor"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
     /// A plain HTTP server that dies after init: once the upstream stops
     /// answering, repeated `call_tool` transport failures flip health to
     /// `Unhealthy` at the threshold (and not before).
@@ -4411,6 +4527,9 @@ mod tests {
     const GET_STREAM_405: u8 = 0;
     const GET_STREAM_EMIT_THEN_END: u8 = 1;
     const GET_STREAM_EMIT_THEN_HOLD: u8 = 2;
+    /// `GET` answered `503`: a retryable non-2xx that proves nothing about
+    /// the upstream's stream support.
+    const GET_STREAM_503: u8 = 3;
 
     impl SupervisorFixture {
         fn fail_init_with(&self, failure: Option<HeldInitFailure>) {
@@ -4508,6 +4627,9 @@ mod tests {
                 match fx.get_stream.load(Ordering::SeqCst) {
                     GET_STREAM_EMIT_THEN_END => return supervisor_fixture_get_stream(false),
                     GET_STREAM_EMIT_THEN_HOLD => return supervisor_fixture_get_stream(true),
+                    GET_STREAM_503 => {
+                        return (StatusCode::SERVICE_UNAVAILABLE, "").into_response();
+                    }
                     _ => {}
                 }
             }
@@ -5540,6 +5662,77 @@ mod tests {
             })
             .await,
             "the next success must reconnect the listener after a transport-failed replacement"
+        );
+        assert!(
+            recv_ticks(&mut rx, Duration::from_secs(5)).await >= 1,
+            "the reconnected listener relays the upstream's push"
+        );
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            1,
+            "the listener is reconnected without a handshake"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 9, Copilot r4056157646): a RETRYABLE non-2xx
+    /// answer to a replacement `GET` (`503` here; 401/403/408/429 alike)
+    /// must not clear the known stream capability. Every non-2xx used to,
+    /// so one upstream blip during a repair left the listener unrepairable
+    /// by later successes and server-initiated `tools/list_changed` were
+    /// lost until the next handshake. Only a definitive 404/405 clears it
+    /// (covered by `get_listener_ended_while_healthy_is_reconnected_by_next_success`).
+    #[tokio::test]
+    async fn retryable_non_2xx_replacement_listener_keeps_upstream_repairable() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        fx.serve_get_stream(GET_STREAM_EMIT_THEN_END);
+        let (mut adapter, mut rx) = adapter_with_connected_get_listener(url).await;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                lock_slot(&adapter.listener_handle)
+                    .as_ref()
+                    .is_some_and(JoinHandle::is_finished)
+            })
+            .await,
+            "the listener exits when the upstream stream ends"
+        );
+        assert_eq!(fx.get_count.load(Ordering::SeqCst), 1);
+        drain_ticks(&mut rx);
+
+        // The repair's replacement `GET` is answered 503.
+        fx.serve_get_stream(GET_STREAM_503);
+        adapter.repair_get_listener_if_ended().await;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                fx.get_count.load(Ordering::SeqCst) == 2
+                    && lock_slot(&adapter.listener_handle)
+                        .as_ref()
+                        .is_some_and(JoinHandle::is_finished)
+            })
+            .await,
+            "the replacement listener exits on the 503"
+        );
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert!(
+            adapter.get_stream_capable.load(Ordering::SeqCst),
+            "a retryable non-2xx must not clear the known GET-stream capability"
+        );
+
+        // Upstream streams again: the next success repairs the listener.
+        fx.serve_get_stream(GET_STREAM_EMIT_THEN_END);
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("live upstream answers");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                fx.get_count.load(Ordering::SeqCst) == 3
+            })
+            .await,
+            "the next success must reconnect the listener after a 503-answered replacement"
         );
         assert!(
             recv_ticks(&mut rx, Duration::from_secs(5)).await >= 1,

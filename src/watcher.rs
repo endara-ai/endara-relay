@@ -1253,7 +1253,10 @@ pub(crate) async fn create_adapter(
                     // A manual restart / re-enable tries again.
                     let msg = format!("Failed to initialize HTTP adapter: {}", e);
                     warn!(endpoint = %ep.name, error = %e, "Failed to initialize HTTP adapter permanently, registering as failed (no background retry)");
-                    Box::new(FailedAdapter::new(msg))
+                    Box::new(
+                        FailedAdapter::new(msg)
+                            .with_server_type_override(ep.server_type_override.clone()),
+                    )
                 }
                 Err(e) => {
                     // A failed `initialize()` has already armed the adapter's
@@ -1826,7 +1829,8 @@ mod tests {
     async fn create_adapter_http_permanent_init_failure_registers_failed_adapter_without_retry() {
         let (url, hits, server) = spawn_status_fixture(404);
         let (tm, inners) = test_oauth_infra();
-        let ep = http_endpoint("wrong_url", &url);
+        let mut ep = http_endpoint("wrong_url", &url);
+        ep.server_type_override = Some("GitHub".to_string());
 
         let adapter = create_adapter(&ep, &tm, &inners, true, None, None, &[]).await;
         match adapter.health() {
@@ -1836,6 +1840,15 @@ mod tests {
         assert!(
             adapter.subscribe_tools_changed().is_none(),
             "a permanent init failure must register a FailedAdapter, not a retrying HttpAdapter"
+        );
+        // PR #163 review (round 9, Copilot r4056157699): the replacement
+        // `FailedAdapter` carries the endpoint's `server_type_override` like
+        // every other failed-registration path, so the endpoint keeps
+        // advertising its configured server type.
+        assert_eq!(
+            adapter.configured_server_type().as_deref(),
+            Some("github"),
+            "the permanent-failure FailedAdapter must keep the server_type_override"
         );
         let initial = hits.load(std::sync::atomic::Ordering::SeqCst);
         assert!(initial >= 1, "the handshake must have reached the upstream");
