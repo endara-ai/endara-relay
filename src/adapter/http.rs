@@ -225,6 +225,16 @@ pub struct HttpAdapter {
     /// Notified by [`Self::note_transport_failure`] when reactive health flips
     /// the adapter to `Unhealthy`, waking the supervisor to start reconnecting.
     reconnect_notify: Arc<Notify>,
+    /// Latched when a handshake fails PERMANENTLY
+    /// ([`Self::is_permanent_init_failure`]) — by the supervisor's own attempt
+    /// or by a caller-owned [`McpAdapter::initialize`] while the supervisor
+    /// is armed. The supervisor checks it before every attempt and stands
+    /// down: retrying a `401`/`403`/`404` or a malformed `initialize` answer
+    /// would only hammer the upstream. Cleared at the arming sites (a fresh
+    /// demotion or a retryable init failure), so the next genuine outage
+    /// retries as usual. Set under [`Self::handshake_lock`] so an attempt
+    /// queued behind the failing handshake observes it before probing.
+    permanent_handshake_failure: Arc<AtomicBool>,
     /// Serializes handshakes. The caller-owned [`McpAdapter::initialize`]
     /// (`&mut self`) and the supervisor's [`Self::task_clone`] share the
     /// session and health state, so `initialize()` can overlap an in-flight
@@ -445,6 +455,7 @@ impl HttpAdapter {
             recovery_generation: Arc::new(AtomicU64::new(0)),
             initialize_from_unhealthy: Arc::new(AtomicBool::new(false)),
             reconnect_notify: Arc::new(Notify::new()),
+            permanent_handshake_failure: Arc::new(AtomicBool::new(false)),
             handshake_lock: Arc::new(Mutex::new(())),
             shutting_down: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
@@ -489,6 +500,7 @@ impl HttpAdapter {
             recovery_generation: self.recovery_generation.clone(),
             initialize_from_unhealthy: self.initialize_from_unhealthy.clone(),
             reconnect_notify: self.reconnect_notify.clone(),
+            permanent_handshake_failure: self.permanent_handshake_failure.clone(),
             handshake_lock: self.handshake_lock.clone(),
             shutting_down: self.shutting_down.clone(),
             #[cfg(test)]
@@ -908,7 +920,8 @@ impl HttpAdapter {
     /// Classify an initialization error as PERMANENT — the upstream answered
     /// and the answer will not change on its own — versus retryable. Only a
     /// retryable failure arms the background init retry; a permanent one
-    /// leaves the adapter `Unhealthy(<reason>)` with no supervisor, and the
+    /// leaves the adapter `Unhealthy(<reason>)` with the supervisor stood
+    /// down (see [`Self::permanent_handshake_failure`]), and the
     /// registration path installs a `FailedAdapter` instead (see
     /// `watcher::create_adapter`). A manual re-initialize / restart still
     /// tries again. Applies to plain `http` endpoints; the OAuth wrapper
@@ -1149,8 +1162,7 @@ impl HttpAdapter {
             }
         };
         if demoted {
-            self.ensure_supervisor_running().await;
-            self.reconnect_notify.notify_one();
+            self.arm_supervisor().await;
         }
     }
 
@@ -1701,8 +1713,49 @@ impl HttpAdapter {
         if !matches!(*self.health.read().await, HealthStatus::Unhealthy(_)) {
             return;
         }
+        self.arm_supervisor().await;
+    }
+
+    /// Spawn the supervisor if needed and hand it a reconnect permit. Every
+    /// arming is a fresh outage (a demotion or a retryable init failure), so
+    /// a permanent-failure latch from an earlier handshake is cleared first:
+    /// this new outage deserves the standard retry loop.
+    async fn arm_supervisor(&self) {
+        self.permanent_handshake_failure
+            .store(false, Ordering::SeqCst);
         self.ensure_supervisor_running().await;
         self.reconnect_notify.notify_one();
+    }
+
+    /// Latch [`Self::permanent_handshake_failure`] when `e` is permanent.
+    /// Returns whether it was. Called by both handshake owners with their
+    /// final error while they still hold [`Self::handshake_lock`].
+    fn latch_permanent_failure(&self, e: &AdapterError) -> bool {
+        let permanent = Self::is_permanent_init_failure(e);
+        if permanent {
+            self.permanent_handshake_failure
+                .store(true, Ordering::SeqCst);
+        }
+        permanent
+    }
+
+    /// Whether the supervisor must stand down because the most recent
+    /// handshake failed permanently (see
+    /// [`Self::permanent_handshake_failure`]). Resets the backoff for the
+    /// caller to `break`: the adapter stays `Unhealthy(<reason>)` until a
+    /// manual re-initialize, exactly as a permanent failure on the initial
+    /// `initialize()` leaves it.
+    async fn stood_down_on_permanent_failure(&self, phase: &str) -> bool {
+        if !self.permanent_handshake_failure.load(Ordering::SeqCst) {
+            return false;
+        }
+        warn!(
+            url = %self.config.url,
+            phase = phase,
+            "HTTP reconnect: handshake failed permanently, standing down until a manual re-initialize"
+        );
+        self.crash_tracker.lock().await.reset();
+        true
     }
 
     /// Reconnect supervisor loop — wait for a "went unhealthy" notification
@@ -1758,6 +1811,16 @@ impl HttpAdapter {
     ///   [`Self::complete_handshake`], so whichever handshake completes last
     ///   is also the last to commit its session (pinned by
     ///   `caller_initialize_waits_for_inflight_supervisor_handshake`).
+    /// * A PERMANENT handshake failure ([`Self::is_permanent_init_failure`])
+    ///   stands the supervisor down instead of being retried, whether the
+    ///   supervisor's own attempt hit it or a caller-owned `initialize()`
+    ///   did while the supervisor was armed
+    ///   ([`Self::permanent_handshake_failure`], checked before the backoff
+    ///   and again once the lock is held). The adapter stays
+    ///   `Unhealthy(<reason>)` until a manual re-initialize; the next
+    ///   arming clears the latch (pinned by
+    ///   `supervisor_stands_down_on_permanent_handshake_error` and
+    ///   `caller_permanent_failure_stands_armed_supervisor_down`).
     ///
     /// The `tools_changed` tick is owned by whichever path performs the
     /// actual `Unhealthy → Healthy` flip (the handshake does it under the
@@ -1792,6 +1855,9 @@ impl HttpAdapter {
                 // obsolete.
                 if !matches!(*self.health.read().await, HealthStatus::Unhealthy(_)) {
                     self.crash_tracker.lock().await.reset();
+                    break;
+                }
+                if self.stood_down_on_permanent_failure("before backoff").await {
                     break;
                 }
 
@@ -1855,6 +1921,13 @@ impl HttpAdapter {
                     self.crash_tracker.lock().await.reset();
                     break;
                 }
+                // The handshake that made this attempt wait may instead have
+                // failed permanently (a caller-owned `initialize()` that got
+                // `401`): it latched the stand-down under the lock, so it is
+                // visible here before anything reaches the upstream.
+                if self.stood_down_on_permanent_failure("handshake lock").await {
+                    break;
+                }
                 // The dialect probe is stateless, so abandoning it mid-flight
                 // has no upstream side effect — the last point at which a
                 // reactive recovery can retire this attempt. A stale hint
@@ -1880,6 +1953,10 @@ impl HttpAdapter {
                 }
 
                 let outcome = self.complete_handshake(discover_result, true).await;
+                let permanent = match &outcome {
+                    Err(e) => self.latch_permanent_failure(e),
+                    Ok(_) => false,
+                };
                 drop(handshake);
                 match outcome {
                     Ok(HandshakeOutcome::Completed) => {
@@ -1889,6 +1966,11 @@ impl HttpAdapter {
                     }
                     Ok(HandshakeOutcome::Obsolete) => {
                         debug!(url = %self.config.url, "HTTP reconnect: recovered during credential loading, abandoning attempt");
+                        self.crash_tracker.lock().await.reset();
+                        break;
+                    }
+                    Err(e) if permanent => {
+                        warn!(url = %self.config.url, error = %e, "HTTP reconnect attempt failed permanently; standing down until a manual re-initialize");
                         self.crash_tracker.lock().await.reset();
                         break;
                     }
@@ -2403,7 +2485,7 @@ impl McpAdapter for HttpAdapter {
             // under the same lock that writes `Starting` and the commit
             // publishes the same single recovery event the supervisor path
             // does (see `mark_healthy_locked`).
-            let outcome = {
+            let (outcome, permanent) = {
                 let _handshake = self.handshake_lock.lock().await;
                 {
                     let mut health = self.health.write().await;
@@ -2413,7 +2495,17 @@ impl McpAdapter for HttpAdapter {
                     );
                     *health = HealthStatus::Starting;
                 }
-                self.connect_and_handshake().await
+                let outcome = self.connect_and_handshake().await;
+                // Latched while the lock is still held: a supervisor attempt
+                // that queued behind this handshake (the supervisor was armed
+                // by an earlier transient failure) re-checks the latch once it
+                // acquires the lock and stands down instead of re-sending the
+                // same doomed `initialize`.
+                let permanent = match &outcome {
+                    Err(e) => self.latch_permanent_failure(e),
+                    Ok(()) => false,
+                };
+                (outcome, permanent)
             };
             if let Err(e) = outcome {
                 self.initialize_from_unhealthy
@@ -2431,8 +2523,10 @@ impl McpAdapter for HttpAdapter {
                 // or an invalid handshake) is not retried: nothing the
                 // supervisor can do changes that answer, and a retry loop
                 // would only hammer the upstream. The adapter stays
-                // `Unhealthy(<reason>)` until a manual re-initialize.
-                if Self::is_permanent_init_failure(&e) {
+                // `Unhealthy(<reason>)` until a manual re-initialize; a
+                // supervisor already armed by an earlier transient failure
+                // stands down on the latch set above.
+                if permanent {
                     warn!(url = %self.config.url, error = %e, "HTTP adapter initialization failed permanently; not retrying in background");
                 } else {
                     self.retry_initialize_in_background().await;
@@ -4518,6 +4612,9 @@ mod tests {
     enum HeldInitFailure {
         /// HTTP 503 with a plain-text body (no session header).
         Http503,
+        /// HTTP 401 with a plain-text body (no session header) — a
+        /// PERMANENT init failure per `is_permanent_init_failure`.
+        Http401,
         /// HTTP 200 + session header, body is a JSON-RPC error object.
         JsonRpcError,
         /// HTTP 200 + session header, body is not JSON-RPC at all.
@@ -4685,6 +4782,9 @@ mod tests {
                     HeldInitFailure::Http503 => {
                         return (StatusCode::SERVICE_UNAVAILABLE, "delayed handshake failure")
                             .into_response();
+                    }
+                    HeldInitFailure::Http401 => {
+                        return (StatusCode::UNAUTHORIZED, "bad credentials").into_response();
                     }
                     HeldInitFailure::JsonRpcError => Json(json!({
                         "jsonrpc": "2.0",
@@ -6311,6 +6411,189 @@ mod tests {
             .call_tool("x", json!({}))
             .await
             .expect("post-recovery request carries the current session");
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// A supervisor armed by a transient failure keeps retrying an upstream
+    /// that has started answering `initialize` with a PERMANENT error
+    /// (`401`): the same answer the initial `initialize()` refuses to retry
+    /// in the background. The supervisor must stand down after the first
+    /// permanent answer — no further `initialize` reaches the upstream, the
+    /// adapter stays `Unhealthy(<401>)`, and the supervisor task stays alive
+    /// so a manual re-initialize (fixed credentials) re-arms recovery for
+    /// the next genuine outage. Deterministic: the fixture parks each
+    /// `initialize` and the test picks the answer before releasing it.
+    #[tokio::test]
+    async fn supervisor_stands_down_on_permanent_handshake_error() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        use_fast_backoff(&adapter).await;
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 1);
+
+        // Attempt 1 fails transiently (503): the supervisor keeps retrying.
+        *fx.fail_init.lock().unwrap() = Some(HeldInitFailure::Http503);
+        demote_via_transport_failures(&adapter).await;
+        tokio::time::timeout(Duration::from_secs(5), fx.started.notified())
+            .await
+            .expect("supervisor attempt 1 should reach initialize");
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 2);
+        *fx.fail_init.lock().unwrap() = Some(HeldInitFailure::Http401);
+        fx.release.notify_one();
+
+        // Attempt 2 gets the permanent answer.
+        tokio::time::timeout(Duration::from_secs(5), fx.started.notified())
+            .await
+            .expect("supervisor attempt 2 should reach initialize after the 503");
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 3);
+        let discovers_before = fx.discover_count.load(Ordering::SeqCst);
+        fx.release.notify_one();
+
+        // Many fast backoffs' worth of time: nothing further is sent.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            3,
+            "a permanent handshake failure must stand the supervisor down"
+        );
+        assert_eq!(
+            fx.discover_count.load(Ordering::SeqCst),
+            discovers_before,
+            "a stood-down supervisor does not even probe the upstream"
+        );
+        assert!(
+            matches!(adapter.health(), HealthStatus::Unhealthy(ref r) if r.contains("401")),
+            "the adapter reports the permanent failure: {:?}",
+            adapter.health()
+        );
+        assert!(
+            lock_slot(&adapter.reconnect_handle)
+                .as_ref()
+                .is_some_and(|h| !h.is_finished()),
+            "the supervisor task stays parked, not exited"
+        );
+
+        // Credentials fixed: a manual re-initialize recovers, and the next
+        // genuine outage is retried as usual.
+        *fx.fail_init.lock().unwrap() = None;
+        adapter
+            .initialize()
+            .await
+            .expect("manual re-initialize succeeds once the upstream accepts");
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 4);
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        demote_via_transport_failures(&adapter).await;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                adapter.health() == HealthStatus::Healthy
+                    && fx.init_count.load(Ordering::SeqCst) == 5
+            })
+            .await,
+            "the latch is cleared by the next arming: the supervisor recovers again"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// The caller-owned variant: the supervisor is armed (backing off after a
+    /// transient failure) when a caller-owned `initialize()` (the management
+    /// enable/restart path) runs and gets the PERMANENT answer. That path
+    /// does not arm the supervisor, but the already-armed one wakes from its
+    /// backoff `Unhealthy` and would re-send the same doomed `initialize`.
+    /// It must observe the caller's failure and stand down without probing
+    /// the upstream again.
+    #[tokio::test]
+    async fn caller_permanent_failure_stands_armed_supervisor_down() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        adapter.initialize().await.expect("initialize succeeds");
+        // A backoff long enough that the caller's handshake below runs while
+        // the supervisor is still asleep between attempts.
+        *adapter.crash_tracker.lock().await = CrashTracker::new_test(
+            Duration::from_millis(300),
+            usize::MAX,
+            Duration::from_secs(60),
+        );
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 1);
+
+        // The supervisor's first attempt fails transiently; it backs off.
+        *fx.fail_init.lock().unwrap() = Some(HeldInitFailure::Http503);
+        demote_via_transport_failures(&adapter).await;
+        tokio::time::timeout(Duration::from_secs(5), fx.started.notified())
+            .await
+            .expect("supervisor attempt should reach initialize");
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 2);
+        *fx.fail_init.lock().unwrap() = Some(HeldInitFailure::Http401);
+        fx.release.notify_one();
+
+        // A caller-owned initialize gets the permanent answer while the
+        // supervisor is asleep. Release its parked `initialize` as soon as it
+        // arrives.
+        let releaser = {
+            let fx = fx.clone();
+            tokio::spawn(async move {
+                fx.started.notified().await;
+                fx.release.notify_one();
+            })
+        };
+        let err = adapter
+            .initialize()
+            .await
+            .expect_err("caller initialize fails with the permanent answer");
+        assert!(
+            matches!(err, AdapterError::HttpError { status: 401, .. }),
+            "unexpected error: {err:?}"
+        );
+        releaser.await.unwrap();
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 3);
+        let discovers_before = fx.discover_count.load(Ordering::SeqCst);
+
+        // Well past the supervisor's pending backoff: it woke, saw the
+        // caller's permanent failure and stood down.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            3,
+            "the armed supervisor must not re-send the initialize the caller just failed"
+        );
+        assert_eq!(
+            fx.discover_count.load(Ordering::SeqCst),
+            discovers_before,
+            "a stood-down supervisor does not even probe the upstream"
+        );
+        assert!(
+            matches!(adapter.health(), HealthStatus::Unhealthy(ref r) if r.contains("401")),
+            "the adapter reports the permanent failure: {:?}",
+            adapter.health()
+        );
+        assert!(
+            lock_slot(&adapter.reconnect_handle)
+                .as_ref()
+                .is_some_and(|h| !h.is_finished()),
+            "the supervisor task stays parked, not exited"
+        );
+
+        // Credentials fixed: manual re-initialize recovers and the next
+        // genuine outage is retried again.
+        *fx.fail_init.lock().unwrap() = None;
+        adapter
+            .initialize()
+            .await
+            .expect("manual re-initialize succeeds once the upstream accepts");
+        assert_eq!(fx.init_count.load(Ordering::SeqCst), 4);
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        demote_via_transport_failures(&adapter).await;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                adapter.health() == HealthStatus::Healthy
+                    && fx.init_count.load(Ordering::SeqCst) == 5
+            })
+            .await,
+            "the latch is cleared by the next arming: the supervisor recovers again"
+        );
 
         adapter.shutdown().await.unwrap();
         server.abort();
