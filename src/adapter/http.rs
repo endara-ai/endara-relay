@@ -182,16 +182,19 @@ pub struct HttpAdapter {
     /// listener install; consumed by a supervisor attempt that stands down
     /// without installing one (see [`Self::run_supervisor`]).
     listener_replacement_deferred: Arc<AtomicBool>,
-    /// `true` once the current `GET` listener's request was answered 2xx —
-    /// the upstream does serve a server-initiated stream — and `false`
-    /// when it was answered non-2xx (404/405: nothing to repair) or when a
-    /// new listener is installed (it reports for itself once it connects).
-    /// A successful request that does NOT flip health repairs the listener
-    /// only if this is set and the listener task has since finished (the
-    /// stream hit EOF or errored while health stayed `Healthy`), so an
-    /// upstream that rejected `GET` is never re-probed by ordinary traffic
-    /// (see [`Self::repair_get_listener_if_ended`]).
-    listener_streamed: Arc<AtomicBool>,
+    /// Known `GET`-stream capability of the upstream, independent of whether
+    /// the current listener is connected: `true` once any listener's request
+    /// was answered 2xx (the upstream does serve a server-initiated stream),
+    /// `false` once one was answered non-2xx (404/405: nothing to repair).
+    /// Installing a replacement listener does NOT reset it, and a listener
+    /// that fails at the transport layer before any response leaves it
+    /// untouched — only a definitive answer changes it. A successful
+    /// request that does NOT flip health repairs the listener iff this is
+    /// set and the listener task has finished (the stream hit EOF, errored,
+    /// or a replacement never connected while health stayed `Healthy`), so
+    /// an upstream that rejected `GET` is never re-probed by ordinary
+    /// traffic (see [`Self::repair_get_listener_if_ended`]).
+    get_stream_capable: Arc<AtomicBool>,
     /// Exponential-backoff state for the reconnect supervisor (1 s base, ×2
     /// per consecutive failure, 60 s cap — same escalation as the SSE
     /// adapter). Reset on every successful handshake.
@@ -434,7 +437,7 @@ impl HttpAdapter {
             transport_failures: Arc::new(AtomicU64::new(0)),
             handshake_completed: Arc::new(AtomicBool::new(false)),
             listener_replacement_deferred: Arc::new(AtomicBool::new(false)),
-            listener_streamed: Arc::new(AtomicBool::new(false)),
+            get_stream_capable: Arc::new(AtomicBool::new(false)),
             crash_tracker: Arc::new(Mutex::new(CrashTracker::new())),
             reconnect_handle: Arc::new(StdMutex::new(None)),
             recovered_notify: Arc::new(Notify::new()),
@@ -478,7 +481,7 @@ impl HttpAdapter {
             transport_failures: self.transport_failures.clone(),
             handshake_completed: self.handshake_completed.clone(),
             listener_replacement_deferred: self.listener_replacement_deferred.clone(),
-            listener_streamed: self.listener_streamed.clone(),
+            get_stream_capable: self.get_stream_capable.clone(),
             crash_tracker: self.crash_tracker.clone(),
             reconnect_handle: self.reconnect_handle.clone(),
             recovered_notify: self.recovered_notify.clone(),
@@ -901,6 +904,32 @@ impl HttpAdapter {
         )
     }
 
+    /// Classify an initialization error as PERMANENT — the upstream answered
+    /// and the answer will not change on its own — versus retryable. Only a
+    /// retryable failure arms the background init retry; a permanent one
+    /// leaves the adapter `Unhealthy(<reason>)` with no supervisor, and the
+    /// registration path installs a `FailedAdapter` instead (see
+    /// `watcher::create_adapter`). A manual re-initialize / restart still
+    /// tries again. Applies to plain `http` endpoints; the OAuth wrapper
+    /// drops a failed inner adapter and handles `401` itself.
+    ///
+    /// - Permanent: `HttpError` `401` / `403` / `404` on the handshake
+    ///   (credentials or URL are wrong) and [`AdapterError::ProtocolError`]
+    ///   (malformed JSON-RPC / `initialize` result, invalid
+    ///   `serverInfo.name`).
+    /// - Retryable: everything transport-dead (see [`Self::is_transport_dead`]),
+    ///   `5xx`, `429`, `408`, any other status, and JSON-RPC errors — the
+    ///   upstream may be starting up or shedding load.
+    pub(crate) fn is_permanent_init_failure(err: &AdapterError) -> bool {
+        matches!(
+            err,
+            AdapterError::HttpError {
+                status: 401 | 403 | 404,
+                ..
+            } | AdapterError::ProtocolError(_)
+        )
+    }
+
     /// Record a successful request: reset the transport-failure counter and, if
     /// the adapter had previously demoted itself to `Unhealthy`, recover to
     /// `Healthy`. Other health states (`Starting`/`Stopped`) are left untouched.
@@ -967,16 +996,16 @@ impl HttpAdapter {
     }
 
     /// Reconnect the `GET` listener on the request path while health stays
-    /// `Healthy`, iff the upstream had established a server-initiated stream
-    /// ([`Self::listener_streamed`]) and that listener task has finished
-    /// since: the stream hit EOF or errored without an outage that would
-    /// have demoted the adapter, so no recovery flip and no supervisor
+    /// `Healthy`, iff the upstream is known to serve a server-initiated
+    /// stream ([`Self::get_stream_capable`]) and the current listener task
+    /// has finished: the stream hit EOF or errored without an outage that
+    /// would have demoted the adapter, so no recovery flip and no supervisor
     /// handshake will ever respawn it, and server-initiated
     /// `notifications/tools/list_changed` would be missed for good. A
-    /// listener that exited on a non-2xx `GET` (404/405) cleared the flag,
-    /// so an upstream without a stream is never re-probed by ordinary
-    /// traffic; a listener that never connected (transport error at `GET`
-    /// time) is left to the next handshake.
+    /// listener that exited on a non-2xx `GET` (404/405) cleared the
+    /// capability, so an upstream without a stream is never re-probed by
+    /// ordinary traffic; a replacement that failed at the transport layer
+    /// before any response left it set, so the next success tries again.
     ///
     /// Serialized with the handshakes through the same `try_lock` on
     /// [`Self::handshake_lock`] as [`Self::replace_get_listener_after_recovery`]
@@ -1009,10 +1038,10 @@ impl HttpAdapter {
         self.spawn_get_listener().await;
     }
 
-    /// Whether the current `GET` listener established a stream and has
-    /// since finished (see [`Self::listener_streamed`]).
+    /// Whether the upstream is known to serve a `GET` stream and the current
+    /// listener has finished (see [`Self::get_stream_capable`]).
     fn listener_ended_after_streaming(&self) -> bool {
-        self.listener_streamed.load(Ordering::SeqCst)
+        self.get_stream_capable.load(Ordering::SeqCst)
             && lock_slot(&self.listener_handle)
                 .as_ref()
                 .is_some_and(JoinHandle::is_finished)
@@ -1240,10 +1269,11 @@ impl HttpAdapter {
     /// On any of: transport error, non-2xx response (notably 404/405 from
     /// servers that don't implement the GET stream), or shutdown signal, the
     /// task exits quietly — inline POST notifications still reach the
-    /// broadcast via [`HttpAdapter::parse_sse_response`]. `streamed` records
-    /// how the `GET` was answered (2xx → `true`, non-2xx → `false`) so the
-    /// request path can tell a stream that ended from an upstream that
-    /// never offered one (see [`HttpAdapter::listener_streamed`]).
+    /// broadcast via [`HttpAdapter::parse_sse_response`]. `capable` records
+    /// how the `GET` was answered (2xx → `true`, non-2xx → `false`) and is
+    /// left untouched when no response arrived, so the request path can
+    /// tell a stream that ended from an upstream that never offered one
+    /// (see [`HttpAdapter::get_stream_capable`]).
     #[allow(clippy::too_many_arguments)]
     async fn run_get_listener(
         url: String,
@@ -1253,7 +1283,7 @@ impl HttpAdapter {
         endpoint_name: String,
         tools_changed_tx: broadcast::Sender<()>,
         shutdown: Arc<Notify>,
-        streamed: Arc<AtomicBool>,
+        capable: Arc<AtomicBool>,
     ) {
         // Separate client for the long-lived stream — the per-request timeout
         // on the main client (30s by default) would tear down the stream.
@@ -1307,14 +1337,14 @@ impl HttpAdapter {
 
         let status = resp.status();
         if !status.is_success() {
-            streamed.store(false, Ordering::SeqCst);
+            capable.store(false, Ordering::SeqCst);
             debug!(
                 status = %status,
                 "GET listener: non-2xx response (upstream likely doesn't support server-initiated streams); exiting"
             );
             return;
         }
-        streamed.store(true, Ordering::SeqCst);
+        capable.store(true, Ordering::SeqCst);
 
         use futures_util::StreamExt;
         let mut bytes_stream = resp.bytes_stream();
@@ -1535,7 +1565,7 @@ impl HttpAdapter {
         let endpoint_name = self.config.endpoint_name.clone();
         let tx = self.tools_changed_tx.clone();
         let shutdown = self.shutdown_notify.clone();
-        let streamed = self.listener_streamed.clone();
+        let capable = self.get_stream_capable.clone();
         let listener_span = self.span.clone();
         // Take the slot lock BEFORE spawning and store the handle with no
         // await point in between: if the calling task (the reconnect
@@ -1553,11 +1583,12 @@ impl HttpAdapter {
             return;
         }
         // Every install pays off a replacement a reactive recovery deferred
-        // to the handshake that held the lock at the time, and starts with
-        // no stream established: the new listener reports for itself.
+        // to the handshake that held the lock at the time. The known
+        // GET-stream capability is deliberately NOT reset: a replacement
+        // that fails at the transport layer before any response must leave
+        // the upstream repairable by the next success.
         self.listener_replacement_deferred
             .store(false, Ordering::SeqCst);
-        self.listener_streamed.store(false, Ordering::SeqCst);
         let handle = tokio::spawn(
             async move {
                 Self::run_get_listener(
@@ -1568,7 +1599,7 @@ impl HttpAdapter {
                     endpoint_name,
                     tx,
                     shutdown,
-                    streamed,
+                    capable,
                 )
                 .await;
             }
@@ -2347,7 +2378,17 @@ impl McpAdapter for HttpAdapter {
                 // with `?`. The OAuth wrapper drops a failed inner adapter,
                 // whose `Drop` aborts the supervisor again, so its behaviour
                 // is unchanged.
-                self.retry_initialize_in_background().await;
+                //
+                // A PERMANENT failure (the upstream answered `401`/`403`/`404`
+                // or an invalid handshake) is not retried: nothing the
+                // supervisor can do changes that answer, and a retry loop
+                // would only hammer the upstream. The adapter stays
+                // `Unhealthy(<reason>)` until a manual re-initialize.
+                if Self::is_permanent_init_failure(&e) {
+                    warn!(url = %self.config.url, error = %e, "HTTP adapter initialization failed permanently; not retrying in background");
+                } else {
+                    self.retry_initialize_in_background().await;
+                }
                 return Err(e);
             }
             // Arm the reconnect supervisor now so a later transport-dead
@@ -4058,6 +4099,103 @@ mod tests {
         ));
     }
 
+    /// Permanent-vs-retryable classification of an `initialize()` failure:
+    /// an answered `401`/`403`/`404` or an invalid handshake will not change
+    /// on its own; transport-dead, `5xx`, `429` and JSON-RPC errors may.
+    #[test]
+    fn is_permanent_init_failure_classifies_errors() {
+        for status in [401u16, 403, 404] {
+            assert!(
+                HttpAdapter::is_permanent_init_failure(&AdapterError::HttpError {
+                    status,
+                    body: String::new(),
+                }),
+                "{status} is permanent"
+            );
+        }
+        assert!(HttpAdapter::is_permanent_init_failure(
+            &AdapterError::ProtocolError("no serverInfo.name".into())
+        ));
+
+        for status in [0u16, 408, 429, 500, 502, 503] {
+            assert!(
+                !HttpAdapter::is_permanent_init_failure(&AdapterError::HttpError {
+                    status,
+                    body: String::new(),
+                }),
+                "{status} is retryable"
+            );
+        }
+        assert!(!HttpAdapter::is_permanent_init_failure(
+            &AdapterError::ConnectionFailed("refused".into())
+        ));
+        assert!(!HttpAdapter::is_permanent_init_failure(
+            &AdapterError::Timeout(30)
+        ));
+        assert!(!HttpAdapter::is_permanent_init_failure(
+            &AdapterError::JsonRpcError {
+                code: -32603,
+                message: "warming up".into(),
+                data: None,
+            }
+        ));
+    }
+
+    /// Regression: a permanent `initialize()` failure must NOT arm the
+    /// background retry supervisor — the upstream answered `404` and nothing
+    /// a retry does changes that. The adapter stays `Unhealthy(<reason>)`
+    /// with no reconnect task, and the upstream sees no further traffic.
+    #[tokio::test]
+    async fn permanent_init_failure_does_not_arm_background_retry() {
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use axum::Router;
+
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_h = hits.clone();
+        let router = Router::new().route(
+            "/mcp",
+            post(move || {
+                let hits = hits_h.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::NOT_FOUND
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.ok();
+        });
+
+        let mut adapter = HttpAdapter::new(HttpConfig::new(url));
+        let err = adapter
+            .initialize()
+            .await
+            .expect_err("a 404 handshake fails initialize");
+        assert!(
+            matches!(err, AdapterError::HttpError { status: 404, .. }),
+            "{err:?}"
+        );
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+        assert!(
+            lock_slot(&adapter.reconnect_handle).is_none(),
+            "a permanent init failure must not arm the retry supervisor"
+        );
+        let initial = hits.load(Ordering::SeqCst);
+        assert!(initial >= 1);
+        // Past the supervisor's 1 s base backoff: still no retry traffic.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            initial,
+            "no background retry may reach a permanently failed upstream"
+        );
+
+        server.abort();
+    }
+
     /// A plain HTTP server that dies after init: once the upstream stops
     /// answering, repeated `call_tool` transport failures flip health to
     /// `Unhealthy` at the threshold (and not before).
@@ -5339,6 +5477,78 @@ mod tests {
             fx.get_count.load(Ordering::SeqCst),
             1,
             "an upstream that rejected GET is not re-probed by successes while Healthy"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 8, Copilot r4056051543): the known `GET`-stream
+    /// capability must survive a replacement listener that fails at the
+    /// transport layer before any response. Installing the replacement used
+    /// to reset the flag, so a connect error (a blip while health stayed
+    /// `Healthy`) left the upstream marked as never having streamed and no
+    /// later success ever repaired the listener again. Only a definitive
+    /// non-2xx answer may clear the capability.
+    #[tokio::test]
+    async fn transport_failed_replacement_listener_keeps_upstream_repairable() {
+        let (url, fx, server) = start_supervisor_fixture().await;
+        fx.serve_get_stream(GET_STREAM_EMIT_THEN_END);
+        let (mut adapter, mut rx) = adapter_with_connected_get_listener(url.clone()).await;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                lock_slot(&adapter.listener_handle)
+                    .as_ref()
+                    .is_some_and(JoinHandle::is_finished)
+            })
+            .await,
+            "the listener exits when the upstream stream ends"
+        );
+        assert_eq!(fx.get_count.load(Ordering::SeqCst), 1);
+        drain_ticks(&mut rx);
+
+        // The repair's replacement `GET` never reaches an upstream: the
+        // connect fails before any response.
+        let (_dead_addr, dead_url) = reserve_dead_upstream().await;
+        adapter.config.url = dead_url;
+        adapter.repair_get_listener_if_ended().await;
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                lock_slot(&adapter.listener_handle)
+                    .as_ref()
+                    .is_some_and(JoinHandle::is_finished)
+            })
+            .await,
+            "the replacement listener exits on the connect failure"
+        );
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert!(
+            adapter.get_stream_capable.load(Ordering::SeqCst),
+            "a transport failure before any response must not clear the known GET-stream capability"
+        );
+
+        // Upstream reachable again: the next success repairs the listener.
+        adapter.config.url = url;
+        adapter
+            .call_tool("x", json!({}))
+            .await
+            .expect("live upstream answers");
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                fx.get_count.load(Ordering::SeqCst) == 2
+            })
+            .await,
+            "the next success must reconnect the listener after a transport-failed replacement"
+        );
+        assert!(
+            recv_ticks(&mut rx, Duration::from_secs(5)).await >= 1,
+            "the reconnected listener relays the upstream's push"
+        );
+        assert_eq!(
+            fx.init_count.load(Ordering::SeqCst),
+            1,
+            "the listener is reconnected without a handshake"
         );
 
         adapter.shutdown().await.unwrap();

@@ -1245,6 +1245,16 @@ pub(crate) async fn create_adapter(
             }
             match adapter.initialize().await {
                 Ok(()) => Box::new(adapter),
+                Err(e) if HttpAdapter::is_permanent_init_failure(&e) => {
+                    // The upstream answered and the answer will not change on
+                    // its own (`401`/`403`/`404`, invalid handshake): no
+                    // background retry was armed, so freeze it as a
+                    // `FailedAdapter` like any other non-retryable init error.
+                    // A manual restart / re-enable tries again.
+                    let msg = format!("Failed to initialize HTTP adapter: {}", e);
+                    warn!(endpoint = %ep.name, error = %e, "Failed to initialize HTTP adapter permanently, registering as failed (no background retry)");
+                    Box::new(FailedAdapter::new(msg))
+                }
                 Err(e) => {
                     // A failed `initialize()` has already armed the adapter's
                     // background retry; register it as the real adapter.
@@ -1769,6 +1779,96 @@ mod tests {
             }
             other => panic!("expected FailedAdapter ConnectionFailed, got {:?}", other),
         }
+    }
+
+    /// Serve an upstream that answers every POST with a fixed non-2xx status
+    /// and counts the requests it received.
+    fn spawn_status_fixture(
+        status: u16,
+    ) -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::http::StatusCode;
+        use axum::routing::post;
+        use axum::Router;
+
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_h = hits.clone();
+        let router = Router::new().route(
+            "/mcp",
+            post(move || {
+                let hits = hits_h.clone();
+                async move {
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    StatusCode::from_u16(status).unwrap()
+                }
+            }),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            axum::serve(listener, router).await.ok();
+        });
+        (format!("http://{}/mcp", addr), hits, server)
+    }
+
+    /// Regression: a plain `http` endpoint whose upstream ANSWERS the
+    /// handshake with a permanent failure (`404` — wrong URL) must be
+    /// registered as a `FailedAdapter` with NO background retry: the
+    /// upstream sees exactly the initial handshake traffic, and nothing more
+    /// after the supervisor's 1 s base backoff would have fired. A transient
+    /// answer (`503`) keeps the real, retrying `HttpAdapter`.
+    #[tokio::test]
+    async fn create_adapter_http_permanent_init_failure_registers_failed_adapter_without_retry() {
+        let (url, hits, server) = spawn_status_fixture(404);
+        let (tm, inners) = test_oauth_infra();
+        let ep = http_endpoint("wrong_url", &url);
+
+        let adapter = create_adapter(&ep, &tm, &inners, true, None, None, &[]).await;
+        match adapter.health() {
+            HealthStatus::Unhealthy(msg) => assert!(msg.contains("404"), "{msg}"),
+            other => panic!("expected Unhealthy after a 404 handshake, got {:?}", other),
+        }
+        assert!(
+            adapter.subscribe_tools_changed().is_none(),
+            "a permanent init failure must register a FailedAdapter, not a retrying HttpAdapter"
+        );
+        let initial = hits.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(initial >= 1, "the handshake must have reached the upstream");
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            initial,
+            "no background retry may reach a permanently failed upstream"
+        );
+        server.abort();
+
+        // Control: a transient `503` keeps the real adapter and its retry.
+        let (url, hits, server) = spawn_status_fixture(503);
+        let ep = http_endpoint("busy_url", &url);
+        let adapter = create_adapter(&ep, &tm, &inners, true, None, None, &[]).await;
+        assert!(matches!(adapter.health(), HealthStatus::Unhealthy(_)));
+        assert!(
+            adapter.subscribe_tools_changed().is_some(),
+            "a transient init failure must keep the real HttpAdapter"
+        );
+        let initial = hits.load(std::sync::atomic::Ordering::SeqCst);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while hits.load(std::sync::atomic::Ordering::SeqCst) == initial
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            hits.load(std::sync::atomic::Ordering::SeqCst) > initial,
+            "a transient init failure must keep retrying in the background"
+        );
+        drop(adapter);
+        server.abort();
     }
 
     /// Build an EMA endpoint config with the given transport/url for the

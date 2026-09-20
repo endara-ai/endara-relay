@@ -214,7 +214,13 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
 
     let mut ticker = tokio::time::interval(Duration::from_secs(interval_secs));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // The hysteresis streak belongs to ONE inner adapter: it is bound to the
+    // lifecycle generation it was accumulated under and starts over when a
+    // dispatch finds a newer generation (a token apply published a
+    // replacement), so a below-threshold failure of the old inner never
+    // pre-charges the replacement.
     let mut consecutive_failures: u32 = 0;
+    let mut streak_generation: u64 = 0;
 
     loop {
         tokio::select! {
@@ -238,6 +244,18 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
                 .load(std::sync::atomic::Ordering::Relaxed);
             (state.clone(), generation)
         };
+        if generation != streak_generation {
+            if consecutive_failures != 0 {
+                debug!(
+                    streak_generation = streak_generation,
+                    current_generation = generation,
+                    failures = consecutive_failures,
+                    "heartbeat dispatch moved to a new inner adapter generation; resetting the failure streak"
+                );
+            }
+            consecutive_failures = 0;
+            streak_generation = generation;
+        }
         match classify_tick_action(&oauth_state) {
             TickAction::Skip => {
                 // No probe will commit anything. In a genuine-auth terminal
@@ -258,43 +276,45 @@ pub async fn heartbeat_loop(inner: Weak<OAuthAdapterInner>) {
             }
             TickAction::Probe => {
                 let result = probe_inner(&adapter).await;
-                // A failed verdict (`Network` / `Upstream`) is fenced by the
-                // lifecycle generation BEFORE the hysteresis accounting and
-                // before its `inner_health` / metric write, exactly as the
-                // healthy and 401 verdicts are fenced at their commits: the
-                // probe ran without the state lock, so a token apply may
-                // have replaced the probed inner adapter mid-probe, and the
-                // failure belongs to the adapter that is gone — counting it
-                // would mark the replacement unhealthy (at threshold) or
-                // pre-charge its hysteresis (below threshold) with no probe
-                // of the replacement ever having failed. The fence is a
-                // `state` read guard held across the accounting and the
-                // commit: every apply transitions under the write lock, so
-                // a failure found current here is committed against the
-                // adapter it probed. Only `inner_health` and metrics are
-                // touched under the guard (no state write).
+                // EVERY verdict is fenced by the lifecycle generation BEFORE
+                // the hysteresis accounting: the probe ran without the state
+                // lock, so a token apply may have replaced the probed inner
+                // adapter mid-probe, and the result belongs to the adapter
+                // that is gone — a stale failure would mark the replacement
+                // unhealthy (at threshold) or pre-charge its hysteresis
+                // (below threshold), and a stale success or 401 would reset a
+                // streak the replacement genuinely accumulated. The fence is
+                // a `state` read guard; for a failed verdict (`Network` /
+                // `Upstream`) it is held across the accounting and the
+                // commit: every apply transitions under the write lock, so a
+                // failure found current here is committed against the
+                // adapter it probed, and only `inner_health` and metrics are
+                // touched under the guard (no state write). The healthy and
+                // 401 commits take their own lock and re-fence there, so the
+                // guard is released before they run.
+                let state = adapter.state.read().await;
+                let current_generation = adapter
+                    .lifecycle_generation
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                if *state != OAuthState::Authenticated || current_generation != generation {
+                    debug!(
+                        oauth_state = ?*state,
+                        dispatched_generation = generation,
+                        current_generation = current_generation,
+                        result = "stale",
+                        "heartbeat probe finished but the lifecycle moved on \
+                         mid-probe (state changed or an apply ran); dropping \
+                         stale result before hysteresis"
+                    );
+                    continue;
+                }
                 let fence = if matches!(
                     result,
                     Err(ProbeError::Network(_)) | Err(ProbeError::Upstream(_))
                 ) {
-                    let state = adapter.state.read().await;
-                    let current_generation = adapter
-                        .lifecycle_generation
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    if *state != OAuthState::Authenticated || current_generation != generation {
-                        debug!(
-                            oauth_state = ?*state,
-                            dispatched_generation = generation,
-                            current_generation = current_generation,
-                            result = "stale",
-                            "heartbeat probe failed but the lifecycle moved on \
-                             mid-probe (state changed or an apply ran); dropping \
-                             stale result before hysteresis"
-                        );
-                        continue;
-                    }
                     Some(state)
                 } else {
+                    drop(state);
                     None
                 };
                 let action = classify_probe_result(result, &mut consecutive_failures, threshold);

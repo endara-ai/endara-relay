@@ -275,12 +275,22 @@ impl TokenPostOutcome {
 /// its commit is acknowledged by that commit rather than published twice,
 /// and a recovery published in a terminal state is acknowledged by that
 /// publication, so the next healthy commit does not publish it again.
+///
+/// `baseline_invalidated` records that an inner tick cleared the tools
+/// fingerprint baseline since the last apply (as opposed to the baseline
+/// being unknown because a probe failed). A tick relayed while
+/// `Authenticated` may be processed by the registry only after the next
+/// apply has entered `Refreshing`, so the rebuild caches the tools as
+/// unavailable; the apply that consumes the flag owes a corrective tick even
+/// when its own fingerprint probe fails (a successful probe already ticks on
+/// the unknown baseline, so exactly one tick is published either way).
 #[derive(Debug, Default)]
 struct RecoveryTickState {
     acked_generation: u64,
     tick_pending: bool,
     pending_recovery: Option<u64>,
     restore_owed: bool,
+    baseline_invalidated: bool,
 }
 
 impl RecoveryTickState {
@@ -330,6 +340,28 @@ impl InnerTickSource {
             recovery_generation: adapter.recovery_generation_handle(),
         })
     }
+}
+
+/// Drain every tick already queued on `rx` without blocking; `true` when
+/// there was at least one (a `Lagged` gap counts: ticks were sent).
+fn drain_queued_ticks(rx: &mut broadcast::Receiver<()>) -> bool {
+    let mut any = false;
+    while let Ok(()) | Err(broadcast::error::TryRecvError::Lagged(_)) = rx.try_recv() {
+        any = true;
+    }
+    any
+}
+
+/// The running inner→outer tools-changed forwarder: its task and the inner
+/// receiver it pumps. The receiver is shared (locked by the task only across
+/// its `recv`) so whoever aborts the task can take the receiver back and
+/// drain the ticks the task never polled — buffered when it was aborted, or
+/// sent to the old inner adapter between the join and its shutdown — instead
+/// of losing them with the task (see
+/// [`OAuthAdapterInner::take_tools_forwarder`]).
+struct ForwarderTask {
+    handle: JoinHandle<()>,
+    rx: Arc<Mutex<broadcast::Receiver<()>>>,
 }
 
 /// Shared inner state for an OAuth adapter, wrapped in `Arc` so it can be
@@ -396,11 +428,12 @@ pub struct OAuthAdapterInner {
     /// ticks from each inner adapter's `subscribe_tools_changed` receiver into
     /// this sender.
     outer_tools_changed_tx: broadcast::Sender<()>,
-    /// Join handle of the current inner→outer tools-changed forwarder task,
-    /// if any. Re-bound on every inner-adapter swap; whoever takes it aborts
-    /// AND awaits it, so the forwarder is gone (not merely cancelled) before
-    /// the taker proceeds.
-    inner_forwarder_handle: Mutex<Option<JoinHandle<()>>>,
+    /// The current inner→outer tools-changed forwarder task, if any, with
+    /// the receiver it pumps. Re-bound on every inner-adapter swap; whoever
+    /// takes it aborts AND awaits it, so the forwarder is gone (not merely
+    /// cancelled) before the taker proceeds, and gets the receiver back
+    /// (see [`Self::take_tools_forwarder`]).
+    inner_forwarder_handle: Mutex<Option<ForwarderTask>>,
     /// Per-endpoint tracing span. Every adapter method instruments its async
     /// body with this span so events emitted directly by `OAuthAdapter` /
     /// `OAuthAdapterInner` (state transitions, refresh, heartbeat) carry
@@ -1641,12 +1674,22 @@ impl OAuthAdapterInner {
                 // sampled: that sample is the final word on what it still
                 // owes. Every later step keeps its order; the swap's own
                 // take then finds the forwarder slot empty.
+                //
+                // The same quiesce must not lose the old adapter's ORDINARY
+                // `tools/list_changed` ticks: one may sit in its receiver
+                // when the forwarder is aborted, or be sent between the join
+                // and `old.shutdown()`. The sample above only accounts for
+                // recoveries, and the replacement fingerprint was taken
+                // before this teardown, so `should_tick` could stay false
+                // and leave the registry catalog stale. The forwarder's
+                // receiver is therefore taken back rather than dropped with
+                // the task, and drained once the old adapter is shut down:
+                // anything found is folded into this commit's tick like the
+                // replacement's own backlog, and invalidates the baseline
+                // the same way.
                 let source = InnerTickSource::bind(&adapter);
                 let new_fingerprint = Self::probe_tools_fingerprint(&adapter).await;
-                if let Some(h) = self.inner_forwarder_handle.lock().await.take() {
-                    h.abort();
-                    let _ = h.await;
-                }
+                let old_rx = self.take_tools_forwarder().await;
                 let old = self.inner_adapter.write().await.replace(adapter);
                 let was_listable = old.is_some();
                 let unacked_old_recovery = match old {
@@ -1658,7 +1701,22 @@ impl OAuthAdapterInner {
                     }
                     None => false,
                 };
-                let restoring = std::mem::take(&mut self.lock_recovery_tick().restore_owed);
+                let old_backlog = old_rx.is_some_and(|rx| {
+                    rx.try_lock()
+                        .map(|mut rx| drain_queued_ticks(&mut rx))
+                        .unwrap_or(false)
+                });
+                if old_backlog {
+                    self.lock_recovery_tick().tick_pending = true;
+                    debug!("inner tools_changed left unpolled by the superseded forwarder: folded into the apply's commit tick");
+                }
+                let (restoring, invalidated) = {
+                    let mut tick = self.lock_recovery_tick();
+                    (
+                        std::mem::take(&mut tick.restore_owed),
+                        std::mem::take(&mut tick.baseline_invalidated),
+                    )
+                };
                 let was_healthy = matches!(
                     std::mem::replace(&mut *self.inner_health.write().await, HealthStatus::Healthy),
                     HealthStatus::Healthy
@@ -1669,24 +1727,37 @@ impl OAuthAdapterInner {
                 // `tick_pending`, which the publish below folds into this
                 // commit's tick; they also leave the baseline unknown, since
                 // the sample may predate the change they announce.
-                let backlog = self.swap_tools_forwarder(source).await;
-                let should_tick =
-                    if !was_listable || !was_healthy || unacked_old_recovery || restoring {
-                        true
-                    } else {
-                        let old_fingerprint = *self.last_tools_fingerprint.read().await;
-                        match (old_fingerprint, new_fingerprint) {
-                            // Both probes succeeded: tick only on an actual change.
-                            (Some(old), Some(new)) => old != new,
-                            // Baseline unknown (previous probe failed): cached
-                            // tools may be stale — tick to be safe.
-                            (None, Some(_)) => true,
-                            // New probe failed: a change is undetectable, and the
-                            // registry's own refetch would fail too — stay silent
-                            // and keep the previous baseline.
-                            (_, None) => false,
-                        }
-                    };
+                let backlog = self.swap_tools_forwarder(source).await || old_backlog;
+                // `invalidated`: an inner tick cleared the baseline since the
+                // last apply. Relayed while `Authenticated`, the registry may
+                // have processed it only after this apply entered
+                // `Refreshing` and rebuilt against `Starting`; this commit
+                // owes the correction whatever the fingerprint probe says —
+                // once: with a successful probe the unknown baseline would
+                // have ticked below anyway, so only a failed probe changes
+                // outcome (it used to stay silent and leave the catalog
+                // marked unavailable).
+                let should_tick = if !was_listable
+                    || !was_healthy
+                    || unacked_old_recovery
+                    || restoring
+                    || invalidated
+                {
+                    true
+                } else {
+                    let old_fingerprint = *self.last_tools_fingerprint.read().await;
+                    match (old_fingerprint, new_fingerprint) {
+                        // Both probes succeeded: tick only on an actual change.
+                        (Some(old), Some(new)) => old != new,
+                        // Baseline unknown (previous probe failed): cached
+                        // tools may be stale — tick to be safe.
+                        (None, Some(_)) => true,
+                        // New probe failed: a change is undetectable, and the
+                        // registry's own refetch would fail too — stay silent
+                        // and keep the previous baseline.
+                        (_, None) => false,
+                    }
+                };
                 if backlog {
                     *self.last_tools_fingerprint.write().await = None;
                 } else if new_fingerprint.is_some() {
@@ -1936,10 +2007,7 @@ impl OAuthAdapterInner {
     /// is kept as an ordinary one.
     async fn swap_tools_forwarder(self: &Arc<Self>, source: Option<InnerTickSource>) -> bool {
         let mut handle_guard = self.inner_forwarder_handle.lock().await;
-        if let Some(h) = handle_guard.take() {
-            h.abort();
-            let _ = h.await;
-        }
+        Self::stop_forwarder(handle_guard.take()).await;
         let Some(InnerTickSource {
             mut rx,
             recovery_generation,
@@ -1950,10 +2018,7 @@ impl OAuthAdapterInner {
         let outer_tx = self.outer_tools_changed_tx.clone();
         let fingerprint = self.last_tools_fingerprint.clone();
         let mut seen_recovery = recovery_generation.load(Ordering::SeqCst);
-        let mut backlog = false;
-        while let Ok(()) | Err(broadcast::error::TryRecvError::Lagged(_)) = rx.try_recv() {
-            backlog = true;
-        }
+        let backlog = drain_queued_ticks(&mut rx);
         {
             let mut tick = self.lock_recovery_tick();
             tick.acked_generation = seen_recovery;
@@ -1965,24 +2030,57 @@ impl OAuthAdapterInner {
             debug!("inner tools_changed queued before the forwarder started: folded into the apply's commit tick");
         }
         let weak = Arc::downgrade(self);
+        let rx = Arc::new(Mutex::new(rx));
+        let task_rx = rx.clone();
         let join = tokio::spawn(async move {
             // `Ok` and `Lagged` both forward a tick; `Closed` ends the task.
-            while let Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) = rx.recv().await {
-                *fingerprint.write().await = None;
-                match weak.upgrade() {
-                    Some(inner) => {
-                        inner
-                            .relay_inner_tick(&recovery_generation, &mut seen_recovery, &outer_tx)
-                            .await;
-                    }
-                    None => {
-                        let _ = outer_tx.send(());
-                    }
+            // The receiver is locked only across the `recv`, so an abort
+            // (which lands at that await) leaves it free for the taker.
+            loop {
+                match task_rx.lock().await.recv().await {
+                    Ok(()) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
+                let Some(inner) = weak.upgrade() else {
+                    let _ = outer_tx.send(());
+                    continue;
+                };
+                // Recorded FIRST, with no await between the poll and the
+                // write: an inner tick invalidates the fingerprint baseline,
+                // and the flag tells the next apply the baseline is unknown
+                // BECAUSE of a tick (not a failed probe) — or that a tick
+                // was polled but never relayed, if an apply aborts this task
+                // at one of the awaits below — so the apply's commit corrects
+                // even when its own probe fails (see `RecoveryTickState`).
+                inner.lock_recovery_tick().baseline_invalidated = true;
+                *fingerprint.write().await = None;
+                inner
+                    .relay_inner_tick(&recovery_generation, &mut seen_recovery, &outer_tx)
+                    .await;
             }
         });
-        *handle_guard = Some(join);
+        *handle_guard = Some(ForwarderTask { handle: join, rx });
         backlog
+    }
+
+    /// Abort and join the current forwarder, if any, and hand back the inner
+    /// receiver it was pumping so the caller can drain what the task never
+    /// polled once the old inner adapter is quiesced (see
+    /// [`Self::apply_tokens_inner`]). `None` when no forwarder was running.
+    async fn take_tools_forwarder(&self) -> Option<Arc<Mutex<broadcast::Receiver<()>>>> {
+        let task = self.inner_forwarder_handle.lock().await.take()?;
+        let rx = task.rx.clone();
+        Self::stop_forwarder(Some(task)).await;
+        Some(rx)
+    }
+
+    /// Abort AND await a forwarder task so it is gone (not merely
+    /// cancelled) before the caller proceeds.
+    async fn stop_forwarder(task: Option<ForwarderTask>) {
+        if let Some(ForwarderTask { handle, .. }) = task {
+            handle.abort();
+            let _ = handle.await;
+        }
     }
 
     /// Handle one inner tick on behalf of the forwarder. A recovery tick is
@@ -5616,6 +5714,77 @@ mod tests {
         server.abort();
     }
 
+    /// PR #163 review (round 8, Copilot r4056051578): the hysteresis streak
+    /// belongs to one inner adapter. A genuine below-threshold failure of
+    /// the inner adapter a token apply then replaces must not pre-charge the
+    /// replacement: with threshold 2, the replacement's first genuine
+    /// failure is below threshold and only its second crosses it.
+    #[tokio::test]
+    async fn failure_streak_does_not_carry_over_a_token_apply() {
+        let (mut adapter, fx, server) = armed_probe_adapter(2).await;
+
+        // One genuine failure of the first inner adapter: counted, below
+        // threshold.
+        fx.fail_probe.store(true, Ordering::SeqCst);
+        let probes_before = fx.tools_list_count.load(Ordering::SeqCst);
+        adapter.inner.probe_now.notify_one();
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                fx.tools_list_count.load(Ordering::SeqCst) > probes_before
+            })
+            .await,
+            "the first probe reaches the upstream"
+        );
+        assert!(
+            !wait_until(Duration::from_millis(500), || {
+                matches!(adapter.health(), HealthStatus::Unhealthy(_))
+            })
+            .await,
+            "one failure is below threshold"
+        );
+        fx.fail_probe.store(false, Ordering::SeqCst);
+
+        // A token apply publishes a replacement inner adapter: the lifecycle
+        // generation moves on.
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Authenticated);
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+
+        // The replacement's first genuine failure: below threshold iff the
+        // old inner adapter's streak was not carried over.
+        fx.fail_probe.store(true, Ordering::SeqCst);
+        let probes_before = fx.tools_list_count.load(Ordering::SeqCst);
+        adapter.inner.probe_now.notify_one();
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                fx.tools_list_count.load(Ordering::SeqCst) > probes_before
+            })
+            .await,
+            "the replacement's probe reaches the upstream"
+        );
+        assert!(
+            !wait_until(Duration::from_millis(500), || {
+                matches!(adapter.health(), HealthStatus::Unhealthy(_))
+            })
+            .await,
+            "the replacement's first failure must not inherit the replaced adapter's streak"
+        );
+
+        // Its second failure crosses the threshold — the streak is live.
+        adapter.inner.probe_now.notify_one();
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                matches!(adapter.health(), HealthStatus::Unhealthy(_))
+            })
+            .await,
+            "two failures of the replacement reach the threshold"
+        );
+        fx.fail_probe.store(false, Ordering::SeqCst);
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
     /// PR #163 review (round 7, Copilot r4054934962): ticks already queued
     /// on a replacement adapter's subscription when its forwarder starts
     /// must not be relayed by the forwarder as outer ticks of their own —
@@ -5684,6 +5853,173 @@ mod tests {
         assert!(
             adapter.inner.last_tools_fingerprint.read().await.is_none(),
             "a change announced around the sample leaves the baseline unknown"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// Stronger companion of the backlog case above (ported from the round-7
+    /// verifier's `verifier_r7_apply_owed_tick_coalesces_inline_probe_notification`,
+    /// r4054934962): when the apply owes a tick of its own anyway (here the
+    /// transition back into `Healthy`), the inline `list_changed` queued by
+    /// its fingerprint probe must be coalesced into that one tick by the
+    /// swap's drain. Without the drain the forwarder task, which may first
+    /// run only after the commit, relays the queued notification as a
+    /// second outer tick — which the test above cannot see, because there
+    /// the deferred relay IS the apply's only tick.
+    #[tokio::test]
+    async fn apply_owed_tick_coalesces_inline_probe_notification() {
+        let (mut adapter, fx, server) = armed_probe_adapter(1).await;
+        stop_heartbeat(&adapter).await;
+        *adapter.inner.inner_health.write().await =
+            HealthStatus::Unhealthy("verifier outage".into());
+        let mut rx = adapter.subscribe_tools_changed().unwrap();
+
+        fx.probe_sse_list_changed.store(true, Ordering::SeqCst);
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        fx.probe_sse_list_changed.store(false, Ordering::SeqCst);
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert!(
+            recv_tick(&mut rx, Duration::from_secs(2)).await,
+            "the transition back into Healthy publishes its tick"
+        );
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "an owed Healthy-transition tick must coalesce the queued inline notification"
+        );
+        assert!(!adapter.inner.recovery_tick_pending());
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 8, Copilot r4056051608): an ordinary
+    /// `tools/list_changed` of the OLD inner adapter that its forwarder never
+    /// polled — sent between the forwarder's join and `old.shutdown()` (or
+    /// still buffered in its receiver when it was aborted) — must not be lost
+    /// with the forwarder. Same tool set, nothing else owed: the apply must
+    /// still publish exactly one commit tick covering it, and leave the
+    /// baseline unknown. The apply is parked at the `inner_adapter` write
+    /// lock (the test holds a read guard), right after it joined the old
+    /// forwarder, and the old adapter pushes the notification there.
+    #[tokio::test]
+    async fn apply_folds_old_inner_tick_left_unpolled_by_its_forwarder() {
+        let (mut adapter, fx, server) = armed_probe_adapter(3).await;
+        stop_heartbeat(&adapter).await;
+        let mut rx = adapter.subscribe_tools_changed().unwrap();
+        drain(&mut rx).await;
+        assert!(adapter.inner.inner_forwarder_handle.lock().await.is_some());
+        assert!(adapter.inner.last_tools_fingerprint.read().await.is_some());
+
+        let hold = adapter.inner.inner_adapter.read().await;
+        let inner = adapter.inner.clone();
+        let apply = tokio::spawn(async move { inner.apply_tokens(make_token_set("second")).await });
+        assert!(
+            wait_until(Duration::from_secs(2), || adapter
+                .inner
+                .inner_forwarder_handle
+                .try_lock()
+                .is_ok_and(|slot| slot.is_none()))
+            .await,
+            "the apply joins the old forwarder before it waits for the write lock"
+        );
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Refreshing);
+
+        // The old adapter announces a tool change now: no forwarder polls
+        // it, so only the apply's quiesce can still account for it.
+        let old = hold.as_ref().expect("old inner adapter still published");
+        fx.probe_sse_list_changed.store(true, Ordering::SeqCst);
+        old.list_tools().await.expect("live upstream answers");
+        fx.probe_sse_list_changed.store(false, Ordering::SeqCst);
+        assert!(!recv_tick(&mut rx, Duration::from_millis(200)).await);
+
+        drop(hold);
+        apply.await.unwrap();
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Authenticated);
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert!(
+            recv_tick(&mut rx, Duration::from_secs(2)).await,
+            "the old adapter's unpolled list_changed is folded into the apply's commit tick"
+        );
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "one change publishes one tick"
+        );
+        assert!(!adapter.inner.recovery_tick_pending());
+        assert!(
+            adapter.inner.last_tools_fingerprint.read().await.is_none(),
+            "a change announced around the sample leaves the baseline unknown"
+        );
+
+        adapter.shutdown().await.unwrap();
+        server.abort();
+    }
+
+    /// PR #163 review (round 8, Copilot r4056051627): an ordinary inner tick
+    /// relayed while `Authenticated` clears the fingerprint baseline, but the
+    /// registry may process it only after the next apply has entered
+    /// `Refreshing` and rebuild against `Starting`. When that apply's own
+    /// fingerprint probe then fails, it used to stay silent (`(None, None)`),
+    /// leaving the cached catalog marked unavailable. The invalidation must be
+    /// carried through the apply: its commit publishes exactly one
+    /// corrective tick.
+    #[tokio::test]
+    async fn apply_with_failed_probe_corrects_a_baseline_invalidated_before_it() {
+        let (mut adapter, fx, server) = armed_probe_adapter(1).await;
+        stop_heartbeat(&adapter).await;
+        let mut rx = adapter.subscribe_tools_changed().unwrap();
+        drain(&mut rx).await;
+        assert!(adapter.inner.last_tools_fingerprint.read().await.is_some());
+
+        // An ordinary list_changed while Authenticated: relayed at once, the
+        // baseline is invalidated.
+        fx.probe_sse_list_changed.store(true, Ordering::SeqCst);
+        adapter.list_tools().await.expect("live upstream answers");
+        fx.probe_sse_list_changed.store(false, Ordering::SeqCst);
+        assert!(
+            recv_tick(&mut rx, Duration::from_secs(2)).await,
+            "the ordinary tick is relayed while Authenticated"
+        );
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                adapter
+                    .inner
+                    .last_tools_fingerprint
+                    .try_read()
+                    .is_ok_and(|fp| fp.is_none())
+            })
+            .await,
+            "the relayed tick invalidates the baseline"
+        );
+        assert!(!recv_tick(&mut rx, Duration::from_millis(200)).await);
+
+        // The next apply's replacement fingerprint probe fails: the
+        // invalidation alone must make its commit tick.
+        fx.fail_probe.store(true, Ordering::SeqCst);
+        adapter.inner.apply_tokens(make_token_set("second")).await;
+        fx.fail_probe.store(false, Ordering::SeqCst);
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Authenticated);
+        assert_eq!(adapter.health(), HealthStatus::Healthy);
+        assert!(
+            recv_tick(&mut rx, Duration::from_secs(2)).await,
+            "the apply must correct an invalidated baseline even when its own probe fails"
+        );
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "one invalidation publishes one corrective tick"
+        );
+        assert!(!adapter.inner.recovery_tick_pending());
+
+        // The invalidation is consumed: a further apply with a failing probe
+        // and nothing else owed stays silent, as before.
+        fx.fail_probe.store(true, Ordering::SeqCst);
+        adapter.inner.apply_tokens(make_token_set("third")).await;
+        fx.fail_probe.store(false, Ordering::SeqCst);
+        assert_eq!(*adapter.inner.state.read().await, OAuthState::Authenticated);
+        assert!(
+            !recv_tick(&mut rx, Duration::from_millis(400)).await,
+            "a failed probe with no outstanding invalidation stays silent"
         );
 
         adapter.shutdown().await.unwrap();
