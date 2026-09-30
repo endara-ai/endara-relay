@@ -8022,6 +8022,165 @@ mod tests {
         state.profile_registry.rebuild(&[profile]).await;
     }
 
+    /// Typed adapter with health independent of administrative disablement.
+    struct AnnouncementAdapter {
+        server_type: String,
+        unhealthy: bool,
+    }
+
+    #[async_trait]
+    impl McpAdapter for AnnouncementAdapter {
+        async fn initialize(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+        async fn list_tools(&self) -> Result<Vec<ToolInfo>, AdapterError> {
+            Ok(vec![])
+        }
+        async fn call_tool(&self, _name: &str, _args: Value) -> Result<Value, AdapterError> {
+            Ok(Value::Null)
+        }
+        fn health(&self) -> HealthStatus {
+            if self.unhealthy {
+                HealthStatus::Unhealthy("offline".into())
+            } else {
+                HealthStatus::Healthy
+            }
+        }
+        fn server_type(&self) -> Option<String> {
+            Some(self.server_type.clone())
+        }
+        async fn shutdown(&mut self) -> Result<(), AdapterError> {
+            Ok(())
+        }
+    }
+
+    async fn announcement_response(state: &AppState, uri: &str, method: &str) -> Value {
+        let response = send_profile_request(
+            state.clone(),
+            "POST",
+            uri,
+            Some(&json!({"jsonrpc":"2.0", "method":method, "id":1})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["id"], 1);
+        assert!(body.get("error").is_none(), "{body}");
+        body["result"].clone()
+    }
+
+    /// Exercise real HTTP JSON-RPC routing for both scopes, with successive
+    /// responses reading the same registry and already-installed profile.
+    async fn check_disabled_announcements(profile: bool, method: &str) {
+        let state = test_app_state();
+        state.js_execution_mode.store(true, Ordering::Relaxed);
+        install_profile_with_flags(
+            &state,
+            "work",
+            vec!["github".into(), "notion".into()],
+            true,
+            false,
+        )
+        .await;
+        let uri = if profile { "/mcp/work" } else { "/mcp" };
+        let empty = announcement_response(&state, uri, method).await;
+        for (name, unhealthy) in [("github", false), ("notion", true), ("linear", false)] {
+            state
+                .registry
+                .register(
+                    name.into(),
+                    Box::new(AnnouncementAdapter {
+                        server_type: name.into(),
+                        unhealthy,
+                    }),
+                    "stdio".into(),
+                    None,
+                    Some(name.into()),
+                )
+                .await;
+        }
+
+        // Disable then re-enable github without rebuilding the profile.
+        for disabled in [false, true, false] {
+            state
+                .registry
+                .entries()
+                .write()
+                .await
+                .get_mut("github")
+                .unwrap()
+                .disabled = disabled;
+            state.registry.invalidate_catalog_cache().await;
+            let result = announcement_response(&state, uri, method).await;
+            let types = match (profile, disabled) {
+                (true, false) => "github, notion",
+                (true, true) => "notion",
+                (false, false) => "github, linear, notion",
+                (false, true) => "linear, notion",
+            };
+            let count = if profile { 2 } else { 3 } - usize::from(disabled);
+            if method == "initialize" {
+                assert_eq!(
+                    result["instructions"],
+                    format!(
+                        "{}\n\nConnected server types: {types}",
+                        crate::advertise::INSTRUCTIONS_LEAD_IN
+                    )
+                );
+            } else {
+                let tools = result["tools"].as_array().unwrap();
+                let description = |name: &str| {
+                    tools.iter().find(|t| t["name"] == name).unwrap()["description"]
+                        .as_str()
+                        .unwrap()
+                };
+                assert_eq!(
+                    description("search_tools"),
+                    format!(
+                        "{}\n\nConnected server types: {types}",
+                        crate::advertise::SEARCH_TOOLS_BASE
+                    )
+                );
+                for (name, base) in [
+                    ("list_tools", crate::advertise::LIST_TOOLS_BASE),
+                    ("execute_tools", crate::advertise::EXECUTE_TOOLS_BASE),
+                ] {
+                    assert_eq!(description(name), format!("{base} {count} servers connected via Endara Relay — use search_tools to discover tools."));
+                }
+            }
+        }
+        {
+            let mut entries = state.registry.entries().write().await;
+            for (name, entry) in entries.iter_mut() {
+                // Keep a foreign endpoint enabled in the all-disabled profile case.
+                entry.disabled = !profile || name != "linear";
+            }
+            assert_eq!(entries.len(), 3, "management must retain disabled entries");
+        }
+        state.registry.invalidate_catalog_cache().await;
+        assert_eq!(announcement_response(&state, uri, method).await, empty);
+    }
+
+    #[tokio::test]
+    async fn disabled_announcements_global_initialize() {
+        check_disabled_announcements(false, "initialize").await;
+    }
+
+    #[tokio::test]
+    async fn disabled_announcements_profile_initialize() {
+        check_disabled_announcements(true, "initialize").await;
+    }
+
+    #[tokio::test]
+    async fn disabled_announcements_global_tools_list() {
+        check_disabled_announcements(false, "tools/list").await;
+    }
+
+    #[tokio::test]
+    async fn disabled_announcements_profile_tools_list() {
+        check_disabled_announcements(true, "tools/list").await;
+    }
+
     // Test-matrix row #24 — unknown profile path → 404 with JSON body.
     #[tokio::test]
     async fn mcp_unified_profiled_unknown_profile_returns_404_json() {

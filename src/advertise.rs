@@ -1,7 +1,7 @@
 //! Server-type advertisement to connected models.
 //!
 //! Renders a deduplicated, alphabetised list of `server_type` values across
-//! **all** currently-registered adapters (regardless of [`HealthStatus`]) and
+//! all enabled adapters (regardless of [`HealthStatus`]) and
 //! provides description builders for the meta-tools (`list_tools`,
 //! `search_tools`, `execute_tools`, `write_file`) so each `tools/list`
 //! response reflects the current registry (and, for `write_file`, the current
@@ -84,15 +84,15 @@ pub const EXECUTE_TOOLS_BASE: &str = concat!(
 /// When `allowed_endpoints` is `Some`, the rendered list and the endpoint
 /// count are restricted to adapters whose endpoint name is in the set —
 /// this powers the `_for_profile` advertising variants. When `None`, the
-/// renderer reflects every registered adapter (the global `/mcp` path).
+/// renderer reflects every enabled adapter (the global `/mcp` path).
 pub struct ServerTypeList<'a> {
     registry: &'a AdapterRegistry,
     allowed_endpoints: Option<&'a HashSet<String>>,
 }
 
 impl<'a> ServerTypeList<'a> {
-    /// Bind a renderer to the given registry (unfiltered — every
-    /// registered adapter contributes).
+    /// Bind a renderer to the given registry (every enabled adapter
+    /// contributes regardless of health).
     pub fn new(registry: &'a AdapterRegistry) -> Self {
         Self {
             registry,
@@ -154,7 +154,7 @@ impl<'a> ServerTypeList<'a> {
         Some(out)
     }
 
-    /// Number of in-scope adapter instances regardless of health (NOT
+    /// Number of enabled in-scope adapter instances regardless of health (NOT
     /// deduplicated by type). When scoped to a profile, only adapters
     /// whose endpoint name is in `allowed_endpoints` are counted.
     pub async fn endpoint_count(&self) -> usize {
@@ -438,6 +438,84 @@ mod tests {
             Some(name.into()),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn disabled_announcements_filter_types_and_counts() {
+        let reg = AdapterRegistry::new();
+        register(&reg, "gmail-enabled", MockAdapter::failed()).await;
+        register(&reg, "gmail-disabled", MockAdapter::ready("gmail")).await;
+        register(&reg, "github", MockAdapter::ready("github")).await;
+        register(
+            &reg,
+            "override",
+            MockAdapter::starting_with_override("slack"),
+        )
+        .await;
+        register(&reg, "untyped", MockAdapter::starting_no_type()).await;
+        register(&reg, "foreign", MockAdapter::ready("linear")).await;
+        {
+            let mut entries = reg.entries().write().await;
+            for name in ["gmail-disabled", "github", "override", "untyped"] {
+                entries.get_mut(name).unwrap().disabled = true;
+            }
+        }
+        let allowed = [
+            "gmail-enabled",
+            "gmail-disabled",
+            "github",
+            "override",
+            "untyped",
+            "missing",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(
+            reg.all_server_types().await,
+            ["gmail", "linear"].into_iter().map(String::from).collect()
+        );
+        assert_eq!(reg.all_endpoint_count().await, 2);
+        assert_eq!(
+            reg.server_types_in(&allowed).await,
+            ["gmail"].into_iter().map(String::from).collect()
+        );
+        assert_eq!(reg.endpoint_count_in(&allowed).await, 1);
+        // Disabled entries remain available to management.
+        assert_eq!(reg.entries().read().await.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn disabled_announcements_use_empty_fallback() {
+        let reg = AdapterRegistry::new();
+        register(&reg, "github", MockAdapter::ready("github")).await;
+        reg.entries()
+            .write()
+            .await
+            .get_mut("github")
+            .unwrap()
+            .disabled = true;
+        let view = view_for(&reg, &["github"]);
+        assert_eq!(instructions(&reg).await, None);
+        assert_eq!(instructions_for_profile(&view).await, None);
+        assert_eq!(list_tools_description(&reg).await, LIST_TOOLS_BASE);
+        assert_eq!(execute_tools_description(&reg).await, EXECUTE_TOOLS_BASE);
+        assert_eq!(
+            search_tools_description(&reg, false).await,
+            SEARCH_TOOLS_BASE
+        );
+        assert_eq!(
+            list_tools_description_for_profile(&view).await,
+            LIST_TOOLS_BASE
+        );
+        assert_eq!(
+            execute_tools_description_for_profile(&view).await,
+            EXECUTE_TOOLS_BASE
+        );
+        assert_eq!(
+            search_tools_description_for_profile(&view, false).await,
+            SEARCH_TOOLS_BASE
+        );
     }
 
     #[tokio::test]

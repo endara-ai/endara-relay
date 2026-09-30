@@ -608,8 +608,8 @@ impl AdapterRegistry {
             .count()
     }
 
-    /// Deduplicated, lower-cased server types across **all** registered
-    /// adapters regardless of health.
+    /// Deduplicated, lower-cased server types across all enabled
+    /// adapters regardless of health. Disabled adapters are excluded.
     ///
     /// For each adapter, prefers the cached upstream-derived `server_type()`
     /// (populated after a successful `initialize` handshake) and falls back
@@ -621,6 +621,7 @@ impl AdapterRegistry {
         let adapters = self.adapters.read().await;
         adapters
             .values()
+            .filter(|entry| !entry.disabled)
             .filter_map(|entry| {
                 entry
                     .adapter
@@ -631,15 +632,15 @@ impl AdapterRegistry {
             .collect()
     }
 
-    /// Total number of registered adapter instances regardless of health
+    /// Total number of enabled adapter instances regardless of health
     /// (NOT deduplicated by server type — three Gmail accounts count as
     /// three).
     pub async fn all_endpoint_count(&self) -> usize {
         let adapters = self.adapters.read().await;
-        adapters.len()
+        adapters.values().filter(|entry| !entry.disabled).count()
     }
 
-    /// Profile-scoped variant of [`Self::all_server_types`] — only adapters
+    /// Profile-scoped variant of [`Self::all_server_types`] — only enabled adapters
     /// whose endpoint name is in `allowed_endpoints` contribute. Used by the
     /// `_for_profile` advertising builders so per-profile `instructions` and
     /// meta-tool descriptions list only the profile's server types.
@@ -647,7 +648,7 @@ impl AdapterRegistry {
         let adapters = self.adapters.read().await;
         adapters
             .iter()
-            .filter(|(name, _)| allowed_endpoints.contains(*name))
+            .filter(|(name, entry)| !entry.disabled && allowed_endpoints.contains(*name))
             .filter_map(|(_, entry)| {
                 entry
                     .adapter
@@ -659,12 +660,12 @@ impl AdapterRegistry {
     }
 
     /// Profile-scoped variant of [`Self::all_endpoint_count`] — counts only
-    /// adapters whose endpoint name is in `allowed_endpoints`.
+    /// enabled adapters whose endpoint name is in `allowed_endpoints`.
     pub async fn endpoint_count_in(&self, allowed_endpoints: &HashSet<String>) -> usize {
         let adapters = self.adapters.read().await;
         adapters
-            .keys()
-            .filter(|name| allowed_endpoints.contains(*name))
+            .iter()
+            .filter(|(name, entry)| !entry.disabled && allowed_endpoints.contains(*name))
             .count()
     }
 
