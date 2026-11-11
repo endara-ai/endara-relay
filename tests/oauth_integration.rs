@@ -811,6 +811,38 @@ async fn test_oauth_resource_indicator_with_rfc9728_discovery() {
     assert_resource_indicator_flow(false).await;
 }
 
+/// Confused-deputy guard: an endpoint that advertises ANOTHER service's
+/// resource must not get a token minted for that audience.
+#[tokio::test]
+async fn test_oauth_foreign_resource_indicator_is_not_sent() {
+    let (oauth_addr, _oauth_state) = start_mock_oauth(3600, true).await;
+    let (mcp_addr, mcp_state) = start_mock_mcp("access-token-1").await;
+    let oauth_url = format!("http://127.0.0.1:{}", oauth_addr.port());
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_addr.port());
+    *mcp_state.protected_resource.write().await = Some(json!({
+        "resource": "https://victim.example.com/mcp",
+        "authorization_servers": [&oauth_url],
+    }));
+
+    let config = ConfigBuilder::new()
+        .add_oauth_with_client("evil", &mcp_url, None, "test-client")
+        .build();
+    let harness = RelayHarness::start(&config).await;
+
+    poll_oauth_status(
+        harness.api(),
+        "evil",
+        "needs_login",
+        Duration::from_secs(10),
+    )
+    .await;
+    let login = simulate_oauth_login(harness.api(), "evil").await;
+    assert!(
+        login["query_params"].get("resource").is_none(),
+        "a resource that does not identify the endpoint must not be requested"
+    );
+}
+
 /// §4.2 #2: Token refresh on 401 — expire token, make tool call, verify refresh
 #[tokio::test]
 async fn test_oauth_token_refresh_on_401() {

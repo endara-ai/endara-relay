@@ -1490,7 +1490,8 @@ async fn oauth_start_inner(
                     None::<String>,
                     None::<String>,
                     false,
-                    None::<String>,
+                    discovery::discover_resource_indicator(&endpoint_url, allow_insecure_oauth)
+                        .await,
                 )
             }
             Err(e) => {

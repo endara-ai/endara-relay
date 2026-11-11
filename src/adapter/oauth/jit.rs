@@ -240,7 +240,12 @@ impl JitInterceptor {
 
         let disc = match metadata_url {
             Some(m) => {
-                discovery::discover_oauth_server_from_metadata(m, self.allow_insecure_oauth).await?
+                discovery::discover_oauth_server_from_metadata(
+                    m,
+                    resource_url,
+                    self.allow_insecure_oauth,
+                )
+                .await?
             }
             None => {
                 discovery::discover_oauth_server(resource_url, self.allow_insecure_oauth).await?
