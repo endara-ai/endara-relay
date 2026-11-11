@@ -628,7 +628,7 @@ async fn test_oauth_fresh_login_flow() {
     // non-MCP authorization servers (e.g. Entra) can reject unknown ones.
     assert!(
         login_result["query_params"].get("resource").is_none(),
-        "no resource indicator without protected-resource metadata: {login_result}"
+        "no resource indicator without protected-resource metadata"
     );
 
     // Wait for authenticated state
@@ -752,7 +752,7 @@ async fn assert_resource_indicator_flow(configured_as: bool) {
     assert_eq!(
         login["query_params"]["resource"].as_str(),
         Some(mcp_url.as_str()),
-        "authorize URL must carry the protected resource: {login}"
+        "authorize URL must carry the protected resource"
     );
     poll_oauth_status(
         harness.api(),
@@ -785,7 +785,7 @@ async fn assert_resource_indicator_flow(configured_as: bool) {
         let grant = grants
             .iter()
             .find(|g| g.get("grant_type").map(String::as_str) == Some(grant_type))
-            .unwrap_or_else(|| panic!("no {grant_type} grant in {grants:?}"));
+            .unwrap_or_else(|| panic!("no {grant_type} grant was posted"));
         assert_eq!(
             grant.get("resource").map(String::as_str),
             Some(mcp_url.as_str()),
