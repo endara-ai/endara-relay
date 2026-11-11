@@ -113,6 +113,15 @@ pub fn append_google_authorize_params(authorize_url: &mut String, authorization_
     }
 }
 
+/// Append the RFC 8707 `resource` indicator (MCP authorization spec) when the
+/// protected resource is known. The URL must already carry a query parameter.
+pub fn append_resource_param(authorize_url: &mut String, resource: Option<&str>) {
+    if let Some(resource) = resource {
+        authorize_url.push_str("&resource=");
+        authorize_url.extend(url::form_urlencoded::byte_serialize(resource.as_bytes()));
+    }
+}
+
 /// Maximum age for a pending OAuth flow before it's considered stale.
 const FLOW_MAX_AGE: Duration = Duration::from_secs(600); // 10 minutes
 
@@ -148,6 +157,9 @@ pub struct PendingFlow {
     /// ordinary resource OAuth flows. When `None` on an EMA flow the callback
     /// falls back to `idp_issuer` as the key.
     pub idp_credential_key: Option<String>,
+    /// RFC 8707 resource indicator sent on the authorize request; the code
+    /// exchange must repeat it. Set via [`OAuthFlowManager::attach_resource`].
+    pub resource: Option<String>,
     pub created_at: Instant,
     /// Per-endpoint reset generation this flow was started under. A
     /// "Reset authorization" bumps the endpoint's generation (see
@@ -218,6 +230,7 @@ impl OAuthFlowManager {
             iss_parameter_supported,
             idp_issuer: None,
             idp_credential_key: None,
+            resource: None,
             created_at: Instant::now(),
             generation: *generations.get(endpoint_name).unwrap_or(&0),
         };
@@ -270,6 +283,7 @@ impl OAuthFlowManager {
             iss_parameter_supported,
             idp_issuer: None,
             idp_credential_key: None,
+            resource: None,
             created_at: Instant::now(),
             generation: expected_generation,
         };
@@ -321,12 +335,21 @@ impl OAuthFlowManager {
             iss_parameter_supported,
             idp_issuer: Some(idp_issuer.to_string()),
             idp_credential_key: Some(idp_credential_key.to_string()),
+            resource: None,
             created_at: Instant::now(),
             generation: *generations.get(endpoint_name).unwrap_or(&0),
         };
         self.pending.write().await.insert(state.clone(), flow);
         drop(generations);
         state
+    }
+
+    /// Record the RFC 8707 resource indicator on a pending flow. Call before
+    /// handing out the authorize URL so the callback always sees it.
+    pub async fn attach_resource(&self, state: &str, resource: Option<&str>) {
+        if let Some(flow) = self.pending.write().await.get_mut(state) {
+            flow.resource = resource.map(str::to_string);
+        }
     }
 
     /// Consume a pending flow (called by /oauth/callback).
@@ -509,6 +532,8 @@ pub struct OAuthSetupSession {
     /// Discovered authorization server issuer (RFC 8414 `issuer`), used for
     /// RFC 9207 `iss` validation on the callback. `None` when not discovered.
     pub issuer: Option<String>,
+    /// RFC 8707 resource indicator from RFC 9728 discovery of `url`.
+    pub resource: Option<String>,
     /// Client ID (from DCR or manual input).
     pub client_id: Option<String>,
     /// Client secret (optional).
@@ -581,6 +606,7 @@ impl OAuthSetupManager {
             registration_endpoint: None,
             oauth_server_url: None,
             issuer: None,
+            resource: None,
             client_id: None,
             client_secret: None,
             client_secret_expires_at: 0,
@@ -1201,6 +1227,7 @@ mod tests {
             token_type: "Bearer".into(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
 
         assert!(mgr.mark_authorized(&id, tokens).await);
@@ -1223,6 +1250,7 @@ mod tests {
             token_type: "Bearer".into(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
         assert!(!mgr.mark_authorized(&fake_id, tokens).await);
     }
@@ -1395,6 +1423,7 @@ mod tests {
             token_type: "Bearer".into(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
         assert!(
             !mgr.mark_authorized(&id, tokens.clone()).await,

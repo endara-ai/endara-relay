@@ -46,6 +46,9 @@ struct MockOAuthState {
     port: u16,
     /// Whether to include registration_endpoint in discovery.
     enable_dcr: bool,
+    /// When set, /token rejects any grant whose RFC 8707 `resource` differs
+    /// (Product Hunt-style strict resource indicators).
+    required_resource: RwLock<Option<String>>,
 }
 
 /// Shared state for the mock MCP upstream server.
@@ -56,6 +59,9 @@ struct MockMcpState {
     requests: RwLock<Vec<RecordedRequest>>,
     /// If true, the next request returns 401 even with valid token (simulates revocation).
     force_401: RwLock<bool>,
+    /// RFC 9728 metadata served at `/.well-known/oauth-protected-resource/mcp`
+    /// (404 when `None`).
+    protected_resource: RwLock<Option<Value>>,
 }
 
 /// Start the mock OAuth authorization server. Returns (addr, state).
@@ -70,6 +76,7 @@ async fn start_mock_oauth(token_ttl: u64, enable_dcr: bool) -> (SocketAddr, Arc<
         fail_refresh: RwLock::new(false),
         port: 0, // will be set below
         enable_dcr,
+        required_resource: RwLock::new(None),
     });
 
     let app = Router::new()
@@ -179,6 +186,16 @@ async fn mock_token(
 
     let grant_type = params.get("grant_type").map(|s| s.as_str()).unwrap_or("");
 
+    if let Some(required) = state.required_resource.read().await.as_deref() {
+        if params.get("resource").map(String::as_str) != Some(required) {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                axum::Json(json!({"error": "invalid_target"})),
+            )
+                .into_response();
+        }
+    }
+
     // Check if refresh should fail
     if grant_type == "refresh_token" && *state.fail_refresh.read().await {
         return (
@@ -250,6 +267,7 @@ async fn start_mock_mcp(initial_token: &str) -> (SocketAddr, Arc<MockMcpState>) 
         valid_token: RwLock::new(initial_token.to_string()),
         requests: RwLock::new(Vec::new()),
         force_401: RwLock::new(false),
+        protected_resource: RwLock::new(None),
     });
 
     async fn mcp_handler(
@@ -340,8 +358,21 @@ async fn start_mock_mcp(initial_token: &str) -> (SocketAddr, Arc<MockMcpState>) 
         }
     }
 
+    async fn protected_resource_handler(
+        State(state): State<Arc<MockMcpState>>,
+    ) -> axum::response::Response {
+        match state.protected_resource.read().await.clone() {
+            Some(meta) => axum::Json(meta).into_response(),
+            None => StatusCode::NOT_FOUND.into_response(),
+        }
+    }
+
     let app = Router::new()
         .route("/mcp", post(mcp_handler))
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            axum::routing::get(protected_resource_handler),
+        )
         .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -370,6 +401,7 @@ async fn start_mock_mcp_without_server_name() -> (SocketAddr, Arc<MockMcpState>)
         valid_token: RwLock::new("unused".to_string()),
         requests: RwLock::new(Vec::new()),
         force_401: RwLock::new(false),
+        protected_resource: RwLock::new(None),
     });
 
     async fn mcp_handler_no_name(
@@ -592,6 +624,12 @@ async fn test_oauth_fresh_login_flow() {
     // Simulate the OAuth login flow
     let login_result = simulate_oauth_login(harness.api(), "test-oauth").await;
     assert_eq!(login_result["status"].as_u64(), Some(200));
+    // The upstream publishes no RFC 9728 metadata, so no `resource` is sent:
+    // non-MCP authorization servers (e.g. Entra) can reject unknown ones.
+    assert!(
+        login_result["query_params"].get("resource").is_none(),
+        "no resource indicator without protected-resource metadata: {login_result}"
+    );
 
     // Wait for authenticated state
     let status = poll_oauth_status(
@@ -679,6 +717,98 @@ async fn test_oauth_reauth_accumulates_prior_scope() {
         "re-auth scope must accumulate previously-granted scopes, got {:?}",
         scope
     );
+}
+
+/// Product Hunt regression: an MCP server that publishes RFC 9728 metadata and
+/// an authorization server that rejects grants without the matching RFC 8707
+/// `resource`. Login and refresh must both carry the protected resource.
+///
+/// `configured_as` mirrors an endpoint committed by Add Server (which persists
+/// `oauth_server_url`) versus a bare URL that relies on RFC 9728 discovery.
+async fn assert_resource_indicator_flow(configured_as: bool) {
+    let (oauth_addr, oauth_state) = start_mock_oauth(3600, true).await;
+    let (mcp_addr, mcp_state) = start_mock_mcp("access-token-1").await;
+
+    let oauth_url = format!("http://127.0.0.1:{}", oauth_addr.port());
+    let mcp_url = format!("http://127.0.0.1:{}/mcp", mcp_addr.port());
+    *mcp_state.protected_resource.write().await = Some(json!({
+        "resource": &mcp_url,
+        "authorization_servers": [&oauth_url],
+    }));
+    *oauth_state.required_resource.write().await = Some(mcp_url.clone());
+
+    let config = ConfigBuilder::new()
+        .add_oauth_with_client(
+            "ph",
+            &mcp_url,
+            configured_as.then_some(oauth_url.as_str()),
+            "test-client",
+        )
+        .build();
+    let harness = RelayHarness::start(&config).await;
+
+    poll_oauth_status(harness.api(), "ph", "needs_login", Duration::from_secs(10)).await;
+    let login = simulate_oauth_login(harness.api(), "ph").await;
+    assert_eq!(
+        login["query_params"]["resource"].as_str(),
+        Some(mcp_url.as_str()),
+        "authorize URL must carry the protected resource: {login}"
+    );
+    poll_oauth_status(
+        harness.api(),
+        "ph",
+        "authenticated",
+        Duration::from_secs(15),
+    )
+    .await;
+
+    // Rotate the upstream's accepted token so the next call 401s and the relay
+    // must refresh against the strict token endpoint.
+    *mcp_state.valid_token.write().await = "access-token-2".to_string();
+    let mut client = McpClient::new(harness.base_url());
+    client.initialize().await.expect("MCP init failed");
+    let _ = client
+        .call_tool("ph__echo", json!({"message": "hello"}))
+        .await;
+
+    let token_requests = oauth_state.requests.read().await.clone();
+    let grants: Vec<HashMap<String, String>> = token_requests
+        .iter()
+        .filter(|r| r.path == "/token")
+        .map(|r| {
+            url::form_urlencoded::parse(r.body.as_bytes())
+                .into_owned()
+                .collect()
+        })
+        .collect();
+    for grant_type in ["authorization_code", "refresh_token"] {
+        let grant = grants
+            .iter()
+            .find(|g| g.get("grant_type").map(String::as_str) == Some(grant_type))
+            .unwrap_or_else(|| panic!("no {grant_type} grant in {grants:?}"));
+        assert_eq!(
+            grant.get("resource").map(String::as_str),
+            Some(mcp_url.as_str()),
+            "{grant_type} grant must carry the protected resource"
+        );
+    }
+    poll_oauth_status(
+        harness.api(),
+        "ph",
+        "authenticated",
+        Duration::from_secs(15),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_oauth_resource_indicator_with_configured_auth_server() {
+    assert_resource_indicator_flow(true).await;
+}
+
+#[tokio::test]
+async fn test_oauth_resource_indicator_with_rfc9728_discovery() {
+    assert_resource_indicator_flow(false).await;
 }
 
 /// §4.2 #2: Token refresh on 401 — expire token, make tool call, verify refresh
@@ -1521,6 +1651,7 @@ async fn refresh_404_triggers_discovery_then_caches_new_token_endpoint() {
         token_type: "Bearer".to_string(),
         scope: None,
         issued_at: None,
+        resource: None,
     });
 
     // First refresh: /old/token returns 404 -> discovery -> /new/token.

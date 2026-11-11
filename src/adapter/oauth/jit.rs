@@ -271,6 +271,9 @@ impl JitInterceptor {
                 disc.authorization_response_iss_parameter_supported,
             )
             .await;
+        self.flow_manager
+            .attach_resource(&state_param, disc.resource.as_deref())
+            .await;
 
         // Choose the query separator based on whether the discovered
         // authorization endpoint already carries a query string; appending a
@@ -298,6 +301,7 @@ impl JitInterceptor {
             &mut authorize_url,
             &disc.authorization_endpoint,
         );
+        crate::oauth::append_resource_param(&mut authorize_url, disc.resource.as_deref());
         // Scope accumulation for step-up authorization: when this endpoint
         // already has a persisted token with a granted scope, request the
         // UNION of previously-granted scopes and the scopes we'd request today
@@ -677,6 +681,11 @@ mod tests {
             Some("http://127.0.0.1:9400/oauth/callback")
         );
         assert!(q.contains_key("code_challenge"));
+        assert_eq!(
+            q.get("resource"),
+            Some(&base),
+            "RFC 8707 resource from RFC 9728 metadata"
+        );
         let state_param = q.get("state").expect("state param present").clone();
 
         // The pending flow carries the DCR-issued client_secret (honored even
@@ -690,6 +699,7 @@ mod tests {
         assert_eq!(flow.client_secret.as_deref(), Some("jit-secret-456"));
         assert_eq!(flow.token_endpoint, format!("{}/token", base));
         assert_eq!(flow.redirect_uri, "http://127.0.0.1:9400/oauth/callback");
+        assert_eq!(flow.resource.as_deref(), Some(base.as_str()));
 
         server.abort();
     }

@@ -375,6 +375,7 @@ pub async fn redeem_id_jag(
         token_type: json["token_type"].as_str().unwrap_or("Bearer").to_string(),
         scope: json["scope"].as_str().map(|s| s.to_string()),
         issued_at: Some(now_secs),
+        resource: None,
     })
 }
 
@@ -1423,6 +1424,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: Some(now_unix()),
+            resource: None,
         }
     }
 
@@ -1434,6 +1436,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: Some(900),
+            resource: None,
         }
     }
 

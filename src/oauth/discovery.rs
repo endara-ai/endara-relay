@@ -9,7 +9,6 @@ use crate::oauth::url_guard::{self, UrlGuardError};
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct ProtectedResourceMetadata {
     /// The resource server's identifier (usually its URL)
-    #[allow(dead_code)]
     pub resource: String,
     /// List of authorization server URLs that protect this resource
     pub authorization_servers: Vec<String>,
@@ -82,6 +81,10 @@ pub struct DiscoveryResult {
     /// Metadata Documents (CIMD).
     #[allow(dead_code)]
     pub client_id_metadata_document_supported: bool,
+    /// RFC 8707 resource indicator: the RFC 9728 `resource` of the protected
+    /// resource. `None` when discovery started from the authorization server,
+    /// so non-MCP servers never receive a `resource` they may reject.
+    pub resource: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -235,36 +238,68 @@ pub async fn discover_oauth_server(
     resource_url: &str,
     allow_insecure: bool,
 ) -> Result<DiscoveryResult, DiscoveryError> {
-    // Step 1: Fetch protected resource metadata (with root fallback) using a
-    // client pinned to the resource host.
+    let resource_meta = fetch_protected_resource_metadata(resource_url, allow_insecure).await?;
+    // Step 2: Fetch authorization server metadata (RFC 8414).
+    discover_from_resource_metadata(resource_meta, allow_insecure).await
+}
+
+/// Fetch RFC 9728 protected-resource metadata for `resource_url`
+/// (`{origin}/.well-known/oauth-protected-resource{path}`, falling back to the
+/// root form on 404) using a client pinned to the resource host.
+pub async fn fetch_protected_resource_metadata(
+    resource_url: &str,
+    allow_insecure: bool,
+) -> Result<ProtectedResourceMetadata, DiscoveryError> {
     let well_known_url = build_well_known_url(resource_url, "oauth-protected-resource")?;
     let resource_client = url_guard::validated_client(&well_known_url, allow_insecure).await?;
 
-    let resource_meta: ProtectedResourceMetadata =
-        match fetch_well_known(&resource_client, &well_known_url).await {
-            Ok(resp) => resp.json().await?,
-            Err(DiscoveryError::MetadataNotFound { .. }) if has_path(resource_url) => {
-                // Fallback: try root well-known URL without path (same host, reuse client)
-                let root_url = build_well_known_url_root(resource_url, "oauth-protected-resource")?;
-                fetch_well_known(&resource_client, &root_url)
-                    .await
-                    .map_err(|_| DiscoveryError::MetadataNotFound {
-                        url: well_known_url.clone(),
-                    })?
-                    .json()
-                    .await?
-            }
-            Err(e) => return Err(e),
-        };
+    match fetch_well_known(&resource_client, &well_known_url).await {
+        Ok(resp) => Ok(resp.json().await?),
+        Err(DiscoveryError::MetadataNotFound { .. }) if has_path(resource_url) => {
+            // Fallback: try root well-known URL without path (same host, reuse client)
+            let root_url = build_well_known_url_root(resource_url, "oauth-protected-resource")?;
+            Ok(fetch_well_known(&resource_client, &root_url)
+                .await
+                .map_err(|_| DiscoveryError::MetadataNotFound {
+                    url: well_known_url.clone(),
+                })?
+                .json()
+                .await?)
+        }
+        Err(e) => Err(e),
+    }
+}
 
+/// Best-effort RFC 8707 resource indicator for an MCP endpoint whose
+/// authorization server is configured explicitly (so discovery skipped RFC
+/// 9728). Any failure means "send no `resource`".
+pub async fn discover_resource_indicator(
+    resource_url: &str,
+    allow_insecure: bool,
+) -> Option<String> {
+    let meta = fetch_protected_resource_metadata(resource_url, allow_insecure)
+        .await
+        .ok()?;
+    non_empty(meta.resource)
+}
+
+fn non_empty(s: String) -> Option<String> {
+    let trimmed = s.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+async fn discover_from_resource_metadata(
+    resource_meta: ProtectedResourceMetadata,
+    allow_insecure: bool,
+) -> Result<DiscoveryResult, DiscoveryError> {
     let auth_server_url = resource_meta
         .authorization_servers
         .first()
         .ok_or(DiscoveryError::NoAuthorizationServer)?
         .clone();
-
-    // Step 2: Fetch authorization server metadata (RFC 8414).
-    discover_authorization_server(&auth_server_url, allow_insecure).await
+    let mut disc = discover_authorization_server(&auth_server_url, allow_insecure).await?;
+    disc.resource = non_empty(resource_meta.resource);
+    Ok(disc)
 }
 
 /// Discover OAuth server metadata starting from an EXPLICIT RFC 9728
@@ -294,13 +329,7 @@ pub async fn discover_oauth_server_from_metadata(
             .json()
             .await?;
 
-    let auth_server_url = resource_meta
-        .authorization_servers
-        .first()
-        .ok_or(DiscoveryError::NoAuthorizationServer)?
-        .clone();
-
-    discover_authorization_server(&auth_server_url, allow_insecure).await
+    discover_from_resource_metadata(resource_meta, allow_insecure).await
 }
 
 /// Discover OAuth authorization server metadata directly (RFC 8414 + OIDC).
@@ -434,6 +463,7 @@ pub async fn discover_authorization_server(
         authorization_response_iss_parameter_supported: as_meta
             .authorization_response_iss_parameter_supported,
         client_id_metadata_document_supported: as_meta.client_id_metadata_document_supported,
+        resource: None,
     })
 }
 

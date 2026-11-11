@@ -23,6 +23,10 @@ pub struct TokenSet {
     /// Unix timestamp (seconds) when the token was issued.
     #[serde(default)]
     pub issued_at: Option<u64>,
+    /// RFC 8707 resource indicator the grant was issued for; repeated on
+    /// refresh because strict authorization servers require it there too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
 }
 
 impl TokenSet {
@@ -460,6 +464,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: Some("read write".to_string()),
             issued_at: Some(1699996400),
+            resource: None,
         }
     }
 
@@ -588,6 +593,7 @@ mod tests {
             token_type: "Bearer".into(),
             scope: None,
             issued_at: Some(now),
+            resource: None,
         };
         assert!(ts.is_valid());
         assert_eq!(ts.issued_at, Some(now));
@@ -984,6 +990,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: Some("read write".to_string()),
             issued_at: Some(now_secs),
+            resource: None,
         };
         assert_eq!(token_set.expires_at, Some(1_700_003_600));
         assert_eq!(token_set.issued_at, Some(now_secs));
@@ -1001,6 +1008,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: Some(now_secs),
+            resource: None,
         };
         assert_eq!(token_set.expires_at, None);
         assert_eq!(token_set.issued_at, Some(now_secs));
@@ -1019,6 +1027,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: Some(now_secs),
+            resource: None,
         };
         // issued_at should be within 1 second of now
         let issued = token_set.issued_at.unwrap();

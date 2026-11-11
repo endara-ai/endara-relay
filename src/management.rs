@@ -1422,6 +1422,7 @@ async fn oauth_start_inner(
         auth_server_label,
         issuer,
         iss_supported,
+        discovered_resource,
     ) = if let Some(ref server_url) = oauth_server_url {
         // Prefer RFC 8414 discovery against the configured AS URL. If it
         // succeeds, use the discovered endpoints (explicit token_endpoint
@@ -1444,6 +1445,10 @@ async fn oauth_start_inner(
                     Some(disc.auth_server_url),
                     Some(disc.issuer),
                     disc.authorization_response_iss_parameter_supported,
+                    // Add Server persists `oauth_server_url`, so this branch
+                    // skipped RFC 9728; ask the endpoint for its resource.
+                    discovery::discover_resource_indicator(&endpoint_url, allow_insecure_oauth)
+                        .await,
                 )
             }
             Err(e) if e.is_transient() => {
@@ -1485,6 +1490,7 @@ async fn oauth_start_inner(
                     None::<String>,
                     None::<String>,
                     false,
+                    None::<String>,
                 )
             }
             Err(e) => {
@@ -1520,6 +1526,7 @@ async fn oauth_start_inner(
                 Some(disc.auth_server_url),
                 Some(disc.issuer),
                 disc.authorization_response_iss_parameter_supported,
+                disc.resource,
             ),
             Err(e) => {
                 return error_response(
@@ -1910,6 +1917,9 @@ async fn oauth_start_inner(
         )
         .into_response();
     };
+    flow_mgr
+        .attach_resource(&state_param, discovered_resource.as_deref())
+        .await;
 
     // ── Step 4: Build authorization URL ────────────────────────────────
     let mut authorize_url = format!(
@@ -1932,6 +1942,7 @@ async fn oauth_start_inner(
     // Google needs `access_type=offline` for a refresh token to be issued
     // (shared helper — see `crate::oauth::append_google_authorize_params`).
     append_google_authorize_params(&mut authorize_url, &authorization_endpoint);
+    crate::oauth::append_resource_param(&mut authorize_url, discovered_resource.as_deref());
 
     // Scope accumulation for step-up authorization: union the scopes we'd
     // request today (config scopes) with any previously-granted scopes from a
@@ -3301,6 +3312,13 @@ async fn oauth_setup(
     let discovered_scopes = disc.scopes_supported.clone();
     let auth_server_url = disc.auth_server_url.clone();
     let issuer = disc.issuer.clone();
+    // An explicit `oauth_server_url` discovery base is not the MCP resource,
+    // so its metadata cannot name the resource; ask the endpoint instead.
+    let resource = if discovery_base == body.url.as_str() {
+        disc.resource.clone()
+    } else {
+        discovery::discover_resource_indicator(&body.url, allow_insecure_oauth).await
+    };
 
     setup_mgr
         .get_session_mut(&session_id, |s| {
@@ -3309,6 +3327,7 @@ async fn oauth_setup(
             s.registration_endpoint = disc.registration_endpoint.clone();
             s.oauth_server_url = Some(disc.auth_server_url.clone());
             s.issuer = Some(disc.issuer.clone());
+            s.resource = resource.clone();
         })
         .await;
 
@@ -3428,6 +3447,9 @@ async fn oauth_setup(
                     disc.authorization_response_iss_parameter_supported,
                 )
                 .await;
+            flow_mgr
+                .attach_resource(&state_param, resource.as_deref())
+                .await;
 
             let mut authorize_url = format!(
                 "{}?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
@@ -3442,6 +3464,7 @@ async fn oauth_setup(
             // (shared helper); setup-created Google endpoints need it too or
             // their very first grant is access-token-only.
             append_google_authorize_params(&mut authorize_url, &auth_endpoint);
+            crate::oauth::append_resource_param(&mut authorize_url, resource.as_deref());
 
             // Scope accumulation: union any previously-granted scopes (from a
             // persisted TokenSet for this name) with the requested scopes.
@@ -3560,11 +3583,13 @@ async fn oauth_setup_credentials(
                 s.scopes.clone(),
                 s.name.clone(),
                 s.issuer.clone(),
+                s.resource.clone(),
             )
         })
         .await;
 
-    let Some((Some(auth_endpoint), Some(token_endpoint), scopes, name, issuer)) = session_data
+    let Some((Some(auth_endpoint), Some(token_endpoint), scopes, name, issuer, resource)) =
+        session_data
     else {
         return error_response(StatusCode::NOT_FOUND, "session not found or expired", None)
             .into_response();
@@ -3609,6 +3634,9 @@ async fn oauth_setup_credentials(
             false,
         )
         .await;
+    flow_mgr
+        .attach_resource(&state_param, resource.as_deref())
+        .await;
 
     let mut authorize_url = format!(
         "{}?response_type=code&client_id={}&redirect_uri={}&state={}&code_challenge={}&code_challenge_method=S256",
@@ -3623,6 +3651,7 @@ async fn oauth_setup_credentials(
     // helper); the manual-credentials setup path needs it too or the very
     // first grant is access-token-only.
     append_google_authorize_params(&mut authorize_url, &auth_endpoint);
+    crate::oauth::append_resource_param(&mut authorize_url, resource.as_deref());
 
     // Scope accumulation: union previously-granted scopes (from a persisted
     // TokenSet for this endpoint) with the requested scopes for step-up.
@@ -9135,6 +9164,7 @@ command = "echo"
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: Some(now),
+            resource: None,
         };
         *inner.tokens.write().await = Some(token_set);
         *inner.state.write().await = OAuthState::Authenticated;
@@ -9338,6 +9368,7 @@ command = "echo"
             token_type: "Bearer".to_string(),
             scope: Some("pre-reset-scope".to_string()),
             issued_at: None,
+            resource: None,
         };
         token_manager.save("oauth-ep", &token_set).await.unwrap();
         // Manually supplied client credentials, stored only in the DCR
@@ -9535,6 +9566,7 @@ command = "echo"
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         });
 
         let app = management_routes(state);
@@ -9869,6 +9901,7 @@ command = "echo"
                     token_type: "Bearer".into(),
                     scope: Some("read write".into()),
                     issued_at: None,
+                    resource: None,
                 });
             })
             .await;
@@ -10064,6 +10097,7 @@ command = "echo"
                     token_type: "Bearer".into(),
                     scope: None,
                     issued_at: None,
+                    resource: None,
                 });
             })
             .await;
@@ -10164,6 +10198,7 @@ command = "echo"
                     token_type: "Bearer".into(),
                     scope: None,
                     issued_at: None,
+                    resource: None,
                 });
                 f(s);
             })
@@ -10381,6 +10416,7 @@ command = "echo"
                     token_type: "Bearer".into(),
                     scope: None,
                     issued_at: None,
+                    resource: None,
                 });
             })
             .await;
@@ -10456,6 +10492,7 @@ command = "echo"
                     token_type: "Bearer".into(),
                     scope: None,
                     issued_at: None,
+                    resource: None,
                 });
             })
             .await;
@@ -10733,6 +10770,7 @@ command = "echo"
                     token_type: "Bearer".into(),
                     scope: None,
                     issued_at: None,
+                    resource: None,
                 });
             })
             .await;

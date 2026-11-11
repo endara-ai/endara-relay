@@ -650,6 +650,7 @@ async fn oauth_login_heals_stale_empty_tools_list() {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         })
         .await;
 

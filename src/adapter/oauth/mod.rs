@@ -908,7 +908,7 @@ impl OAuthAdapterInner {
         // holder acquires the `refresh_mutex`. The guard is dropped before
         // `transition_if_current` below (which re-acquires the
         // `apply_lock` itself).
-        let refresh_token = {
+        let (refresh_token, resource) = {
             let _epoch_guard = self.apply_lock.lock().await;
             if refresh_epoch != self.grant_epoch.load(Ordering::Acquire) {
                 info!(
@@ -920,7 +920,10 @@ impl OAuthAdapterInner {
                 });
             }
             let tokens = self.tokens.read().await;
-            tokens.as_ref().and_then(|t| t.refresh_token.clone())
+            tokens
+                .as_ref()
+                .map(|t| (t.refresh_token.clone(), t.resource.clone()))
+                .unwrap_or_default()
         };
         let refresh_token = match refresh_token {
             Some(rt) => rt,
@@ -971,6 +974,9 @@ impl OAuthAdapterInner {
         ];
         if let Some(secret) = posted_client_secret {
             form_parts.push(("client_secret", secret));
+        }
+        if let Some(resource) = resource {
+            form_parts.push(("resource", resource));
         }
 
         let form_body: String = url::form_urlencoded::Serializer::new(String::new())
@@ -1483,9 +1489,12 @@ impl OAuthAdapterInner {
 
         // Handle token rotation: if the server returns a new refresh_token, use it;
         // otherwise keep the old one.
-        let old_refresh_token = {
+        let (old_refresh_token, resource) = {
             let tokens = self.tokens.read().await;
-            tokens.as_ref().and_then(|t| t.refresh_token.clone())
+            tokens
+                .as_ref()
+                .map(|t| (t.refresh_token.clone(), t.resource.clone()))
+                .unwrap_or_default()
         };
 
         let new_token_set = TokenSet {
@@ -1506,6 +1515,7 @@ impl OAuthAdapterInner {
                 .to_string(),
             scope: token_json["scope"].as_str().map(|s| s.to_string()),
             issued_at: Some(now_secs),
+            resource,
         };
 
         TokenPostOutcome::Success(new_token_set)
@@ -3043,6 +3053,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: Some(now_secs()),
+            resource: None,
         };
         tm.save("ema-ep", &token).await.unwrap();
 
@@ -3070,6 +3081,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: Some(now_secs()),
+            resource: None,
         };
         tm.save("ema-ep", &token).await.unwrap();
 
@@ -3236,6 +3248,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
         adapter.inner.apply_tokens(token_set).await;
 
@@ -3427,6 +3440,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
         adapter.inner.apply_tokens(token_set).await;
 
@@ -3468,6 +3482,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
         adapter.inner.apply_tokens(token_set).await;
         assert!(tm.load("test").await.unwrap().is_some());
@@ -3489,6 +3504,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
         let outcome = adapter
             .inner
@@ -3516,6 +3532,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
         adapter.inner.apply_tokens(new_grant).await;
         assert_eq!(
@@ -3546,6 +3563,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
         adapter.inner.apply_tokens(old_grant).await;
 
@@ -3566,6 +3584,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
         adapter.inner.apply_tokens(new_grant).await;
 
@@ -3578,6 +3597,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
         let outcome = adapter
             .inner
@@ -3624,6 +3644,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
         let outcome = adapter
             .inner
@@ -3665,6 +3686,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
         adapter.inner.apply_tokens(grant_a).await;
 
@@ -3680,6 +3702,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
         adapter.inner.apply_tokens(grant_b).await;
         let state_before = adapter.inner.state.read().await.clone();
@@ -4000,6 +4023,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
         adapter.inner.apply_tokens(token_set).await;
 
@@ -4042,6 +4066,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
         adapter.inner.apply_tokens(token_set).await;
 
@@ -4102,6 +4127,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         });
         adapter
     }
@@ -4222,6 +4248,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         });
         adapter
     }
@@ -4638,6 +4665,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
         adapter.inner.apply_tokens(token_set).await;
 
@@ -4763,6 +4791,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
         adapter.inner.apply_tokens(token_set).await;
 
@@ -7177,6 +7206,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         };
         adapter.inner.apply_tokens(token_set).await;
 
@@ -7235,6 +7265,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         }
     }
 
@@ -8640,6 +8671,7 @@ mod tests {
                         token_type: "Bearer".to_string(),
                         scope: None,
                         issued_at: None,
+                        resource: None,
                     })
                     .await;
 
@@ -8821,6 +8853,7 @@ mod tests {
                         token_type: "Bearer".to_string(),
                         scope: None,
                         issued_at: None,
+                        resource: None,
                     })
                     .await;
 

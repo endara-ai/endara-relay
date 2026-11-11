@@ -312,6 +312,7 @@ fn expired_token_set() -> TokenSet {
         token_type: "Bearer".to_string(),
         scope: None,
         issued_at: Some(900),
+        resource: None,
     }
 }
 
