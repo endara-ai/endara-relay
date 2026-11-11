@@ -3901,6 +3901,7 @@ mod tests {
                 token_type: "Bearer".to_string(),
                 scope: None,
                 issued_at: Some(now),
+                resource: None,
             },
         )
         .await
@@ -4089,6 +4090,7 @@ mod tests {
                 token_type: "Bearer".to_string(),
                 scope: None,
                 issued_at: Some(now),
+                resource: None,
             },
         )
         .await

@@ -2214,6 +2214,9 @@ async fn oauth_callback(
     if let Some(ref secret) = flow.client_secret {
         form_parts.push(("client_secret".into(), secret.clone()));
     }
+    if let Some(ref resource) = flow.resource {
+        form_parts.push(("resource".into(), resource.clone()));
+    }
 
     let form_body: String = url::form_urlencoded::Serializer::new(String::new())
         .extend_pairs(form_parts.iter())
@@ -2343,6 +2346,7 @@ async fn oauth_callback(
             .to_string(),
         scope: token_json["scope"].as_str().map(|s| s.to_string()),
         issued_at: Some(now_secs),
+        resource: flow.resource.clone(),
     };
 
     // Commit phase: serialize against "Reset authorization" for this

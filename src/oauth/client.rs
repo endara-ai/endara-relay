@@ -16,7 +16,20 @@ use std::future::Future;
 /// Endara's hosted Client ID Metadata Document (CIMD). Used as the `client_id`
 /// for zero-config public-client authentication when the authorization server
 /// advertises `client_id_metadata_document_supported`.
-pub const ENDARA_CLIENT_METADATA_URL: &str = "https://endara.ai/oauth/client-metadata.json";
+///
+/// Must be served without redirects: CIMD forbids the AS from following them.
+pub const ENDARA_CLIENT_METADATA_URL: &str = "https://www.endara.ai/oauth/client-metadata.json";
+
+/// The original apex URL, which 308-redirects to `www` and so fails on
+/// spec-compliant authorization servers. Persisted copies are migrated on read.
+pub const LEGACY_ENDARA_CLIENT_METADATA_URL: &str = "https://endara.ai/oauth/client-metadata.json";
+
+/// Rewrite a persisted legacy CIMD `client_id` to [`ENDARA_CLIENT_METADATA_URL`].
+pub fn migrate_legacy_client_id(client_id: &mut String) {
+    if client_id == LEGACY_ENDARA_CLIENT_METADATA_URL {
+        *client_id = ENDARA_CLIENT_METADATA_URL.to_string();
+    }
+}
 
 /// Which path produced the resolved client credentials. Surfaced in structured
 /// logs as `client_registration=<as_str>`.

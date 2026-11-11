@@ -1212,6 +1212,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         });
         *inner.state.write().await = OAuthState::ConnectionFailed;
         inner
@@ -1271,6 +1272,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: None,
+            resource: None,
         }
     }
 

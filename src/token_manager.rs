@@ -23,6 +23,10 @@ pub struct TokenSet {
     /// Unix timestamp (seconds) when the token was issued.
     #[serde(default)]
     pub issued_at: Option<u64>,
+    /// RFC 8707 resource indicator the grant was issued for; repeated on
+    /// refresh because strict authorization servers require it there too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
 }
 
 impl TokenSet {
@@ -263,7 +267,11 @@ impl TokenManager {
     ) -> Result<Option<DcrCredentials>, TokenError> {
         let path = self.token_dir.join(format!("{}.dcr.json", endpoint_name));
         match tokio::fs::read_to_string(&path).await {
-            Ok(json) => Ok(Some(serde_json::from_str(&json)?)),
+            Ok(json) => {
+                let mut creds: DcrCredentials = serde_json::from_str(&json)?;
+                crate::oauth::client::migrate_legacy_client_id(&mut creds.client_id);
+                Ok(Some(creds))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(TokenError::Io(e)),
         }
@@ -460,6 +468,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: Some("read write".to_string()),
             issued_at: Some(1699996400),
+            resource: None,
         }
     }
 
@@ -588,6 +597,7 @@ mod tests {
             token_type: "Bearer".into(),
             scope: None,
             issued_at: Some(now),
+            resource: None,
         };
         assert!(ts.is_valid());
         assert_eq!(ts.issued_at, Some(now));
@@ -623,6 +633,27 @@ mod tests {
         mgr.save_dcr("test-ep", &creds).await.unwrap();
         let loaded = mgr.load_dcr("test-ep").await.unwrap().unwrap();
         assert_eq!(loaded, creds);
+    }
+
+    /// Records saved before the hosted CIMD moved to `www.endara.ai` carry the
+    /// apex URL, which 308-redirects and is rejected by spec-compliant ASes.
+    #[tokio::test]
+    async fn dcr_load_migrates_legacy_cimd_client_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        let creds = DcrCredentials {
+            client_id: crate::oauth::client::LEGACY_ENDARA_CLIENT_METADATA_URL.to_string(),
+            issuer: Some("https://as.example.com".to_string()),
+            ..Default::default()
+        };
+        mgr.save_dcr("cimd-ep", &creds).await.unwrap();
+
+        let loaded = mgr.load_dcr("cimd-ep").await.unwrap().unwrap();
+        assert_eq!(
+            loaded.client_id,
+            crate::oauth::client::ENDARA_CLIENT_METADATA_URL
+        );
+        assert_eq!(loaded.issuer, creds.issuer);
     }
 
     #[tokio::test]
@@ -984,6 +1015,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: Some("read write".to_string()),
             issued_at: Some(now_secs),
+            resource: None,
         };
         assert_eq!(token_set.expires_at, Some(1_700_003_600));
         assert_eq!(token_set.issued_at, Some(now_secs));
@@ -1001,6 +1033,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: Some(now_secs),
+            resource: None,
         };
         assert_eq!(token_set.expires_at, None);
         assert_eq!(token_set.issued_at, Some(now_secs));
@@ -1019,6 +1052,7 @@ mod tests {
             token_type: "Bearer".to_string(),
             scope: None,
             issued_at: Some(now_secs),
+            resource: None,
         };
         // issued_at should be within 1 second of now
         let issued = token_set.issued_at.unwrap();
