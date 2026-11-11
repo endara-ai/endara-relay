@@ -286,7 +286,11 @@ No restart required.
 
 ### Crash recovery
 
-If a STDIO server process dies unexpectedly, Relay respawns it automatically with exponential backoff (1s doubling up to a 60s cap). After 3+ crashes in 60 seconds the endpoint is marked unhealthy — but Relay keeps retrying at the cap indefinitely, so a multi-minute outage (say, your container runtime restarting) self-heals without a manual restart. Once the server comes back, the merged tool catalog refreshes automatically. Plain HTTP servers get equivalent treatment: an upstream that stops responding is marked unhealthy after a few consecutive transport failures, and recovers automatically on the next successful request. This keeps your tool catalog available even when individual servers are flaky.
+If a STDIO server process dies unexpectedly, Relay respawns it automatically with exponential backoff (1s doubling up to a 60s cap). After 3+ crashes in 60 seconds the endpoint is marked unhealthy — but Relay keeps retrying at the cap indefinitely, so a multi-minute outage (say, your container runtime restarting) self-heals without a manual restart. Once the server comes back, the merged tool catalog refreshes automatically. HTTP servers get equivalent treatment: when an upstream drops (or is unreachable at startup), Relay reconnects in the background with the same backoff, re-establishes the session and refreshes the tool catalog once it answers. Permanent misconfigurations (`401`, `403`, `404`, or a malformed `initialize` response) are reported as failed instead of retried forever, while transient errors (network failures, timeouts, `5xx`, `429`) keep retrying. This keeps your tool catalog available even when individual servers are flaky.
+
+### OAuth resource indicators
+
+When an MCP server publishes RFC 9728 protected-resource metadata, Relay sends its `resource` as the RFC 8707 resource indicator on the authorize request, the code exchange and every refresh, as the MCP authorization spec requires. Strict servers such as Product Hunt reject sign-ins without it. The indicator is only sent when it identifies the endpoint being authorized (same origin, same or parent path), so a server cannot obtain a token minted for another service.
 
 ### OAuth self-healing
 
