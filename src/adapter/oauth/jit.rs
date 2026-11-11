@@ -1042,7 +1042,7 @@ mod tests {
         // The URL-encoded CIMD URL must appear verbatim in the raw query string.
         assert!(
             authorize_url
-                .contains("client_id=https%3A%2F%2Fendara.ai%2Foauth%2Fclient-metadata.json"),
+                .contains("client_id=https%3A%2F%2Fwww.endara.ai%2Foauth%2Fclient-metadata.json"),
             "got: {}",
             authorize_url
         );

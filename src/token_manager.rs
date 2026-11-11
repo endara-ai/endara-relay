@@ -267,7 +267,11 @@ impl TokenManager {
     ) -> Result<Option<DcrCredentials>, TokenError> {
         let path = self.token_dir.join(format!("{}.dcr.json", endpoint_name));
         match tokio::fs::read_to_string(&path).await {
-            Ok(json) => Ok(Some(serde_json::from_str(&json)?)),
+            Ok(json) => {
+                let mut creds: DcrCredentials = serde_json::from_str(&json)?;
+                crate::oauth::client::migrate_legacy_client_id(&mut creds.client_id);
+                Ok(Some(creds))
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(TokenError::Io(e)),
         }
@@ -629,6 +633,27 @@ mod tests {
         mgr.save_dcr("test-ep", &creds).await.unwrap();
         let loaded = mgr.load_dcr("test-ep").await.unwrap().unwrap();
         assert_eq!(loaded, creds);
+    }
+
+    /// Records saved before the hosted CIMD moved to `www.endara.ai` carry the
+    /// apex URL, which 308-redirects and is rejected by spec-compliant ASes.
+    #[tokio::test]
+    async fn dcr_load_migrates_legacy_cimd_client_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mgr = TokenManager::new(tmp.path().to_path_buf());
+        let creds = DcrCredentials {
+            client_id: crate::oauth::client::LEGACY_ENDARA_CLIENT_METADATA_URL.to_string(),
+            issuer: Some("https://as.example.com".to_string()),
+            ..Default::default()
+        };
+        mgr.save_dcr("cimd-ep", &creds).await.unwrap();
+
+        let loaded = mgr.load_dcr("cimd-ep").await.unwrap().unwrap();
+        assert_eq!(
+            loaded.client_id,
+            crate::oauth::client::ENDARA_CLIENT_METADATA_URL
+        );
+        assert_eq!(loaded.issuer, creds.issuer);
     }
 
     #[tokio::test]

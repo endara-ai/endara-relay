@@ -722,10 +722,19 @@ pub fn load_config(path: &Path) -> Result<Config, ConfigError> {
     parse_and_validate(&contents)
 }
 
+fn migrate_legacy_client_ids(config: &mut Config) {
+    for ep in &mut config.endpoints {
+        if let Some(ref mut client_id) = ep.client_id {
+            crate::oauth::client::migrate_legacy_client_id(client_id);
+        }
+    }
+}
+
 /// Parse TOML string, resolve env vars, and validate.
 #[allow(dead_code)]
 pub fn parse_and_validate(contents: &str) -> Result<Config, ConfigError> {
     let mut config: Config = toml::from_str(contents)?;
+    migrate_legacy_client_ids(&mut config);
     resolve_env_vars(&mut config)?;
     validate(&config)?;
     validate_profiles(&config).map_err(|errors| ConfigError::ValidationError(errors.join("; ")))?;
@@ -748,6 +757,7 @@ pub fn parse_and_validate_graceful(
     contents: &str,
 ) -> Result<(Config, Vec<EndpointValidationWarning>), ConfigError> {
     let mut config: Config = toml::from_str(contents)?;
+    migrate_legacy_client_ids(&mut config);
     let mut warnings = Vec::new();
 
     // Resolve env vars per-endpoint, collecting failures as warnings
@@ -1312,6 +1322,40 @@ url = "http://localhost:4000/mcp"
         assert_eq!(config.endpoints[0].transport, Transport::Stdio);
         assert_eq!(config.endpoints[1].transport, Transport::Sse);
         assert_eq!(config.endpoints[2].transport, Transport::Http);
+    }
+
+    /// Add Server committed the apex CIMD URL as `client_id`; both parse paths
+    /// must hand out the non-redirecting `www` URL instead.
+    #[test]
+    fn legacy_cimd_client_id_is_migrated_on_parse() {
+        let toml_str = format!(
+            r#"
+[relay]
+machine_name = "dev"
+
+[[endpoints]]
+name = "producthunt"
+transport = "oauth"
+url = "https://mcp.producthunt.com/mcp"
+client_id = "{}"
+
+[[endpoints]]
+name = "manual"
+transport = "oauth"
+url = "https://mcp.example.com/mcp"
+client_id = "my-client"
+"#,
+            crate::oauth::client::LEGACY_ENDARA_CLIENT_METADATA_URL
+        );
+        let strict = parse_and_validate(&toml_str).unwrap();
+        let (graceful, _) = parse_and_validate_graceful(&toml_str).unwrap();
+        for config in [strict, graceful] {
+            assert_eq!(
+                config.endpoints[0].client_id.as_deref(),
+                Some(crate::oauth::client::ENDARA_CLIENT_METADATA_URL)
+            );
+            assert_eq!(config.endpoints[1].client_id.as_deref(), Some("my-client"));
+        }
     }
 
     #[test]

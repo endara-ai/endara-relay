@@ -264,7 +264,7 @@ fn ema_config(urls: &FxUrls) -> OAuthAdapterConfig {
         endpoint_name: "ema-ep".to_string(),
         url: urls.mcp_url.clone(),
         token_endpoint_url: urls.as_token_endpoint.clone(),
-        client_id: "https://endara.ai/oauth/client-metadata.json".to_string(),
+        client_id: "https://www.endara.ai/oauth/client-metadata.json".to_string(),
         client_secret: None,
         heartbeat_interval_secs: 3600,
         probe_timeout_secs: 10,
