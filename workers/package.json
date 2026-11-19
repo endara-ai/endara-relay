@@ -1,0 +1,20 @@
+{
+  "name": "endara-relay-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "worker-build --release",
+    "dev": "npm run build && alchemy dev",
+    "deploy": "npm run build && alchemy deploy",
+    "destroy": "alchemy destroy",
+    "test:e2e": "node e2e/run.mjs"
+  },
+  "devDependencies": {
+    "@alchemy.run/cloudflare": "2.0.0-beta.87",
+    "@effect/platform-node": "^4.1.4",
+    "alchemy": "2.0.0-beta.87",
+    "effect": "^4.1.4",
+    "miniflare": "^4.20260730.0",
+    "workerd": "^1.20261026.1"
+  }
+}

@@ -1,0 +1,30 @@
+# Copy to relay.toml. Same format as the local relay's config.toml; only
+# remote streamable-HTTP endpoints are served. stdio / sse / OAuth endpoints
+# are skipped and listed under "skipped" in GET /healthz.
+
+[relay]
+machine_name = "edge"
+# toon_output = false
+# cache_ttl_secs = 300        # tools/resources/prompts list cache
+# request_timeout_secs = 30   # per upstream request
+
+[[endpoints]]
+name = "github"
+transport = "http"
+url = "https://api.githubcopilot.com/mcp/"
+# $GITHUB_TOKEN is bound as a Worker secret from your deploy environment.
+headers = { Authorization = "Bearer $GITHUB_TOKEN" }
+
+[[endpoints]]
+name = "docs"
+transport = "http"
+url = "https://docs.mcp.cloudflare.com/mcp"
+disabled_tools = []
+
+# Served at /mcp/research with only these endpoints.
+[[profiles]]
+name = "Research"
+path = "research"
+endpoints = ["docs"]
+js_execution = false
+toon_output = false
