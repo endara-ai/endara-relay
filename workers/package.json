@@ -5,8 +5,8 @@
   "scripts": {
     "build": "worker-build --release",
     "dev": "npm run build && alchemy dev",
-    "deploy": "npm run build && alchemy deploy",
-    "destroy": "alchemy destroy",
+    "deploy": "npm run build && alchemy deploy --stage prod",
+    "destroy": "alchemy destroy --stage prod",
     "test:e2e": "node e2e/run.mjs"
   },
   "devDependencies": {
