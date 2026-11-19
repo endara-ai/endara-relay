@@ -29,6 +29,11 @@ impl Cache {
         }
     }
 
+    /// No KV writes: used for one-off connection tests.
+    pub fn memory_only() -> Self {
+        Cache { kv: None }
+    }
+
     pub async fn get(&self, key: &str) -> Option<Value> {
         let hit = MEMORY.with(|m| {
             let mut m = m.borrow_mut();

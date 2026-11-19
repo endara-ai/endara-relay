@@ -11,6 +11,8 @@ process.env.MINIFLARE_WORKERD_PATH ??= workerd.default;
 const { Miniflare } = await import("miniflare");
 
 const AUTH = "e2e-relay-token";
+// Keep the relay and mocks running after the checks (for screenshots).
+const SERVE = process.env.E2E_SERVE === "1";
 const ALPHA_TOKEN = "alpha-secret";
 
 const alpha = await startMockUpstream({
@@ -37,49 +39,13 @@ const beta = await startMockUpstream({
   tools: [{ def: { name: "echo", description: "Echo over SSE", inputSchema: { type: "object" } }, run: ({ text: t }) => text(`beta:${t}`) }],
 });
 
-const relayToml = `
-[relay]
-machine_name = "e2e"
-request_timeout_secs = 5
-
-[[endpoints]]
-name = "alpha"
-description = "Alpha"
-transport = "http"
-url = "${alpha.url}"
-headers = { Authorization = "Bearer $ALPHA_TOKEN" }
-
-[[endpoints]]
-name = "beta"
-transport = "http"
-url = "${beta.url}"
-
-[[endpoints]]
-name = "down"
-transport = "http"
-url = "http://127.0.0.1:9/mcp"
-
-[[endpoints]]
-name = "local-files"
-transport = "stdio"
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-
-[[profiles]]
-name = "Solo"
-path = "solo"
-endpoints = ["beta"]
-js_execution = false
-toon_output = false
-`;
-
 const mf = new Miniflare({
   modules: true,
   scriptPath: "build/index.js",
   modulesRules: [{ type: "CompiledWasm", include: ["**/*.wasm"] }],
   compatibilityDate: "2026-10-01",
   kvNamespaces: ["RELAY_CACHE"],
-  bindings: { RELAY_CONFIG: relayToml, RELAY_AUTH_TOKEN: AUTH, ALPHA_TOKEN },
+  bindings: { RELAY_AUTH_TOKEN: AUTH, RELAY_ENCRYPTION_KEY: "e2e-encryption-key" },
 });
 const base = (await mf.ready).toString().replace(/\/$/, "");
 
@@ -113,12 +79,38 @@ function expect(cond, msg) {
 }
 const eq = (a, b, label) => expect(JSON.stringify(a) === JSON.stringify(b), `${label}: expected ${JSON.stringify(b)}, got ${JSON.stringify(a)}`);
 
-await check("healthz reports served and skipped endpoints", async () => {
+async function apiCall(method, path, body, token = AUTH) {
+  const res = await fetch(`${base}/api/${path}`, {
+    method,
+    headers: { ...(token ? { authorization: `Bearer ${token}` } : {}), ...(body ? { "content-type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const json = await res.json().catch(() => null);
+  transcript.push({ path: `/api/${path}`, method, request: body, status: res.status, response: json });
+  return { status: res.status, json };
+}
+
+const initialConfig = {
+  revision: 0,
+  settings: { machine_name: "e2e", toon_output: false, cache_ttl_secs: 300, request_timeout_secs: 5 },
+  endpoints: [
+    { id: "alpha", name: "alpha", description: "Alpha", url: alpha.url, headers: [{ name: "Authorization", value: `Bearer ${ALPHA_TOKEN}` }], enabled: true, disabled_tools: [] },
+    { id: "beta", name: "beta", url: beta.url, headers: [], enabled: true, disabled_tools: [] },
+    { id: "down", name: "down", url: "http://127.0.0.1:9/mcp", headers: [], enabled: true, disabled_tools: [] },
+  ],
+  profiles: [{ id: "solo", name: "Solo", path: "solo", endpoint_ids: ["beta"], toon_output: null }],
+};
+
+await check("web app config API saves servers and profiles", async () => {
+  const r = await apiCall("PUT", "config", initialConfig);
+  eq(r.status, 200, "status");
+  eq(r.json.revision, 1, "revision");
+  eq(r.json.endpoints.map((e) => e.name), ["alpha", "beta", "down"], "servers");
+});
+
+await check("healthz is public and reveals nothing", async () => {
   const res = await fetch(`${base}/healthz`);
-  const body = await res.json();
-  transcript.push({ path: "/healthz", status: res.status, response: body });
-  eq(body.endpoints, ["alpha", "beta", "down"], "endpoints");
-  eq(body.skipped.map((s) => s.name), ["local-files"], "skipped");
+  eq(await res.json(), { status: "ok" }, "body");
 });
 
 await check("missing bearer token is rejected", async () => {
@@ -256,16 +248,94 @@ await check("parse error returns -32700", async () => {
   eq(body.error.code, -32700, "code");
 });
 
-await check("healthz probe reports per-endpoint reachability", async () => {
-  const res = await fetch(`${base}/healthz?probe=1`, { headers: { authorization: `Bearer ${AUTH}` } });
-  const body = await res.json();
-  transcript.push({ path: "/healthz?probe=1", status: res.status, response: body });
-  eq(body.probe.map((p) => `${p.name}:${p.status}`), ["alpha:ok", "beta:ok", "down:error"], "probe");
+await check("config API requires the bearer token", async () => {
+  eq((await apiCall("GET", "config", null, null)).status, 401, "no token");
+  eq((await apiCall("GET", "config", null, "wrong")).status, 401, "wrong token");
 });
 
-await mf.dispose();
-await alpha.close();
-await beta.close();
+let current;
+await check("config API never returns upstream secrets, only a masked preview", async () => {
+  const r = await apiCall("GET", "config");
+  current = r.json;
+  expect(!JSON.stringify(r.json).includes(ALPHA_TOKEN), "secret leaked in API response");
+  eq(r.json.endpoints[0].headers, [{ name: "Authorization", preview: "Bearer ••••cret" }], "headers");
+});
+
+await check("secrets are encrypted at rest in KV", async () => {
+  const kv = await mf.getKVNamespace("RELAY_CACHE");
+  const raw = await kv.get("config");
+  expect(raw && raw.includes('"enc"'), "no encrypted header in stored config");
+  expect(!raw.includes(ALPHA_TOKEN), "plaintext secret stored in KV");
+});
+
+await check("saving without a header value keeps the stored secret", async () => {
+  const next = { ...current, endpoints: current.endpoints.map((e) => ({ ...e, description: e.id === "alpha" ? "Alpha renamed" : e.description, headers: e.headers.map((hd) => ({ name: hd.name })) })) };
+  const r = await apiCall("PUT", "config", next);
+  eq(r.status, 200, "status");
+  current = r.json;
+  const call = await rpc("tools/call", { name: "alpha__add", arguments: { a: 1, b: 1 } });
+  eq(toolText(call), "2", "call still authenticates");
+});
+
+await check("stale revision is rejected with 409", async () => {
+  const r = await apiCall("PUT", "config", { ...initialConfig, revision: 0 });
+  eq(r.status, 409, "status");
+});
+
+await check("invalid config is rejected with a clear message", async () => {
+  const dup = { ...current, endpoints: [...current.endpoints.map((e) => ({ ...e, headers: e.headers.map((hd) => ({ name: hd.name })) })), { name: "beta", url: beta.url, headers: [], enabled: true, disabled_tools: [] }] };
+  const r = await apiCall("PUT", "config", dup);
+  eq(r.status, 400, "status");
+  expect(r.json.error.includes("two servers are named 'beta'"), r.json.error);
+  const badUrl = { ...current, endpoints: [{ name: "x", url: "ftp://nope", headers: [], enabled: true, disabled_tools: [] }] };
+  eq((await apiCall("PUT", "config", badUrl)).status, 400, "bad url");
+});
+
+await check("status lists each server's tools or error", async () => {
+  const r = await apiCall("GET", "status?fresh=1");
+  const byId = Object.fromEntries(r.json.servers.map((s) => [s.id, s]));
+  eq(byId.alpha.tools.map((t) => t.name), ["add", "echo", "show_app"], "alpha tools");
+  eq(byId.beta.status, "ok", "beta");
+  eq(byId.down.status, "error", "down");
+});
+
+await check("test connection works with a stored secret and reports auth failures", async () => {
+  const ok = await apiCall("POST", "test", { id: "alpha", url: alpha.url, headers: [{ name: "Authorization" }] });
+  eq(ok.json.ok, true, "ok");
+  eq(ok.json.more, true, "has a second page");
+  const bad = await apiCall("POST", "test", { url: alpha.url, headers: [{ name: "Authorization", value: "Bearer nope" }] });
+  eq(bad.json.ok, false, "bad ok");
+  expect(bad.json.error.includes("401"), bad.json.error);
+});
+
+await check("disabling a server and a tool removes them from the catalog", async () => {
+  const next = {
+    ...current,
+    endpoints: current.endpoints.map((e) => ({
+      ...e,
+      headers: e.headers.map((hd) => ({ name: hd.name })),
+      enabled: e.id !== "down",
+      disabled_tools: e.id === "alpha" ? ["echo"] : [],
+    })),
+  };
+  current = (await apiCall("PUT", "config", next)).json;
+  const r = await rpc("tools/list");
+  eq(r.json.result.tools.map((t) => t.name), ["alpha__add", "alpha__show_app", "beta__echo", "list_tools", "search_tools"], "names");
+});
+
+await check("web app is served with a strict CSP", async () => {
+  const res = await fetch(`${base}/`);
+  eq(res.status, 200, "status");
+  expect((res.headers.get("content-security-policy") || "").includes("script-src 'self'"), "csp");
+  expect((await res.text()).includes("/app.js"), "html");
+  eq((await fetch(`${base}/app.js`)).status, 200, "app.js");
+});
+
+if (!SERVE) {
+  await mf.dispose();
+  await alpha.close();
+  await beta.close();
+}
 
 const passed = checks.filter((c) => c.ok).length;
 mkdirSync("e2e/out", { recursive: true });
@@ -275,4 +345,5 @@ writeFileSync(
 );
 for (const c of checks) console.log(`${c.ok ? "PASS" : "FAIL"}  ${c.name}${c.ok ? "" : `\n      ${c.error}`}`);
 console.log(`\n${passed}/${checks.length} checks passed — report: e2e/out/report.json`);
-process.exit(passed === checks.length ? 0 : 1);
+if (SERVE) console.log(`\nServing the relay at ${base}/ (token: ${AUTH}). Ctrl+C to stop.`);
+else process.exit(passed === checks.length ? 0 : 1);

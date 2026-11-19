@@ -27,7 +27,7 @@ pub struct Scope<'a> {
 impl<'a> Scope<'a> {
     pub fn global(config: &'a Config) -> Self {
         Scope {
-            endpoints: config.endpoints.iter().collect(),
+            endpoints: config.endpoints.iter().filter(|e| e.enabled).collect(),
             toon: config.toon_output,
         }
     }
@@ -38,7 +38,7 @@ impl<'a> Scope<'a> {
             endpoints: config
                 .endpoints
                 .iter()
-                .filter(|e| p.endpoints.contains(&e.name))
+                .filter(|e| e.enabled && p.endpoints.contains(&e.name))
                 .collect(),
             toon: p.toon_output,
         })
@@ -172,7 +172,7 @@ impl<'a> Relay<'a> {
     /// Fetch one endpoint's full list for `method`, following `nextCursor`.
     /// Successful lists are cached for `cache_ttl_secs`; failures briefly in
     /// memory so one dead upstream does not stall every listing.
-    async fn endpoint_list(
+    pub async fn endpoint_list(
         &self,
         ep: &'a Endpoint,
         method: &str,
@@ -511,23 +511,35 @@ impl<'a> Relay<'a> {
         }
     }
 
-    /// Per-endpoint reachability for `/healthz?probe=1`.
-    pub async fn probe(&self) -> Vec<Value> {
-        let results = join_all(
-            self.config
-                .endpoints
-                .iter()
-                .map(|ep| async move { (ep, self.upstream(ep).request("ping", json!({})).await) }),
-        )
+    /// Per-endpoint state for the web app: upstream tool names (including
+    /// tools the user turned off) or the error. `fresh` skips the list cache.
+    pub async fn status(&self, fresh: bool) -> Vec<Value> {
+        let results = join_all(self.config.endpoints.iter().map(|ep| async move {
+            if !ep.enabled {
+                return json!({ "id": ep.id, "name": ep.name, "status": "disabled" });
+            }
+            if fresh {
+                self.cache
+                    .delete(&format!("list:tools/list:{}:{}", ep.name, ep.fingerprint))
+                    .await;
+            }
+            match self.endpoint_list(ep, "tools/list", "tools").await {
+                Ok(tools) => json!({
+                    "id": ep.id,
+                    "name": ep.name,
+                    "status": "ok",
+                    "tools": tools.iter().map(|t| json!({
+                        "name": t.get("name"),
+                        "description": t.get("description"),
+                    })).collect::<Vec<_>>(),
+                }),
+                Err(error) => {
+                    json!({ "id": ep.id, "name": ep.name, "status": "error", "error": error })
+                }
+            }
+        }))
         .await;
         results
-            .into_iter()
-            .map(|(ep, r)| match r {
-                Ok(_) => json!({ "name": ep.name, "status": "ok" }),
-                Err(e) if e.is_method_not_found() => json!({ "name": ep.name, "status": "ok" }),
-                Err(e) => json!({ "name": ep.name, "status": "error", "error": e.message() }),
-            })
-            .collect()
     }
 }
 

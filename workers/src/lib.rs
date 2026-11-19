@@ -1,13 +1,19 @@
 //! Endara Relay on Cloudflare Workers.
 //!
-//! Stateless streamable-HTTP MCP front door: `POST /mcp` (and
-//! `/mcp/{profile}`) answers with plain JSON. Upstreams are remote MCP
-//! servers over streamable HTTP; their sessions and catalogs are cached in
-//! isolate memory and the optional `RELAY_CACHE` KV namespace.
+//! - `POST /mcp`, `/mcp/{profile}`: stateless streamable-HTTP MCP, plain JSON
+//!   replies, aggregated across the configured upstream servers.
+//! - `/`: the web app that edits the configuration (stored in KV).
+//! - `/api/*`: the web app's JSON API.
+//!
+//! Everything except `/healthz` and the static web app requires
+//! `Authorization: Bearer <RELAY_AUTH_TOKEN>`.
 
+mod api;
 mod cache;
 mod config;
 mod relay;
+mod store;
+mod ui;
 mod upstream;
 
 #[allow(dead_code)]
@@ -33,14 +39,22 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::rc::Rc;
-use worker::{event, Context, Env, Headers, Method, Request, Response, Result};
+use store::Crypto;
+use worker::{event, Context, Date, Env, Headers, KvStore, Method, Request, Response, Result};
 
-const CONFIG_VAR: &str = "RELAY_CONFIG";
 const TOKEN_SECRET: &str = "RELAY_AUTH_TOKEN";
+const ENCRYPTION_SECRET: &str = "RELAY_ENCRYPTION_KEY";
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
+/// Isolate-local config reuse; saves from this isolate apply immediately.
+const CONFIG_MEMORY_MS: u64 = 5_000;
 
 thread_local! {
-    static CONFIG: RefCell<Option<(String, Rc<Config>)>> = const { RefCell::new(None) };
+    static CONFIG: RefCell<Option<(u64, Rc<Config>)>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn remember_config(config: Rc<Config>) {
+    let exp = Date::now().as_millis() + CONFIG_MEMORY_MS;
+    CONFIG.with(|c| *c.borrow_mut() = Some((exp, config)));
 }
 
 fn env_string(env: &Env, name: &str) -> Option<String> {
@@ -48,31 +62,65 @@ fn env_string(env: &Env, name: &str) -> Option<String> {
         .map(|s| s.to_string())
         .or_else(|_| env.var(name).map(|v| v.to_string()))
         .ok()
+        .filter(|s| !s.is_empty())
 }
 
-fn load_config(env: &Env) -> std::result::Result<Rc<Config>, String> {
-    let raw = env_string(env, CONFIG_VAR).unwrap_or_default();
-    let digest = hex(&Sha256::digest(raw.as_bytes()));
-    if let Some(cfg) = CONFIG.with(|c| {
-        c.borrow()
-            .as_ref()
-            .filter(|(d, _)| *d == digest)
-            .map(|(_, cfg)| cfg.clone())
-    }) {
-        return Ok(cfg);
+pub(crate) fn json_error(status: u16, message: &str) -> Response {
+    Response::from_json(&json!({ "error": message }))
+        .map(|r| r.with_status(status))
+        .unwrap_or_else(|_| Response::empty().unwrap().with_status(status))
+}
+
+/// Per-request handles to the bindings every authenticated route needs.
+pub(crate) struct Ctx {
+    pub env: Env,
+    pub kv: KvStore,
+    pub crypto: Crypto,
+}
+
+impl Ctx {
+    fn new(env: Env) -> std::result::Result<Ctx, Response> {
+        let kv = env.kv(cache::KV_BINDING).map_err(|_| {
+            json_error(
+                503,
+                "relay is not configured: missing the RELAY_CACHE KV binding",
+            )
+        })?;
+        let key = env_string(&env, ENCRYPTION_SECRET).ok_or_else(|| {
+            json_error(
+                503,
+                "relay is not configured: set the RELAY_ENCRYPTION_KEY secret",
+            )
+        })?;
+        Ok(Ctx {
+            crypto: Crypto::new(&key),
+            env,
+            kv,
+        })
     }
-    let cfg = Rc::new(Config::parse(&raw, &|name| env_string(env, name))?);
-    CONFIG.with(|c| *c.borrow_mut() = Some((digest, cfg.clone())));
-    Ok(cfg)
-}
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    pub async fn config(&self) -> std::result::Result<Rc<Config>, Response> {
+        let now = Date::now().as_millis();
+        if let Some(cfg) = CONFIG.with(|c| {
+            c.borrow()
+                .as_ref()
+                .filter(|(exp, _)| *exp > now)
+                .map(|(_, cfg)| cfg.clone())
+        }) {
+            return Ok(cfg);
+        }
+        let stored = store::load(&self.kv)
+            .await
+            .map_err(|e| json_error(500, &e))?;
+        let cfg = Rc::new(Config::build(&stored, &self.crypto).map_err(|e| json_error(500, &e))?);
+        remember_config(cfg.clone());
+        Ok(cfg)
+    }
 }
 
 /// Constant-time bearer check (compares digests, so length leaks nothing).
 fn authorized(req: &Request, env: &Env) -> std::result::Result<(), Response> {
-    let Some(expected) = env_string(env, TOKEN_SECRET).filter(|t| !t.is_empty()) else {
+    let Some(expected) = env_string(env, TOKEN_SECRET) else {
         return Err(json_error(
             503,
             "relay is not configured: set the RELAY_AUTH_TOKEN secret",
@@ -105,12 +153,6 @@ fn authorized(req: &Request, env: &Env) -> std::result::Result<(), Response> {
     }
 }
 
-fn json_error(status: u16, message: &str) -> Response {
-    Response::from_json(&json!({ "error": message }))
-        .map(|r| r.with_status(status))
-        .unwrap_or_else(|_| Response::empty().unwrap().with_status(status))
-}
-
 fn rpc_error(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
 }
@@ -121,7 +163,22 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
     let segments: Vec<&str> = path.trim_matches('/').split('/').collect();
 
     match (req.method(), segments.as_slice()) {
-        (Method::Get, ["healthz"]) => healthz(&req, &env).await,
+        (Method::Get, [""]) | (Method::Get, ["index.html"]) => ui::page(ui::Asset::Html),
+        (Method::Get, ["app.js"]) => ui::page(ui::Asset::Js),
+        (Method::Get, ["app.css"]) => ui::page(ui::Asset::Css),
+        (Method::Get, ["healthz"]) => Response::from_json(&json!({ "status": "ok" })),
+        (_, ["api", rest @ ..]) => {
+            if let Err(resp) = authorized(&req, &env) {
+                return Ok(resp);
+            }
+            let ctx = match Ctx::new(env) {
+                Ok(c) => c,
+                Err(r) => return Ok(r),
+            };
+            let rest: Vec<String> = rest.iter().map(|s| s.to_string()).collect();
+            let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+            api::handle(req, &ctx, &rest).await
+        }
         (_, ["mcp"]) | (_, ["mcp", _]) => {
             if let Err(resp) = authorized(&req, &env) {
                 return Ok(resp);
@@ -131,11 +188,16 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 headers.set("allow", "POST")?;
                 return Ok(json_error(405, "this relay only accepts POST").with_headers(headers));
             }
-            let config = match load_config(&env) {
+            let profile = segments.get(1).map(|s| s.to_string());
+            let ctx = match Ctx::new(env) {
                 Ok(c) => c,
-                Err(e) => return Ok(json_error(500, &e)),
+                Err(r) => return Ok(r),
             };
-            let scope = match segments.get(1) {
+            let config = match ctx.config().await {
+                Ok(c) => c,
+                Err(r) => return Ok(r),
+            };
+            let scope = match &profile {
                 None => Scope::global(&config),
                 Some(p) => match Scope::profile(&config, p) {
                     Some(s) => s,
@@ -146,7 +208,7 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
             if body.len() > MAX_BODY_BYTES {
                 return Ok(json_error(413, "request body too large"));
             }
-            let cache = Cache::new(&env);
+            let cache = Cache::new(&ctx.env);
             let relay = Relay {
                 config: &config,
                 cache: &cache,
@@ -155,33 +217,6 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         }
         _ => Ok(json_error(404, "not found")),
     }
-}
-
-async fn healthz(req: &Request, env: &Env) -> Result<Response> {
-    let config = match load_config(env) {
-        Ok(c) => c,
-        Err(e) => return Ok(json_error(500, &e)),
-    };
-    let mut body = json!({
-        "status": "ok",
-        "endpoints": config.endpoints.iter().map(|e| &e.name).collect::<Vec<_>>(),
-        "skipped": config.skipped.iter().map(|s| json!({ "name": s.name, "reason": s.reason })).collect::<Vec<_>>(),
-        "profiles": config.profiles.iter().map(|p| json!({ "name": p.name, "path": p.path })).collect::<Vec<_>>(),
-    });
-    let wants_probe = req
-        .url()
-        .map(|u| u.query_pairs().any(|(k, v)| k == "probe" && v == "1"))
-        .unwrap_or(false);
-    // Probing calls upstreams, so it sits behind the bearer token.
-    if wants_probe && authorized(req, env).is_ok() {
-        let cache = Cache::new(env);
-        let relay = Relay {
-            config: &config,
-            cache: &cache,
-        };
-        body["probe"] = Value::Array(relay.probe().await);
-    }
-    Response::from_json(&body)
 }
 
 async fn handle_mcp(relay: &Relay<'_>, scope: &Scope<'_>, body: &[u8]) -> Result<Response> {
