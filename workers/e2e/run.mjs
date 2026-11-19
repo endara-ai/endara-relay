@@ -3,7 +3,7 @@
 // Usage: npm run build && npm run test:e2e
 import workerd from "workerd";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { startMockUpstream, text } from "./mock-upstream.mjs";
+import { startMockOAuthUpstream, startMockUpstream, text } from "./mock-upstream.mjs";
 
 // worker-build 0.9 output needs a newer runtime than Miniflare bundles; use
 // the pinned `workerd` package (the same one Alchemy dev uses).
@@ -39,13 +39,15 @@ const beta = await startMockUpstream({
   tools: [{ def: { name: "echo", description: "Echo over SSE", inputSchema: { type: "object" } }, run: ({ text: t }) => text(`beta:${t}`) }],
 });
 
+const gamma = await startMockOAuthUpstream({ name: "gamma-server" });
+
 const mf = new Miniflare({
   modules: true,
   scriptPath: "build/index.js",
   modulesRules: [{ type: "CompiledWasm", include: ["**/*.wasm"] }],
   compatibilityDate: "2026-10-01",
   kvNamespaces: ["RELAY_CACHE"],
-  bindings: { RELAY_AUTH_TOKEN: AUTH, RELAY_ENCRYPTION_KEY: "e2e-encryption-key" },
+  bindings: { RELAY_AUTH_TOKEN: AUTH, RELAY_ENCRYPTION_KEY: "e2e-encryption-key", RELAY_ALLOW_INSECURE_OAUTH: "1" },
 });
 const base = (await mf.ready).toString().replace(/\/$/, "");
 
@@ -323,6 +325,103 @@ await check("disabling a server and a tool removes them from the catalog", async
   eq(r.json.result.tools.map((t) => t.name), ["alpha__add", "alpha__show_app", "beta__echo", "list_tools", "search_tools"], "names");
 });
 
+// ---- OAuth (dynamic client registration) ----------------------------------
+
+const withGamma = (cfg, extra = {}) => ({
+  ...cfg,
+  endpoints: [
+    ...cfg.endpoints.filter((e) => e.id !== "gamma").map((e) => ({ ...e, headers: e.headers.map((hd) => ({ name: hd.name })) })),
+    { id: "gamma", name: "gamma", url: gamma.url, headers: [], enabled: true, disabled_tools: [], oauth: true, ...extra },
+  ],
+});
+const gammaStatus = async () => (await apiCall("GET", "status?fresh=1")).json.servers.find((x) => x.id === "gamma");
+async function signInGamma() {
+  const start = await apiCall("POST", "oauth/start", { id: "gamma" });
+  expect(start.status === 200, `start: ${JSON.stringify(start.json)}`);
+  const auth = await fetch(start.json.authorization_url, { redirect: "manual" });
+  expect(auth.status === 302, `authorize: ${auth.status} ${await auth.text()}`);
+  const callback = auth.headers.get("location");
+  const page = await fetch(callback);
+  const html = await page.text();
+  transcript.push({ path: "/oauth/callback", status: page.status, response: html });
+  return { start: start.json, callback, html };
+}
+
+await check("an OAuth server starts as 'sign in needed' and its tools stay hidden", async () => {
+  current = (await apiCall("PUT", "config", withGamma(current))).json;
+  eq((await gammaStatus()).status, "needs_sign_in", "status");
+  const list = await rpc("tools/list");
+  expect(!list.json.result.tools.some((t) => t.name.startsWith("gamma__")), "gamma tools listed before sign-in");
+  const call = await rpc("tools/call", { name: "gamma__whoami", arguments: {} });
+  expect(call.json.error?.message.includes("needs sign-in"), JSON.stringify(call.json));
+});
+
+let firstSignIn;
+await check("sign-in discovers metadata, registers a client and sends PKCE + resource", async () => {
+  firstSignIn = await signInGamma();
+  const u = new URL(firstSignIn.start.authorization_url);
+  eq(u.origin + u.pathname, `${gamma.base}/auth/authorize`, "authorize endpoint");
+  eq(u.searchParams.get("code_challenge_method"), "S256", "pkce");
+  eq(u.searchParams.get("resource"), gamma.url, "resource");
+  eq(u.searchParams.get("scope"), "mcp:read", "scope from WWW-Authenticate");
+  eq(u.searchParams.get("redirect_uri"), `${base}/oauth/callback`, "redirect_uri");
+  expect(firstSignIn.html.includes("Signed in to gamma"), firstSignIn.html);
+  eq(gamma.stats.register, 1, "registrations");
+});
+
+await check("a sign-in link works only once", async () => {
+  const html = await (await fetch(firstSignIn.callback)).text();
+  expect(html.includes("expired or was already used"), html);
+});
+
+await check("after sign-in the server's tools are listed and callable", async () => {
+  const st = await gammaStatus();
+  eq(st.status, "ok", "status");
+  eq(st.oauth.signed_in, true, "signed_in");
+  const call = await rpc("tools/call", { name: "gamma__whoami", arguments: {} });
+  eq(toolText(call), "user-1", "result");
+});
+
+await check("OAuth tokens are encrypted at rest", async () => {
+  const kv = await mf.getKVNamespace("RELAY_CACHE");
+  const raw = await kv.get("oauth:gamma");
+  expect(raw && raw.includes("access_token_enc"), "no oauth record");
+  expect(!raw.includes(gamma.state.lastAccessToken), "plaintext access token in KV");
+});
+
+await check("a rejected access token is refreshed once and the call succeeds", async () => {
+  const before = gamma.stats.refresh;
+  await fetch(`${gamma.base}/admin/revoke-access`, { method: "POST" });
+  const call = await rpc("tools/call", { name: "gamma__whoami", arguments: {} });
+  eq(toolText(call), "user-1", "result");
+  eq(gamma.stats.refresh, before + 1, "refreshes");
+});
+
+await check("a revoked refresh token turns into 'sign in again'", async () => {
+  await fetch(`${gamma.base}/admin/revoke-all`, { method: "POST" });
+  const call = await rpc("tools/call", { name: "gamma__whoami", arguments: {} });
+  expect(call.json.error?.message.includes("sign-in again"), JSON.stringify(call.json));
+  eq((await gammaStatus()).status, "needs_sign_in", "status");
+});
+
+await check("signing in again reuses the registered client", async () => {
+  const again = await signInGamma();
+  expect(again.html.includes("Signed in to gamma"), again.html);
+  eq(gamma.stats.register, 1, "registrations");
+  eq(toolText(await rpc("tools/call", { name: "gamma__whoami", arguments: {} })), "user-1", "result");
+});
+
+await check("sign-out drops the tokens", async () => {
+  eq((await apiCall("POST", "oauth/sign-out", { id: "gamma" })).status, 200, "status");
+  eq((await gammaStatus()).status, "needs_sign_in", "after sign-out");
+});
+
+await check("OAuth start refuses servers that are not saved as OAuth", async () => {
+  eq((await apiCall("POST", "oauth/start", { id: "beta" })).status, 400, "non-oauth");
+  eq((await apiCall("POST", "oauth/start", { id: "nope" })).status, 404, "unknown");
+  eq((await apiCall("POST", "oauth/start", { id: "gamma" }, null)).status, 401, "no token");
+});
+
 await check("web app is served with a strict CSP", async () => {
   const res = await fetch(`${base}/`);
   eq(res.status, 200, "status");
@@ -335,13 +434,14 @@ if (!SERVE) {
   await mf.dispose();
   await alpha.close();
   await beta.close();
+  await gamma.close();
 }
 
 const passed = checks.filter((c) => c.ok).length;
 mkdirSync("e2e/out", { recursive: true });
 writeFileSync(
   "e2e/out/report.json",
-  JSON.stringify({ passed, total: checks.length, checks, upstreamStats: { alpha: alpha.stats, beta: beta.stats }, transcript }, null, 2),
+  JSON.stringify({ passed, total: checks.length, checks, upstreamStats: { alpha: alpha.stats, beta: beta.stats, gamma: gamma.stats }, transcript }, null, 2),
 );
 for (const c of checks) console.log(`${c.ok ? "PASS" : "FAIL"}  ${c.name}${c.ok ? "" : `\n      ${c.error}`}`);
 console.log(`\n${passed}/${checks.length} checks passed — report: e2e/out/report.json`);

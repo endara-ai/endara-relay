@@ -172,7 +172,8 @@ function renderLogin(message) {
 
 // ---- Server editor ------------------------------------------------------
 
-function authModeOf(headers) {
+function authModeOf(headers, oauth) {
+  if (oauth) return "oauth";
   if (headers.length === 0) return "none";
   if (headers.length === 1 && /^authorization$/i.test(headers[0].name) && /^Bearer /.test(headers[0].preview || "")) return "bearer";
   return "headers";
@@ -181,7 +182,7 @@ function authModeOf(headers) {
 function openServer(id) {
   const existing = state.config.endpoints.find((e) => e.id === id);
   const src = existing || { id: "", name: "", url: "", description: "", tool_prefix: "", headers: [], enabled: true, disabled_tools: [] };
-  const mode = authModeOf(src.headers);
+  const mode = authModeOf(src.headers, src.oauth);
   state.open = { kind: "server", id: existing ? id : "new" };
   state.justOpened = true;
   state.confirmDelete = false;
@@ -235,6 +236,70 @@ async function testDraft() {
   render();
 }
 
+function draftEntry(d) {
+  return {
+    id: d.id,
+    name: d.name.trim(),
+    url: d.url.trim(),
+    description: d.description.trim() || null,
+    tool_prefix: d.tool_prefix.trim() || null,
+    headers: d.authMode === "oauth" ? [] : draftHeaders(d),
+    enabled: d.enabled,
+    disabled_tools: d.disabled_tools,
+    oauth: d.authMode === "oauth",
+  };
+}
+
+/// Save the draft, then send the user to the server's sign-in page. The
+/// popup opens first (synchronously) so the browser does not block it.
+async function saveAndSignIn() {
+  const d = state.draft;
+  const saved = d.id && state.config.endpoints.find((e) => e.id === d.id);
+  const popup = window.open("about:blank", "endara-oauth", "width=520,height=720");
+  let id = d.id;
+  if (!saved || !saved.oauth || saved.url !== d.url.trim() || saved.name !== d.name.trim()) {
+    const next = plainConfig();
+    const entry = draftEntry(d);
+    if (d.id) next.endpoints = next.endpoints.map((e) => (e.id === d.id ? entry : e));
+    else next.endpoints.push(entry);
+    if (!(await saveConfig(next, d.id ? "Server saved" : "Server added"))) {
+      if (popup) popup.close();
+      return;
+    }
+    if (!id) id = state.config.endpoints.find((e) => e.name === entry.name)?.id;
+    state.draft.id = id;
+    state.open = { kind: "server", id };
+  }
+  await signIn(id, popup);
+}
+
+async function signIn(id, popup) {
+  popup = popup || window.open("about:blank", "endara-oauth", "width=520,height=720");
+  state.signingIn = id;
+  render();
+  try {
+    const { authorization_url } = await api("POST", "oauth/start", { id });
+    if (popup) popup.location.href = authorization_url;
+    else location.href = authorization_url;
+  } catch (e) {
+    if (popup) popup.close();
+    if (e.message !== "unauthorized") toast(e.message, true);
+  } finally {
+    state.signingIn = null;
+    render();
+  }
+}
+
+async function signOutServer(id) {
+  try {
+    await api("POST", "oauth/sign-out", { id });
+    toast("Signed out");
+    refreshStatus(true);
+  } catch (e) {
+    if (e.message !== "unauthorized") toast(e.message, true);
+  }
+}
+
 async function saveServer() {
   const d = state.draft;
   if (d.authMode === "bearer" && !d.bearer.trim() && !d.bearerPreview) {
@@ -242,16 +307,7 @@ async function saveServer() {
     return;
   }
   const next = plainConfig();
-  const entry = {
-    id: d.id,
-    name: d.name.trim(),
-    url: d.url.trim(),
-    description: d.description.trim() || null,
-    tool_prefix: d.tool_prefix.trim() || null,
-    headers: draftHeaders(d),
-    enabled: d.enabled,
-    disabled_tools: d.disabled_tools,
-  };
+  const entry = draftEntry(d);
   if (d.id) next.endpoints = next.endpoints.map((e) => (e.id === d.id ? entry : e));
   else next.endpoints.push(entry);
   if (await saveConfig(next, d.id ? "Server saved" : "Server added")) {
@@ -286,6 +342,9 @@ function serverRow(ep) {
     const on = st.tools.filter((t) => !ep.disabled_tools.includes(t.name)).length;
     const off = st.tools.length - on;
     meta = h("span", { class: "meta" }, `${on} tool${on === 1 ? "" : "s"}${off ? ` · ${off} off` : ""}`);
+  } else if (st && st.status === "needs_sign_in") {
+    dot = "dot warn";
+    meta = h("span", { class: "meta warn" }, "Sign in needed");
   } else if (st && st.status === "error") {
     dot = "dot error";
     meta = h("span", { class: "meta error", title: st.error }, st.error);
@@ -355,6 +414,7 @@ function serverEditor() {
       ["none", "None"],
       ["bearer", "Bearer token"],
       ["headers", "Headers"],
+      ["oauth", "OAuth"],
     ].map(([mode, label]) =>
       h(
         "button",
@@ -403,6 +463,25 @@ function serverEditor() {
         ),
       ),
       h("div", {}, h("button", { type: "button", class: "btn quiet", onclick: () => (d.headers.push({ name: "", value: "", saved: false }), render()) }, "Add header")),
+    );
+  }
+
+  if (d.authMode === "oauth") {
+    const st0 = state.status[d.id];
+    const saved = d.id && state.config.endpoints.find((e) => e.id === d.id);
+    const signedIn = !!(saved && saved.oauth && st0 && st0.oauth && st0.oauth.signed_in);
+    const busy = state.signingIn === d.id || state.saving;
+    auth = h(
+      "div",
+      { class: "actions" },
+      h(
+        "span",
+        { class: signedIn ? "note ok" : "note" },
+        signedIn ? "Signed in" : saved && saved.oauth ? "Not signed in" : "The relay registers itself with the server, then you sign in.",
+      ),
+      h("span", { class: "spacer" }),
+      signedIn ? h("button", { type: "button", class: "btn quiet", onclick: () => signOutServer(d.id) }, "Sign out") : null,
+      h("button", { type: "button", class: "btn", disabled: busy || !d.url.trim(), onclick: saveAndSignIn }, busy ? "Opening…" : signedIn ? "Sign in again" : saved && saved.oauth ? "Sign in" : "Save and sign in"),
     );
   }
 
@@ -467,7 +546,7 @@ function serverEditor() {
       "div",
       { class: "actions" },
       h("button", { type: "submit", class: "btn primary", disabled: state.saving }, isNew ? "Add server" : "Save"),
-      h("button", { type: "button", class: "btn", disabled: !!(state.test && state.test.loading), onclick: testDraft }, "Test connection"),
+      d.authMode === "oauth" ? null : h("button", { type: "button", class: "btn", disabled: !!(state.test && state.test.loading), onclick: testDraft }, "Test connection"),
       h("button", { type: "button", class: "btn quiet", onclick: closeEditor }, "Cancel"),
       testNote,
       h("span", { class: "spacer" }),
@@ -828,6 +907,14 @@ function render() {
     }
   }
 }
+
+try {
+  new BroadcastChannel("endara-oauth").onmessage = (ev) => {
+    if (!state.config) return;
+    if (ev.data && ev.data.result === "ok") toast("Signed in");
+    refreshStatus(true);
+  };
+} catch {}
 
 if (state.token) {
   loadAll().catch((e) => {

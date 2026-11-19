@@ -74,6 +74,9 @@ pub struct StoredEndpoint {
     pub enabled: bool,
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+    /// Sign in with OAuth (discovery + dynamic client registration).
+    #[serde(default)]
+    pub oauth: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -128,6 +131,8 @@ pub struct ApiEndpoint {
     pub enabled: bool,
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+    #[serde(default)]
+    pub oauth: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -167,6 +172,7 @@ impl Stored {
                         .collect(),
                     enabled: e.enabled,
                     disabled_tools: e.disabled_tools.clone(),
+                    oauth: e.oauth,
                 })
                 .collect(),
             profiles: self.profiles.clone(),
@@ -235,6 +241,7 @@ fn preview(value: &str) -> String {
     format!("{prefix}••••{tail}")
 }
 
+#[derive(Clone)]
 pub struct Crypto {
     cipher: Aes256Gcm,
 }
@@ -251,6 +258,24 @@ impl Crypto {
     }
 
     pub fn seal(&self, name: &str, value: &str) -> Result<StoredHeader, String> {
+        Ok(StoredHeader {
+            name: name.to_string(),
+            enc: self.seal_str(value)?,
+            preview: preview(value),
+        })
+    }
+
+    pub fn open(&self, header: &StoredHeader) -> Result<String, String> {
+        self.open_str(&header.enc).map_err(|_| {
+            format!(
+                "cannot decrypt header '{}' (was RELAY_ENCRYPTION_KEY changed?)",
+                header.name
+            )
+        })
+    }
+
+    /// base64(nonce || ciphertext)
+    pub fn seal_str(&self, value: &str) -> Result<String, String> {
         let mut nonce = [0u8; 12];
         getrandom::getrandom(&mut nonce).map_err(|e| e.to_string())?;
         let ct = self
@@ -259,17 +284,11 @@ impl Crypto {
             .map_err(|_| "encryption failed".to_string())?;
         let mut blob = nonce.to_vec();
         blob.extend(ct);
-        Ok(StoredHeader {
-            name: name.to_string(),
-            enc: B64.encode(blob),
-            preview: preview(value),
-        })
+        Ok(B64.encode(blob))
     }
 
-    pub fn open(&self, header: &StoredHeader) -> Result<String, String> {
-        let blob = B64
-            .decode(&header.enc)
-            .map_err(|_| "corrupt secret".to_string())?;
+    pub fn open_str(&self, enc: &str) -> Result<String, String> {
+        let blob = B64.decode(enc).map_err(|_| "corrupt secret".to_string())?;
         if blob.len() < 12 {
             return Err("corrupt secret".into());
         }
@@ -278,10 +297,7 @@ impl Crypto {
             .cipher
             .decrypt(Nonce::from_slice(nonce), ct)
             .map_err(|_| {
-                format!(
-                    "cannot decrypt header '{}' (was RELAY_ENCRYPTION_KEY changed?)",
-                    header.name
-                )
+                "cannot decrypt a stored secret (was RELAY_ENCRYPTION_KEY changed?)".to_string()
             })?;
         String::from_utf8(pt).map_err(|_| "corrupt secret".to_string())
     }

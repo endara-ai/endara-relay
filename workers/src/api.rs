@@ -15,7 +15,19 @@ use worker::{Method, Request, Response, Result};
 const MAX_BODY_BYTES: usize = 512 * 1024;
 
 pub async fn handle(mut req: Request, ctx: &Ctx, rest: &[&str]) -> Result<Response> {
+    let origin = req.url()?.origin().ascii_serialization();
     let resp = match (req.method(), rest) {
+        (Method::Post, ["oauth", "start"]) => match read_json::<EndpointRef>(&mut req).await {
+            Ok(body) => oauth_start(ctx, &body.id, &origin).await,
+            Err(r) => Ok(r),
+        },
+        (Method::Post, ["oauth", "sign-out"]) => match read_json::<EndpointRef>(&mut req).await {
+            Ok(body) => match ctx.oauth().sign_out(&body.id).await {
+                Ok(()) => Response::from_json(&json!({ "ok": true })),
+                Err(e) => Ok(json_error(500, &e)),
+            },
+            Err(r) => Ok(r),
+        },
         (Method::Get, ["config"]) => get_config(ctx).await,
         (Method::Put, ["config"]) => match read_json::<ApiConfig>(&mut req).await {
             Ok(body) => put_config(ctx, body).await,
@@ -85,6 +97,14 @@ async fn put_config(ctx: &Ctx, body: ApiConfig) -> Result<Response> {
     if let Err(e) = store::save(&ctx.kv, &next).await {
         return Ok(json_error(500, &format!("could not save: {e}")));
     }
+    let oauth = ctx.oauth();
+    for removed in current
+        .endpoints
+        .iter()
+        .filter(|old| next.endpoint(&old.id).is_none_or(|new| !new.oauth))
+    {
+        oauth.forget(&removed.id).await;
+    }
     crate::remember_config(Rc::new(config));
     Response::from_json(&next.to_api())
 }
@@ -126,6 +146,7 @@ fn merge(
             headers,
             enabled: ep.enabled,
             disabled_tools,
+            oauth: ep.oauth,
         });
     }
     let known: HashSet<&str> = endpoints.iter().map(|e| e.id.as_str()).collect();
@@ -164,9 +185,11 @@ async fn status(ctx: &Ctx, fresh: bool) -> Result<Response> {
         Err(r) => return Ok(r),
     };
     let cache = Cache::new(&ctx.env);
+    let oauth = ctx.oauth();
     let relay = Relay {
         config: &config,
         cache: &cache,
+        oauth: Some(&oauth),
     };
     Response::from_json(
         &json!({ "revision": config.revision, "servers": relay.status(fresh).await }),
@@ -222,15 +245,16 @@ async fn test_connection(ctx: &Ctx, body: TestRequest) -> Result<Response> {
         name: "test".into(),
         label: "test".into(),
         prefix: "test".into(),
-        fingerprint: format!("test-{}", fingerprint("test", &url, &headers)),
+        fingerprint: format!("test-{}", fingerprint("test", &url, &headers, false)),
         url,
         headers,
         enabled: true,
+        oauth: false,
         disabled_tools: HashSet::new(),
     };
     let cache = Cache::memory_only();
     let timeout = stored.settings.request_timeout_secs.clamp(1, 300);
-    let upstream = Upstream::new(&endpoint, &cache, timeout);
+    let upstream = Upstream::new(&endpoint, &cache, timeout, None);
     let reply: Value = match upstream.request("tools/list", json!({})).await {
         Ok(result) => json!({
             "ok": true,
@@ -242,4 +266,28 @@ async fn test_connection(ctx: &Ctx, body: TestRequest) -> Result<Response> {
         Err(e) => json!({ "ok": false, "error": e.message() }),
     };
     Response::from_json(&reply)
+}
+
+#[derive(Deserialize)]
+struct EndpointRef {
+    id: String,
+}
+
+/// Begin an OAuth sign-in for a saved server; the browser opens the URL.
+async fn oauth_start(ctx: &Ctx, id: &str, origin: &str) -> Result<Response> {
+    let config = match ctx.config().await {
+        Ok(c) => c,
+        Err(r) => return Ok(r),
+    };
+    let Some(ep) = config.endpoints.iter().find(|e| e.id == id) else {
+        return Ok(json_error(404, "save the server before signing in"));
+    };
+    if !ep.oauth {
+        return Ok(json_error(400, "this server does not use OAuth"));
+    }
+    let redirect_uri = format!("{origin}/oauth/callback");
+    match ctx.oauth().start(ep, &redirect_uri).await {
+        Ok(url) => Response::from_json(&json!({ "authorization_url": url })),
+        Err(e) => Ok(json_error(502, &e)),
+    }
 }

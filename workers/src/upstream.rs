@@ -6,9 +6,11 @@
 
 use crate::cache::Cache;
 use crate::config::Endpoint;
+use crate::oauth::OAuth;
 use futures_util::future::{select, Either};
 use serde_json::{json, Value};
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::time::Duration;
 use worker::wasm_bindgen::JsValue;
 use worker::{Delay, Fetch, Headers, Method, Request, RequestInit};
@@ -39,13 +41,15 @@ pub enum UpstreamError {
     },
     /// Transport, HTTP status, timeout or framing failure.
     Transport(String),
+    /// HTTP 401 from an OAuth server: refresh the token and retry.
+    Unauthorized(String),
 }
 
 impl UpstreamError {
     pub fn message(&self) -> String {
         match self {
             UpstreamError::Rpc { message, .. } => message.clone(),
-            UpstreamError::Transport(m) => m.clone(),
+            UpstreamError::Transport(m) | UpstreamError::Unauthorized(m) => m.clone(),
         }
     }
 
@@ -64,6 +68,8 @@ pub struct Upstream<'a> {
     pub endpoint: &'a Endpoint,
     cache: &'a Cache,
     timeout: Duration,
+    oauth: Option<&'a OAuth>,
+    token: RefCell<Option<String>>,
 }
 
 struct HttpReply {
@@ -74,12 +80,34 @@ struct HttpReply {
 }
 
 impl<'a> Upstream<'a> {
-    pub fn new(endpoint: &'a Endpoint, cache: &'a Cache, timeout_secs: u64) -> Self {
+    pub fn new(
+        endpoint: &'a Endpoint,
+        cache: &'a Cache,
+        timeout_secs: u64,
+        oauth: Option<&'a OAuth>,
+    ) -> Self {
         Upstream {
             endpoint,
             cache,
             timeout: Duration::from_secs(timeout_secs),
+            oauth,
+            token: RefCell::new(None),
         }
+    }
+
+    async fn load_token(&self, force_refresh: bool) -> Result<(), UpstreamError> {
+        if !self.endpoint.oauth {
+            return Ok(());
+        }
+        let oauth = self.oauth.ok_or_else(|| {
+            UpstreamError::Transport("OAuth is not available for this request".into())
+        })?;
+        let token = oauth
+            .access_token(self.endpoint, force_refresh)
+            .await
+            .map_err(|e| UpstreamError::Transport(e.message()))?;
+        *self.token.borrow_mut() = Some(token);
+        Ok(())
     }
 
     fn session_key(&self) -> String {
@@ -89,19 +117,37 @@ impl<'a> Upstream<'a> {
         )
     }
 
-    /// Send one JSON-RPC request and return its `result`.
+    /// Send one JSON-RPC request and return its `result`. For OAuth servers
+    /// a 401 forces one token refresh and one retry.
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, UpstreamError> {
+        self.load_token(false).await?;
+        match self.request_once(method, &params).await {
+            Err(UpstreamError::Unauthorized(_)) => {
+                self.load_token(true).await?;
+                match self.request_once(method, &params).await {
+                    Err(UpstreamError::Unauthorized(m)) => Err(UpstreamError::Transport(format!(
+                        "'{}' rejected a fresh token; sign in again in the relay web app ({m})",
+                        self.endpoint.name
+                    ))),
+                    r => r,
+                }
+            }
+            r => r,
+        }
+    }
+
+    async fn request_once(&self, method: &str, params: &Value) -> Result<Value, UpstreamError> {
         let cached = self.cached_session().await;
         let had_cached = cached.is_some();
         let session = match cached {
             Some(s) => s,
             None => self.initialize().await?,
         };
-        match self.send_request(&session, method, &params).await {
+        match self.send_request(&session, method, params).await {
             Err(SendError::SessionExpired) if had_cached => {
                 self.cache.delete(&self.session_key()).await;
                 let fresh = self.initialize().await?;
-                match self.send_request(&fresh, method, &params).await {
+                match self.send_request(&fresh, method, params).await {
                     Err(SendError::SessionExpired) => Err(UpstreamError::Transport(
                         "upstream rejected a fresh session (HTTP 404)".into(),
                     )),
@@ -217,6 +263,11 @@ impl<'a> Upstream<'a> {
         if let Some(pv) = protocol_version {
             headers.set("mcp-protocol-version", pv).map_err(t)?;
         }
+        if let Some(token) = self.token.borrow().as_deref() {
+            headers
+                .set("authorization", &format!("Bearer {token}"))
+                .map_err(t)?;
+        }
         let mut init = RequestInit::new();
         init.with_method(Method::Post)
             .with_headers(headers)
@@ -237,6 +288,9 @@ impl<'a> Upstream<'a> {
             })
         };
         match select(Box::pin(exchange), Box::pin(Delay::from(self.timeout))).await {
+            Either::Left((Ok(reply), _)) if reply.status == 401 && self.endpoint.oauth => Err(
+                UpstreamError::Unauthorized(format!("'{}' returned HTTP 401", self.endpoint.name)),
+            ),
             Either::Left((r, _)) => r.map_err(|e| {
                 UpstreamError::Transport(format!("request to '{}' failed: {e}", self.endpoint.name))
             }),

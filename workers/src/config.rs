@@ -17,6 +17,7 @@ pub struct Endpoint {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub enabled: bool,
+    pub oauth: bool,
     pub disabled_tools: HashSet<String>,
     /// Digest of everything that changes what the upstream returns. Cache
     /// keys include it, so an edit never serves a stale catalog.
@@ -42,9 +43,10 @@ pub struct Config {
     pub profiles: Vec<Profile>,
 }
 
-pub fn fingerprint(name: &str, url: &str, headers: &[(String, String)]) -> String {
+pub fn fingerprint(name: &str, url: &str, headers: &[(String, String)], oauth: bool) -> String {
     let mut h = Sha256::new();
     h.update(name.as_bytes());
+    h.update([oauth as u8]);
     h.update([0]);
     h.update(url.as_bytes());
     for (k, v) in headers {
@@ -119,12 +121,13 @@ impl Config {
                     .clone()
                     .filter(|d| !d.trim().is_empty())
                     .unwrap_or_else(|| name.to_string()),
-                fingerprint: fingerprint(name, &ep.url, &headers),
+                fingerprint: fingerprint(name, &ep.url, &headers, ep.oauth),
                 name: name.to_string(),
                 prefix,
                 url: ep.url.trim().to_string(),
                 headers,
                 enabled: ep.enabled,
+                oauth: ep.oauth,
                 disabled_tools: ep.disabled_tools.iter().cloned().collect(),
             });
         }

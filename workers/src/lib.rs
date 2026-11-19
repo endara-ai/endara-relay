@@ -11,6 +11,7 @@
 mod api;
 mod cache;
 mod config;
+mod oauth;
 mod relay;
 mod store;
 mod ui;
@@ -44,6 +45,8 @@ use worker::{event, Context, Date, Env, Headers, KvStore, Method, Request, Respo
 
 const TOKEN_SECRET: &str = "RELAY_AUTH_TOKEN";
 const ENCRYPTION_SECRET: &str = "RELAY_ENCRYPTION_KEY";
+/// Allows http:// OAuth endpoints. Only for local testing.
+const INSECURE_OAUTH_VAR: &str = "RELAY_ALLOW_INSECURE_OAUTH";
 const MAX_BODY_BYTES: usize = 4 * 1024 * 1024;
 /// Isolate-local config reuse; saves from this isolate apply immediately.
 const CONFIG_MEMORY_MS: u64 = 5_000;
@@ -97,6 +100,11 @@ impl Ctx {
             env,
             kv,
         })
+    }
+
+    pub fn oauth(&self) -> oauth::OAuth {
+        let insecure = env_string(&self.env, INSECURE_OAUTH_VAR).is_some_and(|v| v == "1");
+        oauth::OAuth::new(self.kv.clone(), self.crypto.clone(), insecure)
     }
 
     pub async fn config(&self) -> std::result::Result<Rc<Config>, Response> {
@@ -167,6 +175,14 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
         (Method::Get, ["app.js"]) => ui::page(ui::Asset::Js),
         (Method::Get, ["app.css"]) => ui::page(ui::Asset::Css),
         (Method::Get, ["healthz"]) => Response::from_json(&json!({ "status": "ok" })),
+        (Method::Get, ["oauth-done.js"]) => ui::page(ui::Asset::OAuthDoneJs),
+        (Method::Get, ["oauth", "callback"]) => {
+            let ctx = match Ctx::new(env) {
+                Ok(c) => c,
+                Err(r) => return Ok(r),
+            };
+            oauth_callback(&req, &ctx).await
+        }
         (_, ["api", rest @ ..]) => {
             if let Err(resp) = authorized(&req, &env) {
                 return Ok(resp);
@@ -209,13 +225,52 @@ async fn fetch(mut req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 return Ok(json_error(413, "request body too large"));
             }
             let cache = Cache::new(&ctx.env);
+            let oauth = ctx.oauth();
             let relay = Relay {
                 config: &config,
                 cache: &cache,
+                oauth: Some(&oauth),
             };
             handle_mcp(&relay, &scope, &body).await
         }
         _ => Ok(json_error(404, "not found")),
+    }
+}
+
+/// The authorization server redirects the user's browser here. The `state`
+/// value is the only credential: it is random, single-use and short-lived.
+async fn oauth_callback(req: &Request, ctx: &Ctx) -> Result<Response> {
+    let url = req.url()?;
+    let param = |name: &str| {
+        url.query_pairs()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.into_owned())
+    };
+    let Some(state) = param("state") else {
+        return ui::oauth_result(false, "This page is missing the sign-in state.");
+    };
+    if let Some(error) = param("error") {
+        let detail = param("error_description").unwrap_or_default();
+        // Burn the flow so the link cannot be reused.
+        let _ = ctx.kv.delete(&format!("oauth-flow:{state}")).await;
+        return ui::oauth_result(
+            false,
+            &format!("Sign-in was not completed: {error} {detail}"),
+        );
+    }
+    let Some(code) = param("code") else {
+        return ui::oauth_result(false, "The authorization server sent no code.");
+    };
+    match ctx
+        .oauth()
+        .finish(&state, &code, param("iss").as_deref())
+        .await
+    {
+        Ok(name) => ui::oauth_result(
+            true,
+            &format!("Signed in to {name}. You can close this window."),
+        ),
+        Err(e) => ui::oauth_result(false, &e),
     }
 }
 

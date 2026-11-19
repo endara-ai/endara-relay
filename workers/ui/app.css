@@ -62,11 +62,13 @@ section { margin-top: 28px; }
 .row .title { font-weight: 500; }
 .row .sub { color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .row .meta { color: var(--muted); white-space: nowrap; }
+.row .meta.warn { color: var(--warn); }
 .row .meta.error { color: var(--danger); max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
 
 .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
 .dot.ok { background: var(--ok); }
 .dot.error { background: var(--danger); }
+.dot.warn { background: var(--warn); }
 .dot.loading { background: var(--border); animation: pulse 1.2s ease-in-out infinite; }
 @keyframes pulse { 50% { opacity: 0.4; } }
 

@@ -7,6 +7,7 @@
 
 use crate::cache::Cache;
 use crate::config::{Config, Endpoint};
+use crate::oauth::OAuth;
 use crate::upstream::{Upstream, UpstreamError};
 use crate::{prefix, protocol, resource_uri, tool_call_rewrite, toon_convert};
 use futures_util::future::join_all;
@@ -73,6 +74,7 @@ impl<'a> Scope<'a> {
 pub struct Relay<'a> {
     pub config: &'a Config,
     pub cache: &'a Cache,
+    pub oauth: Option<&'a OAuth>,
 }
 
 pub enum Reply {
@@ -96,11 +98,13 @@ impl From<UpstreamError> for Reply {
                 message,
                 data,
             },
-            UpstreamError::Transport(message) => Reply::Error {
-                code: -32603,
-                message,
-                data: None,
-            },
+            UpstreamError::Transport(message) | UpstreamError::Unauthorized(message) => {
+                Reply::Error {
+                    code: -32603,
+                    message,
+                    data: None,
+                }
+            }
         }
     }
 }
@@ -115,7 +119,7 @@ fn invalid_params(message: impl Into<String>) -> Reply {
 
 impl<'a> Relay<'a> {
     fn upstream(&self, ep: &'a Endpoint) -> Upstream<'a> {
-        Upstream::new(ep, self.cache, self.config.request_timeout_secs)
+        Upstream::new(ep, self.cache, self.config.request_timeout_secs, self.oauth)
     }
 
     pub async fn dispatch(&self, scope: &Scope<'a>, method: &str, params: Value) -> Reply {
@@ -518,6 +522,13 @@ impl<'a> Relay<'a> {
             if !ep.enabled {
                 return json!({ "id": ep.id, "name": ep.name, "status": "disabled" });
             }
+            let sign_in = match (ep.oauth, self.oauth) {
+                (true, Some(oauth)) => Some(oauth.state(ep).await),
+                _ => None,
+            };
+            if sign_in.as_ref().is_some_and(|s| !s.signed_in) {
+                return json!({ "id": ep.id, "name": ep.name, "status": "needs_sign_in", "oauth": sign_in });
+            }
             if fresh {
                 self.cache
                     .delete(&format!("list:tools/list:{}:{}", ep.name, ep.fingerprint))
@@ -528,6 +539,7 @@ impl<'a> Relay<'a> {
                     "id": ep.id,
                     "name": ep.name,
                     "status": "ok",
+                    "oauth": sign_in,
                     "tools": tools.iter().map(|t| json!({
                         "name": t.get("name"),
                         "description": t.get("description"),

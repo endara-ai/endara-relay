@@ -21,7 +21,8 @@ so tool names and `mcp-relay://` URIs are the same as on the local relay.
 | `list_tools` / `search_tools` meta-tools, TOON output, profiles (`/mcp/{path}`) | Yes |
 | STDIO servers, Docker isolation | No: Workers cannot start processes |
 | Legacy SSE upstreams | No: use streamable HTTP |
-| OAuth / EMA-managed upstreams | Not yet |
+| OAuth sign-in with dynamic client registration (RFC 9728 / 8414 / 7591, PKCE, RFC 8707) | Yes |
+| Enterprise SSO (EMA) upstreams | Not yet |
 | `execute_tools` JS sandbox, `write_file` | No |
 
 ## Speed
@@ -72,6 +73,21 @@ turn single tools off, make profiles and change settings.
   region within about a minute.
 - The web app API (`/api/config`, `/api/status`, `/api/test`) uses the same
   bearer token, so it can be scripted.
+
+### OAuth servers
+
+Choose **OAuth** as the authentication for a server and click **Sign in**.
+The relay finds the server's authorization server, registers itself as a
+client (dynamic client registration), and opens the sign-in page in a popup.
+The authorization server redirects back to `https://<worker-url>/oauth/callback`.
+
+- Sign-in uses PKCE S256, the `resource` parameter and the `iss` check.
+  Sign-in links are single-use and expire after ten minutes.
+- Access and refresh tokens are encrypted in KV. The relay refreshes the
+  access token before it expires, and once more if the server answers 401.
+- If the refresh token is rejected, the server shows **Sign in needed**.
+- The server must support dynamic client registration. Servers that need a
+  pre-registered client are not supported yet.
 
 Point MCP clients at `https://<worker-url>/mcp` (or `/mcp/<profile>`) with
 `Authorization: Bearer <RELAY_AUTH_TOKEN>`.
