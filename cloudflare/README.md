@@ -41,7 +41,7 @@ so tool names and `mcp-relay://` URIs are the same as on the local relay.
 
 Requires Rust with `wasm32-unknown-unknown`, `cargo install worker-build`, Node 22+.
 
-Create `workers/.env`:
+Create `cloudflare/.env`:
 
 ```
 CLOUDFLARE_ACCOUNT_ID=...
@@ -53,7 +53,7 @@ RELAY_ENCRYPTION_KEY=<long random string>   # encrypts upstream tokens; never ch
 Then:
 
 ```sh
-cd workers
+cd cloudflare
 npm install
 npm run deploy      # worker-build --release && alchemy deploy --stage prod
 ```

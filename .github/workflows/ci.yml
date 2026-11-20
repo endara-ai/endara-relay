@@ -39,12 +39,12 @@ jobs:
       - name: Integration tests
         run: cargo test --test '*' -- --test-threads=4
 
-  worker:
+  cloudflare:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
       run:
-        working-directory: workers
+        working-directory: cloudflare
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -53,7 +53,7 @@ jobs:
           components: rustfmt, clippy
       - uses: swatinem/rust-cache@v2
         with:
-          workspaces: workers
+          workspaces: cloudflare
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: actions/setup-node@v4
         with:
