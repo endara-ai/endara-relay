@@ -39,6 +39,36 @@ jobs:
       - name: Integration tests
         run: cargo test --test '*' -- --test-threads=4
 
+  cloudflare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: cloudflare
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: cloudflare
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install worker-build
+        run: cargo install worker-build --locked
+      - name: Format check
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      - name: Build
+        run: worker-build --release
+      - name: E2E
+        run: npm ci && npm run test:e2e
+
   build:
     strategy:
       matrix:
