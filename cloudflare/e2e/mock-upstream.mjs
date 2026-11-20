@@ -92,6 +92,12 @@ export function startMockUpstream({ name, mode, token, tools, resources = [], pr
     }
     if (mode === "sse") {
       res.writeHead(200, { ...headers, "content-type": "text/event-stream" });
+      if (msg.params?.arguments?.linger) {
+        // Reply, then keep the stream open like a server that sends more events later.
+        res.write(`event: message\ndata: ${JSON.stringify(reply)}\n\n`);
+        setTimeout(() => res.end(), 8000);
+        return;
+      }
       // A server-initiated notification first: the relay must skip it.
       res.write(`event: message\ndata: ${JSON.stringify({ jsonrpc: "2.0", method: "notifications/message", params: { level: "info", data: "working" } })}\n\n`);
       res.end(`event: message\ndata: ${JSON.stringify(reply)}\n\n`);

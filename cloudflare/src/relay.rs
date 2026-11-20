@@ -176,13 +176,32 @@ impl<'a> Relay<'a> {
     /// Fetch one endpoint's full list for `method`, following `nextCursor`.
     /// Successful lists are cached for `cache_ttl_secs`; failures briefly in
     /// memory so one dead upstream does not stall every listing.
+    /// Cache key for an endpoint's list. For OAuth servers it includes the
+    /// current grant, and there is no key (no cached data) while signed out.
+    async fn list_key(&self, ep: &'a Endpoint, method: &str) -> Result<String, String> {
+        let base = format!("list:{}:{}:{}", method, ep.name, ep.fingerprint);
+        if !ep.oauth {
+            return Ok(base);
+        }
+        let grant = match self.oauth {
+            Some(oauth) => oauth.grant_id(ep).await,
+            None => None,
+        };
+        grant.map(|g| format!("{base}:{g}")).ok_or_else(|| {
+            format!(
+                "'{}' needs sign-in: open the relay web app and click Sign in",
+                ep.name
+            )
+        })
+    }
+
     pub async fn endpoint_list(
         &self,
         ep: &'a Endpoint,
         method: &str,
         key: &str,
     ) -> Result<Vec<Value>, String> {
-        let cache_key = format!("list:{}:{}:{}", method, ep.name, ep.fingerprint);
+        let cache_key = self.list_key(ep, method).await?;
         if let Some(v) = self.cache.get(&cache_key).await {
             return match v {
                 Value::Array(items) => Ok(items),
@@ -531,7 +550,7 @@ impl<'a> Relay<'a> {
             }
             if fresh {
                 self.cache
-                    .delete(&format!("list:tools/list:{}:{}", ep.name, ep.fingerprint))
+                    .delete(&self.list_key(ep, "tools/list").await.unwrap_or_default())
                     .await;
             }
             match self.endpoint_list(ep, "tools/list", "tools").await {

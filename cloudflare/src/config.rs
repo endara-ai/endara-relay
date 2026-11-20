@@ -61,6 +61,39 @@ pub fn fingerprint(name: &str, url: &str, headers: &[(String, String)], oauth: b
         .collect()
 }
 
+/// Name-derived prefix: sanitized, with `_` runs collapsed and trimmed so it
+/// can never end in `_` or contain `__`.
+fn derive_prefix(name: &str) -> Option<String> {
+    let sanitized = prefix::sanitize_name(name)?;
+    let mut out = String::with_capacity(sanitized.len());
+    for c in sanitized.chars() {
+        if c == '_' && out.ends_with('_') {
+            continue;
+        }
+        out.push(c);
+    }
+    let out = out.trim_matches('_').to_string();
+    (!out.is_empty()).then_some(out)
+}
+
+/// A prefix must keep `<prefix>__<tool>` unambiguous: ASCII letters, digits,
+/// `-` and `_` only, no leading or trailing `_`, and no `__`.
+fn validate_prefix(prefix: &str) -> Result<(), String> {
+    let ok = prefix
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && !prefix.starts_with('_')
+        && !prefix.ends_with('_')
+        && !prefix.contains("__");
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "tool prefix '{prefix}' may use only letters, digits, '-' and '_', must not start or end with '_', and must not contain '__'"
+        ))
+    }
+}
+
 pub fn validate_url(url: &str) -> Result<(), String> {
     let lower = url.to_ascii_lowercase();
     if !(lower.starts_with("https://") || lower.starts_with("http://")) || url.len() < 10 {
@@ -91,19 +124,18 @@ impl Config {
                 return Err(format!("two servers are named '{name}'"));
             }
             validate_url(&ep.url)?;
-            let prefix = ep
+            let prefix = match ep
                 .tool_prefix
                 .as_deref()
                 .map(str::trim)
                 .filter(|p| !p.is_empty())
-                .map(str::to_string)
-                .or_else(|| prefix::sanitize_name(name))
-                .ok_or_else(|| {
+            {
+                Some(explicit) => explicit.to_string(),
+                None => derive_prefix(name).ok_or_else(|| {
                     format!("'{name}' needs a tool prefix (its name has no usable characters)")
-                })?;
-            if prefix.contains("__") {
-                return Err(format!("tool prefix '{prefix}' must not contain '__'"));
-            }
+                })?,
+            };
+            validate_prefix(&prefix)?;
             if ep.enabled && !prefixes.insert(prefix.clone()) {
                 return Err(format!(
                     "two enabled servers use the tool prefix '{prefix}'"

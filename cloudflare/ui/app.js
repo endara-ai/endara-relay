@@ -227,12 +227,16 @@ async function testDraft() {
   const d = state.draft;
   state.test = { loading: true };
   render();
+  let result;
   try {
     const r = await api("POST", "test", { id: d.id || undefined, url: d.url, headers: draftHeaders(d) });
-    state.test = r.ok ? { ok: true, tools: r.tools, more: r.more } : { ok: false, error: r.error };
+    result = r.ok ? { ok: true, tools: r.tools, more: r.more } : { ok: false, error: r.error };
   } catch (e) {
-    state.test = { ok: false, error: e.message };
+    result = { ok: false, error: e.message };
   }
+  // The user may have opened another server while the test ran.
+  if (state.draft !== d) return;
+  state.test = result;
   render();
 }
 
@@ -267,8 +271,15 @@ async function saveAndSignIn() {
       return;
     }
     if (!id) id = state.config.endpoints.find((e) => e.name === entry.name)?.id;
-    state.draft.id = id;
-    state.open = { kind: "server", id };
+    if (!id) {
+      if (popup) popup.close();
+      return;
+    }
+    // Only adopt the saved id if this editor is still the one open.
+    if (state.draft === d) {
+      d.id = id;
+      state.open = { kind: "server", id };
+    }
   }
   await signIn(id, popup);
 }
@@ -364,6 +375,7 @@ function serverRow(ep) {
         "aria-expanded": isOpen ? "true" : "false",
         onclick: () => (isOpen ? closeEditor() : openServer(ep.id)),
         onkeydown: (ev) => {
+          if (ev.target !== ev.currentTarget) return;
           if (ev.key === "Enter" || ev.key === " ") {
             ev.preventDefault();
             isOpen ? closeEditor() : openServer(ep.id);
@@ -378,6 +390,7 @@ function serverRow(ep) {
         role: "switch",
         "aria-checked": ep.enabled ? "true" : "false",
         "aria-label": `${ep.enabled ? "Disable" : "Enable"} ${ep.name}`,
+        "data-fk": `sw-${ep.id}`,
         disabled: state.saving,
         onclick: (ev) => {
           ev.stopPropagation();
@@ -398,6 +411,7 @@ function bind(key, attrs = {}) {
   return h("input", {
     type: "text",
     "aria-label": key,
+    "data-fk": `d-${key}`,
     ...attrs,
     value: state.draft[key],
     oninput: (ev) => (state.draft[key] = ev.target.value),
@@ -438,6 +452,7 @@ function serverEditor() {
       type: "password",
       autocomplete: "off",
       "aria-label": "Bearer token",
+      "data-fk": "d-bearer",
       placeholder: d.bearerPreview ? `${d.bearerPreview}  (leave empty to keep)` : "Paste the token",
       value: d.bearer,
       oninput: (ev) => (d.bearer = ev.target.value),
@@ -450,11 +465,12 @@ function serverEditor() {
         h(
           "div",
           { class: "header-row" },
-          h("input", { type: "text", placeholder: "Header", "aria-label": "Header name", value: row.name, oninput: (ev) => (row.name = ev.target.value) }),
+          h("input", { type: "text", placeholder: "Header", "aria-label": `Header ${i + 1} name`, "data-fk": `h-name-${i}`, value: row.name, oninput: (ev) => (row.name = ev.target.value) }),
           h("input", {
             type: "password",
             autocomplete: "off",
-            "aria-label": "Header value",
+            "aria-label": `Header ${i + 1} value`,
+            "data-fk": `h-value-${i}`,
             placeholder: row.saved ? `${row.preview}  (leave empty to keep)` : "Value",
             value: row.value,
             oninput: (ev) => (row.value = ev.target.value),
@@ -509,6 +525,8 @@ function serverEditor() {
             { class: "tool" },
             h("input", {
               type: "checkbox",
+              "aria-label": `Use ${t.name}`,
+              "data-fk": `tool-${t.name}`,
               checked: !d.disabled_tools.includes(t.name),
               onchange: (ev) => {
                 d.disabled_tools = ev.target.checked ? d.disabled_tools.filter((x) => x !== t.name) : [...d.disabled_tools, t.name];
@@ -616,6 +634,7 @@ function profileRow(p) {
         "aria-expanded": isOpen ? "true" : "false",
         onclick: () => (isOpen ? closeEditor() : openProfile(p.id)),
         onkeydown: (ev) => {
+          if (ev.target !== ev.currentTarget) return;
           if (ev.key === "Enter" || ev.key === " ") {
             ev.preventDefault();
             isOpen ? closeEditor() : openProfile(p.id);
@@ -668,6 +687,7 @@ function profileEditor() {
                 { class: "chip" },
                 h("input", {
                   type: "checkbox",
+                  "data-fk": `pe-${ep.id}`,
                   checked: d.endpoint_ids.includes(ep.id),
                   onchange: (ev) => (d.endpoint_ids = ev.target.checked ? [...d.endpoint_ids, ep.id] : d.endpoint_ids.filter((x) => x !== ep.id)),
                 }),
@@ -745,6 +765,7 @@ function settingsCard() {
       max,
       value: s[key],
       "aria-label": key,
+      "data-fk": `s-${key}`,
       onchange: (ev) => {
         const v = Number(ev.target.value);
         if (Number.isInteger(v) && v >= min && v <= max && v !== s[key]) commit({ [key]: v });
@@ -765,6 +786,7 @@ function settingsCard() {
           type: "text",
           value: s.machine_name,
           "aria-label": "Relay name",
+          "data-fk": "s-machine_name",
           onchange: (ev) => ev.target.value.trim() && ev.target.value.trim() !== s.machine_name && commit({ machine_name: ev.target.value.trim() }),
         }),
       ),
@@ -805,7 +827,7 @@ function render() {
   if (!state.config) return;
   const app = document.getElementById("app");
   const active = document.activeElement;
-  const focusKey = active && active.getAttribute && active.getAttribute("aria-label");
+  const focusKey = active && active.dataset ? active.dataset.fk : null;
   const caret = active && typeof active.selectionStart === "number" ? [active.selectionStart, active.selectionEnd] : null;
   const c = state.config;
   const mcpUrl = `${location.origin}/mcp`;
@@ -896,7 +918,7 @@ function render() {
 
   state.justOpened = false;
   if (focusKey) {
-    const again = app.querySelector(`[aria-label="${CSS.escape(focusKey)}"]`);
+    const again = app.querySelector(`[data-fk="${CSS.escape(focusKey)}"]`);
     if (again && again !== document.activeElement) {
       again.focus();
       if (caret && typeof again.setSelectionRange === "function") {

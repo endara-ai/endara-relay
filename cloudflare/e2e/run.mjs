@@ -411,15 +411,38 @@ await check("signing in again reuses the registered client", async () => {
   eq(toolText(await rpc("tools/call", { name: "gamma__whoami", arguments: {} })), "user-1", "result");
 });
 
-await check("sign-out drops the tokens", async () => {
+await check("sign-out drops the tokens and the cached catalog", async () => {
+  const before = await rpc("tools/list");
+  expect(before.json.result.tools.some((t) => t.name === "gamma__whoami"), "gamma listed while signed in");
   eq((await apiCall("POST", "oauth/sign-out", { id: "gamma" })).status, 200, "status");
   eq((await gammaStatus()).status, "needs_sign_in", "after sign-out");
+  const after = await rpc("tools/list");
+  expect(!after.json.result.tools.some((t) => t.name.startsWith("gamma__")), "cached gamma catalog served after sign-out");
 });
 
 await check("OAuth start refuses servers that are not saved as OAuth", async () => {
   eq((await apiCall("POST", "oauth/start", { id: "beta" })).status, 400, "non-oauth");
   eq((await apiCall("POST", "oauth/start", { id: "nope" })).status, 404, "unknown");
   eq((await apiCall("POST", "oauth/start", { id: "gamma" }, null)).status, 401, "no token");
+});
+
+await check("ambiguous tool prefixes and duplicate server ids are rejected", async () => {
+  const plain = (cfg) => cfg.endpoints.map((e) => ({ ...e, headers: e.headers.map((hd) => ({ name: hd.name })) }));
+  const trailing = { ...current, endpoints: [...plain(current), { name: "extra", tool_prefix: "a_", url: beta.url, headers: [], enabled: true, disabled_tools: [] }] };
+  const r1 = await apiCall("PUT", "config", trailing);
+  eq(r1.status, 400, "trailing underscore");
+  expect(r1.json.error.includes("must not start or end with '_'"), r1.json.error);
+  const dupId = { ...current, endpoints: [...plain(current), { id: "beta", name: "beta2", url: beta.url, headers: [], enabled: true, disabled_tools: [] }] };
+  const r2 = await apiCall("PUT", "config", dupId);
+  eq(r2.status, 400, "duplicate id");
+  expect(r2.json.error.includes("share the id 'beta'"), r2.json.error);
+});
+
+await check("an SSE reply is used as soon as it arrives, even if the stream stays open", async () => {
+  const started = Date.now();
+  const r = await rpc("tools/call", { name: "beta__echo", arguments: { text: "open", linger: true } });
+  eq(toolText(r), "beta:open", "result");
+  expect(Date.now() - started < 4000, `took ${Date.now() - started} ms (request timeout is 5 s, stream stays open 8 s)`);
 });
 
 await check("web app is served with a strict CSP", async () => {

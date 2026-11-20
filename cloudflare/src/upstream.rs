@@ -8,6 +8,7 @@ use crate::cache::Cache;
 use crate::config::Endpoint;
 use crate::oauth::OAuth;
 use futures_util::future::{select, Either};
+use futures_util::StreamExt;
 use serde_json::{json, Value};
 use std::cell::Cell;
 use std::cell::RefCell;
@@ -21,14 +22,22 @@ const MAX_ERROR_BODY: usize = 300;
 
 thread_local! {
     static NEXT_ID: Cell<u64> = const { Cell::new(1) };
+    /// Random per-isolate prefix: upstream sessions are shared across
+    /// isolates through KV, so request ids must be unique across them too.
+    static ID_PREFIX: String = {
+        let mut b = [0u8; 8];
+        let _ = getrandom::getrandom(&mut b);
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    };
 }
 
-fn next_id() -> u64 {
-    NEXT_ID.with(|c| {
+fn next_id() -> String {
+    let n = NEXT_ID.with(|c| {
         let id = c.get();
         c.set(id.wrapping_add(1));
         id
-    })
+    });
+    ID_PREFIX.with(|p| format!("{p}-{n}"))
 }
 
 #[derive(Debug)]
@@ -70,6 +79,7 @@ pub struct Upstream<'a> {
     timeout: Duration,
     oauth: Option<&'a OAuth>,
     token: RefCell<Option<String>>,
+    grant_id: RefCell<Option<String>>,
 }
 
 struct HttpReply {
@@ -92,6 +102,7 @@ impl<'a> Upstream<'a> {
             timeout: Duration::from_secs(timeout_secs),
             oauth,
             token: RefCell::new(None),
+            grant_id: RefCell::new(None),
         }
     }
 
@@ -106,15 +117,22 @@ impl<'a> Upstream<'a> {
             .access_token(self.endpoint, force_refresh)
             .await
             .map_err(|e| UpstreamError::Transport(e.message()))?;
-        *self.token.borrow_mut() = Some(token);
+        *self.token.borrow_mut() = Some(token.token);
+        *self.grant_id.borrow_mut() = Some(token.id);
         Ok(())
     }
 
     fn session_key(&self) -> String {
-        format!(
-            "session:{}:{}",
-            self.endpoint.name, self.endpoint.fingerprint
-        )
+        match self.grant_id.borrow().as_deref() {
+            Some(grant) => format!(
+                "session:{}:{}:{grant}",
+                self.endpoint.name, self.endpoint.fingerprint
+            ),
+            None => format!(
+                "session:{}:{}",
+                self.endpoint.name, self.endpoint.fingerprint
+            ),
+        }
     }
 
     /// Send one JSON-RPC request and return its `result`. For OAuth servers
@@ -183,11 +201,11 @@ impl<'a> Upstream<'a> {
                 "clientInfo": { "name": "endara-relay-worker", "version": env!("CARGO_PKG_VERSION") }
             }
         });
-        let reply = self.post(&body, None, None).await?;
+        let reply = self.post(&body, None, None, Some(&id)).await?;
         if !(200..300).contains(&reply.status) {
             return Err(status_error("initialize", &reply));
         }
-        let result = extract_result(&reply, id)?;
+        let result = extract_result(&reply, &id)?;
         let session = Session {
             id: reply.session_id.clone(),
             protocol_version: result
@@ -202,6 +220,7 @@ impl<'a> Upstream<'a> {
                 &note,
                 session.id.as_deref(),
                 Some(&session.protocol_version),
+                None,
             )
             .await?;
         if !(200..300).contains(&ack.status) {
@@ -230,6 +249,7 @@ impl<'a> Upstream<'a> {
                 &body,
                 session.id.as_deref(),
                 Some(&session.protocol_version),
+                Some(&id),
             )
             .await
             .map_err(SendError::Other)?;
@@ -239,7 +259,7 @@ impl<'a> Upstream<'a> {
         if !(200..300).contains(&reply.status) {
             return Err(SendError::Other(status_error(method, &reply)));
         }
-        extract_result(&reply, id).map_err(SendError::Other)
+        extract_result(&reply, &id).map_err(SendError::Other)
     }
 
     async fn post(
@@ -247,6 +267,7 @@ impl<'a> Upstream<'a> {
         body: &Value,
         session_id: Option<&str>,
         protocol_version: Option<&str>,
+        expect_id: Option<&str>,
     ) -> Result<HttpReply, UpstreamError> {
         let t = |e: worker::Error| UpstreamError::Transport(e.to_string());
         let headers = Headers::new();
@@ -279,7 +300,12 @@ impl<'a> Upstream<'a> {
             let status = resp.status_code();
             let session_id = resp.headers().get("mcp-session-id")?;
             let content_type = resp.headers().get("content-type")?.unwrap_or_default();
-            let body = resp.text().await?;
+            let body = match expect_id {
+                Some(id) if content_type.starts_with("text/event-stream") => {
+                    read_sse_until(&mut resp, id).await?
+                }
+                _ => resp.text().await?,
+            };
             Ok::<_, worker::Error>(HttpReply {
                 status,
                 session_id,
@@ -325,7 +351,41 @@ fn status_error(method: &str, reply: &HttpReply) -> UpstreamError {
 }
 
 /// Find the response to request `id` in a JSON body or an SSE stream.
-fn extract_result(reply: &HttpReply, id: u64) -> Result<Value, UpstreamError> {
+fn is_response_to(m: &Value, id: &str) -> bool {
+    m.get("id").and_then(|v| v.as_str()) == Some(id) && m.get("method").is_none()
+}
+
+/// Read an SSE body only until the response to `id` arrives. Servers may keep
+/// the stream open afterwards (more events, heartbeats); waiting for the end
+/// would turn a finished request into a timeout. Returns the events read.
+async fn read_sse_until(resp: &mut worker::Response, id: &str) -> worker::Result<String> {
+    let mut stream = resp.stream()?;
+    let mut buf: Vec<u8> = Vec::new();
+    let mut scanned = 0;
+    while let Some(chunk) = stream.next().await {
+        buf.extend_from_slice(&chunk?);
+        // Only complete events (ending in a blank line) are inspected.
+        let text = String::from_utf8_lossy(&buf);
+        let complete = text
+            .rfind("\n\n")
+            .or_else(|| text.rfind("\r\n\r\n"))
+            .map(|i| i + 2);
+        if let Some(end) = complete {
+            if end > scanned {
+                if parse_sse_messages(&text[scanned..end])
+                    .iter()
+                    .any(|m| is_response_to(m, id))
+                {
+                    return Ok(text[..end].to_string());
+                }
+                scanned = end;
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+fn extract_result(reply: &HttpReply, id: &str) -> Result<Value, UpstreamError> {
     let messages: Vec<Value> = if reply.content_type.starts_with("text/event-stream") {
         parse_sse_messages(&reply.body)
     } else {
@@ -341,7 +401,7 @@ fn extract_result(reply: &HttpReply, id: u64) -> Result<Value, UpstreamError> {
     };
     let response = messages
         .into_iter()
-        .find(|m| m.get("id").and_then(|v| v.as_u64()) == Some(id) && m.get("method").is_none())
+        .find(|m| is_response_to(m, id))
         .ok_or_else(|| {
             UpstreamError::Transport("upstream sent no response for the request".into())
         })?;

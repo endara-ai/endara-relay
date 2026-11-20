@@ -28,12 +28,30 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 const REFRESH_MARGIN_MS: u64 = 60_000;
 const CLIENT_NAME: &str = "Endara Relay";
 
-/// (server url, access token, expires_at ms)
-type CachedToken = (String, String, Option<u64>);
+/// How long an isolate trusts its own copy of a token before re-reading KV,
+/// so a sign-out or a new sign-in elsewhere takes effect quickly.
+const MEMORY_TTL_MS: u64 = 30_000;
+
+#[derive(Clone)]
+struct CachedToken {
+    url: String,
+    token: String,
+    grant_id: String,
+    expires_at: Option<u64>,
+    cached_at: u64,
+}
 
 thread_local! {
     /// endpoint id -> cached access token
     static TOKENS: RefCell<HashMap<String, CachedToken>> = RefCell::new(HashMap::new());
+}
+
+/// An access token plus the id of the sign-in (grant) it belongs to. Caches
+/// for OAuth servers include the grant id, so a new account never sees the
+/// previous account's catalog or upstream session.
+pub struct Grant {
+    pub token: String,
+    pub id: String,
 }
 
 fn now_ms() -> u64 {
@@ -85,6 +103,43 @@ struct Record {
     refresh_token_enc: Option<String>,
     #[serde(default)]
     expires_at: Option<u64>,
+    /// New random value for every completed sign-in.
+    #[serde(default)]
+    grant_id: Option<String>,
+}
+
+impl Record {
+    fn grant(&self) -> String {
+        self.grant_id.clone().unwrap_or_else(|| "g0".into())
+    }
+
+    fn clear_tokens(&mut self) {
+        self.access_token_enc = None;
+        self.refresh_token_enc = None;
+        self.expires_at = None;
+        self.grant_id = None;
+    }
+}
+
+fn cache_token(endpoint_id: &str, url: &str, token: &str, record: &Record) {
+    TOKENS.with(|t| {
+        t.borrow_mut().insert(
+            endpoint_id.to_string(),
+            CachedToken {
+                url: url.to_string(),
+                token: token.to_string(),
+                grant_id: record.grant(),
+                expires_at: record.expires_at,
+                cached_at: now_ms(),
+            },
+        )
+    });
+}
+
+fn cached_token(ep: &Endpoint) -> Option<CachedToken> {
+    TOKENS
+        .with(|t| t.borrow().get(&ep.id).cloned())
+        .filter(|c| c.url == ep.url && c.cached_at + MEMORY_TTL_MS > now_ms())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -154,9 +209,7 @@ impl OAuth {
     pub async fn sign_out(&self, endpoint_id: &str) -> Result<(), String> {
         TOKENS.with(|t| t.borrow_mut().remove(endpoint_id));
         if let Some(mut record) = self.load(endpoint_id).await {
-            record.access_token_enc = None;
-            record.refresh_token_enc = None;
-            record.expires_at = None;
+            record.clear_tokens();
             self.save(endpoint_id, &record).await?;
         }
         Ok(())
@@ -177,18 +230,34 @@ impl OAuth {
 
     // ---- tokens for upstream requests -----------------------------------
 
+    /// The current grant id, or `None` when not signed in. Used to key
+    /// caches; it re-reads KV at least every `MEMORY_TTL_MS`.
+    pub async fn grant_id(&self, ep: &Endpoint) -> Option<String> {
+        if let Some(c) = cached_token(ep) {
+            return Some(c.grant_id);
+        }
+        match self.load(&ep.id).await {
+            Some(r) if r.url == ep.url && r.access_token_enc.is_some() => Some(r.grant()),
+            _ => None,
+        }
+    }
+
     /// A valid access token for `ep`, refreshing it if it is about to expire.
     /// `force_refresh` is used after the upstream rejected the current token.
     pub async fn access_token(
         &self,
         ep: &Endpoint,
         force_refresh: bool,
-    ) -> Result<String, OAuthError> {
+    ) -> Result<Grant, OAuthError> {
         if !force_refresh {
-            let cached = TOKENS.with(|t| t.borrow().get(&ep.id).cloned());
-            if let Some((url, token, exp)) = cached {
-                if url == ep.url && exp.is_none_or(|e| e > now_ms() + REFRESH_MARGIN_MS) {
-                    return Ok(token);
+            if let Some(c) = cached_token(ep) {
+                if c.expires_at
+                    .is_none_or(|e| e > now_ms() + REFRESH_MARGIN_MS)
+                {
+                    return Ok(Grant {
+                        token: c.token,
+                        id: c.grant_id,
+                    });
                 }
             }
         }
@@ -210,13 +279,11 @@ impl OAuth {
             .is_none_or(|e| e > now_ms() + REFRESH_MARGIN_MS);
         if fresh && !force_refresh {
             let token = self.crypto.open_str(&access_enc)?;
-            TOKENS.with(|t| {
-                t.borrow_mut().insert(
-                    ep.id.clone(),
-                    (ep.url.clone(), token.clone(), record.expires_at),
-                )
+            cache_token(&ep.id, &ep.url, &token, &record);
+            return Ok(Grant {
+                token,
+                id: record.grant(),
             });
-            return Ok(token);
         }
         let Some(refresh_enc) = record.refresh_token_enc.clone() else {
             return Err(sign_in());
@@ -233,15 +300,31 @@ impl OAuth {
         match self.token_request(&record, form).await {
             Ok(tokens) => {
                 let token = self
-                    .store_tokens(&ep.id, &ep.url, &mut record, tokens)
+                    .store_tokens(&ep.id, &ep.url, &mut record, tokens, false)
                     .await?;
-                Ok(token)
+                Ok(Grant {
+                    token,
+                    id: record.grant(),
+                })
             }
             Err(TokenError::Rejected(msg)) => {
-                // The refresh token is dead: require a new sign-in.
-                record.access_token_enc = None;
-                record.refresh_token_enc = None;
-                record.expires_at = None;
+                // Another request may have rotated the refresh token first:
+                // use its result instead of wiping a valid sign-in.
+                if let Some(latest) = self.load(&ep.id).await {
+                    if latest.url == ep.url && latest.refresh_token_enc != Some(refresh_enc.clone())
+                    {
+                        if let Some(enc) = &latest.access_token_enc {
+                            let token = self.crypto.open_str(enc)?;
+                            cache_token(&ep.id, &ep.url, &token, &latest);
+                            return Ok(Grant {
+                                token,
+                                id: latest.grant(),
+                            });
+                        }
+                        return Err(sign_in());
+                    }
+                }
+                record.clear_tokens();
                 let _ = self.save(&ep.id, &record).await;
                 TOKENS.with(|t| t.borrow_mut().remove(&ep.id));
                 Err(OAuthError::NeedsSignIn(format!(
@@ -259,7 +342,13 @@ impl OAuth {
         url: &str,
         record: &mut Record,
         tokens: Value,
+        new_grant: bool,
     ) -> Result<String, String> {
+        if new_grant {
+            // A new sign-in must never inherit the previous account's tokens.
+            record.clear_tokens();
+            record.grant_id = Some(random_token(12));
+        }
         let access = tokens
             .get("access_token")
             .and_then(|v| v.as_str())
@@ -277,12 +366,7 @@ impl OAuth {
             })
             .map(|secs| now_ms() + secs * 1000);
         self.save(endpoint_id, record).await?;
-        TOKENS.with(|t| {
-            t.borrow_mut().insert(
-                endpoint_id.to_string(),
-                (url.to_string(), access.clone(), record.expires_at),
-            )
-        });
+        cache_token(endpoint_id, url, &access, record);
         Ok(access)
     }
 
@@ -353,7 +437,10 @@ impl OAuth {
             .await
             .map_err(|e| e.to_string())?
             .ok_or("this sign-in link expired or was already used; start again from the relay")?;
-        let _ = self.kv.delete(&key).await;
+        // Consume the state before using it, and fail closed if that fails.
+        self.kv.delete(&key).await.map_err(|_| {
+            "could not use this sign-in link; start again from the relay".to_string()
+        })?;
         let flow: Flow = serde_json::from_str(&text).map_err(|e| e.to_string())?;
         let mut record = flow.record;
         // RFC 9207: reject a response from a different authorization server.
@@ -382,7 +469,7 @@ impl OAuth {
                 }
             })?;
         let url = record.url.clone();
-        self.store_tokens(&flow.endpoint_id, &url, &mut record, tokens)
+        self.store_tokens(&flow.endpoint_id, &url, &mut record, tokens, true)
             .await?;
         Ok(flow.endpoint_name)
     }
@@ -496,44 +583,34 @@ impl OAuth {
         )
     }
 
+    /// Fetch RFC 8414 / OIDC metadata for the advertised issuer. Every
+    /// candidate document must name exactly that issuer (RFC 8414 §3.3), so
+    /// a different server on the same origin is never accepted.
     async fn authorization_server(&self, issuer_url: &str) -> Result<Value, String> {
         let parsed = self.check_url(issuer_url, "authorization server URL")?;
         let origin = parsed.origin().ascii_serialization();
         let path = parsed.path().trim_end_matches('/');
-        let input_issuer = if path.is_empty() {
+        let issuer = if path.is_empty() {
             origin.clone()
         } else {
             format!("{origin}{path}")
         };
-        let mut candidates: Vec<(String, String)> = Vec::new();
-        let mut push = |url: String, issuer: &str| {
-            if !candidates.iter().any(|(u, _)| *u == url) {
-                candidates.push((url, issuer.to_string()));
-            }
-        };
-        push(
+        let mut candidates: Vec<String> = Vec::new();
+        for url in [
             format!("{origin}/.well-known/oauth-authorization-server{path}"),
-            &input_issuer,
-        );
-        push(
-            format!("{origin}/.well-known/oauth-authorization-server"),
-            &origin,
-        );
-        push(
-            format!("{input_issuer}/.well-known/openid-configuration"),
-            &input_issuer,
-        );
-        push(
-            format!("{origin}/.well-known/openid-configuration"),
-            &origin,
-        );
-
-        for (url, expected) in candidates {
+            format!("{issuer}/.well-known/openid-configuration"),
+            format!("{origin}/.well-known/openid-configuration{path}"),
+        ] {
+            if !candidates.contains(&url) {
+                candidates.push(url);
+            }
+        }
+        for url in candidates {
             let Ok(Some(meta)) = self.get_json(&url).await else {
                 continue;
             };
-            let issuer = meta.get("issuer").and_then(|v| v.as_str()).unwrap_or("");
-            if normalize_issuer(issuer) != normalize_issuer(&expected) {
+            let found = meta.get("issuer").and_then(|v| v.as_str()).unwrap_or("");
+            if normalize_issuer(found) != normalize_issuer(&issuer) {
                 continue;
             }
             let methods: Vec<&str> = meta
@@ -554,7 +631,7 @@ impl OAuth {
             return Ok(meta);
         }
         Err(format!(
-            "no authorization server metadata found for {issuer_url}"
+            "no authorization server metadata with issuer {issuer} was found"
         ))
     }
 
@@ -640,6 +717,7 @@ impl OAuth {
             access_token_enc: None,
             refresh_token_enc: None,
             expires_at: None,
+            grant_id: None,
         })
     }
 

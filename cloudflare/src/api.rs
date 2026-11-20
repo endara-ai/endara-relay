@@ -149,6 +149,12 @@ fn merge(
             oauth: ep.oauth,
         });
     }
+    let mut seen_ids = HashSet::new();
+    for e in &endpoints {
+        if !seen_ids.insert(e.id.as_str()) {
+            return Err(format!("two servers share the id '{}'", e.id));
+        }
+    }
     let known: HashSet<&str> = endpoints.iter().map(|e| e.id.as_str()).collect();
     let profiles = body
         .profiles
