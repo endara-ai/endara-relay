@@ -63,8 +63,30 @@ async fn read_json<T: for<'de> Deserialize<'de>>(
     serde_json::from_slice(&body).map_err(|e| json_error(400, &format!("invalid JSON: {e}")))
 }
 
+/// The config from the coordinator (strongly consistent). On first use it
+/// is seeded once from the older KV-only copy, if one exists.
+pub(crate) async fn authoritative_config(ctx: &Ctx) -> std::result::Result<Stored, String> {
+    let reply = ctx.coord.call("config/get", json!({})).await?;
+    if let Some(doc) = reply.get("doc").filter(|d| !d.is_null()) {
+        return serde_json::from_value(doc.clone())
+            .map_err(|e| format!("stored config is invalid: {e}"));
+    }
+    let legacy = store::load(&ctx.kv).await?;
+    if legacy.revision == 0 {
+        return Ok(legacy);
+    }
+    let seeded = ctx
+        .coord
+        .call("config/put", json!({ "seed": true, "doc": legacy }))
+        .await?;
+    serde_json::from_value(seeded.get("doc").cloned().unwrap_or(Value::Null))
+        .map_err(|e| format!("stored config is invalid: {e}"))
+}
+
 async fn load_stored(ctx: &Ctx) -> std::result::Result<Stored, Response> {
-    store::load(&ctx.kv).await.map_err(|e| json_error(500, &e))
+    authoritative_config(ctx)
+        .await
+        .map_err(|e| json_error(500, &e))
 }
 
 async fn get_config(ctx: &Ctx) -> Result<Response> {
@@ -79,12 +101,15 @@ async fn put_config(ctx: &Ctx, body: ApiConfig) -> Result<Response> {
         Ok(s) => s,
         Err(r) => return Ok(r),
     };
-    if body.revision != current.revision {
-        return Ok(Response::from_json(&json!({
+    let conflict = |revision: u64| {
+        Response::from_json(&json!({
             "error": "the configuration changed in another window; reload to see the latest",
-            "revision": current.revision,
-        }))?
-        .with_status(409));
+            "revision": revision,
+        }))
+        .map(|r| r.with_status(409))
+    };
+    if body.revision != current.revision {
+        return conflict(current.revision);
     }
     let next = match merge(&ctx.crypto, &current, body) {
         Ok(s) => s,
@@ -94,8 +119,29 @@ async fn put_config(ctx: &Ctx, body: ApiConfig) -> Result<Response> {
         Ok(c) => c,
         Err(e) => return Ok(json_error(400, &e)),
     };
+    // Compare-and-set in the coordinator: of two saves on the same revision,
+    // exactly one succeeds.
+    let reply = match ctx
+        .coord
+        .call(
+            "config/put",
+            json!({ "expected": current.revision, "doc": next }),
+        )
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return Ok(json_error(500, &format!("could not save: {e}"))),
+    };
+    if reply.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+        return conflict(reply.get("revision").and_then(|v| v.as_u64()).unwrap_or(0));
+    }
+    // Refresh the KV copy that serves MCP traffic. If this fails the copy is
+    // stale until the next save; the coordinator already holds the change.
     if let Err(e) = store::save(&ctx.kv, &next).await {
-        return Ok(json_error(500, &format!("could not save: {e}")));
+        return Ok(json_error(
+            500,
+            &format!("saved, but the edge copy was not updated ({e}); save again to retry"),
+        ));
     }
     let oauth = ctx.oauth();
     for removed in current

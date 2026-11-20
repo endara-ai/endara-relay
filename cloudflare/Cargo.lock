@@ -167,9 +167,11 @@ dependencies = [
  "getrandom",
  "percent-encoding",
  "serde",
+ "serde-wasm-bindgen",
  "serde_json",
  "sha2",
  "toon-format",
+ "wasm-bindgen",
  "worker",
 ]
 

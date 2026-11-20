@@ -25,6 +25,25 @@ so tool names and `mcp-relay://` URIs are the same as on the local relay.
 | Enterprise SSO (EMA) upstreams | Not yet |
 | `execute_tools` JS sandbox, `write_file` | No |
 
+## Consistency
+
+One Durable Object, the **Coordinator**, owns every change that must not
+race. Read traffic does not go through it.
+
+- **Config saves:** a compare-and-set on the revision. Of two saves on the
+  same revision, exactly one succeeds; the other gets 409. KV keeps a copy
+  for the fast path that serves MCP traffic.
+- **Sign-in links:** the pending state is read and deleted in one step, so a
+  link works exactly once, in any region.
+- **OAuth tokens:** sign-in, sign-out and refresh go through the
+  Coordinator. Concurrent refreshes for one server make a single call to the
+  token endpoint. A refresh result is saved only if the sign-in it started
+  from is still current, so a sign-out during a refresh wins.
+
+Isolates keep a copy of a token for at most 30 s. The first deploy of this
+version moves the existing config and OAuth records from KV into the
+Coordinator automatically.
+
 ## Speed
 
 - Upstream sessions (`Mcp-Session-Id`) are cached, so a warm call costs one
@@ -58,8 +77,8 @@ npm install
 npm run deploy      # worker-build --release && alchemy deploy --stage prod
 ```
 
-`alchemy.run.ts` creates the `RelayCache` KV namespace and the `Relay` Worker,
-and binds the two secrets. `npm run destroy` removes them.
+`alchemy.run.ts` creates the `RelayCache` KV namespace, the `Relay` Worker and
+its `Coordinator` Durable Object, and binds the two secrets. `npm run destroy` removes them.
 
 ## Configure
 

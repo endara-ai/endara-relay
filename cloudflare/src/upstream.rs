@@ -106,15 +106,22 @@ impl<'a> Upstream<'a> {
         }
     }
 
-    async fn load_token(&self, force_refresh: bool) -> Result<(), UpstreamError> {
+    /// Load the access token. `after_401` passes the token that was just
+    /// rejected, so the coordinator refreshes it (once for all callers).
+    async fn load_token(&self, after_401: bool) -> Result<(), UpstreamError> {
         if !self.endpoint.oauth {
             return Ok(());
         }
         let oauth = self.oauth.ok_or_else(|| {
             UpstreamError::Transport("OAuth is not available for this request".into())
         })?;
+        let rejected = if after_401 {
+            self.token.borrow().clone()
+        } else {
+            None
+        };
         let token = oauth
-            .access_token(self.endpoint, force_refresh)
+            .access_token(self.endpoint, rejected.as_deref())
             .await
             .map_err(|e| UpstreamError::Transport(e.message()))?;
         *self.token.borrow_mut() = Some(token.token);

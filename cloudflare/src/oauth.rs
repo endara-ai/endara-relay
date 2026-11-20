@@ -3,11 +3,13 @@
 //! (RFC 8414 / OIDC), dynamic client registration (RFC 7591), authorization
 //! code + PKCE S256, resource indicators (RFC 8707) and refresh tokens.
 //!
-//! One record per server lives in KV under `oauth:{endpoint id}`, with the
-//! client secret and tokens encrypted. Pending sign-ins live under
-//! `oauth-flow:{state}` for ten minutes and are single-use.
+//! Records and pending sign-ins live in the Coordinator Durable Object, which
+//! serializes every change (see `coordinator.rs`). The client secret and the
+//! tokens are encrypted. This module does discovery, registration and the
+//! authorization-code exchange; isolates keep a 30 s copy of the token.
 
 use crate::config::Endpoint;
+use crate::coordinator::{token_hash, CoordinatorClient};
 use crate::store::Crypto;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use base64::Engine;
@@ -81,39 +83,42 @@ impl From<String> for OAuthError {
 
 /// Persisted per-server OAuth state. `*_enc` fields are encrypted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct Record {
-    url: String,
-    redirect_uri: String,
-    issuer: String,
-    authorization_endpoint: String,
-    token_endpoint: String,
-    resource: String,
+pub(crate) struct Record {
+    pub(crate) url: String,
+    pub(crate) redirect_uri: String,
+    pub(crate) issuer: String,
+    pub(crate) authorization_endpoint: String,
+    pub(crate) token_endpoint: String,
+    pub(crate) resource: String,
     #[serde(default)]
-    scope: Option<String>,
+    pub(crate) scope: Option<String>,
     #[serde(default)]
-    authorization_response_iss: bool,
-    client_id: String,
+    pub(crate) authorization_response_iss: bool,
+    pub(crate) client_id: String,
     #[serde(default)]
-    client_secret_enc: Option<String>,
+    pub(crate) client_secret_enc: Option<String>,
     #[serde(default)]
-    token_auth_method: String,
+    pub(crate) token_auth_method: String,
     #[serde(default)]
-    access_token_enc: Option<String>,
+    pub(crate) access_token_enc: Option<String>,
     #[serde(default)]
-    refresh_token_enc: Option<String>,
+    pub(crate) refresh_token_enc: Option<String>,
     #[serde(default)]
-    expires_at: Option<u64>,
+    pub(crate) expires_at: Option<u64>,
     /// New random value for every completed sign-in.
     #[serde(default)]
-    grant_id: Option<String>,
+    pub(crate) grant_id: Option<String>,
+    /// Bumped by the coordinator on every write.
+    #[serde(default)]
+    pub(crate) version: u64,
 }
 
 impl Record {
-    fn grant(&self) -> String {
+    pub(crate) fn grant(&self) -> String {
         self.grant_id.clone().unwrap_or_else(|| "g0".into())
     }
 
-    fn clear_tokens(&mut self) {
+    pub(crate) fn clear_tokens(&mut self) {
         self.access_token_enc = None;
         self.refresh_token_enc = None;
         self.expires_at = None;
@@ -121,19 +126,50 @@ impl Record {
     }
 }
 
-fn cache_token(endpoint_id: &str, url: &str, token: &str, record: &Record) {
+fn cache_token(endpoint_id: &str, url: &str, token: &str, grant_id: &str, expires_at: Option<u64>) {
     TOKENS.with(|t| {
         t.borrow_mut().insert(
             endpoint_id.to_string(),
             CachedToken {
                 url: url.to_string(),
                 token: token.to_string(),
-                grant_id: record.grant(),
-                expires_at: record.expires_at,
+                grant_id: grant_id.to_string(),
+                expires_at,
                 cached_at: now_ms(),
             },
         )
     });
+}
+
+/// Seal the tokens of a token-endpoint response into `record`. A new grant
+/// first drops everything from the previous one. Returns the access token.
+pub(crate) fn apply_tokens(
+    crypto: &Crypto,
+    record: &mut Record,
+    tokens: &Value,
+    new_grant: bool,
+) -> Result<String, String> {
+    if new_grant {
+        record.clear_tokens();
+        record.grant_id = Some(random_token(12));
+    }
+    let access = tokens
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or("token response has no access_token")?
+        .to_string();
+    record.access_token_enc = Some(crypto.seal_str(&access)?);
+    if let Some(refresh) = tokens.get("refresh_token").and_then(|v| v.as_str()) {
+        record.refresh_token_enc = Some(crypto.seal_str(refresh)?);
+    }
+    record.expires_at = tokens
+        .get("expires_in")
+        .and_then(|v| {
+            v.as_u64()
+                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+        })
+        .map(|secs| now_ms() + secs * 1000);
+    Ok(access)
 }
 
 fn cached_token(ep: &Endpoint) -> Option<CachedToken> {
@@ -158,13 +194,11 @@ pub struct SignInState {
 
 #[derive(Clone)]
 pub struct OAuth {
-    kv: KvStore,
+    coord: CoordinatorClient,
+    /// Where records lived before the coordinator; migrated on first read.
+    legacy_kv: KvStore,
     crypto: Crypto,
     allow_insecure: bool,
-}
-
-fn record_key(endpoint_id: &str) -> String {
-    format!("oauth:{endpoint_id}")
 }
 
 fn random_token(bytes: usize) -> String {
@@ -174,57 +208,79 @@ fn random_token(bytes: usize) -> String {
 }
 
 impl OAuth {
-    pub fn new(kv: KvStore, crypto: Crypto, allow_insecure: bool) -> Self {
+    pub fn new(
+        coord: CoordinatorClient,
+        legacy_kv: KvStore,
+        crypto: Crypto,
+        allow_insecure: bool,
+    ) -> Self {
         OAuth {
-            kv,
+            coord,
+            legacy_kv,
             crypto,
             allow_insecure,
         }
     }
 
-    // ---- storage ---------------------------------------------------------
+    // ---- storage (the coordinator owns every write) ------------------------
 
-    /// `Ok(None)` only when there is no record. A failed read or a damaged
-    /// record is an error, never "signed out".
+    /// `Ok(None)` only when there is no record; a failed read is an error.
     async fn load(&self, endpoint_id: &str) -> Result<Option<Record>, String> {
-        let text = self
-            .kv
-            .get(&record_key(endpoint_id))
-            .text()
-            .await
-            .map_err(|e| format!("could not read the sign-in record: {e}"))?;
-        match text {
-            None => Ok(None),
-            Some(t) => serde_json::from_str(&t)
+        let reply = self
+            .coord
+            .call("oauth/get", json!({ "id": endpoint_id }))
+            .await?;
+        match reply.get("record") {
+            None | Some(Value::Null) => self.migrate_legacy(endpoint_id).await,
+            Some(v) => serde_json::from_value(v.clone())
                 .map(Some)
                 .map_err(|e| format!("the stored sign-in record is damaged: {e}")),
         }
     }
 
-    async fn save(&self, endpoint_id: &str, record: &Record) -> Result<(), String> {
-        let body = serde_json::to_string(record).map_err(|e| e.to_string())?;
-        self.kv
-            .put(&record_key(endpoint_id), body)
-            .map_err(|e| e.to_string())?
-            .execute()
+    /// One-time move of a record from KV (before the coordinator existed).
+    /// The coordinator stores it only if it still has none; then the KV copy
+    /// is deleted so it can never come back after a sign-out or removal.
+    async fn migrate_legacy(&self, endpoint_id: &str) -> Result<Option<Record>, String> {
+        let key = format!("oauth:{endpoint_id}");
+        let Some(text) = self
+            .legacy_kv
+            .get(&key)
+            .text()
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("could not read the sign-in record: {e}"))?
+        else {
+            return Ok(None);
+        };
+        let legacy: Record = serde_json::from_str(&text)
+            .map_err(|e| format!("the stored sign-in record is damaged: {e}"))?;
+        let reply = self
+            .coord
+            .call("oauth/seed", json!({ "id": endpoint_id, "record": legacy }))
+            .await?;
+        let _ = self.legacy_kv.delete(&key).await;
+        serde_json::from_value(reply.get("record").cloned().unwrap_or(Value::Null))
+            .map(Some)
+            .map_err(|e| format!("coordinator returned a bad record: {e}"))
     }
 
-    /// Drop everything for a server (it was removed).
+    /// Drop everything for a server (it was removed or no longer uses OAuth).
     pub async fn forget(&self, endpoint_id: &str) {
         TOKENS.with(|t| t.borrow_mut().remove(endpoint_id));
-        let _ = self.kv.delete(&record_key(endpoint_id)).await;
+        let _ = self
+            .coord
+            .call("oauth/forget", json!({ "id": endpoint_id }))
+            .await;
+        let _ = self.legacy_kv.delete(&format!("oauth:{endpoint_id}")).await;
     }
 
     /// Sign out: drop the tokens but keep the registered client.
     pub async fn sign_out(&self, endpoint_id: &str) -> Result<(), String> {
         TOKENS.with(|t| t.borrow_mut().remove(endpoint_id));
-        if let Some(mut record) = self.load(endpoint_id).await? {
-            record.clear_tokens();
-            self.save(endpoint_id, &record).await?;
-        }
-        Ok(())
+        self.coord
+            .call("oauth/sign-out", json!({ "id": endpoint_id }))
+            .await
+            .map(|_| ())
     }
 
     pub async fn state(&self, ep: &Endpoint) -> SignInState {
@@ -243,7 +299,7 @@ impl OAuth {
     // ---- tokens for upstream requests -----------------------------------
 
     /// The current grant id, or `None` when not signed in. Used to key
-    /// caches; it re-reads KV at least every `MEMORY_TTL_MS`.
+    /// caches; it re-reads the coordinator at least every `MEMORY_TTL_MS`.
     pub async fn grant_id(&self, ep: &Endpoint) -> Option<String> {
         if let Some(c) = cached_token(ep) {
             return Some(c.grant_id);
@@ -255,14 +311,15 @@ impl OAuth {
         }
     }
 
-    /// A valid access token for `ep`, refreshing it if it is about to expire.
-    /// `force_refresh` is used after the upstream rejected the current token.
+    /// A valid access token for `ep`. `rejected` is the token the upstream
+    /// just answered 401 to; the coordinator then refreshes once for all
+    /// concurrent callers, unless someone already replaced that token.
     pub async fn access_token(
         &self,
         ep: &Endpoint,
-        force_refresh: bool,
+        rejected: Option<&str>,
     ) -> Result<Grant, OAuthError> {
-        if !force_refresh {
+        if rejected.is_none() {
             if let Some(c) = cached_token(ep) {
                 if c.expires_at
                     .is_none_or(|e| e > now_ms() + REFRESH_MARGIN_MS)
@@ -274,114 +331,33 @@ impl OAuth {
                 }
             }
         }
-        let sign_in = || {
-            OAuthError::NeedsSignIn(format!(
-                "'{}' needs sign-in: open the relay web app and click Sign in",
+        let reply = self
+            .coord
+            .call(
+                "oauth/token",
+                json!({ "id": ep.id, "url": ep.url, "stale": rejected.map(token_hash) }),
+            )
+            .await?;
+        if let Some(msg) = reply.get("needs_sign_in").and_then(|v| v.as_str()) {
+            TOKENS.with(|t| t.borrow_mut().remove(&ep.id));
+            return Err(OAuthError::NeedsSignIn(format!(
+                "'{}' needs sign-in again: {msg}. Open the relay web app and click Sign in",
                 ep.name
-            ))
-        };
-        let mut record = match self.load(&ep.id).await? {
-            Some(r) if r.url == ep.url => r,
-            _ => return Err(sign_in()),
-        };
-        let Some(access_enc) = record.access_token_enc.clone() else {
-            return Err(sign_in());
-        };
-        let fresh = record
-            .expires_at
-            .is_none_or(|e| e > now_ms() + REFRESH_MARGIN_MS);
-        if fresh && !force_refresh {
-            let token = self.crypto.open_str(&access_enc)?;
-            cache_token(&ep.id, &ep.url, &token, &record);
-            return Ok(Grant {
-                token,
-                id: record.grant(),
-            });
+            )));
         }
-        let Some(refresh_enc) = record.refresh_token_enc.clone() else {
-            return Err(sign_in());
-        };
-        let refresh_token = self.crypto.open_str(&refresh_enc)?;
-        let mut form = vec![
-            ("grant_type", "refresh_token".to_string()),
-            ("refresh_token", refresh_token),
-            ("resource", record.resource.clone()),
-        ];
-        if let Some(scope) = &record.scope {
-            form.push(("scope", scope.clone()));
-        }
-        match self.token_request(&record, form).await {
-            Ok(tokens) => {
-                let token = self
-                    .store_tokens(&ep.id, &ep.url, &mut record, tokens, false)
-                    .await?;
-                Ok(Grant {
-                    token,
-                    id: record.grant(),
-                })
-            }
-            Err(TokenError::Rejected(msg)) => {
-                // Another request may have rotated the refresh token first:
-                // use its result instead of wiping a valid sign-in.
-                // If the record cannot be read, keep the tokens and report it.
-                if let Some(latest) = self.load(&ep.id).await? {
-                    if latest.url == ep.url && latest.refresh_token_enc != Some(refresh_enc.clone())
-                    {
-                        if let Some(enc) = &latest.access_token_enc {
-                            let token = self.crypto.open_str(enc)?;
-                            cache_token(&ep.id, &ep.url, &token, &latest);
-                            return Ok(Grant {
-                                token,
-                                id: latest.grant(),
-                            });
-                        }
-                        return Err(sign_in());
-                    }
-                }
-                record.clear_tokens();
-                let _ = self.save(&ep.id, &record).await;
-                TOKENS.with(|t| t.borrow_mut().remove(&ep.id));
-                Err(OAuthError::NeedsSignIn(format!(
-                    "'{}' needs sign-in again (refresh was rejected: {msg})",
-                    ep.name
-                )))
-            }
-            Err(TokenError::Other(msg)) => Err(OAuthError::Other(msg)),
-        }
-    }
-
-    async fn store_tokens(
-        &self,
-        endpoint_id: &str,
-        url: &str,
-        record: &mut Record,
-        tokens: Value,
-        new_grant: bool,
-    ) -> Result<String, String> {
-        if new_grant {
-            // A new sign-in must never inherit the previous account's tokens.
-            record.clear_tokens();
-            record.grant_id = Some(random_token(12));
-        }
-        let access = tokens
-            .get("access_token")
+        let token = reply
+            .get("token")
             .and_then(|v| v.as_str())
-            .ok_or("token response has no access_token")?
+            .ok_or_else(|| OAuthError::Other("coordinator returned no token".into()))?
             .to_string();
-        record.access_token_enc = Some(self.crypto.seal_str(&access)?);
-        if let Some(refresh) = tokens.get("refresh_token").and_then(|v| v.as_str()) {
-            record.refresh_token_enc = Some(self.crypto.seal_str(refresh)?);
-        }
-        record.expires_at = tokens
-            .get("expires_in")
-            .and_then(|v| {
-                v.as_u64()
-                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
-            })
-            .map(|secs| now_ms() + secs * 1000);
-        self.save(endpoint_id, record).await?;
-        cache_token(endpoint_id, url, &access, record);
-        Ok(access)
+        let grant = reply
+            .get("grant_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("g0")
+            .to_string();
+        let expires_at = reply.get("expires_at").and_then(|v| v.as_u64());
+        cache_token(&ep.id, &ep.url, &token, &grant, expires_at);
+        Ok(Grant { token, id: grant })
     }
 
     // ---- sign-in ---------------------------------------------------------
@@ -394,10 +370,20 @@ impl OAuth {
             Some(r) if r.url == ep.url && r.redirect_uri == redirect_uri => r,
             _ => {
                 let discovered = self.discover(ep).await?;
-                self.register(ep, redirect_uri, discovered).await?
+                let registered = self.register(ep, redirect_uri, discovered).await?;
+                // The coordinator keeps an equivalent registration if another
+                // sign-in stored one first.
+                let reply = self
+                    .coord
+                    .call(
+                        "oauth/register",
+                        json!({ "id": ep.id, "record": registered }),
+                    )
+                    .await?;
+                serde_json::from_value(reply.get("record").cloned().unwrap_or(Value::Null))
+                    .map_err(|e| format!("coordinator returned a bad record: {e}"))?
             }
         };
-        self.save(&ep.id, &record).await?;
 
         let verifier = random_token(32);
         let challenge = B64URL.encode(Sha256::digest(verifier.as_bytes()));
@@ -423,16 +409,16 @@ impl OAuth {
             verifier,
             record,
         };
-        self.kv
-            .put(
-                &format!("oauth-flow:{state}"),
-                serde_json::to_string(&flow).map_err(|e| e.to_string())?,
+        self.coord
+            .call(
+                "flow/put",
+                json!({
+                    "state": state,
+                    "flow": flow,
+                    "expires_at": now_ms() + FLOW_TTL_SECS * 1000,
+                }),
             )
-            .map_err(|e| e.to_string())?
-            .expiration_ttl(FLOW_TTL_SECS)
-            .execute()
-            .await
-            .map_err(|e| e.to_string())?;
+            .await?;
         Ok(auth_url.to_string())
     }
 
@@ -443,20 +429,22 @@ impl OAuth {
         code: &str,
         iss: Option<&str>,
     ) -> Result<String, String> {
-        let key = format!("oauth-flow:{state}");
-        let text = self
-            .kv
-            .get(&key)
-            .text()
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or("this sign-in link expired or was already used; start again from the relay")?;
-        // Consume the state before using it, and fail closed if that fails.
-        self.kv.delete(&key).await.map_err(|_| {
-            "could not use this sign-in link; start again from the relay".to_string()
-        })?;
+        // Atomic read-and-delete: a state can be used exactly once.
+        let reply = self
+            .coord
+            .call("flow/take", json!({ "state": state }))
+            .await?;
+        let text = match reply.get("flow") {
+            None | Some(Value::Null) => {
+                return Err(
+                    "this sign-in link expired or was already used; start again from the relay"
+                        .into(),
+                )
+            }
+            Some(v) => v.to_string(),
+        };
         let flow: Flow = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-        let mut record = flow.record;
+        let record = flow.record;
         // RFC 9207: reject a response from a different authorization server.
         match iss {
             Some(iss) if normalize_issuer(iss) != normalize_issuer(&record.issuer) => {
@@ -474,17 +462,27 @@ impl OAuth {
             ("code_verifier", flow.verifier),
             ("resource", record.resource.clone()),
         ];
-        let tokens = self
-            .token_request(&record, form)
+        let tokens = token_request(&self.crypto, &record, form)
             .await
             .map_err(|e| match e {
                 TokenError::Rejected(m) | TokenError::Other(m) => {
                     format!("token exchange failed: {m}")
                 }
             })?;
-        let url = record.url.clone();
-        self.store_tokens(&flow.endpoint_id, &url, &mut record, tokens, true)
+        let installed = self
+            .coord
+            .call(
+                "oauth/install",
+                json!({ "id": flow.endpoint_id, "record": record, "tokens": tokens }),
+            )
             .await?;
+        if let (Some(token), Some(grant)) = (
+            installed.get("token").and_then(|v| v.as_str()),
+            installed.get("grant_id").and_then(|v| v.as_str()),
+        ) {
+            let expires_at = installed.get("expires_at").and_then(|v| v.as_u64());
+            cache_token(&flow.endpoint_id, &record.url, token, grant, expires_at);
+        }
         Ok(flow.endpoint_name)
     }
 
@@ -581,10 +579,7 @@ impl OAuth {
                 let _ = headers.set(k, v);
             }
         }
-        let Ok(resp) = self
-            .send(&ep.url, Method::Post, headers, Some(body.to_string()))
-            .await
-        else {
+        let Ok(resp) = send(&ep.url, Method::Post, headers, Some(body.to_string())).await else {
             return (None, None);
         };
         if resp.status != 401 {
@@ -683,14 +678,13 @@ impl OAuth {
         let headers = Headers::new();
         let _ = headers.set("content-type", "application/json");
         let _ = headers.set("accept", "application/json");
-        let resp = self
-            .send(
-                &registration,
-                Method::Post,
-                headers,
-                Some(request.to_string()),
-            )
-            .await?;
+        let resp = send(
+            &registration,
+            Method::Post,
+            headers,
+            Some(request.to_string()),
+        )
+        .await?;
         if !(200..300).contains(&resp.status) {
             return Err(format!(
                 "client registration failed (HTTP {}): {}",
@@ -737,107 +731,104 @@ impl OAuth {
             refresh_token_enc: None,
             expires_at: None,
             grant_id: None,
+            version: 0,
         })
-    }
-
-    // ---- HTTP --------------------------------------------------------------
-
-    async fn token_request(
-        &self,
-        record: &Record,
-        mut form: Vec<(&str, String)>,
-    ) -> Result<Value, TokenError> {
-        let headers = Headers::new();
-        let _ = headers.set("content-type", "application/x-www-form-urlencoded");
-        let _ = headers.set("accept", "application/json");
-        let secret = match &record.client_secret_enc {
-            Some(enc) => Some(self.crypto.open_str(enc).map_err(TokenError::Other)?),
-            None => None,
-        };
-        match (record.token_auth_method.as_str(), &secret) {
-            ("client_secret_basic", Some(secret)) => {
-                let enc =
-                    |s: &str| form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
-                let basic = base64::engine::general_purpose::STANDARD.encode(format!(
-                    "{}:{}",
-                    enc(&record.client_id),
-                    enc(secret)
-                ));
-                let _ = headers.set("authorization", &format!("Basic {basic}"));
-            }
-            (_, Some(secret)) => {
-                form.push(("client_id", record.client_id.clone()));
-                form.push(("client_secret", secret.clone()));
-            }
-            (_, None) => form.push(("client_id", record.client_id.clone())),
-        }
-        let body = form_urlencoded::Serializer::new(String::new())
-            .extend_pairs(form.iter().map(|(k, v)| (*k, v.as_str())))
-            .finish();
-        let resp = self
-            .send(&record.token_endpoint, Method::Post, headers, Some(body))
-            .await
-            .map_err(TokenError::Other)?;
-        let parsed: Option<Value> = serde_json::from_str(&resp.body).ok();
-        if (200..300).contains(&resp.status) {
-            return parsed
-                .ok_or_else(|| TokenError::Other("token endpoint returned invalid JSON".into()));
-        }
-        let detail = parsed
-            .as_ref()
-            .and_then(|v| {
-                let e = v.get("error")?.as_str()?;
-                Some(match v.get("error_description").and_then(|d| d.as_str()) {
-                    Some(d) => format!("{e}: {d}"),
-                    None => e.to_string(),
-                })
-            })
-            .unwrap_or_else(|| format!("HTTP {}: {}", resp.status, snippet(&resp.body)));
-        if resp.status == 400 || resp.status == 401 {
-            Err(TokenError::Rejected(detail))
-        } else {
-            Err(TokenError::Other(detail))
-        }
     }
 
     async fn get_json(&self, url: &str) -> Result<Option<Value>, String> {
         let headers = Headers::new();
         let _ = headers.set("accept", "application/json");
-        let resp = self.send(url, Method::Get, headers, None).await?;
+        let resp = send(url, Method::Get, headers, None).await?;
         if resp.status != 200 {
             return Ok(None);
         }
         Ok(serde_json::from_str(&resp.body).ok())
     }
+}
 
-    async fn send(
-        &self,
-        url: &str,
-        method: Method,
-        headers: Headers,
-        body: Option<String>,
-    ) -> Result<HttpReply, String> {
-        let mut init = RequestInit::new();
-        init.with_method(method).with_headers(headers);
-        if let Some(b) = body {
-            init.with_body(Some(JsValue::from_str(&b)));
+/// Call the token endpoint with the client's credentials.
+pub(crate) async fn token_request(
+    crypto: &Crypto,
+    record: &Record,
+    mut form: Vec<(&str, String)>,
+) -> Result<Value, TokenError> {
+    let headers = Headers::new();
+    let _ = headers.set("content-type", "application/x-www-form-urlencoded");
+    let _ = headers.set("accept", "application/json");
+    let secret = match &record.client_secret_enc {
+        Some(enc) => Some(crypto.open_str(enc).map_err(TokenError::Other)?),
+        None => None,
+    };
+    match (record.token_auth_method.as_str(), &secret) {
+        ("client_secret_basic", Some(secret)) => {
+            let enc = |s: &str| form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
+            let basic = base64::engine::general_purpose::STANDARD.encode(format!(
+                "{}:{}",
+                enc(&record.client_id),
+                enc(secret)
+            ));
+            let _ = headers.set("authorization", &format!("Basic {basic}"));
         }
-        let req = Request::new_with_init(url, &init).map_err(|e| e.to_string())?;
-        let exchange = async {
-            let mut resp = Fetch::Request(req).send().await?;
-            let status = resp.status_code();
-            let www_authenticate = resp.headers().get("www-authenticate")?;
-            let body = resp.text().await?;
-            Ok::<_, worker::Error>(HttpReply {
-                status,
-                www_authenticate,
-                body,
+        (_, Some(secret)) => {
+            form.push(("client_id", record.client_id.clone()));
+            form.push(("client_secret", secret.clone()));
+        }
+        (_, None) => form.push(("client_id", record.client_id.clone())),
+    }
+    let body = form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(form.iter().map(|(k, v)| (*k, v.as_str())))
+        .finish();
+    let resp = send(&record.token_endpoint, Method::Post, headers, Some(body))
+        .await
+        .map_err(TokenError::Other)?;
+    let parsed: Option<Value> = serde_json::from_str(&resp.body).ok();
+    if (200..300).contains(&resp.status) {
+        return parsed
+            .ok_or_else(|| TokenError::Other("token endpoint returned invalid JSON".into()));
+    }
+    let detail = parsed
+        .as_ref()
+        .and_then(|v| {
+            let e = v.get("error")?.as_str()?;
+            Some(match v.get("error_description").and_then(|d| d.as_str()) {
+                Some(d) => format!("{e}: {d}"),
+                None => e.to_string(),
             })
-        };
-        match select(Box::pin(exchange), Box::pin(Delay::from(HTTP_TIMEOUT))).await {
-            Either::Left((r, _)) => r.map_err(|e| format!("request to {url} failed: {e}")),
-            Either::Right(_) => Err(format!("request to {url} timed out")),
-        }
+        })
+        .unwrap_or_else(|| format!("HTTP {}: {}", resp.status, snippet(&resp.body)));
+    if resp.status == 400 || resp.status == 401 {
+        Err(TokenError::Rejected(detail))
+    } else {
+        Err(TokenError::Other(detail))
+    }
+}
+
+async fn send(
+    url: &str,
+    method: Method,
+    headers: Headers,
+    body: Option<String>,
+) -> Result<HttpReply, String> {
+    let mut init = RequestInit::new();
+    init.with_method(method).with_headers(headers);
+    if let Some(b) = body {
+        init.with_body(Some(JsValue::from_str(&b)));
+    }
+    let req = Request::new_with_init(url, &init).map_err(|e| e.to_string())?;
+    let exchange = async {
+        let mut resp = Fetch::Request(req).send().await?;
+        let status = resp.status_code();
+        let www_authenticate = resp.headers().get("www-authenticate")?;
+        let body = resp.text().await?;
+        Ok::<_, worker::Error>(HttpReply {
+            status,
+            www_authenticate,
+            body,
+        })
+    };
+    match select(Box::pin(exchange), Box::pin(Delay::from(HTTP_TIMEOUT))).await {
+        Either::Left((r, _)) => r.map_err(|e| format!("request to {url} failed: {e}")),
+        Either::Right(_) => Err(format!("request to {url} timed out")),
     }
 }
 
@@ -853,7 +844,7 @@ struct HttpReply {
     body: String,
 }
 
-enum TokenError {
+pub(crate) enum TokenError {
     /// The grant itself was refused (invalid_grant and friends).
     Rejected(String),
     Other(String),

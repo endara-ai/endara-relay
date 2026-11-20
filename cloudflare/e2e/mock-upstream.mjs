@@ -140,7 +140,7 @@ export function startMockOAuthUpstream({ name, advertisePkce = true }) {
     state.lastAccessToken = a;
     return { access_token: a, refresh_token: r, token_type: "Bearer", expires_in: 3600 };
   };
-  const state = { lastAccessToken: null };
+  const state = { lastAccessToken: null, tokenDelayMs: 0 };
   const json = (res, status, body, headers = {}) => res.writeHead(status, { "content-type": "application/json", ...headers }).end(JSON.stringify(body));
 
   const server = http.createServer(async (req, res) => {
@@ -150,6 +150,10 @@ export function startMockOAuthUpstream({ name, advertisePkce = true }) {
 
     if (req.method === "POST" && url.pathname === "/admin/revoke-access") {
       access.clear();
+      return res.writeHead(204).end();
+    }
+    if (req.method === "POST" && url.pathname === "/admin/token-delay") {
+      state.tokenDelayMs = Number(url.searchParams.get("ms") || 0);
       return res.writeHead(204).end();
     }
     if (req.method === "POST" && url.pathname === "/admin/revoke-all") {
@@ -197,6 +201,7 @@ export function startMockOAuthUpstream({ name, advertisePkce = true }) {
     }
     if (req.method === "POST" && url.pathname === "/auth/token") {
       stats.token++;
+      if (state.tokenDelayMs) await new Promise((r) => setTimeout(r, state.tokenDelayMs));
       const f = new URLSearchParams(body);
       if (f.get("grant_type") === "authorization_code") {
         const c = codes.get(f.get("code"));

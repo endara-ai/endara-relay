@@ -48,6 +48,7 @@ const mf = new Miniflare({
   modulesRules: [{ type: "CompiledWasm", include: ["**/*.wasm"] }],
   compatibilityDate: "2026-10-01",
   kvNamespaces: ["RELAY_CACHE"],
+  durableObjects: { RELAY_COORDINATOR: "Coordinator" },
   bindings: { RELAY_AUTH_TOKEN: AUTH, RELAY_ENCRYPTION_KEY: "e2e-encryption-key", RELAY_ALLOW_INSECURE_OAUTH: "1" },
 });
 const base = (await mf.ready).toString().replace(/\/$/, "");
@@ -383,9 +384,15 @@ await check("after sign-in the server's tools are listed and callable", async ()
   eq(toolText(call), "user-1", "result");
 });
 
+// The raw stored record, read through the coordinator's own API.
+async function storedOAuthRecord(id) {
+  const ns = await mf.getDurableObjectNamespace("RELAY_COORDINATOR");
+  const res = await ns.get(ns.idFromName("relay")).fetch("https://coordinator/oauth/get", { method: "POST", body: JSON.stringify({ id }) });
+  return JSON.stringify((await res.json()).record);
+}
+
 await check("OAuth tokens are encrypted at rest", async () => {
-  const kv = await mf.getKVNamespace("RELAY_CACHE");
-  const raw = await kv.get("oauth:gamma");
+  const raw = await storedOAuthRecord("gamma");
   expect(raw && raw.includes("access_token_enc"), "no oauth record");
   expect(!raw.includes(gamma.state.lastAccessToken), "plaintext access token in KV");
 });
@@ -412,6 +419,48 @@ await check("signing in again reuses the registered client", async () => {
   eq(toolText(await rpc("tools/call", { name: "gamma__whoami", arguments: {} })), "user-1", "result");
 });
 
+await check("a sign-in stored in KV by the previous version is migrated once", async () => {
+  const ns = await mf.getDurableObjectNamespace("RELAY_COORDINATOR");
+  const coord = ns.get(ns.idFromName("relay"));
+  const record = JSON.parse(await storedOAuthRecord("gamma"));
+  await coord.fetch("https://coordinator/oauth/forget", { method: "POST", body: JSON.stringify({ id: "gamma" }) });
+  const kv = await mf.getKVNamespace("RELAY_CACHE");
+  await kv.put("oauth:gamma", JSON.stringify(record));
+  eq((await gammaStatus()).oauth.signed_in, true, "still signed in");
+  eq(await kv.get("oauth:gamma"), null, "legacy KV copy deleted");
+  eq(JSON.parse(await storedOAuthRecord("gamma")).grant_id, record.grant_id, "same grant in the coordinator");
+});
+
+await check("parallel calls that all hit an expired token share one refresh", async () => {
+  const before = gamma.stats.refresh;
+  await fetch(`${gamma.base}/admin/revoke-access`, { method: "POST" });
+  const calls = await Promise.all(Array.from({ length: 5 }, () => rpc("tools/call", { name: "gamma__whoami", arguments: {} })));
+  eq(calls.map(toolText), Array(5).fill("user-1"), "results");
+  eq(gamma.stats.refresh, before + 1, "refreshes");
+});
+
+await check("a sign-out during a slow refresh wins; the refreshed token is discarded", async () => {
+  await fetch(`${gamma.base}/admin/revoke-access`, { method: "POST" });
+  await fetch(`${gamma.base}/admin/token-delay?ms=1500`, { method: "POST" });
+  const call = rpc("tools/call", { name: "gamma__whoami", arguments: {} });
+  await new Promise((r) => setTimeout(r, 400));
+  eq((await apiCall("POST", "oauth/sign-out", { id: "gamma" })).status, 200, "sign-out");
+  await call;
+  await fetch(`${gamma.base}/admin/token-delay?ms=0`, { method: "POST" });
+  eq((await gammaStatus()).status, "needs_sign_in", "status after sign-out");
+  const next = await rpc("tools/call", { name: "gamma__whoami", arguments: {} });
+  expect(next.json.error?.message.includes("sign"), JSON.stringify(next.json));
+});
+
+await check("the same sign-in callback used twice at once succeeds only once", async () => {
+  const start = await apiCall("POST", "oauth/start", { id: "gamma" });
+  const auth = await fetch(start.json.authorization_url, { redirect: "manual" });
+  const callback = auth.headers.get("location");
+  const pages = await Promise.all([fetch(callback).then((r) => r.text()), fetch(callback).then((r) => r.text())]);
+  eq(pages.filter((p) => p.includes("Signed in to gamma")).length, 1, "successes");
+  eq(pages.filter((p) => p.includes("expired or was already used")).length, 1, "rejections");
+});
+
 await check("sign-out drops the tokens and the cached catalog", async () => {
   const before = await rpc("tools/list");
   expect(before.json.result.tools.some((t) => t.name === "gamma__whoami"), "gamma listed while signed in");
@@ -435,6 +484,18 @@ await check("OAuth start refuses servers that are not saved as OAuth", async () 
   eq((await apiCall("POST", "oauth/start", { id: "beta" })).status, 400, "non-oauth");
   eq((await apiCall("POST", "oauth/start", { id: "nope" })).status, 404, "unknown");
   eq((await apiCall("POST", "oauth/start", { id: "gamma" }, null)).status, 401, "no token");
+});
+
+await check("of parallel saves on the same revision exactly one succeeds", async () => {
+  const fresh = (await apiCall("GET", "config")).json;
+  const plain = fresh.endpoints.map((e) => ({ ...e, headers: e.headers.map((hd) => ({ name: hd.name })) }));
+  const saves = await Promise.all(
+    Array.from({ length: 5 }, (_, i) => apiCall("PUT", "config", { ...fresh, settings: { ...fresh.settings, machine_name: `race-${i}` }, endpoints: plain })),
+  );
+  eq(saves.filter((r) => r.status === 200).length, 1, "successes");
+  eq(saves.filter((r) => r.status === 409).length, 4, "conflicts");
+  current = (await apiCall("GET", "config")).json;
+  eq(current.revision, fresh.revision + 1, "revision");
 });
 
 await check("ambiguous tool prefixes and duplicate server ids are rejected", async () => {

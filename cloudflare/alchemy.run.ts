@@ -23,6 +23,8 @@ export default Alchemy.Stack(
       compatibility: { date: "2026-10-01", flags: [] },
       env: {
         RELAY_CACHE: cache,
+        // Serializes config saves, sign-ins and token refreshes.
+        RELAY_COORDINATOR: Cloudflare.DurableObject("Coordinator", { className: "Coordinator" }),
         RELAY_AUTH_TOKEN: Config.Redacted("RELAY_AUTH_TOKEN"),
         RELAY_ENCRYPTION_KEY: Config.Redacted("RELAY_ENCRYPTION_KEY"),
       },

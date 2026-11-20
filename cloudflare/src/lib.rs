@@ -11,6 +11,7 @@
 mod api;
 mod cache;
 mod config;
+mod coordinator;
 mod oauth;
 mod relay;
 mod store;
@@ -79,6 +80,7 @@ pub(crate) struct Ctx {
     pub env: Env,
     pub kv: KvStore,
     pub crypto: Crypto,
+    pub coord: coordinator::CoordinatorClient,
 }
 
 impl Ctx {
@@ -95,8 +97,10 @@ impl Ctx {
                 "relay is not configured: set the RELAY_ENCRYPTION_KEY secret",
             )
         })?;
+        let coord = coordinator::CoordinatorClient::new(&env).map_err(|e| json_error(503, &e))?;
         Ok(Ctx {
             crypto: Crypto::new(&key),
+            coord,
             env,
             kv,
         })
@@ -104,7 +108,12 @@ impl Ctx {
 
     pub fn oauth(&self) -> oauth::OAuth {
         let insecure = env_string(&self.env, INSECURE_OAUTH_VAR).is_some_and(|v| v == "1");
-        oauth::OAuth::new(self.kv.clone(), self.crypto.clone(), insecure)
+        oauth::OAuth::new(
+            self.coord.clone(),
+            self.kv.clone(),
+            self.crypto.clone(),
+            insecure,
+        )
     }
 
     pub async fn config(&self) -> std::result::Result<Rc<Config>, Response> {
@@ -117,9 +126,16 @@ impl Ctx {
         }) {
             return Ok(cfg);
         }
-        let stored = store::load(&self.kv)
+        // Hot path: the KV copy. The coordinator is the source of truth and
+        // is read when the copy is missing (first boot, or a failed copy).
+        let mut stored = store::load(&self.kv)
             .await
             .map_err(|e| json_error(500, &e))?;
+        if stored.revision == 0 {
+            stored = api::authoritative_config(self)
+                .await
+                .map_err(|e| json_error(500, &e))?;
+        }
         let cfg = Rc::new(Config::build(&stored, &self.crypto).map_err(|e| json_error(500, &e))?);
         remember_config(cfg.clone());
         Ok(cfg)
@@ -252,7 +268,7 @@ async fn oauth_callback(req: &Request, ctx: &Ctx) -> Result<Response> {
     if let Some(error) = param("error") {
         let detail = param("error_description").unwrap_or_default();
         // Burn the flow so the link cannot be reused.
-        let _ = ctx.kv.delete(&format!("oauth-flow:{state}")).await;
+        let _ = ctx.coord.call("flow/take", json!({ "state": state })).await;
         return ui::oauth_result(
             false,
             &format!("Sign-in was not completed: {error} {detail}"),
