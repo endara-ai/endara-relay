@@ -40,6 +40,7 @@ const beta = await startMockUpstream({
 });
 
 const gamma = await startMockOAuthUpstream({ name: "gamma-server" });
+const noPkce = await startMockOAuthUpstream({ name: "no-pkce-server", advertisePkce: false });
 
 const mf = new Miniflare({
   modules: true,
@@ -420,6 +421,16 @@ await check("sign-out drops the tokens and the cached catalog", async () => {
   expect(!after.json.result.tools.some((t) => t.name.startsWith("gamma__")), "cached gamma catalog served after sign-out");
 });
 
+await check("sign-in is refused when the server does not advertise PKCE S256", async () => {
+  const plain = current.endpoints.map((e) => ({ ...e, headers: e.headers.map((hd) => ({ name: hd.name })) }));
+  current = (await apiCall("PUT", "config", { ...current, endpoints: [...plain, { id: "nopkce", name: "nopkce", url: noPkce.url, headers: [], enabled: true, disabled_tools: [], oauth: true }] })).json;
+  const r = await apiCall("POST", "oauth/start", { id: "nopkce" });
+  eq(r.status, 502, "status");
+  expect(r.json.error.includes("PKCE S256"), r.json.error);
+  eq(noPkce.stats.register, 0, "no client registered");
+  current = (await apiCall("PUT", "config", { ...current, endpoints: current.endpoints.filter((e) => e.id !== "nopkce").map((e) => ({ ...e, headers: e.headers.map((hd) => ({ name: hd.name })) })) })).json;
+});
+
 await check("OAuth start refuses servers that are not saved as OAuth", async () => {
   eq((await apiCall("POST", "oauth/start", { id: "beta" })).status, 400, "non-oauth");
   eq((await apiCall("POST", "oauth/start", { id: "nope" })).status, 404, "unknown");
@@ -458,6 +469,7 @@ if (!SERVE) {
   await alpha.close();
   await beta.close();
   await gamma.close();
+  await noPkce.close();
 }
 
 const passed = checks.filter((c) => c.ok).length;

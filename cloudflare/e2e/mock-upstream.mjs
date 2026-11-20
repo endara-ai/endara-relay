@@ -123,7 +123,7 @@ export const text = (t) => ({ content: [{ type: "text", text: String(t) }] });
 // An MCP server protected by its own OAuth authorization server, supporting
 // RFC 9728 discovery, RFC 8414 metadata, RFC 7591 dynamic registration, PKCE
 // S256, RFC 8707 resource checks, RFC 9207 `iss` and refresh-token rotation.
-export function startMockOAuthUpstream({ name }) {
+export function startMockOAuthUpstream({ name, advertisePkce = true }) {
   const stats = { register: 0, authorize: 0, token: 0, refresh: 0, mcp: 0, unauthorized: 0 };
   const clients = new Map(); // client_id -> redirect_uris
   const codes = new Map(); // code -> { client_id, redirect_uri, challenge, resource }
@@ -166,7 +166,7 @@ export function startMockOAuthUpstream({ name }) {
         authorization_endpoint: `${base}/auth/authorize`,
         token_endpoint: `${base}/auth/token`,
         registration_endpoint: `${base}/auth/register`,
-        code_challenge_methods_supported: ["S256"],
+        ...(advertisePkce ? { code_challenge_methods_supported: ["S256"] } : {}),
         authorization_response_iss_parameter_supported: true,
       });
     }

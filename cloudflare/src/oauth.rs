@@ -184,9 +184,21 @@ impl OAuth {
 
     // ---- storage ---------------------------------------------------------
 
-    async fn load(&self, endpoint_id: &str) -> Option<Record> {
-        let text = self.kv.get(&record_key(endpoint_id)).text().await.ok()??;
-        serde_json::from_str(&text).ok()
+    /// `Ok(None)` only when there is no record. A failed read or a damaged
+    /// record is an error, never "signed out".
+    async fn load(&self, endpoint_id: &str) -> Result<Option<Record>, String> {
+        let text = self
+            .kv
+            .get(&record_key(endpoint_id))
+            .text()
+            .await
+            .map_err(|e| format!("could not read the sign-in record: {e}"))?;
+        match text {
+            None => Ok(None),
+            Some(t) => serde_json::from_str(&t)
+                .map(Some)
+                .map_err(|e| format!("the stored sign-in record is damaged: {e}")),
+        }
     }
 
     async fn save(&self, endpoint_id: &str, record: &Record) -> Result<(), String> {
@@ -208,7 +220,7 @@ impl OAuth {
     /// Sign out: drop the tokens but keep the registered client.
     pub async fn sign_out(&self, endpoint_id: &str) -> Result<(), String> {
         TOKENS.with(|t| t.borrow_mut().remove(endpoint_id));
-        if let Some(mut record) = self.load(endpoint_id).await {
+        if let Some(mut record) = self.load(endpoint_id).await? {
             record.clear_tokens();
             self.save(endpoint_id, &record).await?;
         }
@@ -216,7 +228,7 @@ impl OAuth {
     }
 
     pub async fn state(&self, ep: &Endpoint) -> SignInState {
-        match self.load(&ep.id).await {
+        match self.load(&ep.id).await.ok().flatten() {
             Some(r) if r.url == ep.url && r.access_token_enc.is_some() => SignInState {
                 signed_in: true,
                 expires_at: r.expires_at,
@@ -236,7 +248,8 @@ impl OAuth {
         if let Some(c) = cached_token(ep) {
             return Some(c.grant_id);
         }
-        match self.load(&ep.id).await {
+        // On a failed read there is no grant: callers fail closed.
+        match self.load(&ep.id).await.ok().flatten() {
             Some(r) if r.url == ep.url && r.access_token_enc.is_some() => Some(r.grant()),
             _ => None,
         }
@@ -267,7 +280,7 @@ impl OAuth {
                 ep.name
             ))
         };
-        let mut record = match self.load(&ep.id).await {
+        let mut record = match self.load(&ep.id).await? {
             Some(r) if r.url == ep.url => r,
             _ => return Err(sign_in()),
         };
@@ -310,7 +323,8 @@ impl OAuth {
             Err(TokenError::Rejected(msg)) => {
                 // Another request may have rotated the refresh token first:
                 // use its result instead of wiping a valid sign-in.
-                if let Some(latest) = self.load(&ep.id).await {
+                // If the record cannot be read, keep the tokens and report it.
+                if let Some(latest) = self.load(&ep.id).await? {
                     if latest.url == ep.url && latest.refresh_token_enc != Some(refresh_enc.clone())
                     {
                         if let Some(enc) = &latest.access_token_enc {
@@ -375,7 +389,7 @@ impl OAuth {
     /// Discover the server's authorization server, register a client when
     /// needed, and return the URL to send the user to.
     pub async fn start(&self, ep: &Endpoint, redirect_uri: &str) -> Result<String, String> {
-        let existing = self.load(&ep.id).await;
+        let existing = self.load(&ep.id).await?;
         let record = match existing {
             Some(r) if r.url == ep.url && r.redirect_uri == redirect_uri => r,
             _ => {
@@ -618,8 +632,13 @@ impl OAuth {
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|s| s.as_str()).collect())
                 .unwrap_or_default();
-            if !methods.is_empty() && !methods.contains(&"S256") {
-                return Err("the authorization server does not support PKCE S256".into());
+            // The relay is a public client, so PKCE is its only protection
+            // for the code: S256 support must be advertised explicitly.
+            if !methods.contains(&"S256") {
+                return Err(
+                    "the authorization server does not advertise PKCE S256 support, so the relay will not sign in to it"
+                        .into(),
+                );
             }
             for field in ["authorization_endpoint", "token_endpoint"] {
                 let v = meta
