@@ -126,14 +126,25 @@ impl fmt::Display for ResourceUriError {
 impl std::error::Error for ResourceUriError {}
 
 /// Encode an original resource URI into a reversible per-endpoint wrapper:
-/// `mcp-relay://{endpoint}/{percent-encoded-original}`.
+/// `mcp-relay://{percent-encoded-endpoint}/{percent-encoded-original}`.
+///
+/// Endpoint names are only required to be non-empty, so they are encoded too:
+/// a `/` in the name must not move the separator. Names made of unreserved
+/// characters encode to themselves, so their URIs are unchanged.
 ///
 /// Reversible without a lookup table (DD4), which matters because result URIs
 /// are non-enumerable. Idempotent only relative to TOON / non-URI passes —
 /// re-encoding an already-wrapped URI nests it.
 pub fn encode_resource_uri(endpoint: &str, original: &str) -> String {
-    let encoded = utf8_percent_encode(original, ENCODE_SET);
-    format!("{}{}/{}", WRAPPER_PREFIX, endpoint, encoded)
+    wrap(endpoint, original, ENCODE_SET)
+}
+
+fn wrap(endpoint: &str, original: &str, original_set: &'static AsciiSet) -> String {
+    let mut out = String::from(WRAPPER_PREFIX);
+    out.extend(utf8_percent_encode(endpoint, ENCODE_SET));
+    out.push('/');
+    out.extend(utf8_percent_encode(original, original_set));
+    out
 }
 
 /// Decode a wrapped resource URI into `(endpoint, original)`. Rejects any
@@ -154,15 +165,24 @@ pub fn decode_resource_uri(wrapped: &str) -> Result<(String, String), ResourceUr
         ))
     })?;
 
-    let endpoint = &body[..slash_idx];
+    let encoded_endpoint = &body[..slash_idx];
     let encoded_original = &body[slash_idx + 1..];
 
-    if endpoint.is_empty() {
+    if encoded_endpoint.is_empty() {
         return Err(ResourceUriError::InvalidFormat(format!(
             "empty endpoint segment in '{}'",
             wrapped
         )));
     }
+
+    let endpoint = percent_decode_str(encoded_endpoint)
+        .decode_utf8()
+        .map_err(|e| {
+            ResourceUriError::InvalidFormat(format!(
+                "invalid percent-encoding in endpoint of '{}': {}",
+                wrapped, e
+            ))
+        })?;
 
     let original = percent_decode_str(encoded_original)
         .decode_utf8()
@@ -173,7 +193,7 @@ pub fn decode_resource_uri(wrapped: &str) -> Result<(String, String), ResourceUr
             ))
         })?;
 
-    Ok((endpoint.to_string(), original.into_owned()))
+    Ok((endpoint.into_owned(), original.into_owned()))
 }
 
 /// DD5 single-endpoint passthrough on the outbound (wrap) path: when only one
@@ -195,8 +215,7 @@ pub fn maybe_encode_resource_uri(endpoint: &str, original: &str, skip_wrap: bool
 /// substitution would silently no-op.
 #[allow(dead_code)]
 pub fn encode_resource_uri_template(endpoint: &str, original: &str) -> String {
-    let encoded = utf8_percent_encode(original, ENCODE_SET_TEMPLATE);
-    format!("{}{}/{}", WRAPPER_PREFIX, endpoint, encoded)
+    wrap(endpoint, original, ENCODE_SET_TEMPLATE)
 }
 
 /// DD5 single-endpoint passthrough for templates; mirrors
@@ -245,21 +264,28 @@ mod verification {
 
     /// A symbolic string of up to `N` characters drawn from `PIECES`.
     fn any_str<const N: usize>(buf: &mut [u8; MAX_BYTES]) -> &str {
-        let count: usize = kani::any();
-        kani::assume(count <= N);
+        let count: u8 = kani::any();
+        kani::assume(usize::from(count) <= N);
         let mut len = 0;
         for _ in 0..count {
-            let piece = PIECES[kani::any::<usize>() % PIECES.len()].as_bytes();
+            let piece = PIECES[usize::from(kani::any::<u8>() % 7)].as_bytes();
             buf[len..len + piece.len()].copy_from_slice(piece);
             len += piece.len();
         }
-        std::str::from_utf8(&buf[..len]).unwrap()
+        unsafe { std::str::from_utf8_unchecked(&buf[..len]) }
+    }
+
+    /// Error messages are never inspected; formatting them symbolically only
+    /// grows the formula.
+    fn no_format(_: std::fmt::Arguments<'_>) -> String {
+        String::new()
     }
 
     /// Every non-empty endpoint and every original URI (plain or template
     /// wrap, wrapped or passthrough) decodes back to exactly its inputs.
     #[kani::proof]
     #[kani::unwind(10)]
+    #[kani::stub(std::fmt::format, no_format)]
     fn resource_uri_roundtrip() {
         let mut ep_buf = [0u8; MAX_BYTES];
         let mut orig_buf = [0u8; MAX_BYTES];

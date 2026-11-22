@@ -2777,28 +2777,29 @@ async fn mcp_delete_profiled(
 }
 
 /// Check whether an Origin header value is a localhost origin.
-/// Allows `http://localhost`, `http://127.0.0.1`, `http://[::1]` on any port.
+/// Allows `http(s)://localhost`, `127.0.0.1` and `[::1]`, each followed by
+/// nothing or by `:` and a numeric port. Anything after the host other than
+/// a port (`@evil.com`, `evil.com`, `/`) is rejected.
 fn is_localhost_origin(origin: &str) -> bool {
-    // Parse out scheme + host + optional port
-    let without_scheme = origin
+    let Some(rest) = origin
         .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"));
-    let Some(host_port) = without_scheme else {
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
         return false;
     };
-    // Handle IPv6 bracket notation like [::1]:3000
-    let host = if host_port.starts_with('[') {
-        // IPv6: extract up to the closing bracket
-        host_port
-            .split(']')
-            .next()
-            .map(|s| format!("{}]", s))
-            .unwrap_or_default()
-    } else {
-        // IPv4 / hostname: strip port
-        host_port.split(':').next().unwrap_or("").to_string()
+    ["localhost", "127.0.0.1", "[::1]"]
+        .iter()
+        .any(|host| rest.strip_prefix(host).is_some_and(is_port_suffix))
+}
+
+/// `""`, or `:` followed by 1–5 ASCII digits whose value fits a `u16`.
+fn is_port_suffix(tail: &str) -> bool {
+    let Some(port) = tail.strip_prefix(':') else {
+        return tail.is_empty();
     };
-    matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]")
+    (1..=5).contains(&port.len())
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
 }
 
 #[cfg(kani)]

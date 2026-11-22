@@ -549,8 +549,15 @@ mod verification {
     /// Rejected iff absolute, contains NUL, has a `..` segment, or starts
     /// with a `.` segment; accepted paths yield only plain names, one per
     /// non-empty, non-`.` segment.
+    /// Error messages are never inspected; `{:?}` of a symbolic `OsStr`
+    /// otherwise pulls Unicode escape tables into the formula.
+    fn no_format(_: std::fmt::Arguments<'_>) -> String {
+        String::new()
+    }
+
     #[kani::proof]
     #[kani::unwind(8)]
+    #[kani::stub(std::fmt::format, no_format)]
     fn validated_components_yields_only_plain_names() {
         let buf: [u8; N] = kani::any();
         let len: usize = kani::any();
