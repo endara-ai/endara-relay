@@ -6511,6 +6511,35 @@ mod tests {
         assert!(text.contains("ui://app/main"));
     }
 
+    /// An endpoint name containing `/` must not let its wrapped URIs be
+    /// routed to another endpoint whose name is a prefix of it.
+    #[tokio::test]
+    async fn route_resource_read_endpoint_name_with_slash_dispatches_to_owner() {
+        let registry = AdapterRegistry::new();
+        for name in ["team", "team/github"] {
+            registry
+                .register(
+                    name.into(),
+                    Box::new(ResourceMockAdapter {
+                        resources: vec![],
+                        templates: vec![],
+                    }),
+                    "stdio".into(),
+                    None,
+                    Some(name.replace('/', "_")),
+                )
+                .await;
+        }
+
+        let wrapped = crate::resource_uri::encode_resource_uri("team/github", "ui://app/main");
+        let result = registry
+            .route_resource_read(&wrapped)
+            .await
+            .expect("read should succeed");
+        let echoed = result["contents"][0]["uri"].as_str().unwrap();
+        assert_eq!(echoed, "ui://app/main", "must reach the owner with the original URI");
+    }
+
     /// DD5 single-endpoint mode: the wrap was skipped on the outbound side,
     /// so the inbound URI is its own original. The registry must dispatch it
     /// to the sole adapter without trying to decode a `mcp-relay://` prefix.

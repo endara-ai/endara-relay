@@ -88,3 +88,6 @@ which = "7"
 
 [target."cfg(unix)".dependencies]
 libc = "0.2"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

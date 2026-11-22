@@ -232,6 +232,59 @@ pub fn maybe_decode_resource_uri(
     }
 }
 
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// Characters with distinct encoder behaviour: unreserved (`a`), the
+    /// wrapper separator (`/`), the escape byte and the digits of `%25`
+    /// (double-decoding), a byte only `ENCODE_SET` escapes (`{`), and a
+    /// two-byte UTF-8 scalar.
+    const PIECES: [&str; 7] = ["a", "/", "%", "2", "5", "{", "\u{e9}"];
+    const MAX_BYTES: usize = 6;
+
+    /// A symbolic string of up to `N` characters drawn from `PIECES`.
+    fn any_str<const N: usize>(buf: &mut [u8; MAX_BYTES]) -> &str {
+        let count: usize = kani::any();
+        kani::assume(count <= N);
+        let mut len = 0;
+        for _ in 0..count {
+            let piece = PIECES[kani::any::<usize>() % PIECES.len()].as_bytes();
+            buf[len..len + piece.len()].copy_from_slice(piece);
+            len += piece.len();
+        }
+        std::str::from_utf8(&buf[..len]).unwrap()
+    }
+
+    /// Every non-empty endpoint and every original URI (plain or template
+    /// wrap, wrapped or passthrough) decodes back to exactly its inputs.
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn resource_uri_roundtrip() {
+        let mut ep_buf = [0u8; MAX_BYTES];
+        let mut orig_buf = [0u8; MAX_BYTES];
+        let endpoint = any_str::<2>(&mut ep_buf);
+        let original = any_str::<3>(&mut orig_buf);
+        kani::assume(!endpoint.is_empty());
+
+        let skip_wrap: bool = kani::any();
+        let wrapped = if kani::any() {
+            maybe_encode_resource_uri_template(endpoint, original, skip_wrap)
+        } else {
+            maybe_encode_resource_uri(endpoint, original, skip_wrap)
+        };
+        let Ok((decoded_ep, decoded)) = maybe_decode_resource_uri(&wrapped, skip_wrap) else {
+            panic!("wrapped URI must decode");
+        };
+        assert!(decoded == original);
+        if skip_wrap {
+            assert!(decoded_ep.is_none());
+        } else {
+            assert!(decoded_ep.as_deref() == Some(endpoint));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,6 +344,17 @@ mod tests {
         assert_roundtrip("ep", "ui://app/unicode/café/日本語");
         assert_roundtrip("ep", "ui://app/punct!*'();:@&=+$,?#[]");
         assert_roundtrip("ep", "ui://app/control\nchar");
+    }
+
+    /// Counterexample found by the `resource_uri_roundtrip` Kani proof:
+    /// endpoint names are only required to be non-empty, so a `/` (or any
+    /// reserved character) in the name must not leak into the wrapper
+    /// structure.
+    #[test]
+    fn test_roundtrip_endpoint_with_reserved_characters() {
+        for ep in ["team/github", "/", "a/", "My Server", "50%", "q?x#y"] {
+            assert_roundtrip(ep, "ui://app/main");
+        }
     }
 
     #[test]
