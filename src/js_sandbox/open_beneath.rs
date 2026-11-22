@@ -540,54 +540,60 @@ mod openat2 {
 mod verification {
     use super::*;
 
-    const N: usize = 6;
+    const N: usize = 5;
 
-    /// Unix path parsing only gives meaning to `/` and `.`, and the validator
-    /// only to NUL; every other byte behaves like `a`.
-    const ALPHABET: &[u8] = b"a./\0";
-
-    /// Rejected iff absolute, contains NUL, has a `..` segment, or starts
-    /// with a `.` segment; accepted paths yield only plain names, one per
-    /// non-empty, non-`.` segment.
     /// Error messages are never inspected; `{:?}` of a symbolic `OsStr`
     /// otherwise pulls Unicode escape tables into the formula.
     fn no_format(_: std::fmt::Arguments<'_>) -> String {
         String::new()
     }
 
+    /// Rejected iff absolute, contains NUL, has a `..` segment, or starts
+    /// with a `.` segment. Accepted paths yield exactly the non-empty,
+    /// non-`.` segments, in order.
+    ///
+    /// Unix path parsing only gives meaning to `/` and `.`, and the validator
+    /// only to NUL, so every other byte behaves like `a`.
     #[kani::proof]
-    #[kani::unwind(8)]
+    #[kani::unwind(7)]
     #[kani::stub(std::fmt::format, no_format)]
     fn validated_components_yields_only_plain_names() {
         let buf: [u8; N] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= N);
         let bytes = &buf[..len];
-        for b in bytes {
-            kani::assume(ALPHABET.contains(b));
-        }
 
-        let mut has_parent = false;
-        let mut plain_segments = 0usize;
-        for (i, segment) in bytes.split(|&b| b == b'/').enumerate() {
-            match segment {
-                b"" => {}
-                b"." if i == 0 => has_parent = true,
-                b"." => {}
-                b".." => has_parent = true,
-                _ => plain_segments += 1,
+        let mut must_reject = len > 0 && bytes[0] == b'/';
+        let mut expected = [(0usize, 0usize); N];
+        let mut count = 0;
+        let mut start = 0;
+        for i in 0..=len {
+            if i < len {
+                kani::assume(matches!(bytes[i], b'a' | b'.' | b'/' | 0));
+                must_reject |= bytes[i] == 0;
+                if bytes[i] != b'/' {
+                    continue;
+                }
             }
+            match &bytes[start..i] {
+                b"" => {}
+                b"." if start == 0 => must_reject = true,
+                b"." => {}
+                b".." => must_reject = true,
+                _ => {
+                    expected[count] = (start, i);
+                    count += 1;
+                }
+            }
+            start = i + 1;
         }
-        let must_reject = bytes.first() == Some(&b'/') || bytes.contains(&0) || has_parent;
 
         match validated_components(Path::new(OsStr::from_bytes(bytes))) {
             Ok(components) => {
                 assert!(!must_reject);
-                assert!(components.len() == plain_segments);
-                for c in components {
-                    let c = c.as_bytes();
-                    assert!(!c.is_empty() && c != b"." && c != b"..");
-                    assert!(!c.contains(&b'/') && !c.contains(&0));
+                assert!(components.len() == count);
+                for (c, &(s, e)) in components.iter().zip(&expected) {
+                    assert!(c.as_bytes() == &bytes[s..e]);
                 }
             }
             Err(_) => assert!(must_reject),

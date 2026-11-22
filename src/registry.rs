@@ -6537,7 +6537,10 @@ mod tests {
             .await
             .expect("read should succeed");
         let echoed = result["contents"][0]["uri"].as_str().unwrap();
-        assert_eq!(echoed, "ui://app/main", "must reach the owner with the original URI");
+        assert_eq!(
+            echoed, "ui://app/main",
+            "must reach the owner with the original URI"
+        );
     }
 
     /// DD5 single-endpoint mode: the wrap was skipped on the outbound side,

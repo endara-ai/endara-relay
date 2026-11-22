@@ -251,66 +251,6 @@ pub fn maybe_decode_resource_uri(
     }
 }
 
-#[cfg(kani)]
-mod verification {
-    use super::*;
-
-    /// Characters with distinct encoder behaviour: unreserved (`a`), the
-    /// wrapper separator (`/`), the escape byte and the digits of `%25`
-    /// (double-decoding), a byte only `ENCODE_SET` escapes (`{`), and a
-    /// two-byte UTF-8 scalar.
-    const PIECES: [&str; 7] = ["a", "/", "%", "2", "5", "{", "\u{e9}"];
-    const MAX_BYTES: usize = 6;
-
-    /// A symbolic string of up to `N` characters drawn from `PIECES`.
-    fn any_str<const N: usize>(buf: &mut [u8; MAX_BYTES]) -> &str {
-        let count: u8 = kani::any();
-        kani::assume(usize::from(count) <= N);
-        let mut len = 0;
-        for _ in 0..count {
-            let piece = PIECES[usize::from(kani::any::<u8>() % 7)].as_bytes();
-            buf[len..len + piece.len()].copy_from_slice(piece);
-            len += piece.len();
-        }
-        unsafe { std::str::from_utf8_unchecked(&buf[..len]) }
-    }
-
-    /// Error messages are never inspected; formatting them symbolically only
-    /// grows the formula.
-    fn no_format(_: std::fmt::Arguments<'_>) -> String {
-        String::new()
-    }
-
-    /// Every non-empty endpoint and every original URI (plain or template
-    /// wrap, wrapped or passthrough) decodes back to exactly its inputs.
-    #[kani::proof]
-    #[kani::unwind(10)]
-    #[kani::stub(std::fmt::format, no_format)]
-    fn resource_uri_roundtrip() {
-        let mut ep_buf = [0u8; MAX_BYTES];
-        let mut orig_buf = [0u8; MAX_BYTES];
-        let endpoint = any_str::<2>(&mut ep_buf);
-        let original = any_str::<3>(&mut orig_buf);
-        kani::assume(!endpoint.is_empty());
-
-        let skip_wrap: bool = kani::any();
-        let wrapped = if kani::any() {
-            maybe_encode_resource_uri_template(endpoint, original, skip_wrap)
-        } else {
-            maybe_encode_resource_uri(endpoint, original, skip_wrap)
-        };
-        let Ok((decoded_ep, decoded)) = maybe_decode_resource_uri(&wrapped, skip_wrap) else {
-            panic!("wrapped URI must decode");
-        };
-        assert!(decoded == original);
-        if skip_wrap {
-            assert!(decoded_ep.is_none());
-        } else {
-            assert!(decoded_ep.as_deref() == Some(endpoint));
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +320,66 @@ mod tests {
     fn test_roundtrip_endpoint_with_reserved_characters() {
         for ep in ["team/github", "/", "a/", "My Server", "50%", "q?x#y"] {
             assert_roundtrip(ep, "ui://app/main");
+        }
+    }
+
+    /// Every string of up to `max` pieces drawn from `pieces`.
+    fn all_strings(pieces: &[&str], max: usize) -> Vec<String> {
+        let mut out = vec![String::new()];
+        let mut layer = vec![String::new()];
+        for _ in 0..max {
+            layer = layer
+                .iter()
+                .flat_map(|prefix| pieces.iter().map(move |p| format!("{prefix}{p}")))
+                .collect();
+            out.extend(layer.iter().cloned());
+        }
+        out
+    }
+
+    /// Bounded-exhaustive round trip: every endpoint of 1–2 pieces and every
+    /// original of 0–3 pieces, through both encoders and passthrough mode.
+    /// The pieces cover each class the encoders treat differently: unreserved
+    /// bytes, the `/` separator, raw and already-encoded escapes (which must
+    /// not be double-decoded), reserved and template-only bytes, controls, and
+    /// 2- and 4-byte UTF-8 scalars.
+    #[test]
+    fn test_roundtrip_exhaustive_small_domain() {
+        const PIECES: &[&str] = &[
+            "a",
+            "~",
+            "/",
+            "%",
+            "%25",
+            "%2F",
+            ":",
+            "?",
+            "#",
+            "{",
+            " ",
+            "\n",
+            "\u{e9}",
+            "\u{1f600}",
+        ];
+        let originals = all_strings(PIECES, 3);
+        let endpoints: Vec<String> = all_strings(PIECES, 2)
+            .into_iter()
+            .filter(|e| !e.is_empty())
+            .collect();
+        for endpoint in &endpoints {
+            for original in &originals {
+                for wrapped in [
+                    encode_resource_uri(endpoint, original),
+                    encode_resource_uri_template(endpoint, original),
+                ] {
+                    let (ep, orig) =
+                        decode_resource_uri(&wrapped).unwrap_or_else(|e| panic!("{wrapped}: {e}"));
+                    assert!(ep == *endpoint && orig == *original, "{wrapped}");
+                }
+                let passthrough = maybe_encode_resource_uri(endpoint, original, true);
+                let (ep, orig) = maybe_decode_resource_uri(&passthrough, true).unwrap();
+                assert!(ep.is_none() && orig == *original);
+            }
         }
     }
 
