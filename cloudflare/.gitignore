@@ -1,0 +1,7 @@
+/target
+/build
+/node_modules
+/.alchemy
+/e2e/out
+.env
+relay.toml
