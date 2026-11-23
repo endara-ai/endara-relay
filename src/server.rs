@@ -2806,36 +2806,39 @@ fn is_port_suffix(tail: &str) -> bool {
 mod verification {
     use super::is_localhost_origin;
 
-    /// `""` or `:` followed by 1–5 ASCII digits whose value fits a `u16`.
-    fn spec_port_suffix(tail: &[u8]) -> bool {
-        let Some((&b':', digits)) = tail.split_first() else {
-            return tail.is_empty();
-        };
-        if digits.is_empty() || digits.len() > 5 {
-            return false;
-        }
-        let mut value: u32 = 0;
-        for &d in digits {
-            if !d.is_ascii_digit() {
-                return false;
-            }
-            value = value * 10 + u32::from(d - b'0');
-        }
-        value <= u32::from(u16::MAX)
-    }
-
-    /// The serialized-origin grammar the CORS predicate must accept exactly.
+    /// The accepted origins, described the way a URL parser splits them
+    /// rather than the way the predicate scans them: the authority after the
+    /// scheme has no userinfo, path, query or fragment delimiter; a trailing
+    /// `:port` (a last `:` not inside `[...]`) is split off; the remaining
+    /// host is one of the three loopback names; the port is 1–5 digits and
+    /// at most 65535.
     fn spec_localhost_origin(origin: &[u8]) -> bool {
-        let rest = if let Some(r) = origin.strip_prefix(b"http://") {
-            r
-        } else if let Some(r) = origin.strip_prefix(b"https://") {
-            r
+        let authority = if origin.starts_with(b"http://") {
+            &origin[7..]
+        } else if origin.starts_with(b"https://") {
+            &origin[8..]
         } else {
             return false;
         };
-        [&b"localhost"[..], b"127.0.0.1", b"[::1]"]
+        if authority
             .iter()
-            .any(|host| rest.strip_prefix(*host).is_some_and(spec_port_suffix))
+            .any(|b| matches!(b, b'@' | b'/' | b'?' | b'#' | b'\\'))
+        {
+            return false;
+        }
+        let (host, port) = match authority.iter().rposition(|&b| b == b':') {
+            Some(i) if authority[i..].iter().all(|&b| b != b']') => {
+                (&authority[..i], Some(&authority[i + 1..]))
+            }
+            _ => (authority, None),
+        };
+        let host_ok = host == b"localhost" || host == b"127.0.0.1" || host == b"[::1]";
+        let port_ok = port.is_none_or(|p| {
+            (1..=5).contains(&p.len())
+                && p.iter().all(u8::is_ascii_digit)
+                && p.iter().fold(0u32, |v, &d| v * 10 + u32::from(d - b'0')) <= 65535
+        });
+        host_ok && port_ok
     }
 
     /// Copies `parts` into one buffer and returns it as `&str`. Every part
@@ -2865,11 +2868,11 @@ mod verification {
     const TAIL: usize = 7;
     const LEN: usize = 24;
 
-    /// Bytes the parsers treat differently from one another: the port
-    /// delimiter, digits at the `u16` boundary (65535 / 65536), a sign, and
-    /// the userinfo / path / IPv6 / label delimiters. Any other byte is
-    /// treated like `a` by both the predicate and the spec.
-    const TAIL_ALPHABET: &[u8] = b":05 69+@/.]a";
+    /// Every digit (so ports up to the `u16` boundary, 65535 / 65536, occur),
+    /// the port delimiter, a sign, and the userinfo / path / query /
+    /// fragment / IPv6 / label delimiters. Any other byte is treated like `a`
+    /// by both the predicate and the spec.
+    const TAIL_ALPHABET: &[u8] = b"0123456789:+@/?#\\.[]a";
 
     /// Every loopback host followed by every short suffix: accepted iff the
     /// suffix is empty or a valid port.
@@ -2888,19 +2891,17 @@ mod verification {
         assert!(is_localhost_origin(origin) == spec_localhost_origin(origin.as_bytes()));
     }
 
-    /// Arbitrary ASCII strings up to `LEN` bytes: anything accepted conforms
-    /// to the grammar.
+    /// Arbitrary ASCII strings up to `LEN` bytes: accepted iff they match
+    /// the spec.
     #[kani::proof]
     #[kani::unwind(26)]
-    fn localhost_origin_accepts_only_spec() {
+    fn localhost_origin_matches_spec() {
         let buf: [u8; LEN] = kani::any();
         let len: usize = kani::any();
         kani::assume(len <= LEN);
         kani::assume(buf[..len].is_ascii());
         let origin = unsafe { std::str::from_utf8_unchecked(&buf[..len]) };
-        if is_localhost_origin(origin) {
-            assert!(spec_localhost_origin(origin.as_bytes()));
-        }
+        assert!(is_localhost_origin(origin) == spec_localhost_origin(origin.as_bytes()));
     }
 }
 
