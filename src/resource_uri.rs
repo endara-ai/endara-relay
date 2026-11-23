@@ -126,14 +126,25 @@ impl fmt::Display for ResourceUriError {
 impl std::error::Error for ResourceUriError {}
 
 /// Encode an original resource URI into a reversible per-endpoint wrapper:
-/// `mcp-relay://{endpoint}/{percent-encoded-original}`.
+/// `mcp-relay://{percent-encoded-endpoint}/{percent-encoded-original}`.
+///
+/// Endpoint names are only required to be non-empty, so they are encoded too:
+/// a `/` in the name must not move the separator. Names made of unreserved
+/// characters encode to themselves, so their URIs are unchanged.
 ///
 /// Reversible without a lookup table (DD4), which matters because result URIs
 /// are non-enumerable. Idempotent only relative to TOON / non-URI passes —
 /// re-encoding an already-wrapped URI nests it.
 pub fn encode_resource_uri(endpoint: &str, original: &str) -> String {
-    let encoded = utf8_percent_encode(original, ENCODE_SET);
-    format!("{}{}/{}", WRAPPER_PREFIX, endpoint, encoded)
+    wrap(endpoint, original, ENCODE_SET)
+}
+
+fn wrap(endpoint: &str, original: &str, original_set: &'static AsciiSet) -> String {
+    let mut out = String::from(WRAPPER_PREFIX);
+    out.extend(utf8_percent_encode(endpoint, ENCODE_SET));
+    out.push('/');
+    out.extend(utf8_percent_encode(original, original_set));
+    out
 }
 
 /// Decode a wrapped resource URI into `(endpoint, original)`. Rejects any
@@ -154,15 +165,24 @@ pub fn decode_resource_uri(wrapped: &str) -> Result<(String, String), ResourceUr
         ))
     })?;
 
-    let endpoint = &body[..slash_idx];
+    let encoded_endpoint = &body[..slash_idx];
     let encoded_original = &body[slash_idx + 1..];
 
-    if endpoint.is_empty() {
+    if encoded_endpoint.is_empty() {
         return Err(ResourceUriError::InvalidFormat(format!(
             "empty endpoint segment in '{}'",
             wrapped
         )));
     }
+
+    let endpoint = percent_decode_str(encoded_endpoint)
+        .decode_utf8()
+        .map_err(|e| {
+            ResourceUriError::InvalidFormat(format!(
+                "invalid percent-encoding in endpoint of '{}': {}",
+                wrapped, e
+            ))
+        })?;
 
     let original = percent_decode_str(encoded_original)
         .decode_utf8()
@@ -173,7 +193,7 @@ pub fn decode_resource_uri(wrapped: &str) -> Result<(String, String), ResourceUr
             ))
         })?;
 
-    Ok((endpoint.to_string(), original.into_owned()))
+    Ok((endpoint.into_owned(), original.into_owned()))
 }
 
 /// DD5 single-endpoint passthrough on the outbound (wrap) path: when only one
@@ -195,8 +215,7 @@ pub fn maybe_encode_resource_uri(endpoint: &str, original: &str, skip_wrap: bool
 /// substitution would silently no-op.
 #[allow(dead_code)]
 pub fn encode_resource_uri_template(endpoint: &str, original: &str) -> String {
-    let encoded = utf8_percent_encode(original, ENCODE_SET_TEMPLATE);
-    format!("{}{}/{}", WRAPPER_PREFIX, endpoint, encoded)
+    wrap(endpoint, original, ENCODE_SET_TEMPLATE)
 }
 
 /// DD5 single-endpoint passthrough for templates; mirrors
@@ -291,6 +310,77 @@ mod tests {
         assert_roundtrip("ep", "ui://app/unicode/café/日本語");
         assert_roundtrip("ep", "ui://app/punct!*'();:@&=+$,?#[]");
         assert_roundtrip("ep", "ui://app/control\nchar");
+    }
+
+    /// Counterexample found by the `resource_uri_roundtrip` Kani proof:
+    /// endpoint names are only required to be non-empty, so a `/` (or any
+    /// reserved character) in the name must not leak into the wrapper
+    /// structure.
+    #[test]
+    fn test_roundtrip_endpoint_with_reserved_characters() {
+        for ep in ["team/github", "/", "a/", "My Server", "50%", "q?x#y"] {
+            assert_roundtrip(ep, "ui://app/main");
+        }
+    }
+
+    /// Every string of up to `max` pieces drawn from `pieces`.
+    fn all_strings(pieces: &[&str], max: usize) -> Vec<String> {
+        let mut out = vec![String::new()];
+        let mut layer = vec![String::new()];
+        for _ in 0..max {
+            layer = layer
+                .iter()
+                .flat_map(|prefix| pieces.iter().map(move |p| format!("{prefix}{p}")))
+                .collect();
+            out.extend(layer.iter().cloned());
+        }
+        out
+    }
+
+    /// Bounded-exhaustive round trip: every endpoint of 1–2 pieces and every
+    /// original of 0–3 pieces, through both encoders and passthrough mode.
+    /// The pieces cover each class the encoders treat differently: unreserved
+    /// bytes, the `/` separator, raw and already-encoded escapes (which must
+    /// not be double-decoded), reserved and template-only bytes, controls, and
+    /// 2- and 4-byte UTF-8 scalars.
+    #[test]
+    fn test_roundtrip_exhaustive_small_domain() {
+        const PIECES: &[&str] = &[
+            "a",
+            "~",
+            "/",
+            "%",
+            "%25",
+            "%2F",
+            ":",
+            "?",
+            "#",
+            "{",
+            " ",
+            "\n",
+            "\u{e9}",
+            "\u{1f600}",
+        ];
+        let originals = all_strings(PIECES, 3);
+        let endpoints: Vec<String> = all_strings(PIECES, 2)
+            .into_iter()
+            .filter(|e| !e.is_empty())
+            .collect();
+        for endpoint in &endpoints {
+            for original in &originals {
+                for wrapped in [
+                    encode_resource_uri(endpoint, original),
+                    encode_resource_uri_template(endpoint, original),
+                ] {
+                    let (ep, orig) =
+                        decode_resource_uri(&wrapped).unwrap_or_else(|e| panic!("{wrapped}: {e}"));
+                    assert!(ep == *endpoint && orig == *original, "{wrapped}");
+                }
+                let passthrough = maybe_encode_resource_uri(endpoint, original, true);
+                let (ep, orig) = maybe_decode_resource_uri(&passthrough, true).unwrap();
+                assert!(ep.is_none() && orig == *original);
+            }
+        }
     }
 
     #[test]

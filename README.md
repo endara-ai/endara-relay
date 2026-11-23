@@ -271,7 +271,7 @@ Every tool is automatically prefixed with its endpoint name to prevent collision
 
 ### Resources & prompts proxying
 
-Tools aren't the only thing the relay aggregates. Upstream MCP **resources** and **prompts** are merged and proxied too: `resources/list`, `resources/read`, `resources/templates/list`, `prompts/list`, and `prompts/get` all route through the relay. Prompt names are prefixed with the endpoint name using the same scheme as tools, and resource URIs are wrapped in a reversible per-endpoint namespace (`mcp-relay://{endpoint}/{percent-encoded-uri}`) so reads route back to the right server without a lookup table. This makes MCP Apps (`ui://` resources) and prompt catalogs work through the relay, and it works in JS execution mode too — the meta-tool catalog reduction applies only to `tools/list`.
+Tools aren't the only thing the relay aggregates. Upstream MCP **resources** and **prompts** are merged and proxied too: `resources/list`, `resources/read`, `resources/templates/list`, `prompts/list`, and `prompts/get` all route through the relay. Prompt names are prefixed with the endpoint name using the same scheme as tools, and resource URIs are wrapped in a reversible per-endpoint namespace (`mcp-relay://{percent-encoded-endpoint}/{percent-encoded-uri}`) so reads route back to the right server without a lookup table. This makes MCP Apps (`ui://` resources) and prompt catalogs work through the relay, and it works in JS execution mode too — the meta-tool catalog reduction applies only to `tools/list`.
 
 ### Config hot-reload
 

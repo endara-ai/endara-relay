@@ -2777,28 +2777,132 @@ async fn mcp_delete_profiled(
 }
 
 /// Check whether an Origin header value is a localhost origin.
-/// Allows `http://localhost`, `http://127.0.0.1`, `http://[::1]` on any port.
+/// Allows `http(s)://localhost`, `127.0.0.1` and `[::1]`, each followed by
+/// nothing or by `:` and a numeric port. Anything after the host other than
+/// a port (`@evil.com`, `evil.com`, `/`) is rejected.
 fn is_localhost_origin(origin: &str) -> bool {
-    // Parse out scheme + host + optional port
-    let without_scheme = origin
+    let Some(rest) = origin
         .strip_prefix("http://")
-        .or_else(|| origin.strip_prefix("https://"));
-    let Some(host_port) = without_scheme else {
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
         return false;
     };
-    // Handle IPv6 bracket notation like [::1]:3000
-    let host = if host_port.starts_with('[') {
-        // IPv6: extract up to the closing bracket
-        host_port
-            .split(']')
-            .next()
-            .map(|s| format!("{}]", s))
-            .unwrap_or_default()
-    } else {
-        // IPv4 / hostname: strip port
-        host_port.split(':').next().unwrap_or("").to_string()
+    ["localhost", "127.0.0.1", "[::1]"]
+        .iter()
+        .any(|host| rest.strip_prefix(host).is_some_and(is_port_suffix))
+}
+
+/// `""`, or `:` followed by 1–5 ASCII digits whose value fits a `u16`.
+fn is_port_suffix(tail: &str) -> bool {
+    let Some(port) = tail.strip_prefix(':') else {
+        return tail.is_empty();
     };
-    matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]")
+    (1..=5).contains(&port.len())
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().is_ok()
+}
+
+#[cfg(kani)]
+mod verification {
+    use super::is_localhost_origin;
+
+    /// The accepted origins, described the way a URL parser splits them
+    /// rather than the way the predicate scans them: the authority after the
+    /// scheme has no userinfo, path, query or fragment delimiter; a trailing
+    /// `:port` (a last `:` not inside `[...]`) is split off; the remaining
+    /// host is one of the three loopback names; the port is 1–5 digits and
+    /// at most 65535.
+    fn spec_localhost_origin(origin: &[u8]) -> bool {
+        let authority = if origin.starts_with(b"http://") {
+            &origin[7..]
+        } else if origin.starts_with(b"https://") {
+            &origin[8..]
+        } else {
+            return false;
+        };
+        if authority
+            .iter()
+            .any(|b| matches!(b, b'@' | b'/' | b'?' | b'#' | b'\\'))
+        {
+            return false;
+        }
+        let (host, port) = match authority.iter().rposition(|&b| b == b':') {
+            Some(i) if authority[i..].iter().all(|&b| b != b']') => {
+                (&authority[..i], Some(&authority[i + 1..]))
+            }
+            _ => (authority, None),
+        };
+        let host_ok = host == b"localhost" || host == b"127.0.0.1" || host == b"[::1]";
+        let port_ok = port.is_none_or(|p| {
+            (1..=5).contains(&p.len())
+                && p.iter().all(u8::is_ascii_digit)
+                && p.iter().fold(0u32, |v, &d| v * 10 + u32::from(d - b'0')) <= 65535
+        });
+        host_ok && port_ok
+    }
+
+    /// Copies `parts` into one buffer and returns it as `&str`. Every part
+    /// is ASCII, so the result is valid UTF-8.
+    fn concat<'a>(buf: &'a mut [u8; LEN], parts: [&[u8]; 3]) -> &'a str {
+        let mut len = 0;
+        for part in parts {
+            buf[len..len + part.len()].copy_from_slice(part);
+            len += part.len();
+        }
+        assert!(buf[..len].is_ascii());
+        unsafe { std::str::from_utf8_unchecked(&buf[..len]) }
+    }
+
+    /// Symbolic ASCII bytes of symbolic length `<= N`, each drawn from
+    /// `alphabet`.
+    fn any_bytes<const N: usize>(alphabet: &[u8]) -> ([u8; N], usize) {
+        let buf: [u8; N] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= N);
+        for &b in &buf[..len] {
+            kani::assume(alphabet.contains(&b));
+        }
+        (buf, len)
+    }
+
+    const TAIL: usize = 7;
+    const LEN: usize = 24;
+
+    /// Every digit (so ports up to the `u16` boundary, 65535 / 65536, occur),
+    /// the port delimiter, a sign, and the userinfo / path / query /
+    /// fragment / IPv6 / label delimiters. Any other byte is treated like `a`
+    /// by both the predicate and the spec.
+    const TAIL_ALPHABET: &[u8] = b"0123456789:+@/?#\\.[]a";
+
+    /// Every loopback host followed by every short suffix: accepted iff the
+    /// suffix is empty or a valid port.
+    #[kani::proof]
+    #[kani::unwind(26)]
+    fn localhost_origin_suffix_matches_spec() {
+        let scheme: &[u8] = if kani::any() { b"http://" } else { b"https://" };
+        let host: &[u8] = match kani::any::<u8>() % 3 {
+            0 => b"localhost",
+            1 => b"127.0.0.1",
+            _ => b"[::1]",
+        };
+        let (tail, len) = any_bytes::<TAIL>(TAIL_ALPHABET);
+        let mut buf = [0u8; LEN];
+        let origin = concat(&mut buf, [scheme, host, &tail[..len]]);
+        assert!(is_localhost_origin(origin) == spec_localhost_origin(origin.as_bytes()));
+    }
+
+    /// Arbitrary ASCII strings up to `LEN` bytes: accepted iff they match
+    /// the spec.
+    #[kani::proof]
+    #[kani::unwind(26)]
+    fn localhost_origin_matches_spec() {
+        let buf: [u8; LEN] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= LEN);
+        kani::assume(buf[..len].is_ascii());
+        let origin = unsafe { std::str::from_utf8_unchecked(&buf[..len]) };
+        assert!(is_localhost_origin(origin) == spec_localhost_origin(origin.as_bytes()));
+    }
 }
 
 /// Request-body budget for the MCP JSON-RPC POST routes.
@@ -5529,6 +5633,30 @@ mod tests {
         assert!(!is_localhost_origin("http://192.168.1.1"));
         assert!(!is_localhost_origin("ftp://localhost"));
         assert!(!is_localhost_origin("localhost"));
+    }
+
+    /// Counterexamples found by the `localhost_origin_*` Kani proofs: the
+    /// host must be followed by nothing or a numeric port, never by trailing
+    /// text that the old split-at-delimiter parser ignored.
+    #[test]
+    fn is_localhost_origin_rejects_trailing_text_after_host() {
+        for origin in [
+            "http://localhost:80@evil.com",
+            "http://localhost:evil.com",
+            "http://127.0.0.1:x",
+            "http://[::1]evil.com",
+            "http://[::1]@evil.com",
+            "http://localhost/",
+            "http://localhost:",
+            "http://localhost:+80",
+            "http://localhost:65536",
+            "http://localhost.evil.com",
+            "http://127.0.0.10",
+        ] {
+            assert!(!is_localhost_origin(origin), "must reject {origin}");
+        }
+        assert!(is_localhost_origin("http://localhost:65535"));
+        assert!(is_localhost_origin("https://[::1]:0"));
     }
 
     // =====================================================================

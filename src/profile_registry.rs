@@ -1077,6 +1077,57 @@ mod tests {
         }
     }
 
+    /// Endpoint names may contain `/`. The profile guard and the dispatch
+    /// both use the decoded name, so `team/github` is reachable and the
+    /// prefix endpoint `team` (outside the profile) is not, including through
+    /// the pre-encoding URI shape `mcp-relay://team/github/...`.
+    #[tokio::test]
+    async fn route_resource_read_endpoint_name_with_slash_is_profile_scoped() {
+        let registry = registry_with_four_endpoints().await;
+        for name in ["team", "team/github"] {
+            registry
+                .register(
+                    name.into(),
+                    Box::new(MockAdapter { tools: vec![] }),
+                    "stdio".into(),
+                    None,
+                    Some(name.replace('/', "_")),
+                )
+                .await;
+        }
+        let pr = ProfileRegistry::new(registry);
+        pr.rebuild(&[ProfileConfig {
+            name: "Work".into(),
+            path: "work".into(),
+            endpoints: vec!["team/github".into(), "gmail".into()],
+            js_execution: false,
+            toon_output: true,
+        }])
+        .await;
+        let view = &pr.get("work").await.unwrap().registry_view;
+
+        let wrapped = crate::resource_uri::encode_resource_uri("team/github", "ui://app/main");
+        let result = view
+            .route_resource_read(&wrapped)
+            .await
+            .expect("in-profile endpoint with '/' must be readable");
+        assert_eq!(result["contents"][0]["uri"], "ui://app/main");
+
+        for foreign in [
+            crate::resource_uri::encode_resource_uri("team", "ui://app/main"),
+            "mcp-relay://team/github/ui%3A%2F%2Fapp%2Fmain".to_string(),
+        ] {
+            let err = view
+                .route_resource_read(&foreign)
+                .await
+                .expect_err("prefix endpoint outside the profile must be rejected");
+            assert!(
+                matches!(&err, AdapterError::ProtocolError(m) if m.contains("not available in this profile")),
+                "{foreign}: {err:?}"
+            );
+        }
+    }
+
     /// T12 regression — the `(global>=2, profile==1)` foreign-endpoint
     /// bypass. With multiple endpoints globally but only one in the
     /// profile, the profile's in-scope `skip_wrap` is `true` so the

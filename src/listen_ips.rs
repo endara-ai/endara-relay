@@ -199,6 +199,91 @@ pub fn canonical_listen_ips(listen_ips: Option<&[String]>) -> Vec<String> {
         .collect()
 }
 
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    /// 10/8, 172.16/12, 192.168/16, 100.64/10 by raw prefix bits.
+    fn spec_v4_eligible(bits: u32) -> bool {
+        bits >> 24 == 10
+            || bits >> 20 == 0xac1
+            || bits >> 16 == 0xc0a8
+            || bits >> 22 == (100 << 2) | 0b01
+    }
+
+    fn spec_v4_loopback(bits: u32) -> bool {
+        bits >> 24 == 127
+    }
+
+    /// `::ffff:0:0/96` carries an IPv4 address in its low 32 bits.
+    fn mapped_v4(bits: u128) -> Option<u32> {
+        (bits >> 32 == 0xffff).then_some(bits as u32)
+    }
+
+    #[kani::proof]
+    fn classify_v4_matches_spec() {
+        let bits: u32 = kani::any();
+        let class = classify_listen_ip(IpAddr::V4(Ipv4Addr::from(bits)));
+        assert!((class == ListenIpClass::Eligible) == spec_v4_eligible(bits));
+        assert!((class == ListenIpClass::Loopback) == spec_v4_loopback(bits));
+    }
+
+    #[kani::proof]
+    fn classify_v6_matches_spec() {
+        let bits: u128 = kani::any();
+        let class = classify_listen_ip(IpAddr::V6(Ipv6Addr::from(bits)));
+        let (eligible, loopback) = match mapped_v4(bits) {
+            Some(v4) => (spec_v4_eligible(v4), spec_v4_loopback(v4)),
+            None => (bits >> 121 == 0b111_1110, bits == 1),
+        };
+        assert!((class == ListenIpClass::Eligible) == eligible);
+        assert!((class == ListenIpClass::Loopback) == loopback);
+    }
+
+    #[derive(PartialEq)]
+    enum Kind {
+        Cgnat,
+        Private,
+        Ula,
+    }
+
+    fn kind(ip: IpAddr) -> Option<Kind> {
+        eligible_ip_kind(ip).map(|k| match k.as_bytes() {
+            b"cgnat" => Kind::Cgnat,
+            b"private" => Kind::Private,
+            b"ula" => Kind::Ula,
+            _ => panic!("unknown kind"),
+        })
+    }
+
+    fn spec_v4_kind(bits: u32) -> Option<Kind> {
+        if !spec_v4_eligible(bits) {
+            None
+        } else if bits >> 22 == (100 << 2) | 0b01 {
+            Some(Kind::Cgnat)
+        } else {
+            Some(Kind::Private)
+        }
+    }
+
+    #[kani::proof]
+    fn eligible_ip_kind_v4_matches_spec() {
+        let bits: u32 = kani::any();
+        assert!(kind(IpAddr::V4(Ipv4Addr::from(bits))) == spec_v4_kind(bits));
+    }
+
+    #[kani::proof]
+    fn eligible_ip_kind_v6_matches_spec() {
+        let bits: u128 = kani::any();
+        let expected = match mapped_v4(bits) {
+            Some(v4) => spec_v4_kind(v4),
+            None if bits >> 121 == 0b111_1110 => Some(Kind::Ula),
+            None => None,
+        };
+        assert!(kind(IpAddr::V6(Ipv6Addr::from(bits))) == expected);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
